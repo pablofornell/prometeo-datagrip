@@ -4,6 +4,12 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
+# rustup installs cargo in ~/.cargo/bin. A shell started before the install
+# does not have it in PATH yet, so add it here (no effect if it is already there).
+ifneq ($(wildcard $(HOME)/.cargo/bin/cargo),)
+export PATH := $(HOME)/.cargo/bin:$(PATH)
+endif
+
 CARGO ?= cargo
 NPM   ?= npm
 NPX   ?= npx
