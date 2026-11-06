@@ -5,8 +5,9 @@
 use std::path::PathBuf;
 
 use dbcore::{
-    ApplyResult, ConnectInfo, DataSourceConfig, Driver, ExecEvent, ExecOptions, ExportFormat, ExportOptions, FetchedRows, HistoryEntry,
-    ObjectRef, ResultSet, RowChange, SessionState, SnapshotObject, Statement, TableDataRequest, TestResult, TreeNode, TxStatus,
+    ApplyResult, ConnectInfo, DataSourceConfig, Driver, ExecEvent, ExecOptions, ExportFormat,
+    ExportOptions, FetchedRows, HistoryEntry, ObjectRef, ResultSet, RowChange, SessionState,
+    SnapshotObject, Statement, TableDataRequest, TestResult, TreeNode, TxStatus,
 };
 use serde_json::Value;
 use tauri::ipc::Channel;
@@ -31,7 +32,10 @@ pub async fn list_data_sources(state: State<'_, AppState>) -> Res<Vec<DataSource
 
 /// Insert or update by `ds.id` (empty id = new). `ds.password`: null keeps, "" clears, text replaces.
 #[tauri::command]
-pub async fn save_data_source(state: State<'_, AppState>, ds: DataSourceConfig) -> Res<DataSourceView> {
+pub async fn save_data_source(
+    state: State<'_, AppState>,
+    ds: DataSourceConfig,
+) -> Res<DataSourceView> {
     state.save_data_source(ds).await
 }
 
@@ -71,8 +75,14 @@ pub async fn connected_data_sources(state: State<'_, AppState>) -> Res<Vec<Strin
 /// re-apply per-session settings (`SET search_path`, `USE db`, isolation level) of a reopened console.
 /// The backend does not remember them. A failing statement fails the call and no session is left behind.
 #[tauri::command]
-pub async fn open_session(state: State<'_, AppState>, ds_id: String, init_sql: Option<Vec<String>>) -> Res<String> {
-    state.open_session_with(&ds_id, &init_sql.unwrap_or_default()).await
+pub async fn open_session(
+    state: State<'_, AppState>,
+    ds_id: String,
+    init_sql: Option<Vec<String>>,
+) -> Res<String> {
+    state
+        .open_session_with(&ds_id, &init_sql.unwrap_or_default())
+        .await
 }
 
 #[tauri::command]
@@ -105,8 +115,15 @@ pub async fn session_state(state: State<'_, AppState>, session_id: String) -> Re
 // ---------------------------------------------------------------- introspection
 
 #[tauri::command]
-pub async fn introspect(state: State<'_, AppState>, ds_id: String, path: Vec<String>, show_system: Option<bool>) -> Res<Vec<TreeNode>> {
-    state.introspect(&ds_id, path, show_system.unwrap_or(false)).await
+pub async fn introspect(
+    state: State<'_, AppState>,
+    ds_id: String,
+    path: Vec<String>,
+    show_system: Option<bool>,
+) -> Res<Vec<TreeNode>> {
+    state
+        .introspect(&ds_id, path, show_system.unwrap_or(false))
+        .await
 }
 
 #[tauri::command]
@@ -115,7 +132,11 @@ pub async fn get_ddl(state: State<'_, AppState>, ds_id: String, object: ObjectRe
 }
 
 #[tauri::command]
-pub async fn schema_snapshot(state: State<'_, AppState>, ds_id: String, schema: Option<String>) -> Res<Vec<SnapshotObject>> {
+pub async fn schema_snapshot(
+    state: State<'_, AppState>,
+    ds_id: String,
+    schema: Option<String>,
+) -> Res<Vec<SnapshotObject>> {
     state.schema_snapshot(&ds_id, schema).await
 }
 
@@ -140,7 +161,12 @@ pub async fn execute(
 }
 
 #[tauri::command]
-pub async fn fetch_more(state: State<'_, AppState>, execution_id: String, result_index: usize, count: usize) -> Res<FetchedRows> {
+pub async fn fetch_more(
+    state: State<'_, AppState>,
+    execution_id: String,
+    result_index: usize,
+    count: usize,
+) -> Res<FetchedRows> {
     state.fetch_more(&execution_id, result_index, count).await
 }
 
@@ -157,12 +183,24 @@ pub async fn close_execution(state: State<'_, AppState>, execution_id: String) -
 // ---------------------------------------------------------------- table data
 
 #[tauri::command]
-pub async fn table_data(state: State<'_, AppState>, ds_id: String, table: ObjectRef, request: Option<TableDataRequest>) -> Res<ResultSet> {
-    state.table_data(&ds_id, table, request.unwrap_or_default()).await
+pub async fn table_data(
+    state: State<'_, AppState>,
+    ds_id: String,
+    table: ObjectRef,
+    request: Option<TableDataRequest>,
+) -> Res<ResultSet> {
+    state
+        .table_data(&ds_id, table, request.unwrap_or_default())
+        .await
 }
 
 #[tauri::command]
-pub async fn apply_changes(state: State<'_, AppState>, ds_id: String, table: ObjectRef, changes: Vec<RowChange>) -> Res<ApplyResult> {
+pub async fn apply_changes(
+    state: State<'_, AppState>,
+    ds_id: String,
+    table: ObjectRef,
+    changes: Vec<RowChange>,
+) -> Res<ApplyResult> {
     state.apply_changes(&ds_id, table, changes).await
 }
 
@@ -173,12 +211,21 @@ pub async fn table_data_in_session(
     table: ObjectRef,
     request: Option<TableDataRequest>,
 ) -> Res<ResultSet> {
-    state.table_data_in_session(&session_id, table, request.unwrap_or_default()).await
+    state
+        .table_data_in_session(&session_id, table, request.unwrap_or_default())
+        .await
 }
 
 #[tauri::command]
-pub async fn apply_changes_in_session(state: State<'_, AppState>, session_id: String, table: ObjectRef, changes: Vec<RowChange>) -> Res<ApplyResult> {
-    state.apply_changes_in_session(&session_id, table, changes).await
+pub async fn apply_changes_in_session(
+    state: State<'_, AppState>,
+    session_id: String,
+    table: ObjectRef,
+    changes: Vec<RowChange>,
+) -> Res<ApplyResult> {
+    state
+        .apply_changes_in_session(&session_id, table, changes)
+        .await
 }
 
 // ---------------------------------------------------------------- export
@@ -202,17 +249,30 @@ pub async fn choose_export_path(
         Some(ExportFormat::Markdown) => ("md", "Markdown"),
         _ => ("csv", "CSV"),
     };
-    let mut dlg = app.dialog().file().set_parent(&window).add_filter(label, &[ext]).add_filter("All files", &["*"]);
+    let mut dlg = app
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .add_filter(label, &[ext])
+        .add_filter("All files", &["*"]);
     if let Some(name) = suggested_name.as_deref().filter(|n| !n.trim().is_empty()) {
         // a file name only: the dialog decides the folder
-        let name = std::path::Path::new(name).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = std::path::Path::new(name)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         dlg = dlg.set_file_name(name);
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
     dlg.save_file(move |p| {
         let _ = tx.send(p);
     });
-    let Some(chosen) = rx.await.map_err(|_| "The save dialog was closed".to_string())? else { return Ok(None) };
+    let Some(chosen) = rx
+        .await
+        .map_err(|_| "The save dialog was closed".to_string())?
+    else {
+        return Ok(None);
+    };
     let path = chosen.into_path().map_err(|e| e.to_string())?;
     state.allow_export_path(path.clone());
     Ok(Some(path.display().to_string()))
@@ -220,48 +280,95 @@ pub async fn choose_export_path(
 
 /// `path` must come from `choose_export_path`.
 #[tauri::command]
-pub async fn export_query(state: State<'_, AppState>, ds_id: String, sql: String, options: ExportOptions, path: String) -> Res<usize> {
-    state.export_query(&ds_id, &sql, options, &PathBuf::from(path)).await
+pub async fn export_query(
+    state: State<'_, AppState>,
+    ds_id: String,
+    sql: String,
+    options: ExportOptions,
+    path: String,
+) -> Res<usize> {
+    state
+        .export_query(&ds_id, &sql, options, &PathBuf::from(path))
+        .await
 }
 
 #[tauri::command]
-pub async fn export_query_to_string(state: State<'_, AppState>, ds_id: String, sql: String, options: ExportOptions) -> Res<String> {
+pub async fn export_query_to_string(
+    state: State<'_, AppState>,
+    ds_id: String,
+    sql: String,
+    options: ExportOptions,
+) -> Res<String> {
     state.export_query_to_string(&ds_id, &sql, options).await
 }
 
 /// `path` must come from `choose_export_path`.
 #[tauri::command]
-pub async fn export_result(state: State<'_, AppState>, result: ResultSet, options: ExportOptions, path: String) -> Res<usize> {
-    state.export_result(result, options, PathBuf::from(path)).await
+pub async fn export_result(
+    state: State<'_, AppState>,
+    result: ResultSet,
+    options: ExportOptions,
+    path: String,
+) -> Res<usize> {
+    state
+        .export_result(result, options, PathBuf::from(path))
+        .await
 }
 
 #[tauri::command]
-pub async fn export_to_string(state: State<'_, AppState>, result: ResultSet, options: ExportOptions) -> Res<String> {
+pub async fn export_to_string(
+    state: State<'_, AppState>,
+    result: ResultSet,
+    options: ExportOptions,
+) -> Res<String> {
     state.export_to_string(result, options).await
 }
 
 // ---------------------------------------------------------------- splitter
 
 #[tauri::command]
-pub async fn split_statements(state: State<'_, AppState>, sql: String, driver: Driver) -> Res<Vec<Statement>> {
+pub async fn split_statements(
+    state: State<'_, AppState>,
+    sql: String,
+    driver: Driver,
+) -> Res<Vec<Statement>> {
     Ok(state.split_statements(&sql, driver))
 }
 
 #[tauri::command]
-pub async fn statement_at(state: State<'_, AppState>, sql: String, caret_utf16: usize, driver: Driver) -> Res<Option<Statement>> {
+pub async fn statement_at(
+    state: State<'_, AppState>,
+    sql: String,
+    caret_utf16: usize,
+    driver: Driver,
+) -> Res<Option<Statement>> {
     Ok(state.statement_at(&sql, caret_utf16, driver))
 }
 
 // ---------------------------------------------------------------- history
 
 #[tauri::command]
-pub async fn history_list(state: State<'_, AppState>, ds_id: Option<String>, offset: Option<usize>, limit: Option<usize>) -> Res<Vec<HistoryEntry>> {
-    state.history_list(ds_id, offset.unwrap_or(0), limit.unwrap_or(200)).await
+pub async fn history_list(
+    state: State<'_, AppState>,
+    ds_id: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Res<Vec<HistoryEntry>> {
+    state
+        .history_list(ds_id, offset.unwrap_or(0), limit.unwrap_or(200))
+        .await
 }
 
 #[tauri::command]
-pub async fn history_search(state: State<'_, AppState>, text: String, ds_id: Option<String>, limit: Option<usize>) -> Res<Vec<HistoryEntry>> {
-    state.history_search(text, ds_id, limit.unwrap_or(200)).await
+pub async fn history_search(
+    state: State<'_, AppState>,
+    text: String,
+    ds_id: Option<String>,
+    limit: Option<usize>,
+) -> Res<Vec<HistoryEntry>> {
+    state
+        .history_search(text, ds_id, limit.unwrap_or(200))
+        .await
 }
 
 #[tauri::command]
@@ -300,7 +407,12 @@ pub async fn read_console(state: State<'_, AppState>, ds_id: String, name: Strin
 }
 
 #[tauri::command]
-pub async fn write_console(state: State<'_, AppState>, ds_id: String, name: String, text: String) -> Res<()> {
+pub async fn write_console(
+    state: State<'_, AppState>,
+    ds_id: String,
+    name: String,
+    text: String,
+) -> Res<()> {
     state.write_console(&ds_id, &name, text).await
 }
 
@@ -315,6 +427,11 @@ pub async fn delete_console(state: State<'_, AppState>, ds_id: String, name: Str
 }
 
 #[tauri::command]
-pub async fn rename_console(state: State<'_, AppState>, ds_id: String, from: String, to: String) -> Res<()> {
+pub async fn rename_console(
+    state: State<'_, AppState>,
+    ds_id: String,
+    from: String,
+    to: String,
+) -> Res<()> {
     state.rename_console(&ds_id, &from, &to).await
 }

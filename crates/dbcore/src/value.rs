@@ -165,7 +165,10 @@ fn builtin(oid: u32) -> Option<(&'static str, PgCat)> {
 
 fn pg_row_of(cache: &HashMap<u32, PgTypeRow>, oid: u32) -> Option<PgTypeRow> {
     if let Some((n, c)) = builtin(oid) {
-        return Some(PgTypeRow { name: n.to_string(), cat: c });
+        return Some(PgTypeRow {
+            name: n.to_string(),
+            cat: c,
+        });
     }
     cache.get(&oid).cloned()
 }
@@ -203,8 +206,11 @@ async fn pg_ensure_types(live: &Live, oids: &[u32]) -> Result<()> {
     for _ in 0..4 {
         let missing: Vec<u32> = {
             let cache = live.pg_types.lock().unwrap();
-            let mut m: Vec<u32> =
-                need.iter().copied().filter(|o| builtin(*o).is_none() && !cache.contains_key(o)).collect();
+            let mut m: Vec<u32> = need
+                .iter()
+                .copied()
+                .filter(|o| builtin(*o).is_none() && !cache.contains_key(o))
+                .collect();
             m.sort_unstable();
             m.dedup();
             m
@@ -212,7 +218,11 @@ async fn pg_ensure_types(live: &Live, oids: &[u32]) -> Result<()> {
         if missing.is_empty() {
             return Ok(());
         }
-        let list = missing.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+        let list = missing
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         let rows = live
             .pool
             .query_strings(&format!(
@@ -241,7 +251,10 @@ async fn pg_ensure_types(live: &Live, oids: &[u32]) -> Result<()> {
             }
             // anything the catalog did not return is marked as plain text so we do not loop
             for o in &missing {
-                cache.entry(*o).or_insert(PgTypeRow { name: format!("oid:{o}"), cat: PgCat::Text });
+                cache.entry(*o).or_insert(PgTypeRow {
+                    name: format!("oid:{o}"),
+                    cat: PgCat::Text,
+                });
             }
         }
         need = next;
@@ -253,7 +266,13 @@ async fn pg_ensure_types(live: &Live, oids: &[u32]) -> Result<()> {
 async fn pg_table_refs(live: &Live, cols: &[sqlx::postgres::PgColumn]) -> Vec<Option<String>> {
     let rels: Vec<u32> = cols
         .iter()
-        .map(|c| if c.relation_attribute_no().is_some_and(|n| n > 0) { c.relation_id().map(|o| o.0).unwrap_or(0) } else { 0 })
+        .map(|c| {
+            if c.relation_attribute_no().is_some_and(|n| n > 0) {
+                c.relation_id().map(|o| o.0).unwrap_or(0)
+            } else {
+                0
+            }
+        })
         .collect();
     pg_ensure_rels(live, &rels).await;
     let cache = live.pg_rels.lock().unwrap_or_else(|e| e.into_inner());
@@ -265,7 +284,11 @@ async fn pg_table_refs(live: &Live, cols: &[sqlx::postgres::PgColumn]) -> Vec<Op
 async fn pg_ensure_rels(live: &Live, rels: &[u32]) {
     let missing: Vec<u32> = {
         let cache = live.pg_rels.lock().unwrap_or_else(|e| e.into_inner());
-        let mut m: Vec<u32> = rels.iter().copied().filter(|o| *o != 0 && !cache.contains_key(o)).collect();
+        let mut m: Vec<u32> = rels
+            .iter()
+            .copied()
+            .filter(|o| *o != 0 && !cache.contains_key(o))
+            .collect();
         m.sort_unstable();
         m.dedup();
         m
@@ -273,7 +296,11 @@ async fn pg_ensure_rels(live: &Live, rels: &[u32]) {
     if missing.is_empty() {
         return;
     }
-    let list = missing.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let list = missing
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     let Ok(rows) = live
         .pool
         .query_strings(&format!(
@@ -302,8 +329,14 @@ pub(crate) fn pg_text_cell(kind: &PgKind, s: &str, opts: DecodeOpts) -> Cell {
             "f" | "false" => Value::Bool(false),
             _ => Value::String(s.to_string()),
         },
-        PgKind::Int => s.parse::<i64>().map(int_cell).unwrap_or_else(|_| Value::String(s.to_string())),
-        PgKind::Int8 => s.parse::<i64>().map(int_cell).unwrap_or_else(|_| Value::String(s.to_string())),
+        PgKind::Int => s
+            .parse::<i64>()
+            .map(int_cell)
+            .unwrap_or_else(|_| Value::String(s.to_string())),
+        PgKind::Int8 => s
+            .parse::<i64>()
+            .map(int_cell)
+            .unwrap_or_else(|_| Value::String(s.to_string())),
         PgKind::Float => match s.parse::<f64>() {
             Ok(v) if v.is_finite() => float_cell(v),
             _ => Value::String(s.to_string()),
@@ -400,11 +433,12 @@ fn my_kind(name: &str) -> MyKind {
         // sqlx reports every TINYINT(1) as BOOLEAN, but MySQL keeps any value -128..127 there
         // (BOOL is just an alias): show the integer, not `true`
         "BOOLEAN" | "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" | "YEAR" => MyKind::Int,
-        "TINYINT UNSIGNED" | "SMALLINT UNSIGNED" | "MEDIUMINT UNSIGNED" | "INT UNSIGNED" | "BIGINT UNSIGNED" => {
-            MyKind::UInt
-        }
+        "TINYINT UNSIGNED" | "SMALLINT UNSIGNED" | "MEDIUMINT UNSIGNED" | "INT UNSIGNED"
+        | "BIGINT UNSIGNED" => MyKind::UInt,
         "FLOAT" | "DOUBLE" => MyKind::Float,
-        "BINARY" | "VARBINARY" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB" | "GEOMETRY" => MyKind::Bin,
+        "BINARY" | "VARBINARY" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB" | "GEOMETRY" => {
+            MyKind::Bin
+        }
         "BIT" => MyKind::Bit,
         // DECIMAL stays text on purpose (precision)
         _ => MyKind::Text,
@@ -424,8 +458,14 @@ fn my_cell(kind: MyKind, bytes: &[u8], opts: DecodeOpts) -> Cell {
         _ => {
             let s = String::from_utf8_lossy(bytes);
             match kind {
-                MyKind::Int => s.parse::<i64>().map(int_cell).unwrap_or_else(|_| Value::String(s.into_owned())),
-                MyKind::UInt => s.parse::<u64>().map(uint_cell).unwrap_or_else(|_| Value::String(s.into_owned())),
+                MyKind::Int => s
+                    .parse::<i64>()
+                    .map(int_cell)
+                    .unwrap_or_else(|_| Value::String(s.into_owned())),
+                MyKind::UInt => s
+                    .parse::<u64>()
+                    .map(uint_cell)
+                    .unwrap_or_else(|_| Value::String(s.into_owned())),
                 MyKind::Float => match s.parse::<f64>() {
                     Ok(v) if v.is_finite() => float_cell(v),
                     _ => Value::String(s.into_owned()),
@@ -439,17 +479,26 @@ fn my_cell(kind: MyKind, bytes: &[u8], opts: DecodeOpts) -> Cell {
 // -------------------------------------------------------------------- SQLite
 
 fn lite_cell(row: &SqliteRow, i: usize, opts: DecodeOpts) -> Cell {
-    let Ok(raw) = row.try_get_raw(i) else { return Value::Null };
+    let Ok(raw) = row.try_get_raw(i) else {
+        return Value::Null;
+    };
     if raw.is_null() {
         return Value::Null;
     }
     let ty = raw.type_info().name().to_string();
     match ty.as_str() {
-        "INTEGER" | "INT" | "INT8" | "BOOLEAN" => {
-            row.try_get_unchecked::<i64, _>(i).map(int_cell).unwrap_or(Value::Null)
-        }
-        "REAL" | "NUMERIC" => row.try_get_unchecked::<f64, _>(i).map(float_cell).unwrap_or(Value::Null),
-        "BLOB" => row.try_get_unchecked::<Vec<u8>, _>(i).map(|b| bin_cell(&b, opts)).unwrap_or(Value::Null),
+        "INTEGER" | "INT" | "INT8" | "BOOLEAN" => row
+            .try_get_unchecked::<i64, _>(i)
+            .map(int_cell)
+            .unwrap_or(Value::Null),
+        "REAL" | "NUMERIC" => row
+            .try_get_unchecked::<f64, _>(i)
+            .map(float_cell)
+            .unwrap_or(Value::Null),
+        "BLOB" => row
+            .try_get_unchecked::<Vec<u8>, _>(i)
+            .map(|b| bin_cell(&b, opts))
+            .unwrap_or(Value::Null),
         _ => row
             .try_get_unchecked::<String, _>(i)
             .map(Value::String)
@@ -477,10 +526,18 @@ pub(crate) enum RowDecoder {
 }
 
 impl RowDecoder {
-    pub async fn build(live: &Live, first: &RawRow, opts: DecodeOpts) -> Result<(RowDecoder, Vec<ColumnMeta>)> {
+    pub async fn build(
+        live: &Live,
+        first: &RawRow,
+        opts: DecodeOpts,
+    ) -> Result<(RowDecoder, Vec<ColumnMeta>)> {
         match first {
             RawRow::Pg(r) => {
-                let oids: Vec<u32> = r.columns().iter().map(|c| c.type_info().oid().map(|o| o.0).unwrap_or(0)).collect();
+                let oids: Vec<u32> = r
+                    .columns()
+                    .iter()
+                    .map(|c| c.type_info().oid().map(|o| o.0).unwrap_or(0))
+                    .collect();
                 pg_ensure_types(live, &oids).await?;
                 let rels = pg_table_refs(live, r.columns()).await;
                 let cache = live.pg_types.lock().unwrap_or_else(|e| e.into_inner());
@@ -490,7 +547,10 @@ impl RowDecoder {
                 for ((c, oid), rel) in r.columns().iter().zip(oids).zip(rels) {
                     let (name, kind) = pg_resolve(&cache, oid, 0);
                     kinds.push(kind);
-                    metas.push(ColumnMeta { table_ref: rel, ..meta(c.name(), name) });
+                    metas.push(ColumnMeta {
+                        table_ref: rel,
+                        ..meta(c.name(), name)
+                    });
                     sig.push((c.name().to_string(), oid));
                 }
                 Ok((RowDecoder::Pg(Arc::new(kinds), opts, sig), metas))
@@ -502,7 +562,11 @@ impl RowDecoder {
                 for c in r.columns() {
                     let tn = c.type_info().name().to_string();
                     kinds.push(my_kind(&tn));
-                    let shown = if tn == "BOOLEAN" { "tinyint(1)".to_string() } else { tn.to_lowercase() };
+                    let shown = if tn == "BOOLEAN" {
+                        "tinyint(1)".to_string()
+                    } else {
+                        tn.to_lowercase()
+                    };
                     metas.push(meta(c.name(), shown));
                     sig.push((c.name().to_string(), tn));
                 }
@@ -514,7 +578,14 @@ impl RowDecoder {
                     .iter()
                     .map(|c| {
                         let tn = c.type_info().name().to_string();
-                        meta(c.name(), if tn == "NULL" { String::new() } else { tn.to_lowercase() })
+                        meta(
+                            c.name(),
+                            if tn == "NULL" {
+                                String::new()
+                            } else {
+                                tn.to_lowercase()
+                            },
+                        )
                     })
                     .collect();
                 let sig = r.columns().iter().map(|c| c.name().to_string()).collect();
@@ -530,11 +601,17 @@ impl RowDecoder {
             (RowDecoder::Pg(_, _, sig), RawRow::Pg(r)) => {
                 let cols = r.columns();
                 cols.len() == sig.len()
-                    && cols.iter().zip(sig).all(|(c, (n, oid))| c.name() == n && c.type_info().oid().map(|o| o.0).unwrap_or(0) == *oid)
+                    && cols.iter().zip(sig).all(|(c, (n, oid))| {
+                        c.name() == n && c.type_info().oid().map(|o| o.0).unwrap_or(0) == *oid
+                    })
             }
             (RowDecoder::My(_, _, sig), RawRow::My(r)) => {
                 let cols = r.columns();
-                cols.len() == sig.len() && cols.iter().zip(sig).all(|(c, (n, t))| c.name() == n && c.type_info().name() == t)
+                cols.len() == sig.len()
+                    && cols
+                        .iter()
+                        .zip(sig)
+                        .all(|(c, (n, t))| c.name() == n && c.type_info().name() == t)
             }
             (RowDecoder::Lite(_, sig), RawRow::Lite(r)) => {
                 let cols = r.columns();
@@ -556,19 +633,29 @@ impl RowDecoder {
                 .collect(),
             (RowDecoder::My(kinds, opts, _), RawRow::My(r)) => (0..r.len())
                 .map(|i| match r.try_get_unchecked::<Option<Vec<u8>>, _>(i) {
-                    Ok(Some(b)) => my_cell(kinds.get(i).copied().unwrap_or(MyKind::Text), &b, *opts),
+                    Ok(Some(b)) => {
+                        my_cell(kinds.get(i).copied().unwrap_or(MyKind::Text), &b, *opts)
+                    }
                     Ok(None) => Value::Null,
                     Err(_) => Value::String("<unsupported type>".into()),
                 })
                 .collect(),
-            (RowDecoder::Lite(opts, _), RawRow::Lite(r)) => (0..r.len()).map(|i| lite_cell(r, i, *opts)).collect(),
+            (RowDecoder::Lite(opts, _), RawRow::Lite(r)) => {
+                (0..r.len()).map(|i| lite_cell(r, i, *opts)).collect()
+            }
             _ => Vec::new(),
         }
     }
 }
 
 fn meta(name: &str, type_name: String) -> ColumnMeta {
-    ColumnMeta { name: name.to_string(), type_name, nullable: true, is_pk: false, table_ref: None }
+    ColumnMeta {
+        name: name.to_string(),
+        type_name,
+        nullable: true,
+        is_pk: false,
+        table_ref: None,
+    }
 }
 
 /// Column metadata of a statement without running it (`describe`). Used to show the
@@ -576,30 +663,58 @@ fn meta(name: &str, type_name: String) -> ColumnMeta {
 pub(crate) async fn describe_columns(live: &Live, conn: &mut Conn, sql: &str) -> Vec<ColumnMeta> {
     use sqlx::Executor;
     fn conv<C: Column>(cols: &[C]) -> Vec<ColumnMeta> {
-        cols.iter().map(|c| meta(c.name(), c.type_info().name().to_lowercase())).collect()
+        cols.iter()
+            .map(|c| meta(c.name(), c.type_info().name().to_lowercase()))
+            .collect()
     }
     match conn {
         Conn::Pg(c) => match c.describe(sql).await {
             Ok(d) => {
                 let refs = pg_table_refs(live, d.columns()).await;
-                conv(d.columns()).into_iter().zip(refs).map(|(m, table_ref)| ColumnMeta { table_ref, ..m }).collect()
+                conv(d.columns())
+                    .into_iter()
+                    .zip(refs)
+                    .map(|(m, table_ref)| ColumnMeta { table_ref, ..m })
+                    .collect()
             }
             Err(_) => Vec::new(),
         },
-        Conn::My(c) => c.describe(sql).await.map(|d| conv(d.columns())).unwrap_or_default(),
-        Conn::Lite(c) => c.describe(sql).await.map(|d| conv(d.columns())).unwrap_or_default(),
+        Conn::My(c) => c
+            .describe(sql)
+            .await
+            .map(|d| conv(d.columns()))
+            .unwrap_or_default(),
+        Conn::Lite(c) => c
+            .describe(sql)
+            .await
+            .map(|d| conv(d.columns()))
+            .unwrap_or_default(),
     }
 }
 
 pub(crate) async fn describe_columns_pool(pool: &crate::conn::Pool, sql: &str) -> Vec<ColumnMeta> {
     use sqlx::Executor;
     fn conv<C: Column>(cols: &[C]) -> Vec<ColumnMeta> {
-        cols.iter().map(|c| meta(c.name(), c.type_info().name().to_lowercase())).collect()
+        cols.iter()
+            .map(|c| meta(c.name(), c.type_info().name().to_lowercase()))
+            .collect()
     }
     match pool {
-        crate::conn::Pool::Pg(p) => p.describe(sql).await.map(|d| conv(d.columns())).unwrap_or_default(),
-        crate::conn::Pool::My(p) => p.describe(sql).await.map(|d| conv(d.columns())).unwrap_or_default(),
-        crate::conn::Pool::Lite(p) => p.describe(sql).await.map(|d| conv(d.columns())).unwrap_or_default(),
+        crate::conn::Pool::Pg(p) => p
+            .describe(sql)
+            .await
+            .map(|d| conv(d.columns()))
+            .unwrap_or_default(),
+        crate::conn::Pool::My(p) => p
+            .describe(sql)
+            .await
+            .map(|d| conv(d.columns()))
+            .unwrap_or_default(),
+        crate::conn::Pool::Lite(p) => p
+            .describe(sql)
+            .await
+            .map(|d| conv(d.columns()))
+            .unwrap_or_default(),
     }
 }
 
@@ -616,12 +731,18 @@ mod tests {
     fn pg_arrays() {
         assert_eq!(arr("{1,2,NULL,4}", PgKind::Int), json!([1, 2, null, 4]));
         assert_eq!(arr("{}", PgKind::Int), json!([]));
-        assert_eq!(arr(r#"{a,"b c","d\"e","NULL",NULL}"#, PgKind::Text), json!(["a", "b c", "d\"e", "NULL", null]));
+        assert_eq!(
+            arr(r#"{a,"b c","d\"e","NULL",NULL}"#, PgKind::Text),
+            json!(["a", "b c", "d\"e", "NULL", null])
+        );
         assert_eq!(arr("{{1,2},{3,4}}", PgKind::Int), json!([[1, 2], [3, 4]]));
         assert_eq!(arr("[0:1]={5,6}", PgKind::Int), json!([5, 6]));
         assert_eq!(arr("{t,f}", PgKind::Bool), json!([true, false]));
         assert_eq!(arr("{1.50,2}", PgKind::Numeric), json!(["1.50", "2"]));
-        assert_eq!(arr("{9007199254740993}", PgKind::Int8), json!(["9007199254740993"]));
+        assert_eq!(
+            arr("{9007199254740993}", PgKind::Int8),
+            json!(["9007199254740993"])
+        );
     }
 
     #[test]
@@ -629,9 +750,18 @@ mod tests {
         let o = DecodeOpts::default();
         assert_eq!(pg_text_cell(&PgKind::Float, "NaN", o), json!("NaN"));
         assert_eq!(pg_text_cell(&PgKind::Float, "1.5", o), json!(1.5));
-        assert_eq!(pg_text_cell(&PgKind::Numeric, "12345678901234567890.123", o), json!("12345678901234567890.123"));
-        assert_eq!(pg_text_cell(&PgKind::Int8, "9223372036854775807", o), json!("9223372036854775807"));
-        assert_eq!(pg_text_cell(&PgKind::Bytea, "\\xdeadbeef", o), json!({"$bin": "deadbeef", "len": 4}));
+        assert_eq!(
+            pg_text_cell(&PgKind::Numeric, "12345678901234567890.123", o),
+            json!("12345678901234567890.123")
+        );
+        assert_eq!(
+            pg_text_cell(&PgKind::Int8, "9223372036854775807", o),
+            json!("9223372036854775807")
+        );
+        assert_eq!(
+            pg_text_cell(&PgKind::Bytea, "\\xdeadbeef", o),
+            json!({"$bin": "deadbeef", "len": 4})
+        );
         let small = DecodeOpts { bin_limit: 2 };
         assert_eq!(
             pg_text_cell(&PgKind::Bytea, "\\xdeadbeef", small),
@@ -642,7 +772,10 @@ mod tests {
     #[test]
     fn mysql_cells() {
         let o = DecodeOpts::default();
-        assert_eq!(my_cell(MyKind::UInt, b"18446744073709551615", o), json!("18446744073709551615"));
+        assert_eq!(
+            my_cell(MyKind::UInt, b"18446744073709551615", o),
+            json!("18446744073709551615")
+        );
         assert_eq!(my_cell(MyKind::Int, b"-5", o), json!(-5));
         // TINYINT(1) (sqlx name BOOLEAN) holds any tinyint: 0 / 1 / 5 stay integers
         for (v, want) in [(&b"0"[..], 0), (b"1", 1), (b"5", 5), (b"-3", -3)] {
@@ -650,6 +783,9 @@ mod tests {
         }
         assert_eq!(my_cell(my_kind("TINYINT"), b"5", o), json!(5));
         assert_eq!(my_cell(MyKind::Bit, &[0, 5], o), json!(5));
-        assert_eq!(my_cell(MyKind::Bin, &[1, 2], o), json!({"$bin": "0102", "len": 2}));
+        assert_eq!(
+            my_cell(MyKind::Bin, &[1, 2], o),
+            json!({"$bin": "0102", "len": 2})
+        );
     }
 }

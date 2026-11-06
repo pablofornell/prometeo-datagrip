@@ -48,7 +48,11 @@ pub(crate) enum CancelTarget {
 }
 
 pub(crate) enum ExecCmd {
-    FetchMore { result_index: usize, count: usize, reply: oneshot::Sender<Result<FetchedRows>> },
+    FetchMore {
+        result_index: usize,
+        count: usize,
+        reply: oneshot::Sender<Result<FetchedRows>>,
+    },
     Close,
 }
 
@@ -117,14 +121,25 @@ pub(crate) async fn open_conn(live: &Live) -> Result<Opened> {
         }
     };
     let autocommit_on = match &mut conn {
-        Conn::My(_) => conn_scalar(&mut conn, "select @@autocommit").await?.map(|v| v != "0").unwrap_or(true),
+        Conn::My(_) => conn_scalar(&mut conn, "select @@autocommit")
+            .await?
+            .map(|v| v != "0")
+            .unwrap_or(true),
         _ => true,
     };
     let server_ver = match &mut conn {
-        Conn::My(_) => conn_scalar(&mut conn, "select @@version").await?.map(|v| ServerVer::parse(&v)).unwrap_or(ServerVer::UNKNOWN),
+        Conn::My(_) => conn_scalar(&mut conn, "select @@version")
+            .await?
+            .map(|v| ServerVer::parse(&v))
+            .unwrap_or(ServerVer::UNKNOWN),
         _ => ServerVer::UNKNOWN,
     };
-    Ok(Opened { conn, cancel, autocommit_on, server_ver })
+    Ok(Opened {
+        conn,
+        cancel,
+        autocommit_on,
+        server_ver,
+    })
 }
 
 impl Session {
@@ -169,13 +184,18 @@ impl Session {
     /// `e` is not a lost connection, else `Some(had_tx)`: a transaction was open and is gone now (false when
     /// the session was already dead). The caller drops the connection it holds.
     pub fn lose(&self, e: &DbError) -> Option<bool> {
-        let DbError::ConnectionLost(info) = e else { return None };
+        let DbError::ConnectionLost(info) = e else {
+            return None;
+        };
         let mut lost = self.lost.lock().unwrap();
         if lost.is_some() {
             return Some(false);
         }
         let had_tx = self.in_tx();
-        *lost = Some(Lost { info: info.clone(), had_tx });
+        *lost = Some(Lost {
+            info: info.clone(),
+            had_tx,
+        });
         drop(lost);
         self.set_tx_status(TxStatus::Idle);
         self.tables_locked.store(false, Ordering::Relaxed);
@@ -214,7 +234,8 @@ impl Session {
                 *guard = Some(o.conn);
                 *self.cancel.lock().unwrap() = o.cancel;
                 self.autocommit_on.store(o.autocommit_on, Ordering::Relaxed);
-                self.server_version.store(o.server_ver.num, Ordering::Relaxed);
+                self.server_version
+                    .store(o.server_ver.num, Ordering::Relaxed);
                 self.mariadb.store(o.server_ver.mariadb, Ordering::Relaxed);
                 self.tables_locked.store(false, Ordering::Relaxed);
                 self.set_tx_status(TxStatus::Idle);
@@ -234,7 +255,11 @@ impl Session {
         match &self.cancel_target() {
             CancelTarget::None => {}
             CancelTarget::Pg(pid) => {
-                let _ = self.live.pool.exec(&format!("select pg_cancel_backend({pid})")).await;
+                let _ = self
+                    .live
+                    .pool
+                    .exec(&format!("select pg_cancel_backend({pid})"))
+                    .await;
             }
             CancelTarget::My(id) => {
                 let _ = self.live.pool.exec(&format!("KILL QUERY {id}")).await;
@@ -244,7 +269,9 @@ impl Session {
                 if let Some(ptr) = *g {
                     // SAFETY: the pointer is cleared (under this lock) before the connection
                     // is dropped, and sqlite3_interrupt is documented as thread-safe.
-                    unsafe { libsqlite3_sys::sqlite3_interrupt(ptr as *mut libsqlite3_sys::sqlite3) };
+                    unsafe {
+                        libsqlite3_sys::sqlite3_interrupt(ptr as *mut libsqlite3_sys::sqlite3)
+                    };
                 }
             }
         }
@@ -306,20 +333,36 @@ impl ConnectionManager {
         .await;
         let elapsed_ms = t0.elapsed().as_millis() as u64;
         match res {
-            Ok(v) => TestResult { ok: true, message: format!("Succeeded. {v}"), server_version: Some(v), elapsed_ms },
-            Err(e) => TestResult { ok: false, server_version: None, message: e.to_string(), elapsed_ms },
+            Ok(v) => TestResult {
+                ok: true,
+                message: format!("Succeeded. {v}"),
+                server_version: Some(v),
+                elapsed_ms,
+            },
+            Err(e) => TestResult {
+                ok: false,
+                server_version: None,
+                message: e.to_string(),
+                elapsed_ms,
+            },
         }
     }
 
     /// Connect (idempotent). Use [`reconnect`](Self::reconnect) to apply a changed config.
     pub async fn connect(&self, cfg: &DataSourceConfig) -> Result<ConnectInfo> {
         if let Some(l) = self.inner.sources.read().unwrap().get(&cfg.id) {
-            return Ok(ConnectInfo { server_version: l.server_version.clone() });
+            return Ok(ConnectInfo {
+                server_version: l.server_version.clone(),
+            });
         }
         let opts = build_opts(cfg)?;
         let version = probe(cfg, &opts).await?;
         let pool = open_pool(cfg, &opts).await?;
-        let keepalive = if is_memory(cfg) { Some(connect_one(&opts, cfg).await?) } else { None };
+        let keepalive = if is_memory(cfg) {
+            Some(connect_one(&opts, cfg).await?)
+        } else {
+            None
+        };
         let live = Arc::new(Live {
             cfg: cfg.clone(),
             pool,
@@ -329,8 +372,14 @@ impl ConnectionManager {
             pg_rels: Mutex::new(HashMap::new()),
             keepalive: Mutex::new(keepalive),
         });
-        self.inner.sources.write().unwrap().insert(cfg.id.clone(), live);
-        Ok(ConnectInfo { server_version: version })
+        self.inner
+            .sources
+            .write()
+            .unwrap()
+            .insert(cfg.id.clone(), live);
+        Ok(ConnectInfo {
+            server_version: version,
+        })
     }
 
     pub async fn reconnect(&self, cfg: &DataSourceConfig) -> Result<ConnectInfo> {
@@ -377,7 +426,13 @@ impl ConnectionManager {
     }
 
     pub(crate) fn session(&self, id: &SessionId) -> Result<Arc<Session>> {
-        self.inner.sessions.lock().unwrap().get(&id.0).cloned().ok_or_else(|| DbError::NoSession(id.0.clone()))
+        self.inner
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&id.0)
+            .cloned()
+            .ok_or_else(|| DbError::NoSession(id.0.clone()))
     }
 
     pub fn server_version(&self, ds_id: &str) -> Result<String> {
@@ -400,7 +455,12 @@ impl ConnectionManager {
     /// fails, the connection is closed and its error is returned (no session is left behind).
     pub async fn open_session_with(&self, ds_id: &str, init_sql: &[String]) -> Result<SessionId> {
         let live = self.live(ds_id)?;
-        let Opened { conn, cancel, autocommit_on, server_ver } = open_conn(&live).await?;
+        let Opened {
+            conn,
+            cancel,
+            autocommit_on,
+            server_ver,
+        } = open_conn(&live).await?;
         let id = uuid::Uuid::new_v4().to_string();
         let session = Arc::new(Session {
             id: id.clone(),
@@ -437,13 +497,19 @@ impl ConnectionManager {
                 return Err(e);
             }
         }
-        self.inner.sessions.lock().unwrap().insert(id.clone(), session);
+        self.inner
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(id.clone(), session);
         Ok(SessionId(id))
     }
 
     /// Close the session. Always succeeds, also when its connection is already dead.
     pub async fn close_session(&self, id: &SessionId) {
-        let Some(sess) = self.inner.sessions.lock().unwrap().remove(&id.0) else { return };
+        let Some(sess) = self.inner.sessions.lock().unwrap().remove(&id.0) else {
+            return;
+        };
         if let Some((_, ctl)) = sess.current.lock().unwrap().take() {
             ctl.token.cancel();
             let _ = ctl.cmd.send(ExecCmd::Close);
@@ -461,12 +527,17 @@ impl ConnectionManager {
     /// Exclusive use of the session connection for a one-off operation (table read / edit). An open paging
     /// result of the session is released first (inside a transaction its rest is drained, like a new
     /// `execute` does); `Busy` while a statement is running.
-    pub(crate) async fn lock_session_conn(&self, sess: &Arc<Session>) -> Result<tokio::sync::OwnedMutexGuard<Option<Conn>>> {
+    pub(crate) async fn lock_session_conn(
+        &self,
+        sess: &Arc<Session>,
+    ) -> Result<tokio::sync::OwnedMutexGuard<Option<Conn>>> {
         {
             let cur = sess.current.lock().unwrap();
             if let Some((_, ctl)) = cur.as_ref() {
                 if ctl.running.load(Ordering::Relaxed) {
-                    return Err(DbError::Busy("The session is busy executing another statement".into()));
+                    return Err(DbError::Busy(
+                        "The session is busy executing another statement".into(),
+                    ));
                 }
                 let _ = ctl.cmd.send(ExecCmd::Close);
             }

@@ -28,7 +28,10 @@ impl HistoryEntry {
     pub fn new(data_source_id: &str, sql: &str) -> Self {
         HistoryEntry {
             id: uuid::Uuid::new_v4().to_string(),
-            ts_ms: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
+            ts_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
             data_source_id: data_source_id.to_string(),
             sql: sql.to_string(),
             duration_ms: None,
@@ -46,7 +49,10 @@ pub struct QueryHistory {
 
 impl QueryHistory {
     pub fn new(path: impl AsRef<Path>) -> Self {
-        QueryHistory { path: path.as_ref().to_path_buf(), lock: Mutex::new(()) }
+        QueryHistory {
+            path: path.as_ref().to_path_buf(),
+            lock: Mutex::new(()),
+        }
     }
 
     pub fn append(&self, entry: &HistoryEntry) -> Result<()> {
@@ -56,7 +62,10 @@ impl QueryHistory {
                 fs::create_dir_all(dir)?;
             }
         }
-        let mut f = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
         let mut line = serde_json::to_string(entry)?;
         line.push('\n');
         f.write_all(line.as_bytes())?;
@@ -79,25 +88,43 @@ impl QueryHistory {
     }
 
     /// Newest first.
-    pub fn list(&self, data_source_id: Option<&str>, offset: usize, limit: usize) -> Result<Vec<HistoryEntry>> {
+    pub fn list(
+        &self,
+        data_source_id: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<HistoryEntry>> {
         Ok(self
             .read_all()?
             .into_iter()
             .rev()
-            .filter(|e| data_source_id.map(|d| d == e.data_source_id).unwrap_or(true))
+            .filter(|e| {
+                data_source_id
+                    .map(|d| d == e.data_source_id)
+                    .unwrap_or(true)
+            })
             .skip(offset)
             .take(limit)
             .collect())
     }
 
     /// Case-insensitive substring search in the SQL text, newest first.
-    pub fn search(&self, text: &str, data_source_id: Option<&str>, limit: usize) -> Result<Vec<HistoryEntry>> {
+    pub fn search(
+        &self,
+        text: &str,
+        data_source_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<HistoryEntry>> {
         let needle = text.to_lowercase();
         Ok(self
             .read_all()?
             .into_iter()
             .rev()
-            .filter(|e| data_source_id.map(|d| d == e.data_source_id).unwrap_or(true))
+            .filter(|e| {
+                data_source_id
+                    .map(|d| d == e.data_source_id)
+                    .unwrap_or(true)
+            })
             .filter(|e| e.sql.to_lowercase().contains(&needle))
             .take(limit)
             .collect())
@@ -122,17 +149,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let h = QueryHistory::new(dir.path().join("sub/history.jsonl"));
         assert!(h.list(None, 0, 10).unwrap().is_empty());
-        for (ds, sql) in [("a", "select 1"), ("b", "SELECT * FROM Orders"), ("a", "update t set x = 1")] {
+        for (ds, sql) in [
+            ("a", "select 1"),
+            ("b", "SELECT * FROM Orders"),
+            ("a", "update t set x = 1"),
+        ] {
             h.append(&HistoryEntry::new(ds, sql)).unwrap();
         }
         let all = h.list(None, 0, 10).unwrap();
-        assert_eq!(all.iter().map(|e| e.sql.as_str()).collect::<Vec<_>>(), vec!["update t set x = 1", "SELECT * FROM Orders", "select 1"]);
+        assert_eq!(
+            all.iter().map(|e| e.sql.as_str()).collect::<Vec<_>>(),
+            vec!["update t set x = 1", "SELECT * FROM Orders", "select 1"]
+        );
         assert_eq!(h.list(Some("a"), 0, 10).unwrap().len(), 2);
         assert_eq!(h.list(None, 1, 1).unwrap()[0].sql, "SELECT * FROM Orders");
         assert_eq!(h.search("orders", None, 10).unwrap().len(), 1);
         assert_eq!(h.search("orders", Some("a"), 10).unwrap().len(), 0);
         // garbage line is skipped
-        let mut f = OpenOptions::new().append(true).open(dir.path().join("sub/history.jsonl")).unwrap();
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("sub/history.jsonl"))
+            .unwrap();
         f.write_all(b"{not json\n").unwrap();
         assert_eq!(h.list(None, 0, 10).unwrap().len(), 3);
         h.clear().unwrap();

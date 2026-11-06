@@ -82,13 +82,19 @@ pub struct StartupNotice {
 }
 
 fn unix_secs() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Move an unreadable `path` to `<path>.corrupt-<ts>` so the app can start with an empty file and the user
 /// can still recover the content. `reason` is the parse error.
 fn set_aside_corrupt(path: &Path, reason: &str) -> StartupNotice {
-    let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let file = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let mut backup = path.as_os_str().to_owned();
     backup.push(format!(".corrupt-{}", unix_secs()));
     let backup = PathBuf::from(backup);
@@ -103,7 +109,9 @@ fn set_aside_corrupt(path: &Path, reason: &str) -> StartupNotice {
     tracing::warn!("{file} is not valid ({reason}); starting empty");
     StartupNotice {
         file: file.clone(),
-        message: format!("{file} could not be read ({reason}), so Prometeo started with an empty one. {tail}"),
+        message: format!(
+            "{file} could not be read ({reason}), so Prometeo started with an empty one. {tail}"
+        ),
         backup: moved_path(&backup),
     }
 }
@@ -134,14 +142,19 @@ fn pct_decode(s: &str) -> String {
 
 /// Query parameters that carry a password in connection URLs.
 fn is_password_param(key: &str) -> bool {
-    matches!(pct_decode(key).to_ascii_lowercase().as_str(), "password" | "passwd" | "pwd")
+    matches!(
+        pct_decode(key).to_ascii_lowercase().as_str(),
+        "password" | "passwd" | "pwd"
+    )
 }
 
 /// Split the password out of a connection URL: `scheme://user:PASS@host/db?password=PASS&x=1` becomes
 /// `scheme://user@host/db?x=1` plus `Some(PASS)` (percent-decoded). Everything else is kept byte for byte.
 /// A URL without a password comes back unchanged with `None`.
 pub fn strip_url_password(url: &str) -> (String, Option<String>) {
-    let Some(i) = url.find("://") else { return (url.to_string(), None) };
+    let Some(i) = url.find("://") else {
+        return (url.to_string(), None);
+    };
     let (scheme, rest) = url.split_at(i + 3);
     let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (auth, tail) = rest.split_at(auth_end);
@@ -154,7 +167,11 @@ pub fn strip_url_password(url: &str) -> (String, Option<String>) {
             if !pw.is_empty() {
                 password = Some(pw);
             }
-            auth_out = if c == 0 { host[1..].to_string() } else { format!("{}{host}", &userinfo[..c]) };
+            auth_out = if c == 0 {
+                host[1..].to_string()
+            } else {
+                format!("{}{host}", &userinfo[..c])
+            };
         }
     }
     // path ? query # fragment
@@ -186,10 +203,16 @@ pub fn strip_url_password(url: &str) -> (String, Option<String>) {
             query_out = format!("?{}", kept.join("&"));
         }
     }
-    if password.is_none() && auth_out == auth && query.map(|q| q.len() + 1).unwrap_or(0) == query_out.len() {
+    if password.is_none()
+        && auth_out == auth
+        && query.map(|q| q.len() + 1).unwrap_or(0) == query_out.len()
+    {
         return (url.to_string(), None);
     }
-    (format!("{scheme}{auth_out}{path}{query_out}{frag}"), password)
+    (
+        format!("{scheme}{auth_out}{path}{query_out}{frag}"),
+        password,
+    )
 }
 
 /// Does the URL carry a password?
@@ -203,7 +226,16 @@ pub fn redact(msg: &str, known: &[&str]) -> String {
     let mut out = msg.to_string();
     for k in known.iter().filter(|k| k.chars().count() >= 3) {
         out = out.replace(k, "***");
-        let enc: String = k.bytes().map(|b| if b.is_ascii_alphanumeric() { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
+        let enc: String = k
+            .bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect();
         if enc != *k {
             out = out.replace(&enc, "***");
         }
@@ -214,7 +246,9 @@ pub fn redact(msg: &str, known: &[&str]) -> String {
     while let Some(i) = rest.find("://") {
         let (head, tail) = rest.split_at(i + 3);
         res.push_str(head);
-        let end = tail.find(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '"' | '\'')).unwrap_or(tail.len());
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '"' | '\''))
+            .unwrap_or(tail.len());
         let (auth, after) = tail.split_at(end);
         match (auth.rfind('@'), auth.find(':')) {
             (Some(at), Some(c)) if c < at => {
@@ -232,12 +266,17 @@ pub fn redact(msg: &str, known: &[&str]) -> String {
     let lower = res.to_ascii_lowercase();
     let mut i = 0;
     while i < res.len() {
-        let hit = ["password=", "passwd=", "pwd="].iter().find(|k| lower[i..].starts_with(**k) && (i == 0 || !lower.as_bytes()[i - 1].is_ascii_alphanumeric()));
+        let hit = ["password=", "passwd=", "pwd="].iter().find(|k| {
+            lower[i..].starts_with(**k)
+                && (i == 0 || !lower.as_bytes()[i - 1].is_ascii_alphanumeric())
+        });
         if let Some(k) = hit {
             cleaned.push_str(&res[i..i + k.len()]);
             cleaned.push_str("***");
             i += k.len();
-            while i < res.len() && !matches!(res.as_bytes()[i], b'&' | b' ' | b'\n' | b'"' | b'\'' | b'#') {
+            while i < res.len()
+                && !matches!(res.as_bytes()[i], b'&' | b' ' | b'\n' | b'"' | b'\'' | b'#')
+            {
                 i += 1;
             }
         } else {
@@ -274,7 +313,8 @@ const KEYRING_SERVICE: &str = "dev.prometeo.datagrip";
 
 impl OsKeyring {
     fn entry(id: &str) -> Result<keyring::Entry, String> {
-        keyring::Entry::new(KEYRING_SERVICE, &format!("data-source:{id}")).map_err(|e| e.to_string())
+        keyring::Entry::new(KEYRING_SERVICE, &format!("data-source:{id}"))
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -287,7 +327,9 @@ impl SecretStore for OsKeyring {
         }
     }
     fn set(&self, id: &str, password: &str) -> Result<(), String> {
-        Self::entry(id)?.set_password(password).map_err(|e| e.to_string())
+        Self::entry(id)?
+            .set_password(password)
+            .map_err(|e| e.to_string())
     }
     fn delete(&self, id: &str) -> Result<(), String> {
         match Self::entry(id)?.delete_credential() {
@@ -358,10 +400,15 @@ impl Serialize for DataSourceView {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::Error;
         let mut v = serde_json::to_value(&self.cfg).map_err(S::Error::custom)?;
-        let m = v.as_object_mut().ok_or_else(|| S::Error::custom("data source is not an object"))?;
+        let m = v
+            .as_object_mut()
+            .ok_or_else(|| S::Error::custom("data source is not an object"))?;
         m.remove("password");
         m.insert("hasPassword".into(), self.has_password.into());
-        m.insert("passwordStorage".into(), serde_json::to_value(self.password_storage).map_err(S::Error::custom)?);
+        m.insert(
+            "passwordStorage".into(),
+            serde_json::to_value(self.password_storage).map_err(S::Error::custom)?,
+        );
         v.serialize(s)
     }
 }
@@ -372,7 +419,11 @@ impl From<&StoredDs> for DataSourceView {
         cfg.password = None;
         // never hand a password-bearing URL to the UI (stored URLs are clean, this is the safety net)
         cfg.url_override = cfg.url_override.map(|u| strip_url_password(&u).0);
-        DataSourceView { cfg, has_password: s.has_password, password_storage: s.password_storage }
+        DataSourceView {
+            cfg,
+            has_password: s.has_password,
+            password_storage: s.password_storage,
+        }
     }
 }
 
@@ -412,7 +463,13 @@ impl DataSourceStore {
             .filter(|s| s.cfg.url_override.as_deref().is_some_and(url_has_password))
             .map(|s| s.cfg.clone())
             .collect();
-        let store = DataSourceStore { path, secrets, keyring: AtomicU8::new(KEYRING_UNKNOWN), items: Mutex::new(items), notices: Mutex::new(notices) };
+        let store = DataSourceStore {
+            path,
+            secrets,
+            keyring: AtomicU8::new(KEYRING_UNKNOWN),
+            items: Mutex::new(items),
+            notices: Mutex::new(notices),
+        };
         for cfg in legacy {
             let name = cfg.name.clone();
             // `save` takes the password out of the URL
@@ -435,7 +492,10 @@ impl DataSourceStore {
             KEYRING_DOWN => false,
             _ => {
                 let ok = self.secrets.get("__probe__").is_ok();
-                self.keyring.store(if ok { KEYRING_OK } else { KEYRING_DOWN }, Ordering::Relaxed);
+                self.keyring.store(
+                    if ok { KEYRING_OK } else { KEYRING_DOWN },
+                    Ordering::Relaxed,
+                );
                 if !ok {
                     tracing::warn!("OS keyring not available: passwords will be stored in the data sources file");
                 }
@@ -453,18 +513,31 @@ impl DataSourceStore {
     }
 
     fn persist(&self, items: &[StoredDs]) -> Result<(), String> {
-        let file = SourcesFile { version: 1, data_sources: items.to_vec() };
+        let file = SourcesFile {
+            version: 1,
+            data_sources: items.to_vec(),
+        };
         let json = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
         // may hold a password (keyring fallback): owner only
         write_private(&self.path, &json)
     }
 
     pub fn list(&self) -> Vec<DataSourceView> {
-        self.items.lock().unwrap().iter().map(DataSourceView::from).collect()
+        self.items
+            .lock()
+            .unwrap()
+            .iter()
+            .map(DataSourceView::from)
+            .collect()
     }
 
     pub fn view(&self, id: &str) -> Option<DataSourceView> {
-        self.items.lock().unwrap().iter().find(|s| s.cfg.id == id).map(DataSourceView::from)
+        self.items
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|s| s.cfg.id == id)
+            .map(DataSourceView::from)
     }
 
     /// The config with its password filled in (from the keyring or the file).
@@ -479,17 +552,22 @@ impl DataSourceStore {
             .ok_or_else(|| format!("Data source '{id}' does not exist"))?;
         let mut cfg = stored.cfg;
         if stored.has_password && stored.password_storage == PasswordStorage::Keyring {
-            cfg.password = self
-                .secrets
-                .get(id)
-                .map_err(|e| format!("Cannot read the password of '{}' from the OS keyring: {e}", cfg.name))?;
+            cfg.password = self.secrets.get(id).map_err(|e| {
+                format!(
+                    "Cannot read the password of '{}' from the OS keyring: {e}",
+                    cfg.name
+                )
+            })?;
         }
         Ok(cfg)
     }
 
     /// Fill `cfg.password` from the stored one when the caller did not provide a password
     /// (the UI never sees stored passwords, so "unchanged" is `null`).
-    pub fn with_stored_password(&self, mut cfg: DataSourceConfig) -> Result<DataSourceConfig, String> {
+    pub fn with_stored_password(
+        &self,
+        mut cfg: DataSourceConfig,
+    ) -> Result<DataSourceConfig, String> {
         // a password typed into the URL of a draft wins over the stored one
         if let Some(pw) = take_url_password(&mut cfg) {
             cfg.password = Some(pw);
@@ -516,7 +594,11 @@ impl DataSourceStore {
         let mut items = self.items.lock().unwrap();
         let pos = items.iter().position(|s| s.cfg.id == cfg.id);
         let (mut has_password, mut storage, kept_file_pw) = match pos {
-            Some(i) => (items[i].has_password, items[i].password_storage, items[i].cfg.password.clone()),
+            Some(i) => (
+                items[i].has_password,
+                items[i].password_storage,
+                items[i].cfg.password.clone(),
+            ),
             None => (false, self.default_storage(), None),
         };
         match new_password.as_deref() {
@@ -532,7 +614,10 @@ impl DataSourceStore {
                 has_password = false;
             }
             Some(pw) => {
-                match self.keyring_available().then(|| self.secrets.set(&cfg.id, pw)) {
+                match self
+                    .keyring_available()
+                    .then(|| self.secrets.set(&cfg.id, pw))
+                {
                     Some(Ok(())) => storage = PasswordStorage::Keyring,
                     other => {
                         if let Some(Err(e)) = other {
@@ -547,7 +632,11 @@ impl DataSourceStore {
                 has_password = true;
             }
         }
-        let stored = StoredDs { cfg, password_storage: storage, has_password };
+        let stored = StoredDs {
+            cfg,
+            password_storage: storage,
+            has_password,
+        };
         let view = DataSourceView::from(&stored);
         match pos {
             Some(i) => items[i] = stored,
@@ -559,7 +648,9 @@ impl DataSourceStore {
 
     pub fn delete(&self, id: &str) -> Result<(), String> {
         let mut items = self.items.lock().unwrap();
-        let Some(i) = items.iter().position(|s| s.cfg.id == id) else { return Ok(()) };
+        let Some(i) = items.iter().position(|s| s.cfg.id == id) else {
+            return Ok(());
+        };
         let removed = items.remove(i);
         if removed.password_storage == PasswordStorage::Keyring && removed.has_password {
             let _ = self.secrets.delete(id);
@@ -570,7 +661,13 @@ impl DataSourceStore {
     /// Copy of a data source with a new id and the name "<name> 1" (or the next free number).
     pub fn duplicate(&self, id: &str) -> Result<DataSourceView, String> {
         let mut cfg = self.get(id)?;
-        let names: Vec<String> = self.items.lock().unwrap().iter().map(|s| s.cfg.name.clone()).collect();
+        let names: Vec<String> = self
+            .items
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.cfg.name.clone())
+            .collect();
         let base = cfg.name.clone();
         let mut n = 1;
         while names.contains(&format!("{base} {n}")) {
@@ -611,7 +708,13 @@ impl UiStateStore {
             },
             Err(_) => BTreeMap::new(),
         };
-        UiStateStore { path, map: Mutex::new(map), generation: AtomicU64::new(0), debounce, notices }
+        UiStateStore {
+            path,
+            map: Mutex::new(map),
+            generation: AtomicU64::new(0),
+            debounce,
+            notices,
+        }
     }
 
     /// What was repaired while loading.
@@ -659,7 +762,8 @@ fn safe_component(kind: &str, s: &str) -> Result<(), String> {
     let ok = !s.is_empty()
         && s.len() <= 120
         && !s.starts_with('.')
-        && s.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '(' | ')' | '@'));
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '(' | ')' | '@'));
     if ok {
         Ok(())
     } else {
@@ -672,7 +776,10 @@ fn console_order(name: &str) -> (u64, String) {
     if name == "console" {
         return (0, String::new());
     }
-    match name.strip_prefix("console_").and_then(|n| n.parse::<u64>().ok()) {
+    match name
+        .strip_prefix("console_")
+        .and_then(|n| n.parse::<u64>().ok())
+    {
         Some(n) => (n, String::new()),
         None => (u64::MAX, name.to_lowercase()),
     }
@@ -723,8 +830,16 @@ impl ConsoleStore {
         let dir = self.dir(ds_id)?;
         fs::create_dir_all(&dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
         for i in 0u32.. {
-            let name = if i == 0 { "console".to_string() } else { format!("console_{i}") };
-            match fs::OpenOptions::new().write(true).create_new(true).open(dir.join(format!("{name}.sql"))) {
+            let name = if i == 0 {
+                "console".to_string()
+            } else {
+                format!("console_{i}")
+            };
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dir.join(format!("{name}.sql")))
+            {
                 Ok(_) => return Ok(name),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(format!("Cannot create console: {e}")),
@@ -783,7 +898,13 @@ mod tests {
     }
 
     fn cfg(name: &str, pw: Option<&str>) -> DataSourceConfig {
-        DataSourceConfig { name: name.into(), host: "h".into(), port: 5432, password: pw.map(Into::into), ..Default::default() }
+        DataSourceConfig {
+            name: name.into(),
+            host: "h".into(),
+            port: 5432,
+            password: pw.map(Into::into),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -793,7 +914,10 @@ mod tests {
         let secrets = Arc::new(MemSecrets::default());
         let store = DataSourceStore::load(path.clone(), secrets.clone()).unwrap();
         let v = store.save(cfg("a", Some("s3cret"))).unwrap();
-        assert_eq!((v.has_password, v.password_storage), (true, PasswordStorage::Keyring));
+        assert_eq!(
+            (v.has_password, v.password_storage),
+            (true, PasswordStorage::Keyring)
+        );
         let id = v.cfg.id.clone();
         assert!(!fs::read_to_string(&path).unwrap().contains("s3cret"));
         assert_eq!(store.get(&id).unwrap().password.as_deref(), Some("s3cret"));
@@ -823,37 +947,82 @@ mod tests {
         assert!(!store.keyring_available());
         let v = store.save(cfg("a", Some("pw"))).unwrap();
         assert_eq!(v.password_storage, PasswordStorage::File);
-        assert!(fs::read_to_string(&path).unwrap().contains("\"password\": \"pw\""));
-        assert_eq!(store.get(&v.cfg.id).unwrap().password.as_deref(), Some("pw"));
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("\"password\": \"pw\""));
+        assert_eq!(
+            store.get(&v.cfg.id).unwrap().password.as_deref(),
+            Some("pw")
+        );
         // unchanged save keeps the file password
         let mut c = cfg("a", None);
         c.id = v.cfg.id.clone();
         store.save(c).unwrap();
-        assert_eq!(store.get(&v.cfg.id).unwrap().password.as_deref(), Some("pw"));
+        assert_eq!(
+            store.get(&v.cfg.id).unwrap().password.as_deref(),
+            Some("pw")
+        );
         let dup = store.duplicate(&v.cfg.id).unwrap();
         assert_eq!(dup.cfg.name, "a 1");
-        assert_eq!(store.get(&dup.cfg.id).unwrap().password.as_deref(), Some("pw"));
+        assert_eq!(
+            store.get(&dup.cfg.id).unwrap().password.as_deref(),
+            Some("pw")
+        );
         store.delete(&v.cfg.id).unwrap();
         assert_eq!(store.list().len(), 1);
     }
 
     fn url_cfg(url: &str, pw: Option<&str>) -> DataSourceConfig {
-        DataSourceConfig { name: "u".into(), driver: dbcore::Driver::Postgres, url_override: Some(url.into()), password: pw.map(Into::into), ..Default::default() }
+        DataSourceConfig {
+            name: "u".into(),
+            driver: dbcore::Driver::Postgres,
+            url_override: Some(url.into()),
+            password: pw.map(Into::into),
+            ..Default::default()
+        }
     }
 
     #[test]
     fn url_password_is_split_off() {
         let cases = [
-            ("postgres://u:s3cret@h:5432/db", "postgres://u@h:5432/db", Some("s3cret")),
-            ("postgres://u:p%40ss%3Aw@h/db?sslmode=require", "postgres://u@h/db?sslmode=require", Some("p@ss:w")),
-            ("postgres://u@h/db?password=s3cret&sslmode=require", "postgres://u@h/db?sslmode=require", Some("s3cret")),
-            ("mysql://u@h/db?sslmode=x&PASSWORD=s%20x", "mysql://u@h/db?sslmode=x", Some("s x")),
+            (
+                "postgres://u:s3cret@h:5432/db",
+                "postgres://u@h:5432/db",
+                Some("s3cret"),
+            ),
+            (
+                "postgres://u:p%40ss%3Aw@h/db?sslmode=require",
+                "postgres://u@h/db?sslmode=require",
+                Some("p@ss:w"),
+            ),
+            (
+                "postgres://u@h/db?password=s3cret&sslmode=require",
+                "postgres://u@h/db?sslmode=require",
+                Some("s3cret"),
+            ),
+            (
+                "mysql://u@h/db?sslmode=x&PASSWORD=s%20x",
+                "mysql://u@h/db?sslmode=x",
+                Some("s x"),
+            ),
             ("mysql://u@h/db?passwd=a", "mysql://u@h/db", Some("a")),
             ("postgres://:pw@h/db", "postgres://h/db", Some("pw")),
             ("postgres://u:@h/db", "postgres://u@h/db", None),
-            ("postgres://u@h:5432/db#frag", "postgres://u@h:5432/db#frag", None),
-            ("postgres://u@h/db?sslmode=require", "postgres://u@h/db?sslmode=require", None),
-            ("postgres://u:pw@/db?host=%2Ftmp", "postgres://u@/db?host=%2Ftmp", Some("pw")),
+            (
+                "postgres://u@h:5432/db#frag",
+                "postgres://u@h:5432/db#frag",
+                None,
+            ),
+            (
+                "postgres://u@h/db?sslmode=require",
+                "postgres://u@h/db?sslmode=require",
+                None,
+            ),
+            (
+                "postgres://u:pw@/db?host=%2Ftmp",
+                "postgres://u@/db?host=%2Ftmp",
+                Some("pw"),
+            ),
             ("sqlite::memory:", "sqlite::memory:", None),
             ("not a url", "not a url", None),
         ];
@@ -869,11 +1038,17 @@ mod tests {
     fn redaction() {
         let m = redact("error connecting to postgres://bob:s3cret@db.example/x?password=s3cret&a=b: refused, tried s3cret", &["s3cret"]);
         assert!(!m.contains("s3cret"), "{m}");
-        assert!(m.contains("postgres://bob:***@db.example/x?password=***&a=b"), "{m}");
+        assert!(
+            m.contains("postgres://bob:***@db.example/x?password=***&a=b"),
+            "{m}"
+        );
         let m = redact("see mysql://u:hunter2@h and PWD=zzz tail", &[]);
         assert_eq!(m, "see mysql://u:***@h and PWD=*** tail");
         // short passwords are not replaced blindly inside ordinary words, text without secrets is untouched
-        assert_eq!(redact("connection refused (os error 111)", &["ab"]), "connection refused (os error 111)");
+        assert_eq!(
+            redact("connection refused (os error 111)", &["ab"]),
+            "connection refused (os error 111)"
+        );
     }
 
     #[test]
@@ -882,15 +1057,25 @@ mod tests {
         let path = dir.path().join("ds.json");
         let secrets = Arc::new(MemSecrets::default());
         let store = DataSourceStore::load(path.clone(), secrets.clone()).unwrap();
-        let v = store.save(url_cfg("postgres://bob:s3cret@db/x?sslmode=require", None)).unwrap();
-        assert_eq!(v.cfg.url_override.as_deref(), Some("postgres://bob@db/x?sslmode=require"));
+        let v = store
+            .save(url_cfg("postgres://bob:s3cret@db/x?sslmode=require", None))
+            .unwrap();
+        assert_eq!(
+            v.cfg.url_override.as_deref(),
+            Some("postgres://bob@db/x?sslmode=require")
+        );
         assert!(v.has_password);
         let on_disk = fs::read_to_string(&path).unwrap();
         assert!(!on_disk.contains("s3cret"), "{on_disk}");
-        assert!(!serde_json::to_string(&store.list()).unwrap().contains("s3cret"));
+        assert!(!serde_json::to_string(&store.list())
+            .unwrap()
+            .contains("s3cret"));
         let id = v.cfg.id.clone();
         let full = store.get(&id).unwrap();
-        assert_eq!((full.url_override.as_deref(), full.password.as_deref()), (Some("postgres://bob@db/x?sslmode=require"), Some("s3cret")));
+        assert_eq!(
+            (full.url_override.as_deref(), full.password.as_deref()),
+            (Some("postgres://bob@db/x?sslmode=require"), Some("s3cret"))
+        );
 
         // a password query parameter, and the URL password wins over the password field
         let mut c = url_cfg("postgres://bob@db/x?password=other", Some("ignored"));
@@ -900,13 +1085,21 @@ mod tests {
         assert!(!fs::read_to_string(&path).unwrap().contains("other"));
 
         // a draft in test_connection: the URL password wins over the stored one, and is not kept in the URL
-        let draft = store.with_stored_password(url_cfg("postgres://bob:typed@db/x", None)).unwrap();
-        assert_eq!((draft.url_override.as_deref(), draft.password.as_deref()), (Some("postgres://bob@db/x"), Some("typed")));
+        let draft = store
+            .with_stored_password(url_cfg("postgres://bob:typed@db/x", None))
+            .unwrap();
+        assert_eq!(
+            (draft.url_override.as_deref(), draft.password.as_deref()),
+            (Some("postgres://bob@db/x"), Some("typed"))
+        );
 
         // SQLite URLs are not touched
         let mut lite = url_cfg("sqlite:///tmp/a:b@c.db", None);
         lite.driver = dbcore::Driver::Sqlite;
-        assert_eq!(store.save(lite).unwrap().cfg.url_override.as_deref(), Some("sqlite:///tmp/a:b@c.db"));
+        assert_eq!(
+            store.save(lite).unwrap().cfg.url_override.as_deref(),
+            Some("sqlite:///tmp/a:b@c.db")
+        );
     }
 
     #[test]
@@ -941,7 +1134,9 @@ mod tests {
         assert_eq!(mode(&path), 0o600);
         // the plain-text password fallback file
         store.save(cfg("a", Some("pw"))).unwrap();
-        assert!(fs::read_to_string(&path).unwrap().contains("\"password\": \"pw\""));
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("\"password\": \"pw\""));
         assert_eq!(mode(&path), 0o600);
         // ui state
         let ui = UiStateStore::load(dir.path().join("ui.json"), Duration::from_millis(10));
@@ -962,16 +1157,39 @@ mod tests {
         assert_eq!(n.len(), 1, "{n:?}");
         assert_eq!(n[0].file, "data-sources.json");
         let backup = PathBuf::from(n[0].backup.clone().expect("backup path"));
-        assert!(backup.file_name().unwrap().to_string_lossy().starts_with("data-sources.json.corrupt-"));
+        assert!(backup
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("data-sources.json.corrupt-"));
         assert_eq!(fs::read(&backup).unwrap(), b"{ this is not json");
-        assert!(n[0].message.contains("data-sources.json"), "{}", n[0].message);
+        assert!(
+            n[0].message.contains("data-sources.json"),
+            "{}",
+            n[0].message
+        );
         // the app keeps working: saving creates a fresh file next to the backup
         store.save(cfg("a", None)).unwrap();
-        assert_eq!(DataSourceStore::load(path, Arc::new(MemSecrets::default())).unwrap().list().len(), 1);
+        assert_eq!(
+            DataSourceStore::load(path, Arc::new(MemSecrets::default()))
+                .unwrap()
+                .list()
+                .len(),
+            1
+        );
         assert_eq!(fs::read(&backup).unwrap(), b"{ this is not json");
 
         // a healthy file produces no notice
-        assert!(store.notices().len() == 1 && DataSourceStore::load(dir.path().join("none.json"), Arc::new(MemSecrets::default())).unwrap().notices().is_empty());
+        assert!(
+            store.notices().len() == 1
+                && DataSourceStore::load(
+                    dir.path().join("none.json"),
+                    Arc::new(MemSecrets::default())
+                )
+                .unwrap()
+                .notices()
+                .is_empty()
+        );
 
         // ui-state.json: same treatment
         let ui_path = dir.path().join("ui-state.json");
@@ -984,7 +1202,12 @@ mod tests {
         assert!(!ui_path.exists());
         // valid JSON of the wrong shape is corrupt too
         fs::write(&ui_path, b"[1,2]").unwrap();
-        assert_eq!(UiStateStore::load(ui_path, Duration::from_millis(10)).notices().len(), 1);
+        assert_eq!(
+            UiStateStore::load(ui_path, Duration::from_millis(10))
+                .notices()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -998,7 +1221,10 @@ mod tests {
         for _ in 0..8 {
             cs.create("ds").unwrap();
         }
-        assert_eq!(cs.list("ds").unwrap()[..3], ["console", "console_1", "console_2"]);
+        assert_eq!(
+            cs.list("ds").unwrap()[..3],
+            ["console", "console_1", "console_2"]
+        );
         assert_eq!(cs.list("ds").unwrap().last().unwrap(), "console_10");
         cs.write("ds", "console_1", "select 1;").unwrap();
         assert_eq!(cs.read("ds", "console_1").unwrap(), "select 1;");

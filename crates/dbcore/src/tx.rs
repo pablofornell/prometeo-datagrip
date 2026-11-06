@@ -62,8 +62,12 @@ use futures_util::StreamExt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TxKind {
     Begin,
-    Commit { chain: bool },
-    Rollback { chain: bool },
+    Commit {
+        chain: bool,
+    },
+    Rollback {
+        chain: bool,
+    },
     /// `ROLLBACK TO SAVEPOINT`: ends a failed state but not the transaction.
     RollbackTo,
     /// `PREPARE TRANSACTION` (PG): the session leaves the transaction.
@@ -104,7 +108,9 @@ pub(crate) fn classify(sql: &str) -> TxKind {
         Some("COMMIT" | "END") if w.get(1) == Some(&"PREPARED") => TxKind::Other,
         Some("COMMIT" | "END") => TxKind::Commit { chain: chain() },
         Some("ROLLBACK" | "ABORT") if w.get(1) == Some(&"PREPARED") => TxKind::Other,
-        Some("ROLLBACK" | "ABORT") if w.get(1) == Some(&"TO") || w.get(2) == Some(&"TO") => TxKind::RollbackTo,
+        Some("ROLLBACK" | "ABORT") if w.get(1) == Some(&"TO") || w.get(2) == Some(&"TO") => {
+            TxKind::RollbackTo
+        }
         Some("ROLLBACK" | "ABORT") => TxKind::Rollback { chain: chain() },
         Some("PREPARE") if w.get(1) == Some(&"TRANSACTION") => TxKind::Prepare,
         _ => TxKind::Other,
@@ -116,7 +122,10 @@ pub(crate) fn classify(sql: &str) -> TxKind {
 pub(crate) enum Outcome {
     Ok,
     /// Failed; carries the SQLSTATE / vendor number when the server reported one.
-    Err { state: Option<String>, native: Option<i64> },
+    Err {
+        state: Option<String>,
+        native: Option<i64>,
+    },
 }
 
 impl Outcome {
@@ -128,7 +137,10 @@ impl Outcome {
     }
 
     pub fn from_error(e: &DbError) -> Outcome {
-        Outcome::Err { state: e.server().map(|s| s.code.clone()), native: e.server().and_then(|s| s.native_code) }
+        Outcome::Err {
+            state: e.server().map(|s| s.code.clone()),
+            native: e.server().and_then(|s| s.native_code),
+        }
     }
 
     fn is_ok(&self) -> bool {
@@ -209,7 +221,10 @@ pub(crate) enum MyStmt {
     /// `BEGIN`, `START TRANSACTION`, `XA START`: commits what is open, then starts a transaction.
     Begin,
     /// `COMMIT`, `ROLLBACK`, `XA COMMIT`, `XA ROLLBACK` (`chain`: `AND CHAIN` starts the next transaction).
-    End { commit: bool, chain: bool },
+    End {
+        commit: bool,
+        chain: bool,
+    },
     /// `ROLLBACK TO SAVEPOINT`: the transaction stays.
     RollbackTo,
     /// `SET ... autocommit = v ...` (`None`: a value that is not a literal).
@@ -246,16 +261,29 @@ pub(crate) struct ServerVer {
 }
 
 impl ServerVer {
-    pub(crate) const UNKNOWN: ServerVer = ServerVer { num: u32::MAX, mariadb: false };
+    pub(crate) const UNKNOWN: ServerVer = ServerVer {
+        num: u32::MAX,
+        mariadb: false,
+    };
 
     /// From `@@version`: `8.4.3`, `8.0.36-0ubuntu0.22.04.1`, `10.11.6-MariaDB-1:10.11.6+maria~ubu2204`,
     /// `5.5.5-10.0.38-MariaDB` (the replication-compatible prefix of old MariaDB clients).
     pub(crate) fn parse(v: &str) -> ServerVer {
         let mariadb = v.contains("MariaDB");
-        let v = if mariadb { v.strip_prefix("5.5.5-").unwrap_or(v) } else { v };
-        let mut it = v.split(|c: char| !c.is_ascii_digit()).filter(|p| !p.is_empty()).map(|p| p.parse::<u32>().unwrap_or(0));
+        let v = if mariadb {
+            v.strip_prefix("5.5.5-").unwrap_or(v)
+        } else {
+            v
+        };
+        let mut it = v
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|p| !p.is_empty())
+            .map(|p| p.parse::<u32>().unwrap_or(0));
         match (it.next(), it.next(), it.next()) {
-            (Some(a), Some(b), Some(c)) => ServerVer { num: a * 10000 + b * 100 + c, mariadb },
+            (Some(a), Some(b), Some(c)) => ServerVer {
+                num: a * 10000 + b * 100 + c,
+                mariadb,
+            },
             _ => ServerVer::UNKNOWN,
         }
     }
@@ -285,7 +313,11 @@ fn mysql_tokens(sql: &str, ver: ServerVer) -> Vec<Tok> {
         } else if c == b'*' && open > 0 && b.get(i + 1) == Some(&b'/') {
             open -= 1;
             i += 2;
-        } else if c == b'/' && b.get(i + 1) == Some(&b'*') && (b.get(i + 2) == Some(&b'!') || (ver.mariadb && b.get(i + 2..i + 4) == Some(&b"M!"[..]))) {
+        } else if c == b'/'
+            && b.get(i + 1) == Some(&b'*')
+            && (b.get(i + 2) == Some(&b'!')
+                || (ver.mariadb && b.get(i + 2..i + 4) == Some(&b"M!"[..])))
+        {
             let mut j = i + if b[i + 2] == b'!' { 3 } else { 4 };
             let digits = b[j..].iter().take_while(|d| d.is_ascii_digit()).count();
             let mut run = true;
@@ -345,7 +377,9 @@ fn set_autocommit(toks: &[Tok]) -> Option<Option<bool>> {
     parts.push(&body[from..]);
     let mut found = None;
     for part in parts {
-        let Some(eq) = part.iter().position(|t| *t == Tok::Sym(b'=')) else { continue };
+        let Some(eq) = part.iter().position(|t| *t == Tok::Sym(b'=')) else {
+            continue;
+        };
         let mut lhs = &part[..eq];
         let mut rhs = &part[eq + 1..];
         if lhs.last() == Some(&Tok::Sym(b':')) {
@@ -391,7 +425,13 @@ pub(crate) fn classify_mysql(sql: &str, ver: ServerVer) -> MyStmt {
     let toks = mysql_tokens(sql, ver);
     let w: Vec<&str> = toks
         .iter()
-        .filter_map(|t| if let Tok::Word(w) = t { Some(w.as_str()) } else { None })
+        .filter_map(|t| {
+            if let Tok::Word(w) = t {
+                Some(w.as_str())
+            } else {
+                None
+            }
+        })
         .take(6)
         .collect();
     let w1 = w.get(1).copied();
@@ -404,13 +444,25 @@ pub(crate) fn classify_mysql(sql: &str, ver: ServerVer) -> MyStmt {
             Some("REPLICA" | "SLAVE" | "GROUP_REPLICATION") => MyStmt::ImplicitCommit,
             _ => MyStmt::Other,
         },
-        Some("COMMIT") => MyStmt::End { commit: true, chain: no_chain },
+        Some("COMMIT") => MyStmt::End {
+            commit: true,
+            chain: no_chain,
+        },
         Some("ROLLBACK") if w1 == Some("TO") || w.get(2) == Some(&"TO") => MyStmt::RollbackTo,
-        Some("ROLLBACK") => MyStmt::End { commit: false, chain: no_chain },
+        Some("ROLLBACK") => MyStmt::End {
+            commit: false,
+            chain: no_chain,
+        },
         Some("XA") => match w1 {
             Some("START" | "BEGIN") => MyStmt::Begin,
-            Some("COMMIT") => MyStmt::End { commit: true, chain: false },
-            Some("ROLLBACK") => MyStmt::End { commit: false, chain: false },
+            Some("COMMIT") => MyStmt::End {
+                commit: true,
+                chain: false,
+            },
+            Some("ROLLBACK") => MyStmt::End {
+                commit: false,
+                chain: false,
+            },
             _ => MyStmt::Passive,
         },
         Some("SET") => match set_autocommit(&toks) {
@@ -419,16 +471,31 @@ pub(crate) fn classify_mysql(sql: &str, ver: ServerVer) -> MyStmt {
             None => MyStmt::Passive,
         },
         Some("CREATE" | "DROP") if w1 == Some("TEMPORARY") => MyStmt::Other,
-        Some("CREATE" | "ALTER" | "DROP" | "RENAME" | "TRUNCATE" | "GRANT" | "REVOKE" | "INSTALL" | "UNINSTALL" | "ANALYZE"
-            | "CHECK" | "OPTIMIZE" | "REPAIR" | "CACHE" | "FLUSH" | "CHANGE") => MyStmt::ImplicitCommit,
+        Some(
+            "CREATE" | "ALTER" | "DROP" | "RENAME" | "TRUNCATE" | "GRANT" | "REVOKE" | "INSTALL"
+            | "UNINSTALL" | "ANALYZE" | "CHECK" | "OPTIMIZE" | "REPAIR" | "CACHE" | "FLUSH"
+            | "CHANGE",
+        ) => MyStmt::ImplicitCommit,
         Some("LOAD") if w1 == Some("INDEX") => MyStmt::ImplicitCommit,
         Some("RESET") if w1 != Some("PERSIST") => MyStmt::ImplicitCommit,
-        Some("STOP") if matches!(w1, Some("REPLICA" | "SLAVE" | "GROUP_REPLICATION")) => MyStmt::ImplicitCommit,
+        Some("STOP") if matches!(w1, Some("REPLICA" | "SLAVE" | "GROUP_REPLICATION")) => {
+            MyStmt::ImplicitCommit
+        }
         Some("LOCK") if w1 == Some("TABLES") || w1 == Some("TABLE") => MyStmt::LockTables,
         Some("UNLOCK") if w1 == Some("TABLES") || w1 == Some("TABLE") => MyStmt::UnlockTables,
-        Some("USE" | "PREPARE" | "DEALLOCATE" | "KILL" | "HELP" | "DO" | "VALUES") => MyStmt::Passive,
-        Some("SHOW") if matches!(w1, Some("WARNINGS" | "ERRORS")) || w1 == Some("COUNT") => MyStmt::Passive,
-        Some("SELECT") if !toks.iter().any(|t| matches!(t, Tok::Word(w) if w == "FROM")) => MyStmt::Passive,
+        Some("USE" | "PREPARE" | "DEALLOCATE" | "KILL" | "HELP" | "DO" | "VALUES") => {
+            MyStmt::Passive
+        }
+        Some("SHOW") if matches!(w1, Some("WARNINGS" | "ERRORS")) || w1 == Some("COUNT") => {
+            MyStmt::Passive
+        }
+        Some("SELECT")
+            if !toks
+                .iter()
+                .any(|t| matches!(t, Tok::Word(w) if w == "FROM")) =>
+        {
+            MyStmt::Passive
+        }
         _ => MyStmt::Other,
     }
 }
@@ -476,7 +543,11 @@ pub(crate) fn track_mysql(prev: MyState, stmt: MyStmt, outcome: &Outcome) -> MyS
                 if open {
                     ended = Some((commit, if commit { "COMMIT" } else { "ROLLBACK" }));
                 }
-                next.status = if chain { TxStatus::Active } else { TxStatus::Idle };
+                next.status = if chain {
+                    TxStatus::Active
+                } else {
+                    TxStatus::Idle
+                };
             }
             MyStmt::SetAutocommit(Some(v)) => {
                 if v && !prev.autocommit {
@@ -504,7 +575,9 @@ pub(crate) fn track_mysql(prev: MyState, stmt: MyStmt, outcome: &Outcome) -> MyS
         },
         Outcome::Err { state, native } => match stmt {
             // they commit before they run: a statement that parsed has committed, even if it then failed
-            MyStmt::ImplicitCommit | MyStmt::LockTables | MyStmt::UnlockTables if *native != Some(1064) => {
+            MyStmt::ImplicitCommit | MyStmt::LockTables | MyStmt::UnlockTables
+                if *native != Some(1064) =>
+            {
                 implicit(&mut next, &mut ended);
                 if stmt == MyStmt::LockTables && prev.locked {
                     next.locked = false;
@@ -519,7 +592,9 @@ pub(crate) fn track_mysql(prev: MyState, stmt: MyStmt, outcome: &Outcome) -> MyS
             }
             // the statement ran against a table before it failed: it opened the transaction
             MyStmt::Other
-                if !prev.autocommit && !open && matches!(state.as_deref(), Some(s) if s.starts_with("23") || s.starts_with("22")) =>
+                if !prev.autocommit
+                    && !open
+                    && matches!(state.as_deref(), Some(s) if s.starts_with("23") || s.starts_with("22")) =>
             {
                 next.status = TxStatus::Active;
             }
@@ -536,7 +611,11 @@ async fn probe_sqlite(conn: &mut Conn) -> Option<TxStatus> {
     let ptr = h.as_raw_handle().as_ptr();
     // SAFETY: the handle is locked by `lock_handle` (the worker thread cannot use it meanwhile).
     let auto = unsafe { libsqlite3_sys::sqlite3_get_autocommit(ptr) };
-    Some(if auto == 0 { TxStatus::Active } else { TxStatus::Idle })
+    Some(if auto == 0 {
+        TxStatus::Active
+    } else {
+        TxStatus::Idle
+    })
 }
 
 /// Read the real state of an idle connection (SQLite only; PostgreSQL and MySQL have no probe: `None`).
@@ -604,12 +683,26 @@ pub(crate) async fn after_statement(
         TxKind::Rollback { .. } if prev.is_open() && ok => ended = Some((false, "ROLLBACK")),
         // PostgreSQL: the transaction left the session. Prepared (detached, not committed), or rolled back when
         // it was failed or the PREPARE itself failed.
-        TxKind::Prepare if driver == Driver::Postgres && prev.is_open() && next == TxStatus::Idle => {
-            ended = Some((false, if ok && prev == TxStatus::Active { "PREPARE TRANSACTION" } else { "ROLLBACK" }));
+        TxKind::Prepare
+            if driver == Driver::Postgres && prev.is_open() && next == TxStatus::Idle =>
+        {
+            ended = Some((
+                false,
+                if ok && prev == TxStatus::Active {
+                    "PREPARE TRANSACTION"
+                } else {
+                    "ROLLBACK"
+                },
+            ));
         }
         _ => {}
     }
-    TxUpdate { status: next, changed: next != prev, ended, note }
+    TxUpdate {
+        status: next,
+        changed: next != prev,
+        ended,
+        note,
+    }
 }
 
 fn after_mysql(sess: &Session, prev: TxStatus, sql: &str, outcome: &Outcome) -> TxUpdate {
@@ -618,21 +711,35 @@ fn after_mysql(sess: &Session, prev: TxStatus, sql: &str, outcome: &Outcome) -> 
         autocommit: sess.autocommit_on.load(Ordering::Relaxed),
         locked: sess.tables_locked.load(Ordering::Relaxed),
     };
-    let ver = ServerVer { num: sess.server_version.load(Ordering::Relaxed), mariadb: sess.mariadb.load(Ordering::Relaxed) };
+    let ver = ServerVer {
+        num: sess.server_version.load(Ordering::Relaxed),
+        mariadb: sess.mariadb.load(Ordering::Relaxed),
+    };
     let step = track_mysql(state, classify_mysql(sql, ver), outcome);
-    sess.autocommit_on.store(step.next.autocommit, Ordering::Relaxed);
-    sess.tables_locked.store(step.next.locked, Ordering::Relaxed);
+    sess.autocommit_on
+        .store(step.next.autocommit, Ordering::Relaxed);
+    sess.tables_locked
+        .store(step.next.locked, Ordering::Relaxed);
     sess.set_tx_status(step.next.status);
     let note = step.ended.filter(|e| e.1 == "IMPLICIT COMMIT").map(|_| {
         "The statement committed the open transaction implicitly (MySQL DDL / transaction control).".to_string()
     });
-    TxUpdate { status: step.next.status, changed: step.next.status != prev, ended: step.ended, note }
+    TxUpdate {
+        status: step.next.status,
+        changed: step.next.status != prev,
+        ended: step.ended,
+        note,
+    }
 }
 
 /// An error that surfaced while paging an open result (after the statement itself was accounted for).
 pub(crate) fn note_stream_error(sess: &Session, e: &DbError) {
     if sess.live.driver() == Driver::Postgres {
-        sess.set_tx_status(track_pg(sess.tx_status(), TxKind::Other, &Outcome::from_error(e)));
+        sess.set_tx_status(track_pg(
+            sess.tx_status(),
+            TxKind::Other,
+            &Outcome::from_error(e),
+        ));
     }
 }
 
@@ -678,15 +785,24 @@ mod tests {
 
     #[test]
     fn classification() {
-        assert_eq!(classify("  /* c */ begin isolation level serializable"), TxKind::Begin);
+        assert_eq!(
+            classify("  /* c */ begin isolation level serializable"),
+            TxKind::Begin
+        );
         assert_eq!(classify("START TRANSACTION READ ONLY"), TxKind::Begin);
         assert_eq!(classify("start slave"), TxKind::Other);
         assert_eq!(classify("commit"), TxKind::Commit { chain: false });
         assert_eq!(classify("END"), TxKind::Commit { chain: false });
         assert_eq!(classify("commit and chain"), TxKind::Commit { chain: true });
-        assert_eq!(classify("commit and no chain"), TxKind::Commit { chain: false });
+        assert_eq!(
+            classify("commit and no chain"),
+            TxKind::Commit { chain: false }
+        );
         assert_eq!(classify("rollback"), TxKind::Rollback { chain: false });
-        assert_eq!(classify("abort and chain"), TxKind::Rollback { chain: true });
+        assert_eq!(
+            classify("abort and chain"),
+            TxKind::Rollback { chain: true }
+        );
         assert_eq!(classify("rollback to savepoint a"), TxKind::RollbackTo);
         assert_eq!(classify("rollback to a"), TxKind::RollbackTo);
         assert_eq!(classify("commit prepared 'x'"), TxKind::Other);
@@ -704,36 +820,80 @@ mod tests {
         let e = Outcome::from_error(&pg_err("22012"));
         assert_eq!(track_pg(Active, TxKind::Other, &e), Failed);
         assert_eq!(track_pg(Idle, TxKind::Other, &e), Idle);
-        assert_eq!(track_pg(Failed, TxKind::Other, &Outcome::from_error(&pg_err("25P02"))), Failed);
+        assert_eq!(
+            track_pg(
+                Failed,
+                TxKind::Other,
+                &Outcome::from_error(&pg_err("25P02"))
+            ),
+            Failed
+        );
         assert_eq!(track_pg(Failed, TxKind::RollbackTo, ok), Active);
         assert_eq!(track_pg(Failed, TxKind::Commit { chain: false }, ok), Idle);
-        assert_eq!(track_pg(Failed, TxKind::Rollback { chain: false }, ok), Idle);
+        assert_eq!(
+            track_pg(Failed, TxKind::Rollback { chain: false }, ok),
+            Idle
+        );
         assert_eq!(track_pg(Active, TxKind::Commit { chain: true }, ok), Active);
         assert_eq!(track_pg(Active, TxKind::Commit { chain: false }, &e), Idle);
         // a failing COMMIT AND CHAIN ends the transaction too; a failing PREPARE TRANSACTION rolls back
         assert_eq!(track_pg(Active, TxKind::Commit { chain: true }, &e), Idle);
-        assert_eq!(track_pg(Active, TxKind::Prepare, &Outcome::from_error(&pg_err("55000"))), Idle);
-        assert_eq!(track_pg(Active, TxKind::Prepare, &Outcome::from_error(&pg_err("42601"))), Failed);
+        assert_eq!(
+            track_pg(
+                Active,
+                TxKind::Prepare,
+                &Outcome::from_error(&pg_err("55000"))
+            ),
+            Idle
+        );
+        assert_eq!(
+            track_pg(
+                Active,
+                TxKind::Prepare,
+                &Outcome::from_error(&pg_err("42601"))
+            ),
+            Failed
+        );
         assert_eq!(track_pg(Failed, TxKind::Prepare, ok), Idle);
         // self-healing
-        assert_eq!(track_pg(Idle, TxKind::Other, &Outcome::from_error(&pg_err("25P02"))), Failed);
-        assert_eq!(track_pg(Active, TxKind::Other, &Outcome::from_error(&pg_err("25P01"))), Idle);
+        assert_eq!(
+            track_pg(Idle, TxKind::Other, &Outcome::from_error(&pg_err("25P02"))),
+            Failed
+        );
+        assert_eq!(
+            track_pg(
+                Active,
+                TxKind::Other,
+                &Outcome::from_error(&pg_err("25P01"))
+            ),
+            Idle
+        );
         assert_eq!(track_pg(Failed, TxKind::Other, ok), Active);
     }
 
     /// A MySQL 8.4 server.
-    const V84: ServerVer = ServerVer { num: 80400, mariadb: false };
+    const V84: ServerVer = ServerVer {
+        num: 80400,
+        mariadb: false,
+    };
 
     fn cm(sql: &str) -> MyStmt {
         classify_mysql(sql, V84)
     }
 
     fn my_err(native: i64, state: &str) -> Outcome {
-        Outcome::Err { state: Some(state.into()), native: Some(native) }
+        Outcome::Err {
+            state: Some(state.into()),
+            native: Some(native),
+        }
     }
 
     fn my_state(status: TxStatus, autocommit: bool) -> MyState {
-        MyState { status, autocommit, locked: false }
+        MyState {
+            status,
+            autocommit,
+            locked: false,
+        }
     }
 
     #[test]
@@ -742,21 +902,72 @@ mod tests {
         assert_eq!(cm("  /* c */ begin work"), Begin);
         assert_eq!(cm("START TRANSACTION READ ONLY"), Begin);
         assert_eq!(cm("xa start 'a'"), Begin);
-        assert_eq!(cm("commit"), End { commit: true, chain: false });
-        assert_eq!(cm("commit and chain"), End { commit: true, chain: true });
-        assert_eq!(cm("commit and no chain"), End { commit: true, chain: false });
-        assert_eq!(cm("rollback and chain"), End { commit: false, chain: true });
-        assert_eq!(cm("xa rollback 'a'"), End { commit: false, chain: false });
+        assert_eq!(
+            cm("commit"),
+            End {
+                commit: true,
+                chain: false
+            }
+        );
+        assert_eq!(
+            cm("commit and chain"),
+            End {
+                commit: true,
+                chain: true
+            }
+        );
+        assert_eq!(
+            cm("commit and no chain"),
+            End {
+                commit: true,
+                chain: false
+            }
+        );
+        assert_eq!(
+            cm("rollback and chain"),
+            End {
+                commit: false,
+                chain: true
+            }
+        );
+        assert_eq!(
+            cm("xa rollback 'a'"),
+            End {
+                commit: false,
+                chain: false
+            }
+        );
         assert_eq!(cm("rollback to savepoint a"), RollbackTo);
         assert_eq!(cm("end"), Other, "END is not MySQL");
         // implicit commits (15.3.3) and their exceptions
         for sql in [
-            "create table t (i int)", "alter table t add x int", "drop database d", "truncate t", "rename table a to b",
-            "create index i on t (c)", "create or replace view v as select 1", "create user u", "drop role r", "grant all on *.* to u",
-            "revoke all on *.* from u", "set password = 'x'", "analyze table t", "optimize table t", "repair table t",
-            "check table t", "cache index t in k", "load index into cache t", "flush tables", "reset master", "reset replica",
-            "start replica", "stop slave", "change replication source to source_host='h'", "install plugin p soname 'x'",
-            "alter instance rotate innodb master key", "create spatial reference system 1 definition 'x'",
+            "create table t (i int)",
+            "alter table t add x int",
+            "drop database d",
+            "truncate t",
+            "rename table a to b",
+            "create index i on t (c)",
+            "create or replace view v as select 1",
+            "create user u",
+            "drop role r",
+            "grant all on *.* to u",
+            "revoke all on *.* from u",
+            "set password = 'x'",
+            "analyze table t",
+            "optimize table t",
+            "repair table t",
+            "check table t",
+            "cache index t in k",
+            "load index into cache t",
+            "flush tables",
+            "reset master",
+            "reset replica",
+            "start replica",
+            "stop slave",
+            "change replication source to source_host='h'",
+            "install plugin p soname 'x'",
+            "alter instance rotate innodb master key",
+            "create spatial reference system 1 definition 'x'",
         ] {
             assert_eq!(cm(sql), ImplicitCommit, "{sql}");
         }
@@ -766,12 +977,31 @@ mod tests {
         assert_eq!(cm("lock tables t write"), LockTables);
         assert_eq!(cm("unlock tables"), UnlockTables);
         // passive statements
-        for sql in ["set @a = 1", "set names utf8mb4", "set transaction isolation level serializable", "use d", "show warnings",
-            "show errors", "select 1", "select now(), @@version", "select 'from'", "select 1 -- from t", "prepare s from 'select 1'", "kill 3"]
-        {
+        for sql in [
+            "set @a = 1",
+            "set names utf8mb4",
+            "set transaction isolation level serializable",
+            "use d",
+            "show warnings",
+            "show errors",
+            "select 1",
+            "select now(), @@version",
+            "select 'from'",
+            "select 1 -- from t",
+            "prepare s from 'select 1'",
+            "kill 3",
+        ] {
             assert_eq!(cm(sql), Passive, "{sql}");
         }
-        for sql in ["select * from t", "select 1 from dual", "show tables", "insert into t values (1)", "call p()", "execute s", "with x as (select 1) select * from x"] {
+        for sql in [
+            "select * from t",
+            "select 1 from dual",
+            "show tables",
+            "insert into t values (1)",
+            "call p()",
+            "execute s",
+            "with x as (select 1) select * from x",
+        ] {
             assert_eq!(cm(sql), Other, "{sql}");
         }
     }
@@ -786,8 +1016,15 @@ mod tests {
         assert_eq!(v("set local autocommit = 'OFF'"), Some(Some(false)));
         assert_eq!(v("set @@autocommit = 0"), Some(Some(false)));
         assert_eq!(v("set @@session.autocommit = false"), Some(Some(false)));
-        assert_eq!(v("/* c */ set sql_mode = '', autocommit = 0"), Some(Some(false)));
-        assert_eq!(v("set autocommit = 0, autocommit = 1"), Some(Some(true)), "the last assignment wins");
+        assert_eq!(
+            v("/* c */ set sql_mode = '', autocommit = 0"),
+            Some(Some(false))
+        );
+        assert_eq!(
+            v("set autocommit = 0, autocommit = 1"),
+            Some(Some(true)),
+            "the last assignment wins"
+        );
         assert_eq!(v("set autocommit = @x"), Some(None));
         assert_eq!(v("set autocommit = if(1, 0, 1)"), Some(None));
         assert_eq!(v("set @autocommit = 0"), None, "a user variable");
@@ -811,7 +1048,10 @@ mod tests {
             ("/*+ hint */ create table t(i int)", true),
             ("create/**/table t(i int)", true),
             ("CREATE /* x */ TABLE /* y */ t(i int)", true),
-            ("create /* x */ or /* y */ replace /* z */ view v as select 1", true),
+            (
+                "create /* x */ or /* y */ replace /* z */ view v as select 1",
+                true,
+            ),
             ("create # x\n table t(i int)", true),
             ("create -- x\n table t(i int)", true),
             ("create table t2 select 1 as i", true),
@@ -856,24 +1096,72 @@ mod tests {
         }
         // a gated comment follows the server version
         assert_eq!(c("/*!80500 create table t(i int) */", V84), Other);
-        assert_eq!(c("/*!80500 create table t(i int) */", ServerVer { num: 80500, mariadb: false }), ImplicitCommit);
-        assert_eq!(c("/*!80500 create table t(i int) */", ServerVer::UNKNOWN), ImplicitCommit);
+        assert_eq!(
+            c(
+                "/*!80500 create table t(i int) */",
+                ServerVer {
+                    num: 80500,
+                    mariadb: false
+                }
+            ),
+            ImplicitCommit
+        );
+        assert_eq!(
+            c("/*!80500 create table t(i int) */", ServerVer::UNKNOWN),
+            ImplicitCommit
+        );
         // MariaDB's own marker is a plain comment on MySQL
-        let maria = ServerVer { num: 101106, mariadb: true };
-        assert_eq!(c("/*M!100100 create table t(i int) */", maria), ImplicitCommit);
-        assert_eq!(c("/*M!100100 create table t(i int) */", ServerVer { num: 101000, mariadb: true }), ImplicitCommit);
+        let maria = ServerVer {
+            num: 101106,
+            mariadb: true,
+        };
+        assert_eq!(
+            c("/*M!100100 create table t(i int) */", maria),
+            ImplicitCommit
+        );
+        assert_eq!(
+            c(
+                "/*M!100100 create table t(i int) */",
+                ServerVer {
+                    num: 101000,
+                    mariadb: true
+                }
+            ),
+            ImplicitCommit
+        );
         assert_eq!(c("/*M!999999 create table t(i int) */", maria), Other);
         assert_eq!(c("/*M!100100 create table t(i int) */", V84), Other);
         // transaction control and SET behind comments
-        assert_eq!(c("/* a */ commit /* b */ and /* c */ chain", V84), End { commit: true, chain: true });
+        assert_eq!(
+            c("/* a */ commit /* b */ and /* c */ chain", V84),
+            End {
+                commit: true,
+                chain: true
+            }
+        );
         assert_eq!(c("rollback # x\n to savepoint a", V84), RollbackTo);
         assert_eq!(c("/*!50001 start transaction */", V84), Begin);
-        assert_eq!(c("set autocommit = 0 -- manual", V84), SetAutocommit(Some(false)));
-        assert_eq!(c("set /* a */ @@session.autocommit /* b */ = /* c */ 0", V84), SetAutocommit(Some(false)));
-        assert_eq!(c("SET @@session.autocommit=0", V84), SetAutocommit(Some(false)));
-        assert_eq!(c("SET autocommit=OFF /* x */", V84), SetAutocommit(Some(false)));
+        assert_eq!(
+            c("set autocommit = 0 -- manual", V84),
+            SetAutocommit(Some(false))
+        );
+        assert_eq!(
+            c("set /* a */ @@session.autocommit /* b */ = /* c */ 0", V84),
+            SetAutocommit(Some(false))
+        );
+        assert_eq!(
+            c("SET @@session.autocommit=0", V84),
+            SetAutocommit(Some(false))
+        );
+        assert_eq!(
+            c("SET autocommit=OFF /* x */", V84),
+            SetAutocommit(Some(false))
+        );
         assert_eq!(c("set sql_mode = '' # autocommit = 0", V84), Passive);
-        assert_eq!(c("set /*!50001 autocommit = 0 */", V84), SetAutocommit(Some(false)));
+        assert_eq!(
+            c("set /*!50001 autocommit = 0 */", V84),
+            SetAutocommit(Some(false))
+        );
         assert_eq!(c("set /*!99999 autocommit = 0 */", V84), Passive);
         assert_eq!(c("set `autocommit` = 1", V84), SetAutocommit(Some(true)));
     }
@@ -881,11 +1169,41 @@ mod tests {
     #[test]
     fn server_versions_parse() {
         let p = ServerVer::parse;
-        assert_eq!(p("8.4.3"), ServerVer { num: 80403, mariadb: false });
-        assert_eq!(p("8.0.36-0ubuntu0.22.04.1"), ServerVer { num: 80036, mariadb: false });
-        assert_eq!(p("5.7.44-log"), ServerVer { num: 50744, mariadb: false });
-        assert_eq!(p("10.11.6-MariaDB-1:10.11.6+maria~ubu2204"), ServerVer { num: 101106, mariadb: true });
-        assert_eq!(p("5.5.5-10.0.38-MariaDB"), ServerVer { num: 100038, mariadb: true });
+        assert_eq!(
+            p("8.4.3"),
+            ServerVer {
+                num: 80403,
+                mariadb: false
+            }
+        );
+        assert_eq!(
+            p("8.0.36-0ubuntu0.22.04.1"),
+            ServerVer {
+                num: 80036,
+                mariadb: false
+            }
+        );
+        assert_eq!(
+            p("5.7.44-log"),
+            ServerVer {
+                num: 50744,
+                mariadb: false
+            }
+        );
+        assert_eq!(
+            p("10.11.6-MariaDB-1:10.11.6+maria~ubu2204"),
+            ServerVer {
+                num: 101106,
+                mariadb: true
+            }
+        );
+        assert_eq!(
+            p("5.5.5-10.0.38-MariaDB"),
+            ServerVer {
+                num: 100038,
+                mariadb: true
+            }
+        );
         assert_eq!(p("unknown"), ServerVer::UNKNOWN);
     }
 
@@ -901,43 +1219,139 @@ mod tests {
         assert_eq!(step(my_state(Idle, false), Passive, ok).next.status, Idle);
         // SET autocommit
         let s = step(my_state(Active, false), SetAutocommit(Some(true)), ok);
-        assert_eq!((s.next.status, s.next.autocommit, s.ended), (Idle, true, Some((true, "IMPLICIT COMMIT"))));
+        assert_eq!(
+            (s.next.status, s.next.autocommit, s.ended),
+            (Idle, true, Some((true, "IMPLICIT COMMIT")))
+        );
         let s = step(my_state(Idle, false), SetAutocommit(Some(true)), ok);
-        assert_eq!((s.next.status, s.ended), (Idle, None), "nothing open: nothing committed");
+        assert_eq!(
+            (s.next.status, s.ended),
+            (Idle, None),
+            "nothing open: nothing committed"
+        );
         let s = step(my_state(Active, true), SetAutocommit(Some(true)), ok);
-        assert_eq!((s.next.status, s.ended), (Active, None), "already 1: no implicit commit");
+        assert_eq!(
+            (s.next.status, s.ended),
+            (Active, None),
+            "already 1: no implicit commit"
+        );
         let s = step(my_state(Active, true), SetAutocommit(Some(false)), ok);
         assert_eq!((s.next.status, s.next.autocommit), (Active, false));
         // transaction control
         let s = step(my_state(Active, true), Begin, ok);
-        assert_eq!((s.next.status, s.ended), (Active, Some((true, "IMPLICIT COMMIT"))));
-        let s = step(my_state(Active, false), End { commit: true, chain: false }, ok);
+        assert_eq!(
+            (s.next.status, s.ended),
+            (Active, Some((true, "IMPLICIT COMMIT")))
+        );
+        let s = step(
+            my_state(Active, false),
+            End {
+                commit: true,
+                chain: false,
+            },
+            ok,
+        );
         assert_eq!((s.next.status, s.ended), (Idle, Some((true, "COMMIT"))));
-        let s = step(my_state(Active, false), End { commit: false, chain: true }, ok);
-        assert_eq!((s.next.status, s.ended), (Active, Some((false, "ROLLBACK"))));
+        let s = step(
+            my_state(Active, false),
+            End {
+                commit: false,
+                chain: true,
+            },
+            ok,
+        );
+        assert_eq!(
+            (s.next.status, s.ended),
+            (Active, Some((false, "ROLLBACK")))
+        );
         // implicit commit, also when it fails but parsed
         let s = step(my_state(Active, true), ImplicitCommit, ok);
-        assert_eq!((s.next.status, s.ended), (Idle, Some((true, "IMPLICIT COMMIT"))));
-        let s = step(my_state(Active, true), ImplicitCommit, &my_err(1050, "42S01"));
-        assert_eq!((s.next.status, s.ended), (Idle, Some((true, "IMPLICIT COMMIT"))));
-        let s = step(my_state(Active, true), ImplicitCommit, &my_err(1064, "42000"));
-        assert_eq!((s.next.status, s.ended), (Active, None), "a syntax error never ran");
+        assert_eq!(
+            (s.next.status, s.ended),
+            (Idle, Some((true, "IMPLICIT COMMIT")))
+        );
+        let s = step(
+            my_state(Active, true),
+            ImplicitCommit,
+            &my_err(1050, "42S01"),
+        );
+        assert_eq!(
+            (s.next.status, s.ended),
+            (Idle, Some((true, "IMPLICIT COMMIT")))
+        );
+        let s = step(
+            my_state(Active, true),
+            ImplicitCommit,
+            &my_err(1064, "42000"),
+        );
+        assert_eq!(
+            (s.next.status, s.ended),
+            (Active, None),
+            "a syntax error never ran"
+        );
         // LOCK / UNLOCK TABLES
         let s = step(my_state(Active, true), LockTables, ok);
         assert!(s.next.locked && s.next.status == Idle);
-        let s = step(MyState { status: Active, autocommit: true, locked: true }, UnlockTables, ok);
+        let s = step(
+            MyState {
+                status: Active,
+                autocommit: true,
+                locked: true,
+            },
+            UnlockTables,
+            ok,
+        );
         assert!(!s.next.locked && s.next.status == Idle);
         let s = step(my_state(Active, true), UnlockTables, ok);
         assert_eq!(s.next.status, Active);
-        let s = step(MyState { status: Idle, autocommit: true, locked: true }, Begin, ok);
+        let s = step(
+            MyState {
+                status: Idle,
+                autocommit: true,
+                locked: true,
+            },
+            Begin,
+            ok,
+        );
         assert!(!s.next.locked, "START TRANSACTION releases the locks");
         // errors
-        assert_eq!(step(my_state(Active, true), Other, &my_err(1146, "42S02")).next.status, Active);
-        assert_eq!(step(my_state(Idle, false), Other, &my_err(1146, "42S02")).next.status, Idle);
-        assert_eq!(step(my_state(Idle, false), Other, &my_err(1062, "23000")).next.status, Active);
+        assert_eq!(
+            step(my_state(Active, true), Other, &my_err(1146, "42S02"))
+                .next
+                .status,
+            Active
+        );
+        assert_eq!(
+            step(my_state(Idle, false), Other, &my_err(1146, "42S02"))
+                .next
+                .status,
+            Idle
+        );
+        assert_eq!(
+            step(my_state(Idle, false), Other, &my_err(1062, "23000"))
+                .next
+                .status,
+            Active
+        );
         let s = step(my_state(Active, true), Other, &my_err(1213, "40001"));
-        assert_eq!((s.next.status, s.ended), (Idle, Some((false, "ROLLBACK"))), "deadlock rolls the transaction back");
-        assert_eq!(step(my_state(Active, true), Other, &my_err(1205, "HY000")).next.status, Active, "lock wait timeout does not");
-        assert_eq!(step(my_state(Active, true), Other, &my_err(1317, "70100")).next.status, Active, "KILL QUERY does not");
+        assert_eq!(
+            (s.next.status, s.ended),
+            (Idle, Some((false, "ROLLBACK"))),
+            "deadlock rolls the transaction back"
+        );
+        assert_eq!(
+            step(my_state(Active, true), Other, &my_err(1205, "HY000"))
+                .next
+                .status,
+            Active,
+            "lock wait timeout does not"
+        );
+        assert_eq!(
+            step(my_state(Active, true), Other, &my_err(1317, "70100"))
+                .next
+                .status,
+            Active,
+            "KILL QUERY does not"
+        );
     }
 }

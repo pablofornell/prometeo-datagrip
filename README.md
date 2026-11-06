@@ -42,10 +42,9 @@ Run `make help` to see all targets. The most used:
 | `make install` | Install the frontend dependencies |
 | `make dev` | Run the app in development mode |
 | `make build` | Build the release binary (`target/release/prometeo-datagrip`) |
-| `make check` | Type-check, clippy and unit tests (no databases needed) |
+| `make check` | Type-check, clippy, Rust format check and unit tests (no databases needed) |
 | `make db-up` | Start the PostgreSQL (54329) and MySQL (33069) test containers |
 | `make test-all` | All tests, including the database integration tests |
 | `make ci` | Lint, all tests and the frontend build |
 
-`make fmt-check` is not part of `check` or `ci` yet, because the Rust code is not rustfmt-formatted.
-Run `make fmt` once to format it.
+`make lint` (and so `check` and `ci`) also runs `make fmt-check`: run `make fmt` before you commit Rust changes.

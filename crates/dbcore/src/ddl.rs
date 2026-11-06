@@ -19,7 +19,13 @@ fn g(r: &[Option<String>], i: usize) -> String {
 }
 
 async fn first_cell(pool: &Pool, sql: &str) -> Result<Option<String>> {
-    Ok(pool.query_strings(sql).await?.into_iter().next().and_then(|r| r.into_iter().next()).flatten())
+    Ok(pool
+        .query_strings(sql)
+        .await?
+        .into_iter()
+        .next()
+        .and_then(|r| r.into_iter().next())
+        .flatten())
 }
 
 fn end_stmt(mut s: String) -> String {
@@ -52,11 +58,19 @@ fn pl(v: &str) -> String {
 
 /// `quote_ident` evaluated by the server (exact PG rules for reserved words etc).
 async fn pgq(pool: &Pool, ident: &str) -> Result<String> {
-    Ok(first_cell(pool, &format!("select quote_ident({})", pl(ident))).await?.unwrap_or_else(|| ident.to_string()))
+    Ok(
+        first_cell(pool, &format!("select quote_ident({})", pl(ident)))
+            .await?
+            .unwrap_or_else(|| ident.to_string()),
+    )
 }
 
 async fn pg_qname(pool: &Pool, schema: &str, name: &str) -> Result<String> {
-    Ok(format!("{}.{}", pgq(pool, schema).await?, pgq(pool, name).await?))
+    Ok(format!(
+        "{}.{}",
+        pgq(pool, schema).await?,
+        pgq(pool, name).await?
+    ))
 }
 
 fn pg_rel_expr(schema: &str, name: &str) -> String {
@@ -293,7 +307,11 @@ impl PgCon {
             name: g(r, 0),
             kind: g(r, 1).chars().next().unwrap_or('c'),
             def: lower_keywords(&g(r, 2)),
-            cols: g(r, 3).split(',').filter(|c| !c.is_empty()).map(str::to_string).collect(),
+            cols: g(r, 3)
+                .split(',')
+                .filter(|c| !c.is_empty())
+                .map(str::to_string)
+                .collect(),
             ref_is_pk: g(r, 4) == "true",
         }
     }
@@ -399,7 +417,9 @@ async fn pg_table_ddl(pool: &Pool, sc: &str, name: &str) -> Result<String> {
              from pg_class c where c.oid = {rel}"
         ))
         .await?;
-    let h = head.first().ok_or_else(|| DbError::NotFound(format!("Table {sc}.{name} not found")))?;
+    let h = head
+        .first()
+        .ok_or_else(|| DbError::NotFound(format!("Table {sc}.{name} not found")))?;
     let qname = pg_qname(pool, sc, name).await?;
     let unlogged = if g(h, 1) == "u" { "unlogged " } else { "" };
 
@@ -433,9 +453,11 @@ async fn pg_table_ddl(pool: &Pool, sc: &str, name: &str) -> Result<String> {
         let mut table_level: Vec<&PgCon> = Vec::new();
         let mut inline: Vec<Vec<(&PgCon, String)>> = vec![Vec::new(); cols.len()];
         for c in &cons {
-            let target = c
-                .inline_clause()
-                .and_then(|cl| cols.iter().position(|r| g(r, 8) == c.cols[0]).map(|i| (i, cl)));
+            let target = c.inline_clause().and_then(|cl| {
+                cols.iter()
+                    .position(|r| g(r, 8) == c.cols[0])
+                    .map(|i| (i, cl))
+            });
             match target {
                 Some((i, cl)) => inline[i].push((c, cl)),
                 None => table_level.push(c),
@@ -443,7 +465,11 @@ async fn pg_table_ddl(pool: &Pool, sc: &str, name: &str) -> Result<String> {
         }
 
         let parts: Vec<(String, String)> = cols.iter().map(|r| pg_column_parts(r)).collect();
-        let width = parts.iter().map(|(n, _)| n.chars().count()).max().unwrap_or(0);
+        let width = parts
+            .iter()
+            .map(|(n, _)| n.chars().count())
+            .max()
+            .unwrap_or(0);
         let mut items: Vec<String> = Vec::new();
         for (i, (n, rest)) in parts.iter().enumerate() {
             let mut item = format!("    {n:<width$} {rest}");
@@ -456,7 +482,10 @@ async fn pg_table_ddl(pool: &Pool, sc: &str, name: &str) -> Result<String> {
         for c in table_level {
             items.push(c.lines(name, &c.table_clause(), 4));
         }
-        let mut create = format!("create {unlogged}table {qname}\n(\n{}\n)", items.join(",\n"));
+        let mut create = format!(
+            "create {unlogged}table {qname}\n(\n{}\n)",
+            items.join(",\n")
+        );
         if !g(h, 2).is_empty() {
             create.push_str(&format!("\npartition by {}", lower_keywords(&g(h, 2))));
         }
@@ -468,7 +497,11 @@ async fn pg_table_ddl(pool: &Pool, sc: &str, name: &str) -> Result<String> {
         }
         for r in &cols {
             if !g(r, 6).is_empty() {
-                comments.push(format!("comment on column {qname}.{} is {};", g(r, 0), pl(&g(r, 6))));
+                comments.push(format!(
+                    "comment on column {qname}.{} is {};",
+                    g(r, 0),
+                    pl(&g(r, 6))
+                ));
             }
         }
     }
@@ -479,7 +512,13 @@ async fn pg_table_ddl(pool: &Pool, sc: &str, name: &str) -> Result<String> {
 }
 
 /// Indexes (not backing a constraint) and triggers appended to table / view DDL, one statement each.
-async fn pg_extras(pool: &Pool, sc: &str, name: &str, indexes: bool, triggers: bool) -> Result<Vec<String>> {
+async fn pg_extras(
+    pool: &Pool,
+    sc: &str,
+    name: &str,
+    indexes: bool,
+    triggers: bool,
+) -> Result<Vec<String>> {
     let rel = pg_rel_expr(sc, name);
     let mut out = Vec::new();
     if indexes {
@@ -579,7 +618,10 @@ fn lower_keywords(s: &str) -> String {
 fn index_def(def: &str) -> String {
     let d = lower_keywords(def.trim_end().trim_end_matches(';'));
     match d.split_once(" on ") {
-        Some((head, rest)) => format!("{head}\n    on {}", rest.replacen(" using btree (", " (", 1)),
+        Some((head, rest)) => format!(
+            "{head}\n    on {}",
+            rest.replacen(" using btree (", " (", 1)
+        ),
         None => d,
     }
 }
@@ -592,7 +634,14 @@ fn trigger_def(def: &str) -> String {
         Some((a, b)) => (a.to_string(), Some(b.to_string())),
         None => (d.clone(), None),
     };
-    let Some(after_create) = pre.strip_prefix("create constraint trigger ").map(|r| ("create constraint trigger", r)).or_else(|| pre.strip_prefix("create trigger ").map(|r| ("create trigger", r))) else {
+    let Some(after_create) = pre
+        .strip_prefix("create constraint trigger ")
+        .map(|r| ("create constraint trigger", r))
+        .or_else(|| {
+            pre.strip_prefix("create trigger ")
+                .map(|r| ("create trigger", r))
+        })
+    else {
         return d;
     };
     let (kw, rest) = after_create;
@@ -607,7 +656,11 @@ fn trigger_def(def: &str) -> String {
         return d;
     };
     let (table, tail) = rest.split_once(' ').unwrap_or((rest, ""));
-    let mut lines = vec![format!("{kw} {name}"), format!("    {timing}"), format!("    on {table}")];
+    let mut lines = vec![
+        format!("{kw} {name}"),
+        format!("    {timing}"),
+        format!("    on {table}"),
+    ];
     let tail = tail.trim();
     if let Some((before, when)) = tail.split_once(" when ") {
         if !before.is_empty() {
@@ -635,12 +688,16 @@ async fn my_ddl(live: &Live, o: &ObjectRef) -> Result<String> {
     let pool = &live.pool;
     let sc = match &o.schema {
         Some(s) => s.clone(),
-        None => first_cell(pool, "select database()").await?.unwrap_or_default(),
+        None => first_cell(pool, "select database()")
+            .await?
+            .unwrap_or_default(),
     };
     async fn show(pool: &Pool, sc: &str, what: &str, name: &str, col: usize) -> Result<String> {
         let sql = format!("show create {what} {}.{}", mq(sc), mq(name));
         let rows = pool.query_strings(&sql).await?;
-        rows.first().map(|r| end_stmt(g(r, col))).ok_or_else(|| DbError::NotFound(format!("{name} not found")))
+        rows.first()
+            .map(|r| end_stmt(g(r, col)))
+            .ok_or_else(|| DbError::NotFound(format!("{name} not found")))
     }
     match o.kind {
         NodeKind::Table | NodeKind::Folder => show(pool, &sc, "table", &o.name, 1).await,
@@ -653,11 +710,18 @@ async fn my_ddl(live: &Live, o: &ObjectRef) -> Result<String> {
         },
         NodeKind::Trigger => show(pool, &sc, "trigger", &o.name, 2).await,
         NodeKind::Schema | NodeKind::Database => {
-            let rows = pool.query_strings(&format!("show create database {}", mq(&o.name))).await?;
-            rows.first().map(|r| end_stmt(g(r, 1))).ok_or_else(|| DbError::NotFound(o.name.clone()))
+            let rows = pool
+                .query_strings(&format!("show create database {}", mq(&o.name)))
+                .await?;
+            rows.first()
+                .map(|r| end_stmt(g(r, 1)))
+                .ok_or_else(|| DbError::NotFound(o.name.clone()))
         }
         NodeKind::Index => {
-            let t = o.table.clone().ok_or_else(|| DbError::InvalidArgument("index needs a table".into()))?;
+            let t = o
+                .table
+                .clone()
+                .ok_or_else(|| DbError::InvalidArgument("index needs a table".into()))?;
             let rows = pool
                 .query_strings(&format!(
                     "select max(non_unique), group_concat(concat('`', column_name, '`') order by seq_in_index separator ', ') \
@@ -667,15 +731,30 @@ async fn my_ddl(live: &Live, o: &ObjectRef) -> Result<String> {
                     quote_literal(Driver::MySql, &o.name)
                 ))
                 .await?;
-            let r = rows.first().ok_or_else(|| DbError::NotFound(o.name.clone()))?;
+            let r = rows
+                .first()
+                .ok_or_else(|| DbError::NotFound(o.name.clone()))?;
             if g(r, 1).is_empty() {
                 return Err(DbError::NotFound(format!("Index {} not found", o.name)));
             }
             let unique = if g(r, 0) == "0" { "unique " } else { "" };
-            Ok(format!("create {unique}index {} on {}.{} ({});", mq(&o.name), mq(&sc), mq(&t), g(r, 1)))
+            Ok(format!(
+                "create {unique}index {} on {}.{} ({});",
+                mq(&o.name),
+                mq(&sc),
+                mq(&t),
+                g(r, 1)
+            ))
         }
-        NodeKind::Column | NodeKind::PrimaryKey | NodeKind::ForeignKey | NodeKind::UniqueKey | NodeKind::Check => {
-            let t = o.table.clone().ok_or_else(|| DbError::InvalidArgument("object needs a table".into()))?;
+        NodeKind::Column
+        | NodeKind::PrimaryKey
+        | NodeKind::ForeignKey
+        | NodeKind::UniqueKey
+        | NodeKind::Check => {
+            let t = o
+                .table
+                .clone()
+                .ok_or_else(|| DbError::InvalidArgument("object needs a table".into()))?;
             show(pool, &sc, "table", &t, 1).await
         }
         k => Err(DbError::Unsupported(format!("No DDL for {k:?}"))),
@@ -699,9 +778,15 @@ async fn lite_ddl(live: &Live, o: &ObjectRef) -> Result<String> {
         NodeKind::View => ("view", o.name.clone()),
         NodeKind::Index => ("index", o.name.clone()),
         NodeKind::Trigger => ("trigger", o.name.clone()),
-        NodeKind::Column | NodeKind::PrimaryKey | NodeKind::ForeignKey | NodeKind::UniqueKey | NodeKind::Check => (
+        NodeKind::Column
+        | NodeKind::PrimaryKey
+        | NodeKind::ForeignKey
+        | NodeKind::UniqueKey
+        | NodeKind::Check => (
             "table",
-            o.table.clone().ok_or_else(|| DbError::InvalidArgument("object needs a table".into()))?,
+            o.table
+                .clone()
+                .ok_or_else(|| DbError::InvalidArgument("object needs a table".into()))?,
         ),
         NodeKind::Schema | NodeKind::Database => return Ok(format!("-- schema {}", o.name)),
         k => return Err(DbError::Unsupported(format!("No DDL for {k:?}"))),
@@ -709,7 +794,10 @@ async fn lite_ddl(live: &Live, o: &ObjectRef) -> Result<String> {
     let sql = first_cell(pool, &lookup(ty, &name)).await?;
     match sql {
         Some(s) => Ok(end_stmt(s)),
-        None if ty == "index" => Ok(format!("-- {} is created automatically by a UNIQUE / PRIMARY KEY constraint", o.name)),
+        None if ty == "index" => Ok(format!(
+            "-- {} is created automatically by a UNIQUE / PRIMARY KEY constraint",
+            o.name
+        )),
         None => Err(DbError::NotFound(format!("{} {} not found", ty, name))),
     }
 }
@@ -720,16 +808,28 @@ mod tests {
 
     #[test]
     fn keywords_go_lower_case_but_quoted_text_does_not() {
-        assert_eq!(lower_keywords("FOREIGN KEY (a) REFERENCES shop.categories(id) ON DELETE CASCADE"), "foreign key (a) references shop.categories(id) on delete cascade");
-        assert_eq!(lower_keywords(r#"CHECK (("Name" <> 'NOT NULL'::text))"#), r#"check (("Name" <> 'NOT NULL'::text))"#);
+        assert_eq!(
+            lower_keywords("FOREIGN KEY (a) REFERENCES shop.categories(id) ON DELETE CASCADE"),
+            "foreign key (a) references shop.categories(id) on delete cascade"
+        );
+        assert_eq!(
+            lower_keywords(r#"CHECK (("Name" <> 'NOT NULL'::text))"#),
+            r#"check (("Name" <> 'NOT NULL'::text))"#
+        );
         assert_eq!(lower_keywords("CURRENT_TIMESTAMP"), "current_timestamp");
-        assert_eq!(lower_keywords("t1 = 10 AND x IS NOT NULL"), "t1 = 10 and x is not null");
+        assert_eq!(
+            lower_keywords("t1 = 10 AND x IS NOT NULL"),
+            "t1 = 10 and x is not null"
+        );
         assert_eq!(lower_keywords("'it''s OK' AS x"), "'it''s OK' as x");
     }
 
     #[test]
     fn index_and_trigger_layout() {
-        assert_eq!(index_def("CREATE INDEX idx_a ON shop.t USING btree (a)"), "create index idx_a\n    on shop.t (a)");
+        assert_eq!(
+            index_def("CREATE INDEX idx_a ON shop.t USING btree (a)"),
+            "create index idx_a\n    on shop.t (a)"
+        );
         assert_eq!(
             index_def("CREATE UNIQUE INDEX u ON shop.t USING gin (a) WHERE (b < 5)"),
             "create unique index u\n    on shop.t using gin (a) where (b < 5)"
@@ -746,21 +846,61 @@ mod tests {
 
     #[test]
     fn constraints_sit_under_their_column() {
-        let pk = PgCon { name: "invoices_pkey".into(), kind: 'p', def: "primary key (id)".into(), cols: vec!["id".into()], ref_is_pk: false };
+        let pk = PgCon {
+            name: "invoices_pkey".into(),
+            kind: 'p',
+            def: "primary key (id)".into(),
+            cols: vec!["id".into()],
+            ref_is_pk: false,
+        };
         assert_eq!(pk.inline_clause().as_deref(), Some("primary key"));
-        assert_eq!(pk.lines("invoices", "primary key", 8), "        primary key");
-        let fk = PgCon { name: "fk_client".into(), kind: 'f', def: "foreign key (client_id) references clients(id) on delete cascade".into(), cols: vec!["client_id".into()], ref_is_pk: true };
-        assert_eq!(fk.inline_clause().as_deref(), Some("references clients on delete cascade"));
-        assert_eq!(fk.lines("invoices", "references clients", 8), "        constraint fk_client\n            references clients");
-        let fk2 = PgCon { name: "x".into(), kind: 'f', def: "foreign key (a) references t(b)".into(), cols: vec!["a".into()], ref_is_pk: false };
+        assert_eq!(
+            pk.lines("invoices", "primary key", 8),
+            "        primary key"
+        );
+        let fk = PgCon {
+            name: "fk_client".into(),
+            kind: 'f',
+            def: "foreign key (client_id) references clients(id) on delete cascade".into(),
+            cols: vec!["client_id".into()],
+            ref_is_pk: true,
+        };
+        assert_eq!(
+            fk.inline_clause().as_deref(),
+            Some("references clients on delete cascade")
+        );
+        assert_eq!(
+            fk.lines("invoices", "references clients", 8),
+            "        constraint fk_client\n            references clients"
+        );
+        let fk2 = PgCon {
+            name: "x".into(),
+            kind: 'f',
+            def: "foreign key (a) references t(b)".into(),
+            cols: vec!["a".into()],
+            ref_is_pk: false,
+        };
         assert_eq!(fk2.inline_clause().as_deref(), Some("references t (b)"));
-        let comp = PgCon { name: "t_pkey".into(), kind: 'p', def: "primary key (a, b)".into(), cols: vec!["a".into(), "b".into()], ref_is_pk: false };
+        let comp = PgCon {
+            name: "t_pkey".into(),
+            kind: 'p',
+            def: "primary key (a, b)".into(),
+            cols: vec!["a".into(), "b".into()],
+            ref_is_pk: false,
+        };
         assert_eq!(comp.inline_clause(), None);
         assert_eq!(comp.table_clause(), "primary key (a, b)");
     }
 
     #[test]
     fn statements_are_paragraphs_under_the_header() {
-        assert_eq!(join_stmts(vec![AUTO_GENERATED.into(), "create a;".into(), "alter b;".into()]), "-- auto-generated definition\ncreate a;\n\nalter b;");
+        assert_eq!(
+            join_stmts(vec![
+                AUTO_GENERATED.into(),
+                "create a;".into(),
+                "alter b;".into()
+            ]),
+            "-- auto-generated definition\ncreate a;\n\nalter b;"
+        );
     }
 }

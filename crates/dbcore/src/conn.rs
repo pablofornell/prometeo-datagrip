@@ -5,9 +5,13 @@ use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use sqlx::mysql::{MySqlConnectOptions, MySqlConnection, MySqlPool, MySqlPoolOptions, MySqlRow, MySqlSslMode};
+use sqlx::mysql::{
+    MySqlConnectOptions, MySqlConnection, MySqlPool, MySqlPoolOptions, MySqlRow, MySqlSslMode,
+};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions, PgRow, PgSslMode};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePool, SqlitePoolOptions, SqliteRow};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteConnection, SqlitePool, SqlitePoolOptions, SqliteRow,
+};
 use sqlx::{ConnectOptions, Connection, Row};
 
 use crate::error::{connect_error, DbError, Result};
@@ -71,7 +75,10 @@ pub(crate) async fn connect_one(opts: &ConnOpts, cfg: &DataSourceConfig) -> Resu
             ConnOpts::My(o) => {
                 let mut c = o.connect().await.map_err(connect_error)?;
                 if cfg.read_only {
-                    sqlx::query("SET SESSION TRANSACTION READ ONLY").execute(&mut c).await.map_err(connect_error)?;
+                    sqlx::query("SET SESSION TRANSACTION READ ONLY")
+                        .execute(&mut c)
+                        .await
+                        .map_err(connect_error)?;
                 }
                 Conn::My(c)
             }
@@ -80,7 +87,10 @@ pub(crate) async fn connect_one(opts: &ConnOpts, cfg: &DataSourceConfig) -> Resu
     };
     match tokio::time::timeout(timeout, fut).await {
         Ok(r) => r,
-        Err(_) => Err(DbError::Connection(format!("Connection timed out after {}s", timeout.as_secs()))),
+        Err(_) => Err(DbError::Connection(format!(
+            "Connection timed out after {}s",
+            timeout.as_secs()
+        ))),
     }
 }
 
@@ -104,19 +114,34 @@ pub(crate) fn is_memory(cfg: &DataSourceConfig) -> bool {
     if cfg.driver != Driver::Sqlite {
         return false;
     }
-    let t = cfg.url_override.as_deref().map(str::trim).filter(|u| !u.is_empty()).unwrap_or(cfg.file.trim());
+    let t = cfg
+        .url_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .unwrap_or(cfg.file.trim());
     t.contains(":memory:") || t.contains("mode=memory")
 }
 
 /// Percent-encode everything but `[A-Za-z0-9_-]` so a data source id is safe inside a URI.
 fn uri_safe(id: &str) -> String {
     id.bytes()
-        .map(|b| if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' { (b as char).to_string() } else { format!("%{b:02X}") })
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
         .collect()
 }
 
 pub(crate) fn build_opts(cfg: &DataSourceConfig) -> Result<ConnOpts> {
-    let url = cfg.url_override.as_deref().map(str::trim).filter(|u| !u.is_empty());
+    let url = cfg
+        .url_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty());
     match cfg.driver {
         Driver::Postgres => {
             let mut o = match url {
@@ -130,7 +155,11 @@ pub(crate) fn build_opts(cfg: &DataSourceConfig) -> Result<ConnOpts> {
                 }
                 None => {
                     let mut o = PgConnectOptions::new_without_pgpass()
-                        .host(if cfg.host.is_empty() { "localhost" } else { &cfg.host })
+                        .host(if cfg.host.is_empty() {
+                            "localhost"
+                        } else {
+                            &cfg.host
+                        })
                         .port(if cfg.port == 0 { 5432 } else { cfg.port });
                     if !cfg.user.is_empty() {
                         o = o.username(&cfg.user);
@@ -147,7 +176,9 @@ pub(crate) fn build_opts(cfg: &DataSourceConfig) -> Result<ConnOpts> {
             if let Some(m) = opt(cfg, &["sslmode", "ssl-mode"]) {
                 o = o.ssl_mode(PgSslMode::from_str(m).map_err(bad)?);
             }
-            o = o.application_name(opt(cfg, &["application_name", "applicationName"]).unwrap_or("Prometeo DataGrip"));
+            o = o.application_name(
+                opt(cfg, &["application_name", "applicationName"]).unwrap_or("Prometeo DataGrip"),
+            );
             if cfg.read_only {
                 o = o.options([("default_transaction_read_only", "on")]);
             }
@@ -164,7 +195,11 @@ pub(crate) fn build_opts(cfg: &DataSourceConfig) -> Result<ConnOpts> {
                 }
                 None => {
                     let mut o = MySqlConnectOptions::new()
-                        .host(if cfg.host.is_empty() { "localhost" } else { &cfg.host })
+                        .host(if cfg.host.is_empty() {
+                            "localhost"
+                        } else {
+                            &cfg.host
+                        })
                         .port(if cfg.port == 0 { 3306 } else { cfg.port });
                     if !cfg.user.is_empty() {
                         o = o.username(&cfg.user);
@@ -191,18 +226,29 @@ pub(crate) fn build_opts(cfg: &DataSourceConfig) -> Result<ConnOpts> {
                 // every connection of this data source (pool, console sessions) must see the
                 // same database: a named shared-cache in-memory one, unique per `build_opts`
                 None if is_memory(cfg) => SqliteConnectOptions::new()
-                    .filename(format!("file:prometeo-{}-{}?mode=memory&cache=shared", uri_safe(&cfg.id), uuid::Uuid::new_v4().simple()))
+                    .filename(format!(
+                        "file:prometeo-{}-{}?mode=memory&cache=shared",
+                        uri_safe(&cfg.id),
+                        uuid::Uuid::new_v4().simple()
+                    ))
                     .in_memory(true)
                     .shared_cache(true),
                 None => {
                     if cfg.file.trim().is_empty() {
-                        return Err(DbError::InvalidArgument("SQLite database file is not set".into()));
+                        return Err(DbError::InvalidArgument(
+                            "SQLite database file is not set".into(),
+                        ));
                     }
                     SqliteConnectOptions::new().filename(&cfg.file)
                 }
             };
-            let create = opt(cfg, &["create", "createIfMissing"]).map(|v| v == "true").unwrap_or(false);
-            o = o.create_if_missing(create).read_only(cfg.read_only).busy_timeout(Duration::from_secs(5));
+            let create = opt(cfg, &["create", "createIfMissing"])
+                .map(|v| v == "true")
+                .unwrap_or(false);
+            o = o
+                .create_if_missing(create)
+                .read_only(cfg.read_only)
+                .busy_timeout(Duration::from_secs(5));
             if is_memory(cfg) {
                 // shared-cache table locks would otherwise make readers block writers
                 o = o.pragma("read_uncommitted", "1");
@@ -213,7 +259,9 @@ pub(crate) fn build_opts(cfg: &DataSourceConfig) -> Result<ConnOpts> {
 }
 
 fn connect_timeout(cfg: &DataSourceConfig) -> Duration {
-    let secs = opt(cfg, &["connectTimeout", "connect_timeout"]).and_then(|v| v.parse::<u64>().ok()).unwrap_or(15);
+    let secs = opt(cfg, &["connectTimeout", "connect_timeout"])
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(15);
     Duration::from_secs(secs.max(1))
 }
 
@@ -239,7 +287,9 @@ pub(crate) async fn open_pool(cfg: &DataSourceConfig, opts: &ConnOpts) -> Result
                     .after_connect(move |conn, _| {
                         Box::pin(async move {
                             if ro {
-                                sqlx::query("SET SESSION TRANSACTION READ ONLY").execute(&mut *conn).await?;
+                                sqlx::query("SET SESSION TRANSACTION READ ONLY")
+                                    .execute(&mut *conn)
+                                    .await?;
                             }
                             Ok(())
                         })
@@ -249,16 +299,14 @@ pub(crate) async fn open_pool(cfg: &DataSourceConfig, opts: &ConnOpts) -> Result
                     .map_err(connect_error)?,
             )
         }
-        ConnOpts::Lite(o) => {
-            Pool::Lite(
-                SqlitePoolOptions::new()
-                    .max_connections(4)
-                    .acquire_timeout(timeout)
-                    .connect_with(o.clone())
-                    .await
-                    .map_err(connect_error)?,
-            )
-        }
+        ConnOpts::Lite(o) => Pool::Lite(
+            SqlitePoolOptions::new()
+                .max_connections(4)
+                .acquire_timeout(timeout)
+                .connect_with(o.clone())
+                .await
+                .map_err(connect_error)?,
+        ),
     })
 }
 
@@ -292,9 +340,24 @@ impl Pool {
     /// where the SQL text is built by us and values are parsed back by position.
     pub async fn query_strings(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
         Ok(match self {
-            Pool::Pg(p) => sqlx::raw_sql(sql).fetch_all(p).await?.iter().map(pg_strings).collect(),
-            Pool::My(p) => sqlx::raw_sql(sql).fetch_all(p).await?.iter().map(my_strings).collect(),
-            Pool::Lite(p) => sqlx::raw_sql(sql).fetch_all(p).await?.iter().map(lite_strings).collect(),
+            Pool::Pg(p) => sqlx::raw_sql(sql)
+                .fetch_all(p)
+                .await?
+                .iter()
+                .map(pg_strings)
+                .collect(),
+            Pool::My(p) => sqlx::raw_sql(sql)
+                .fetch_all(p)
+                .await?
+                .iter()
+                .map(my_strings)
+                .collect(),
+            Pool::Lite(p) => sqlx::raw_sql(sql)
+                .fetch_all(p)
+                .await?
+                .iter()
+                .map(lite_strings)
+                .collect(),
         })
     }
 }
@@ -318,7 +381,9 @@ impl Conn {
 }
 
 pub(crate) fn pg_strings(r: &PgRow) -> Vec<Option<String>> {
-    (0..r.len()).map(|i| r.try_get_unchecked::<Option<String>, _>(i).ok().flatten()).collect()
+    (0..r.len())
+        .map(|i| r.try_get_unchecked::<Option<String>, _>(i).ok().flatten())
+        .collect()
 }
 
 pub(crate) fn my_strings(r: &MySqlRow) -> Vec<Option<String>> {
@@ -342,9 +407,14 @@ pub(crate) fn lite_strings(r: &SqliteRow) -> Vec<Option<String>> {
             }
             let ty = raw.type_info().name().to_string();
             match ty.as_str() {
-                "INTEGER" | "INT" | "INT8" | "BOOLEAN" => r.try_get_unchecked::<i64, _>(i).ok().map(|v| v.to_string()),
+                "INTEGER" | "INT" | "INT8" | "BOOLEAN" => {
+                    r.try_get_unchecked::<i64, _>(i).ok().map(|v| v.to_string())
+                }
                 "REAL" | "NUMERIC" => r.try_get_unchecked::<f64, _>(i).ok().map(|v| v.to_string()),
-                "BLOB" => r.try_get_unchecked::<Vec<u8>, _>(i).ok().map(|b| crate::quote::hex_encode(&b)),
+                "BLOB" => r
+                    .try_get_unchecked::<Vec<u8>, _>(i)
+                    .ok()
+                    .map(|b| crate::quote::hex_encode(&b)),
                 _ => r.try_get_unchecked::<String, _>(i).ok(),
             }
         })

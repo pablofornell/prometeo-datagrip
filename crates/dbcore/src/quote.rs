@@ -43,7 +43,10 @@ pub fn hex_encode(b: &[u8]) -> String {
 
 pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
-    let s = s.strip_prefix("\\x").or_else(|| s.strip_prefix("0x")).unwrap_or(s);
+    let s = s
+        .strip_prefix("\\x")
+        .or_else(|| s.strip_prefix("0x"))
+        .unwrap_or(s);
     if !s.len().is_multiple_of(2) {
         return None;
     }
@@ -53,7 +56,10 @@ pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
         b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
     };
-    s.as_bytes().chunks(2).map(|p| Some(v(p[0])? << 4 | v(p[1])?)).collect()
+    s.as_bytes()
+        .chunks(2)
+        .map(|p| Some(v(p[0])? << 4 | v(p[1])?))
+        .collect()
 }
 
 /// First SQL keyword of a statement (upper-case), skipping leading whitespace and comments.
@@ -83,7 +89,10 @@ mod tests {
     fn quoting() {
         assert_eq!(quote_ident(Driver::Postgres, "a\"b"), "\"a\"\"b\"");
         assert_eq!(quote_ident(Driver::MySql, "a`b"), "`a``b`");
-        assert_eq!(qualified(Driver::Sqlite, Some("main"), "t"), "\"main\".\"t\"");
+        assert_eq!(
+            qualified(Driver::Sqlite, Some("main"), "t"),
+            "\"main\".\"t\""
+        );
         assert_eq!(quote_literal(Driver::Postgres, "it's"), "'it''s'");
         assert_eq!(quote_literal(Driver::Postgres, "a\\b"), "E'a\\\\b'");
         assert_eq!(quote_literal(Driver::MySql, "a\\'"), "'a\\\\'''");

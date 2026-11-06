@@ -57,8 +57,24 @@ fn node_id(ds: &str, path: &[String]) -> String {
     id
 }
 
-fn mk(ds: &str, kind: NodeKind, name: &str, hint: Option<String>, path: Vec<String>, has_children: bool, extra: Value) -> TreeNode {
-    TreeNode { id: node_id(ds, &path), kind, name: name.to_string(), hint, path, has_children, extra }
+fn mk(
+    ds: &str,
+    kind: NodeKind,
+    name: &str,
+    hint: Option<String>,
+    path: Vec<String>,
+    has_children: bool,
+    extra: Value,
+) -> TreeNode {
+    TreeNode {
+        id: node_id(ds, &path),
+        kind,
+        name: name.to_string(),
+        hint,
+        path,
+        has_children,
+        extra,
+    }
 }
 
 fn child_path(base: &[String], name: &str) -> Vec<String> {
@@ -71,7 +87,14 @@ fn folder_label(key: &str) -> String {
     key.replace('_', " ")
 }
 
-fn folder(ds: &str, base: &[String], key: &str, count: i64, schema: Option<&str>, table: Option<&str>) -> TreeNode {
+fn folder(
+    ds: &str,
+    base: &[String],
+    key: &str,
+    count: i64,
+    schema: Option<&str>,
+    table: Option<&str>,
+) -> TreeNode {
     mk(
         ds,
         NodeKind::Folder,
@@ -100,10 +123,16 @@ fn short_type(t: &str) -> String {
 impl ConnectionManager {
     /// Children of a tree node, with default options.
     pub async fn introspect(&self, ds_id: &str, path: &[String]) -> Result<Vec<TreeNode>> {
-        self.introspect_with(ds_id, path, &IntrospectOptions::default()).await
+        self.introspect_with(ds_id, path, &IntrospectOptions::default())
+            .await
     }
 
-    pub async fn introspect_with(&self, ds_id: &str, path: &[String], opts: &IntrospectOptions) -> Result<Vec<TreeNode>> {
+    pub async fn introspect_with(
+        &self,
+        ds_id: &str,
+        path: &[String],
+        opts: &IntrospectOptions,
+    ) -> Result<Vec<TreeNode>> {
         let live = self.live(ds_id)?;
         match live.driver() {
             Driver::Postgres => pg_children(&live, ds_id, path, opts).await,
@@ -114,7 +143,11 @@ impl ConnectionManager {
 
     /// Flat list of tables / views with their columns, for completion and "go to object".
     /// `schema = None` returns every non-system schema.
-    pub async fn schema_snapshot(&self, ds_id: &str, schema: Option<&str>) -> Result<Vec<SnapshotObject>> {
+    pub async fn schema_snapshot(
+        &self,
+        ds_id: &str,
+        schema: Option<&str>,
+    ) -> Result<Vec<SnapshotObject>> {
         let live = self.live(ds_id)?;
         snapshot(&live, schema).await
     }
@@ -154,7 +187,12 @@ fn pg_trigger_hint(tgtype: i64) -> String {
     format!("{timing} {}", ev.join(" OR "))
 }
 
-async fn pg_children(live: &Live, ds: &str, path: &[String], opts: &IntrospectOptions) -> Result<Vec<TreeNode>> {
+async fn pg_children(
+    live: &Live,
+    ds: &str,
+    path: &[String],
+    opts: &IntrospectOptions,
+) -> Result<Vec<TreeNode>> {
     let pool = &live.pool;
     let lit = |v: &str| quote_literal(Driver::Postgres, v);
     match path.len() {
@@ -183,7 +221,11 @@ async fn pg_children(live: &Live, ds: &str, path: &[String], opts: &IntrospectOp
         }
         1 => {
             pg_check_db(pool, &path[0]).await?;
-            let sys = if opts.show_system { "" } else { " and nspname not in ('pg_catalog','information_schema')" };
+            let sys = if opts.show_system {
+                ""
+            } else {
+                " and nspname not in ('pg_catalog','information_schema')"
+            };
             let rows = pool
                 .query_strings(&format!(
                     "select nspname, coalesce(obj_description(oid, 'pg_namespace'), ''), pg_get_userbyid(nspowner) \
@@ -221,8 +263,16 @@ async fn pg_children(live: &Live, ds: &str, path: &[String], opts: &IntrospectOp
                     lit(sc)
                 ))
                 .await?;
-            let r = rows.first().ok_or_else(|| DbError::NotFound(format!("Schema {sc} not found")))?;
-            let keys = ["tables", "views", "materialized_views", "routines", "sequences"];
+            let r = rows
+                .first()
+                .ok_or_else(|| DbError::NotFound(format!("Schema {sc} not found")))?;
+            let keys = [
+                "tables",
+                "views",
+                "materialized_views",
+                "routines",
+                "sequences",
+            ];
             Ok(keys
                 .iter()
                 .enumerate()
@@ -335,7 +385,14 @@ async fn pg_object_folders(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec
         .await?;
     let r = rows.first().ok_or_else(|| bad_path(path))?;
     let wanted: &[(&str, usize)] = match key {
-        "tables" => &[("columns", 0), ("keys", 1), ("foreign_keys", 2), ("indexes", 3), ("checks", 4), ("triggers", 5)],
+        "tables" => &[
+            ("columns", 0),
+            ("keys", 1),
+            ("foreign_keys", 2),
+            ("indexes", 3),
+            ("checks", 4),
+            ("triggers", 5),
+        ],
         "views" => &[("columns", 0), ("triggers", 5)],
         _ => &[("columns", 0), ("indexes", 3)],
     };
@@ -466,7 +523,15 @@ async fn pg_object_items(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec<T
             Ok(rows
                 .iter()
                 .map(|r| {
-                    mk(ds, NodeKind::Check, &s(r, 0), Some(s(r, 1)), child_path(path, &s(r, 0)), false, ex(json!({ "definition": s(r, 1) })))
+                    mk(
+                        ds,
+                        NodeKind::Check,
+                        &s(r, 0),
+                        Some(s(r, 1)),
+                        child_path(path, &s(r, 0)),
+                        false,
+                        ex(json!({ "definition": s(r, 1) })),
+                    )
                 })
                 .collect())
         }
@@ -531,7 +596,12 @@ fn my_lit(v: &str) -> String {
 
 const MY_SYSTEM: [&str; 4] = ["information_schema", "mysql", "performance_schema", "sys"];
 
-async fn my_children(live: &Live, ds: &str, path: &[String], opts: &IntrospectOptions) -> Result<Vec<TreeNode>> {
+async fn my_children(
+    live: &Live,
+    ds: &str,
+    path: &[String],
+    opts: &IntrospectOptions,
+) -> Result<Vec<TreeNode>> {
     let pool = &live.pool;
     match path.len() {
         0 => {
@@ -609,7 +679,17 @@ async fn my_children(live: &Live, ds: &str, path: &[String], opts: &IntrospectOp
                         .await?;
                     Ok(rows
                         .iter()
-                        .map(|r| mk(ds, NodeKind::View, &s(r, 0), None, child_path(path, &s(r, 0)), true, json!({ "schema": sc })))
+                        .map(|r| {
+                            mk(
+                                ds,
+                                NodeKind::View,
+                                &s(r, 0),
+                                None,
+                                child_path(path, &s(r, 0)),
+                                true,
+                                json!({ "schema": sc }),
+                            )
+                        })
                         .collect())
                 }
                 "routines" => {
@@ -626,7 +706,11 @@ async fn my_children(live: &Live, ds: &str, path: &[String], opts: &IntrospectOp
                             let proc_ = s(r, 1) == "PROCEDURE";
                             mk(
                                 ds,
-                                if proc_ { NodeKind::Procedure } else { NodeKind::Function },
+                                if proc_ {
+                                    NodeKind::Procedure
+                                } else {
+                                    NodeKind::Function
+                                },
                                 &s(r, 0),
                                 if proc_ { None } else { nonempty(s(r, 2)) },
                                 child_path(path, &s(r, 0)),
@@ -648,7 +732,14 @@ async fn my_children(live: &Live, ds: &str, path: &[String], opts: &IntrospectOp
                         "select count(*) from information_schema.columns where table_schema = {l} and table_name = {tl}"
                     ))
                     .await?;
-                return Ok(vec![folder(ds, path, "columns", rows.first().map(|r| n(r, 0)).unwrap_or(0), Some(sc), Some(t))]);
+                return Ok(vec![folder(
+                    ds,
+                    path,
+                    "columns",
+                    rows.first().map(|r| n(r, 0)).unwrap_or(0),
+                    Some(sc),
+                    Some(t),
+                )]);
             }
             if key != "tables" {
                 return Err(bad_path(path));
@@ -671,11 +762,18 @@ async fn my_children(live: &Live, ds: &str, path: &[String], opts: &IntrospectOp
                 ))
                 .await?;
             let r = rows.first().cloned().unwrap_or_default();
-            Ok([("columns", 0), ("keys", 1), ("foreign_keys", 2), ("indexes", 3), ("checks", 4), ("triggers", 5)]
-                .iter()
-                .filter(|(k, i)| *k == "columns" || n(&r, *i) > 0)
-                .map(|(k, i)| folder(ds, path, k, n(&r, *i), Some(sc), Some(t)))
-                .collect())
+            Ok([
+                ("columns", 0),
+                ("keys", 1),
+                ("foreign_keys", 2),
+                ("indexes", 3),
+                ("checks", 4),
+                ("triggers", 5),
+            ]
+            .iter()
+            .filter(|(k, i)| *k == "columns" || n(&r, *i) > 0)
+            .map(|(k, i)| folder(ds, path, k, n(&r, *i), Some(sc), Some(t)))
+            .collect())
         }
         4 => my_object_items(&live.pool, ds, path).await,
         _ => Err(bad_path(path)),
@@ -735,7 +833,11 @@ async fn my_object_items(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec<T
                     let pk = s(r, 1) == "PRIMARY KEY";
                     mk(
                         ds,
-                        if pk { NodeKind::PrimaryKey } else { NodeKind::UniqueKey },
+                        if pk {
+                            NodeKind::PrimaryKey
+                        } else {
+                            NodeKind::UniqueKey
+                        },
                         &s(r, 0),
                         Some(format!("({})", s(r, 2))),
                         child_path(path, &s(r, 0)),
@@ -810,7 +912,17 @@ async fn my_object_items(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec<T
                 .await?;
             Ok(rows
                 .iter()
-                .map(|r| mk(ds, NodeKind::Check, &s(r, 0), Some(s(r, 1)), child_path(path, &s(r, 0)), false, ex(json!({ "definition": s(r, 1) }))))
+                .map(|r| {
+                    mk(
+                        ds,
+                        NodeKind::Check,
+                        &s(r, 0),
+                        Some(s(r, 1)),
+                        child_path(path, &s(r, 0)),
+                        false,
+                        ex(json!({ "definition": s(r, 1) })),
+                    )
+                })
                 .collect())
         }
         "triggers" => {
@@ -848,7 +960,12 @@ fn ll(v: &str) -> String {
     quote_literal(Driver::Sqlite, v)
 }
 
-async fn lite_children(live: &Live, ds: &str, path: &[String], opts: &IntrospectOptions) -> Result<Vec<TreeNode>> {
+async fn lite_children(
+    live: &Live,
+    ds: &str,
+    path: &[String],
+    opts: &IntrospectOptions,
+) -> Result<Vec<TreeNode>> {
     let pool = &live.pool;
     match path.len() {
         0 => {
@@ -878,7 +995,12 @@ async fn lite_children(live: &Live, ds: &str, path: &[String], opts: &Introspect
                     lq(sc)
                 ))
                 .await?;
-            let cnt = |ty: &str| rows.iter().find(|r| s(r, 0) == ty).map(|r| n(r, 1)).unwrap_or(0);
+            let cnt = |ty: &str| {
+                rows.iter()
+                    .find(|r| s(r, 0) == ty)
+                    .map(|r| n(r, 1))
+                    .unwrap_or(0)
+            };
             let mut out = Vec::new();
             for (k, ty) in [("tables", "table"), ("views", "view")] {
                 if cnt(ty) > 0 {
@@ -894,19 +1016,43 @@ async fn lite_children(live: &Live, ds: &str, path: &[String], opts: &Introspect
                 "views" => ("view", NodeKind::View),
                 _ => return Err(bad_path(path)),
             };
-            let sys = if opts.show_system { "" } else { " and name not like 'sqlite\\_%' escape '\\'" };
+            let sys = if opts.show_system {
+                ""
+            } else {
+                " and name not like 'sqlite\\_%' escape '\\'"
+            };
             let rows = pool
-                .query_strings(&format!("select name from {}.sqlite_master where type = '{ty}'{sys} order by name", lq(sc)))
+                .query_strings(&format!(
+                    "select name from {}.sqlite_master where type = '{ty}'{sys} order by name",
+                    lq(sc)
+                ))
                 .await?;
             Ok(rows
                 .iter()
-                .map(|r| mk(ds, kind, &s(r, 0), None, child_path(path, &s(r, 0)), true, json!({ "schema": sc })))
+                .map(|r| {
+                    mk(
+                        ds,
+                        kind,
+                        &s(r, 0),
+                        None,
+                        child_path(path, &s(r, 0)),
+                        true,
+                        json!({ "schema": sc }),
+                    )
+                })
                 .collect())
         }
         3 => {
             let (sc, key, t) = (&path[0], path[1].as_str(), &path[2]);
             let cols = lite_columns(pool, sc, t).await?;
-            let mut out = vec![folder(ds, path, "columns", cols.len() as i64, Some(sc), Some(t))];
+            let mut out = vec![folder(
+                ds,
+                path,
+                "columns",
+                cols.len() as i64,
+                Some(sc),
+                Some(t),
+            )];
             if key == "tables" {
                 let has_pk = cols.iter().any(|c| c.is_pk);
                 let idx = lite_index_list(pool, sc, t).await?;
@@ -924,7 +1070,12 @@ async fn lite_children(live: &Live, ds: &str, path: &[String], opts: &Introspect
                     .first()
                     .map(|r| n(r, 0))
                     .unwrap_or(0);
-                for (k, c) in [("keys", keys), ("foreign_keys", fks), ("indexes", user_idx), ("triggers", trig)] {
+                for (k, c) in [
+                    ("keys", keys),
+                    ("foreign_keys", fks),
+                    ("indexes", user_idx),
+                    ("triggers", trig),
+                ] {
                     if c > 0 {
                         out.push(folder(ds, path, k, c, Some(sc), Some(t)));
                     }
@@ -1044,7 +1195,10 @@ async fn lite_children(live: &Live, ds: &str, path: &[String], opts: &Introspect
 }
 
 fn lite_trigger_hint(sql: &str) -> String {
-    let up: Vec<String> = sql.split_whitespace().map(|w| w.to_ascii_uppercase()).collect();
+    let up: Vec<String> = sql
+        .split_whitespace()
+        .map(|w| w.to_ascii_uppercase())
+        .collect();
     let mut timing = String::new();
     let mut event = String::new();
     for (i, w) in up.iter().enumerate() {
@@ -1074,20 +1228,35 @@ struct LiteFk {
 }
 
 async fn lite_index_list(pool: &Pool, schema: &str, table: &str) -> Result<Vec<LiteIndex>> {
-    let rows = pool.query_strings(&format!("pragma {}.index_list({})", lq(schema), ll(table))).await?;
+    let rows = pool
+        .query_strings(&format!("pragma {}.index_list({})", lq(schema), ll(table)))
+        .await?;
     Ok(rows
         .iter()
-        .map(|r| LiteIndex { name: s(r, 1), unique: b(r, 2), origin: s(r, 3), partial: b(r, 4) })
+        .map(|r| LiteIndex {
+            name: s(r, 1),
+            unique: b(r, 2),
+            origin: s(r, 3),
+            partial: b(r, 4),
+        })
         .collect())
 }
 
 async fn lite_index_columns(pool: &Pool, schema: &str, index: &str) -> Result<Vec<String>> {
-    let rows = pool.query_strings(&format!("pragma {}.index_info({})", lq(schema), ll(index))).await?;
+    let rows = pool
+        .query_strings(&format!("pragma {}.index_info({})", lq(schema), ll(index)))
+        .await?;
     Ok(rows.iter().map(|r| s(r, 2)).collect())
 }
 
 async fn lite_fks(pool: &Pool, schema: &str, table: &str) -> Result<Vec<LiteFk>> {
-    let rows = pool.query_strings(&format!("pragma {}.foreign_key_list({})", lq(schema), ll(table))).await?;
+    let rows = pool
+        .query_strings(&format!(
+            "pragma {}.foreign_key_list({})",
+            lq(schema),
+            ll(table)
+        ))
+        .await?;
     // columns: id, seq, table, from, to, on_update, on_delete, match
     let mut out: Vec<(i64, LiteFk)> = Vec::new();
     for r in &rows {
@@ -1099,7 +1268,13 @@ async fn lite_fks(pool: &Pool, schema: &str, table: &str) -> Result<Vec<LiteFk>>
             }
             None => out.push((
                 id,
-                LiteFk { from: vec![s(r, 3)], table: s(r, 2), to: vec![s(r, 4)], on_update: s(r, 5), on_delete: s(r, 6) },
+                LiteFk {
+                    from: vec![s(r, 3)],
+                    table: s(r, 2),
+                    to: vec![s(r, 4)],
+                    on_update: s(r, 5),
+                    on_delete: s(r, 6),
+                },
             )),
         }
     }
@@ -1126,7 +1301,9 @@ pub(crate) struct ColInfo {
 
 async fn lite_columns(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ColInfo>> {
     // table_xinfo: cid, name, type, notnull, dflt_value, pk, hidden
-    let rows = pool.query_strings(&format!("pragma {}.table_xinfo({})", lq(schema), ll(table))).await?;
+    let rows = pool
+        .query_strings(&format!("pragma {}.table_xinfo({})", lq(schema), ll(table)))
+        .await?;
     Ok(rows
         .iter()
         .filter(|r| n(r, 6) != 1)
@@ -1144,12 +1321,18 @@ async fn lite_columns(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ColI
 }
 
 /// Columns of a table / view with PK flags, for the data editor and DDL.
-pub(crate) async fn table_columns(live: &Live, schema: Option<&str>, table: &str) -> Result<Vec<ColInfo>> {
+pub(crate) async fn table_columns(
+    live: &Live,
+    schema: Option<&str>,
+    table: &str,
+) -> Result<Vec<ColInfo>> {
     let pool = &live.pool;
     let cols: Vec<ColInfo> = match live.driver() {
         Driver::Postgres => {
             let sc = schema.unwrap_or("public");
-            let rows = pool.query_strings(&pg_columns_sql(&pg_rel(sc, table))).await?;
+            let rows = pool
+                .query_strings(&pg_columns_sql(&pg_rel(sc, table)))
+                .await?;
             rows.iter()
                 .map(|r| ColInfo {
                     name: s(r, 0),
@@ -1166,7 +1349,12 @@ pub(crate) async fn table_columns(live: &Live, schema: Option<&str>, table: &str
         Driver::MySql => {
             let sc = match schema {
                 Some(sc) => sc.to_string(),
-                None => pool.query_strings("select database()").await?.first().map(|r| s(r, 0)).unwrap_or_default(),
+                None => pool
+                    .query_strings("select database()")
+                    .await?
+                    .first()
+                    .map(|r| s(r, 0))
+                    .unwrap_or_default(),
             };
             let rows = pool
                 .query_strings(&format!(
@@ -1198,7 +1386,12 @@ pub(crate) async fn table_columns(live: &Live, schema: Option<&str>, table: &str
 }
 
 /// How the rows of a table can be addressed physically when it has no primary key.
-pub(crate) async fn row_addr(live: &Live, schema: Option<&str>, table: &str, info: &[ColInfo]) -> Result<crate::table::RowAddr> {
+pub(crate) async fn row_addr(
+    live: &Live,
+    schema: Option<&str>,
+    table: &str,
+    info: &[ColInfo],
+) -> Result<crate::table::RowAddr> {
     use crate::table::RowAddr;
     if info.iter().any(|c| c.is_pk) {
         return Ok(RowAddr::None);
@@ -1206,7 +1399,12 @@ pub(crate) async fn row_addr(live: &Live, schema: Option<&str>, table: &str, inf
     match live.driver() {
         Driver::Postgres => {
             let rel = pg_rel(schema.unwrap_or("public"), table);
-            let rows = live.pool.query_strings(&format!("select relkind::text from pg_class where oid = {rel}")).await?;
+            let rows = live
+                .pool
+                .query_strings(&format!(
+                    "select relkind::text from pg_class where oid = {rel}"
+                ))
+                .await?;
             // ordinary and partitioned tables have ctid / tableoid; views, foreign tables, ... do not
             Ok(match rows.first().map(|r| s(r, 0)).as_deref() {
                 Some("r") | Some("p") => RowAddr::PgCtid,
@@ -1216,17 +1414,27 @@ pub(crate) async fn row_addr(live: &Live, schema: Option<&str>, table: &str, inf
         Driver::Sqlite => {
             let sc = schema.unwrap_or("main");
             // table_list: schema, name, type, ncol, wr (WITHOUT ROWID), strict
-            let rows = match live.pool.query_strings(&format!("pragma {}.table_list({})", lq(sc), ll(table))).await {
+            let rows = match live
+                .pool
+                .query_strings(&format!("pragma {}.table_list({})", lq(sc), ll(table)))
+                .await
+            {
                 Ok(r) => r,
                 Err(_) => return Ok(RowAddr::None),
             };
-            let is_rowid_table = rows.iter().any(|r| s(r, 1).eq_ignore_ascii_case(table) && s(r, 2) == "table" && n(r, 4) == 0);
+            let is_rowid_table = rows
+                .iter()
+                .any(|r| s(r, 1).eq_ignore_ascii_case(table) && s(r, 2) == "table" && n(r, 4) == 0);
             if !is_rowid_table {
                 return Ok(RowAddr::None);
             }
             // a user column named rowid shadows the alias: use the next free one
-            let alias = ["rowid", "_rowid_", "oid"].into_iter().find(|a| !info.iter().any(|c| c.name.eq_ignore_ascii_case(a)));
-            Ok(alias.map(|a| RowAddr::SqliteRowid(a.to_string())).unwrap_or(RowAddr::None))
+            let alias = ["rowid", "_rowid_", "oid"]
+                .into_iter()
+                .find(|a| !info.iter().any(|c| c.name.eq_ignore_ascii_case(a)));
+            Ok(alias
+                .map(|a| RowAddr::SqliteRowid(a.to_string()))
+                .unwrap_or(RowAddr::None))
         }
         Driver::MySql => Ok(RowAddr::None),
     }
@@ -1238,8 +1446,17 @@ async fn snapshot(live: &Live, schema: Option<&str>) -> Result<Vec<SnapshotObjec
     let pool = &live.pool;
     let mut out: Vec<SnapshotObject> = Vec::new();
     let mut push = |schema: String, name: String, kind: NodeKind, col: Option<SnapshotColumn>| {
-        if out.last().map(|o| o.schema != schema || o.name != name).unwrap_or(true) {
-            out.push(SnapshotObject { schema, name, kind, columns: Vec::new() });
+        if out
+            .last()
+            .map(|o| o.schema != schema || o.name != name)
+            .unwrap_or(true)
+        {
+            out.push(SnapshotObject {
+                schema,
+                name,
+                kind,
+                columns: Vec::new(),
+            });
         }
         if let (Some(c), Some(o)) = (col, out.last_mut()) {
             o.columns.push(c);
@@ -1267,7 +1484,11 @@ async fn snapshot(live: &Live, schema: Option<&str>) -> Result<Vec<SnapshotObjec
                     "m" => NodeKind::MaterializedView,
                     _ => NodeKind::Table,
                 };
-                let col = so(&r, 3).map(|name| SnapshotColumn { name, type_name: short_type(&s(&r, 4)), is_pk: b(&r, 5) });
+                let col = so(&r, 3).map(|name| SnapshotColumn {
+                    name,
+                    type_name: short_type(&s(&r, 4)),
+                    is_pk: b(&r, 5),
+                });
                 push(s(&r, 0), s(&r, 1), kind, col);
             }
         }
@@ -1285,15 +1506,29 @@ async fn snapshot(live: &Live, schema: Option<&str>) -> Result<Vec<SnapshotObjec
                 ))
                 .await?;
             for r in rows {
-                let kind = if s(&r, 2).contains("VIEW") { NodeKind::View } else { NodeKind::Table };
-                let col = so(&r, 3).map(|name| SnapshotColumn { name, type_name: s(&r, 4), is_pk: s(&r, 5) == "PRI" });
+                let kind = if s(&r, 2).contains("VIEW") {
+                    NodeKind::View
+                } else {
+                    NodeKind::Table
+                };
+                let col = so(&r, 3).map(|name| SnapshotColumn {
+                    name,
+                    type_name: s(&r, 4),
+                    is_pk: s(&r, 5) == "PRI",
+                });
                 push(s(&r, 0), s(&r, 1), kind, col);
             }
         }
         Driver::Sqlite => {
             let schemas: Vec<String> = match schema {
                 Some(sc) => vec![sc.to_string()],
-                None => pool.query_strings("pragma database_list").await?.iter().map(|r| s(r, 1)).filter(|n| n != "temp").collect(),
+                None => pool
+                    .query_strings("pragma database_list")
+                    .await?
+                    .iter()
+                    .map(|r| s(r, 1))
+                    .filter(|n| n != "temp")
+                    .collect(),
             };
             for sc in schemas {
                 let objs = pool
@@ -1303,11 +1538,24 @@ async fn snapshot(live: &Live, schema: Option<&str>) -> Result<Vec<SnapshotObjec
                     ))
                     .await?;
                 for o in objs {
-                    let kind = if s(&o, 1) == "view" { NodeKind::View } else { NodeKind::Table };
+                    let kind = if s(&o, 1) == "view" {
+                        NodeKind::View
+                    } else {
+                        NodeKind::Table
+                    };
                     let cols = lite_columns(pool, &sc, &s(&o, 0)).await?;
                     push(sc.clone(), s(&o, 0), kind, None);
                     for c in cols {
-                        push(sc.clone(), s(&o, 0), kind, Some(SnapshotColumn { name: c.name, type_name: c.type_name, is_pk: c.is_pk }));
+                        push(
+                            sc.clone(),
+                            s(&o, 0),
+                            kind,
+                            Some(SnapshotColumn {
+                                name: c.name,
+                                type_name: c.type_name,
+                                is_pk: c.is_pk,
+                            }),
+                        );
                     }
                 }
             }

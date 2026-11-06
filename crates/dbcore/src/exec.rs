@@ -261,16 +261,29 @@ struct Task {
 impl Task {
     /// Update the session's transaction state after a statement and report what changed. `conn` is
     /// `None` while a result stream still occupies the connection (state from the statement text only).
-    async fn tx_after(&mut self, conn: Option<&mut Conn>, idx: usize, sql: &str, outcome: tx::Outcome) {
+    async fn tx_after(
+        &mut self,
+        conn: Option<&mut Conn>,
+        idx: usize,
+        sql: &str,
+        outcome: tx::Outcome,
+    ) {
         let u = tx::after_statement(&self.sh.session, conn, sql, outcome).await;
         if self.done_sent {
             return;
         }
         if let Some((committed, tag)) = u.ended {
-            self.sh.send(ExecEvent::TxEnded { index: idx, committed, tag: tag.to_string() });
+            self.sh.send(ExecEvent::TxEnded {
+                index: idx,
+                committed,
+                tag: tag.to_string(),
+            });
         }
         if let Some(text) = u.note {
-            self.sh.send(ExecEvent::Message { index: Some(idx), text });
+            self.sh.send(ExecEvent::Message {
+                index: Some(idx),
+                text,
+            });
         }
         if u.changed {
             self.sh.send(ExecEvent::TxStatus { status: u.status });
@@ -295,7 +308,8 @@ impl Task {
             self.lost_events(idx, had_tx);
             return true;
         }
-        self.tx_after(conn, idx, sql, tx::Outcome::from_error(e)).await;
+        self.tx_after(conn, idx, sql, tx::Outcome::from_error(e))
+            .await;
         false
     }
 
@@ -312,8 +326,14 @@ impl Task {
     /// The connection died: the open transaction (if any) is gone.
     fn lost_events(&self, idx: usize, had_tx: bool) {
         if had_tx {
-            self.sh.send(ExecEvent::TxEnded { index: idx, committed: false, tag: "CONNECTION LOST".to_string() });
-            self.sh.send(ExecEvent::TxStatus { status: TxStatus::Idle });
+            self.sh.send(ExecEvent::TxEnded {
+                index: idx,
+                committed: false,
+                tag: "CONNECTION LOST".to_string(),
+            });
+            self.sh.send(ExecEvent::TxStatus {
+                status: TxStatus::Idle,
+            });
         }
     }
 
@@ -363,7 +383,9 @@ async fn pull(stream: &mut ItemStream<'_>, sh: &Shared, st: &mut StreamState, t0
         }
         match item {
             None => return Pull::End,
-            Some(Err(e)) => return Pull::Err(DbError::from(e).for_driver(sh.session.live.driver())),
+            Some(Err(e)) => {
+                return Pull::Err(DbError::from(e).for_driver(sh.session.live.driver()))
+            }
             Some(Ok(Item::Done(n))) => {
                 st.block_done = true;
                 st.rows_affected = n;
@@ -405,14 +427,31 @@ async fn abort_stream(mut stream: ItemStream<'_>, sh: &Shared) -> Option<DbError
 /// Convert a 1-based position in Unicode code points (what PostgreSQL reports) into a 1-based offset in
 /// UTF-16 code units (what the editor counts) inside `text`.
 pub(crate) fn utf16_position(text: &str, position: usize) -> usize {
-    1 + text.chars().take(position.saturating_sub(1)).map(char::len_utf16).sum::<usize>()
+    1 + text
+        .chars()
+        .take(position.saturating_sub(1))
+        .map(char::len_utf16)
+        .sum::<usize>()
 }
 
 fn might_return_rows(sql: &str) -> bool {
     matches!(
         first_keyword(sql).as_str(),
-        "SELECT" | "WITH" | "SHOW" | "EXPLAIN" | "VALUES" | "TABLE" | "DESCRIBE" | "DESC" | "PRAGMA" | "CALL" | "EXEC"
-            | "EXECUTE" | "FETCH" | "LIST" | "ANALYZE"
+        "SELECT"
+            | "WITH"
+            | "SHOW"
+            | "EXPLAIN"
+            | "VALUES"
+            | "TABLE"
+            | "DESCRIBE"
+            | "DESC"
+            | "PRAGMA"
+            | "CALL"
+            | "EXEC"
+            | "EXECUTE"
+            | "FETCH"
+            | "LIST"
+            | "ANALYZE"
     ) || sql.to_ascii_uppercase().contains("RETURNING")
 }
 
@@ -468,26 +507,45 @@ async fn run_statement(
         if might_return_rows(sql) {
             let cols = describe_columns(&live, conn, sql).await;
             if !cols.is_empty() {
-                task.sh.send(ExecEvent::ResultSet { index: idx, columns: cols, rows: Vec::new(), has_more: false });
+                task.sh.send(ExecEvent::ResultSet {
+                    index: idx,
+                    columns: cols,
+                    rows: Vec::new(),
+                    has_more: false,
+                });
                 return Ok(Flow::Next);
             }
         }
-        task.sh.send(ExecEvent::Update { index: idx, rows_affected: st.rows_affected });
+        task.sh.send(ExecEvent::Update {
+            index: idx,
+            rows_affected: st.rows_affected,
+        });
         return Ok(Flow::Next);
     };
 
     if !has_more {
         drop(stream);
-        task.sh.send(ExecEvent::ResultSet { index: idx, columns: cols, rows, has_more: false });
+        task.sh.send(ExecEvent::ResultSet {
+            index: idx,
+            columns: cols,
+            rows,
+            has_more: false,
+        });
     } else if is_last && !task.sh.token.is_cancelled() {
-        task.sh.send(ExecEvent::ResultSet { index: idx, columns: cols, rows, has_more: true });
+        task.sh.send(ExecEvent::ResultSet {
+            index: idx,
+            columns: cols,
+            rows,
+            has_more: true,
+        });
         // the connection is busy: the state can only be derived from the statement text for now
         task.tx_after(None, idx, sql, tx::Outcome::Ok).await;
         // idle first, then `Done`: a client that reacts to `Done` with a new execute must
         // never see the session as busy
         task.sh.ctl.running.store(false, Ordering::Relaxed);
         task.send_done();
-        let exhausted = page_loop(task, &mut stream, &decoder, &mut st, pending, idx, sql, t0).await;
+        let exhausted =
+            page_loop(task, &mut stream, &decoder, &mut st, pending, idx, sql, t0).await;
         if !exhausted {
             if let Some(e) = abort_stream(stream, &task.sh).await {
                 task.stream_failed(idx, sql, &e, true);
@@ -501,7 +559,12 @@ async fn run_statement(
         }
         return Ok(Flow::Paged);
     } else {
-        task.sh.send(ExecEvent::ResultSet { index: idx, columns: cols, rows, has_more: false });
+        task.sh.send(ExecEvent::ResultSet {
+            index: idx,
+            columns: cols,
+            rows,
+            has_more: false,
+        });
         task.sh.send(ExecEvent::Message {
             index: Some(idx),
             text: format!(
@@ -529,7 +592,8 @@ async fn page_loop(
     t0: Instant,
 ) -> bool {
     // idle limit for the open result: every request restarts it
-    let keep_open = (task.opts.keep_open_secs > 0).then(|| Duration::from_secs(task.opts.keep_open_secs));
+    let keep_open =
+        (task.opts.keep_open_secs > 0).then(|| Duration::from_secs(task.opts.keep_open_secs));
     loop {
         let idle = async {
             match keep_open {
@@ -552,7 +616,11 @@ async fn page_loop(
         };
         match cmd {
             None | Some(ExecCmd::Close) => return false,
-            Some(ExecCmd::FetchMore { result_index, count, reply }) => {
+            Some(ExecCmd::FetchMore {
+                result_index,
+                count,
+                reply,
+            }) => {
                 if result_index != idx {
                     let _ = reply.send(Err(DbError::InvalidArgument(format!(
                         "result {result_index} is closed (only result {idx} can be paged)"
@@ -594,7 +662,10 @@ async fn page_loop(
                 }
                 let _ = reply.send(match err {
                     Some(e) => Err(e),
-                    None => Ok(FetchedRows { rows: out, has_more: !exhausted }),
+                    None => Ok(FetchedRows {
+                        rows: out,
+                        has_more: !exhausted,
+                    }),
                 });
                 if exhausted {
                     return true;
@@ -616,7 +687,12 @@ async fn exec_task(
     cmd_rx: mpsc::UnboundedReceiver<ExecCmd>,
 ) {
     let mut task = Task {
-        sh: Shared { token: ctl.token.clone(), session: sess.clone(), tx, ctl: ctl.clone() },
+        sh: Shared {
+            token: ctl.token.clone(),
+            session: sess.clone(),
+            tx,
+            ctl: ctl.clone(),
+        },
         cmd_rx,
         opts,
         exec: Duration::ZERO,
@@ -646,19 +722,32 @@ async fn exec_task(
                     break;
                 }
                 let Some(conn) = guard.as_mut() else { break };
-                task.sh.send(ExecEvent::Statement { index: i, sql: st.text.clone(), range: st.range() });
+                task.sh.send(ExecEvent::Statement {
+                    index: i,
+                    sql: st.text.clone(),
+                    range: st.range(),
+                });
                 ctl.running.store(true, Ordering::Relaxed);
                 let mut lost = false;
                 match run_statement(&mut task, conn, i, &st.text, i + 1 == n).await {
                     Ok(Flow::Next) => match task.abort_err.take() {
-                        None => task.tx_after(Some(&mut *conn), i, &st.text, tx::Outcome::Ok).await,
+                        None => {
+                            task.tx_after(Some(&mut *conn), i, &st.text, tx::Outcome::Ok)
+                                .await
+                        }
                         // the statement itself finished; closing its stream hit an error (a cancel)
-                        Some(e) => lost = task.statement_failed(Some(&mut *conn), i, &st.text, &e, false).await,
+                        Some(e) => {
+                            lost = task
+                                .statement_failed(Some(&mut *conn), i, &st.text, &e, false)
+                                .await
+                        }
                     },
                     Ok(Flow::Paged) => lost = sess.is_lost(),
                     Err(e) => {
                         let e = e.for_driver(sess.live.driver());
-                        lost = task.statement_failed(Some(&mut *conn), i, &st.text, &e, true).await;
+                        lost = task
+                            .statement_failed(Some(&mut *conn), i, &st.text, &e, true)
+                            .await;
                         if !lost && task.opts.stop_on_error {
                             break;
                         }
@@ -690,7 +779,12 @@ impl ConnectionManager {
     /// Run `sql` (one or more statements) on the session. Returns immediately with a
     /// handle whose `events` channel yields [`ExecEvent`]s; the last event is always
     /// `Done`.
-    pub async fn execute(&self, session: &SessionId, sql: &str, opts: ExecOptions) -> Result<ExecHandle> {
+    pub async fn execute(
+        &self,
+        session: &SessionId,
+        sql: &str,
+        opts: ExecOptions,
+    ) -> Result<ExecHandle> {
         let sess = self.session(session)?;
         let stmts = split_statements(sql, sess.live.driver());
         let id = uuid::Uuid::new_v4().to_string();
@@ -705,26 +799,57 @@ impl ConnectionManager {
             let mut cur = sess.current.lock().unwrap();
             if let Some((_, prev)) = cur.as_ref() {
                 if prev.running.load(Ordering::Relaxed) {
-                    return Err(DbError::Busy("The session is busy executing another statement".into()));
+                    return Err(DbError::Busy(
+                        "The session is busy executing another statement".into(),
+                    ));
                 }
                 // previous result is only being held open for paging: release it
                 let _ = prev.cmd.send(ExecCmd::Close);
             }
             *cur = Some((id.clone(), ctl.clone()));
         }
-        self.inner.execs.lock().unwrap().insert(id.clone(), ctl.clone());
-        tokio::spawn(exec_task(self.clone(), sess, ctl, id.clone(), stmts, opts, tx, cmd_rx));
-        Ok(ExecHandle { id: ExecutionId(id), events: rx })
+        self.inner
+            .execs
+            .lock()
+            .unwrap()
+            .insert(id.clone(), ctl.clone());
+        tokio::spawn(exec_task(
+            self.clone(),
+            sess,
+            ctl,
+            id.clone(),
+            stmts,
+            opts,
+            tx,
+            cmd_rx,
+        ));
+        Ok(ExecHandle {
+            id: ExecutionId(id),
+            events: rx,
+        })
     }
 
     fn exec_ctl(&self, id: &ExecutionId) -> Result<Arc<ExecCtl>> {
-        self.inner.execs.lock().unwrap().get(&id.0).cloned().ok_or_else(|| {
-            if self.inner.closed_execs.lock().unwrap().iter().any(|c| c == &id.0) {
-                result_closed()
-            } else {
-                DbError::NoExecution(id.0.clone())
-            }
-        })
+        self.inner
+            .execs
+            .lock()
+            .unwrap()
+            .get(&id.0)
+            .cloned()
+            .ok_or_else(|| {
+                if self
+                    .inner
+                    .closed_execs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c == &id.0)
+                {
+                    result_closed()
+                } else {
+                    DbError::NoExecution(id.0.clone())
+                }
+            })
     }
 
     /// Remember a finished execution so a late `fetch_more` says "closed", not "unknown".
@@ -737,10 +862,21 @@ impl ConnectionManager {
     }
 
     /// Pull the next `count` rows of a still-open result set (see module docs).
-    pub async fn fetch_more(&self, exec: &ExecutionId, result_index: usize, count: usize) -> Result<FetchedRows> {
+    pub async fn fetch_more(
+        &self,
+        exec: &ExecutionId,
+        result_index: usize,
+        count: usize,
+    ) -> Result<FetchedRows> {
         let ctl = self.exec_ctl(exec)?;
         let (reply, rx) = oneshot::channel();
-        ctl.cmd.send(ExecCmd::FetchMore { result_index, count, reply }).map_err(|_| result_closed())?;
+        ctl.cmd
+            .send(ExecCmd::FetchMore {
+                result_index,
+                count,
+                reply,
+            })
+            .map_err(|_| result_closed())?;
         // the execution task drops the reply when it closes the result meanwhile
         rx.await.map_err(|_| result_closed())?
     }
@@ -773,7 +909,12 @@ impl ConnectionManager {
     }
 
     /// Convenience for tests / scripts: run `sql` and collect every event until `Done`.
-    pub async fn execute_collect(&self, session: &SessionId, sql: &str, opts: ExecOptions) -> Result<Vec<ExecEvent>> {
+    pub async fn execute_collect(
+        &self,
+        session: &SessionId,
+        sql: &str,
+        opts: ExecOptions,
+    ) -> Result<Vec<ExecEvent>> {
         let mut h = self.execute(session, sql, opts).await?;
         let mut out = Vec::new();
         while let Some(e) = h.events.recv().await {

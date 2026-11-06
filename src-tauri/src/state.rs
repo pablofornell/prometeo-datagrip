@@ -12,16 +12,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dbcore::{
-    export_result, export_to_string, ApplyResult, ConnectInfo, ConnectionManager, DataSourceConfig, Driver, ExecEvent,
-    ExecOptions, ExecutionId, ExportOptions, FetchedRows, HistoryEntry, ObjectRef, QueryHistory, ResultSet, RowChange,
-    SessionId, SessionState, SnapshotObject, Statement, TableDataRequest, TestResult, TreeNode, TxStatus,
+    export_result, export_to_string, ApplyResult, ConnectInfo, ConnectionManager, DataSourceConfig,
+    Driver, ExecEvent, ExecOptions, ExecutionId, ExportOptions, FetchedRows, HistoryEntry,
+    ObjectRef, QueryHistory, ResultSet, RowChange, SessionId, SessionState, SnapshotObject,
+    Statement, TableDataRequest, TestResult, TreeNode, TxStatus,
 };
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::store::{
-    redact, strip_url_password, ConsoleStore, DataSourceStore, DataSourceView, NoKeyring, OsKeyring, PasswordStorage, SecretStore, StartupNotice,
-    UiStateStore,
+    redact, strip_url_password, ConsoleStore, DataSourceStore, DataSourceView, NoKeyring,
+    OsKeyring, PasswordStorage, SecretStore, StartupNotice, UiStateStore,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -67,8 +68,12 @@ pub struct AppState {
 }
 
 /// Run blocking work (file IO, keyring) off the async workers.
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
-    tokio::task::spawn_blocking(f).await.map_err(|e| format!("internal error: {e}"))?
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("internal error: {e}"))?
 }
 
 /// `options` keys that only the UI reads (the backend takes none of them into account when it connects), so
@@ -79,8 +84,15 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, String> + Sen
 /// (`sslmode`, `application_name`, `connectTimeout`, `create`, ...), `dbms`, `auth` and free driver
 /// properties stay in the fingerprint.
 const VIEW_ONLY_OPTIONS: [&str; 9] = [
-    "comment", "visibleSchemas", "showSystemSchemas", "txMode", "sessionControl", "keepAliveSec", "autoDisconnectSec",
-    "startupScript", "passwordSave",
+    "comment",
+    "visibleSchemas",
+    "showSystemSchemas",
+    "txMode",
+    "sessionControl",
+    "keepAliveSec",
+    "autoDisconnectSec",
+    "startupScript",
+    "passwordSave",
 ];
 
 /// Fields whose change invalidates a live pool.
@@ -101,24 +113,45 @@ fn connection_fingerprint(c: &DataSourceConfig) -> Value {
 
 /// `msg` without the password of `cfg` (also when it sits in a URL): error texts reach the UI and logs.
 fn redact_for(cfg: &DataSourceConfig, msg: &str) -> String {
-    let url_pw = cfg.url_override.as_deref().and_then(|u| strip_url_password(u).1);
-    let known: Vec<&str> = cfg.password.as_deref().into_iter().chain(url_pw.as_deref()).collect();
+    let url_pw = cfg
+        .url_override
+        .as_deref()
+        .and_then(|u| strip_url_password(u).1);
+    let known: Vec<&str> = cfg
+        .password
+        .as_deref()
+        .into_iter()
+        .chain(url_pw.as_deref())
+        .collect();
     redact(msg, &known)
 }
 
 impl AppState {
     /// Production state: the OS keyring unless `PROMETEO_NO_KEYRING` is set.
     pub fn open(config_dir: PathBuf, data_dir: PathBuf) -> Result<Self, String> {
-        let secrets: Arc<dyn SecretStore> =
-            if std::env::var_os("PROMETEO_NO_KEYRING").is_some() { Arc::new(NoKeyring) } else { Arc::new(OsKeyring) };
+        let secrets: Arc<dyn SecretStore> = if std::env::var_os("PROMETEO_NO_KEYRING").is_some() {
+            Arc::new(NoKeyring)
+        } else {
+            Arc::new(OsKeyring)
+        };
         Self::with_secrets(config_dir, data_dir, secrets)
     }
 
-    pub fn with_secrets(config_dir: PathBuf, data_dir: PathBuf, secrets: Arc<dyn SecretStore>) -> Result<Self, String> {
+    pub fn with_secrets(
+        config_dir: PathBuf,
+        data_dir: PathBuf,
+        secrets: Arc<dyn SecretStore>,
+    ) -> Result<Self, String> {
         Ok(AppState {
             mgr: ConnectionManager::new(),
-            sources: Arc::new(DataSourceStore::load(config_dir.join("data-sources.json"), secrets)?),
-            ui: Arc::new(UiStateStore::load(config_dir.join("ui-state.json"), UiStateStore::DEFAULT_DEBOUNCE)),
+            sources: Arc::new(DataSourceStore::load(
+                config_dir.join("data-sources.json"),
+                secrets,
+            )?),
+            ui: Arc::new(UiStateStore::load(
+                config_dir.join("ui-state.json"),
+                UiStateStore::DEFAULT_DEBOUNCE,
+            )),
             history: Arc::new(QueryHistory::new(data_dir.join("history.jsonl"))),
             consoles: Arc::new(ConsoleStore::new(data_dir.join("consoles"))),
             config_dir,
@@ -156,11 +189,20 @@ impl AppState {
     }
 
     pub async fn save_data_source(&self, cfg: DataSourceConfig) -> Result<DataSourceView, String> {
-        let prev = self.sources.view(&cfg.id).map(|v| connection_fingerprint(&v.cfg));
-        let password_given = cfg.password.is_some() || cfg.url_override.as_deref().is_some_and(crate::store::url_has_password);
+        let prev = self
+            .sources
+            .view(&cfg.id)
+            .map(|v| connection_fingerprint(&v.cfg));
+        let password_given = cfg.password.is_some()
+            || cfg
+                .url_override
+                .as_deref()
+                .is_some_and(crate::store::url_has_password);
         let sources = self.sources.clone();
         let view = blocking(move || sources.save(cfg)).await?;
-        let changed = prev.map(|p| p != connection_fingerprint(&view.cfg)).unwrap_or(false);
+        let changed = prev
+            .map(|p| p != connection_fingerprint(&view.cfg))
+            .unwrap_or(false);
         if (changed || password_given) && self.mgr.is_connected(&view.cfg.id) {
             // the pool was built from the old config: the UI reconnects on demand
             self.disconnect(&view.cfg.id).await?;
@@ -198,7 +240,10 @@ impl AppState {
 
     pub async fn connect(&self, id: &str) -> Result<ConnectInfo, String> {
         let cfg = self.config(id).await?;
-        self.mgr.connect(&cfg).await.map_err(|e| redact_for(&cfg, &e.to_string()))
+        self.mgr
+            .connect(&cfg)
+            .await
+            .map_err(|e| redact_for(&cfg, &e.to_string()))
     }
 
     pub async fn disconnect(&self, id: &str) -> Result<(), String> {
@@ -209,7 +254,12 @@ impl AppState {
     }
 
     pub fn connected_data_sources(&self) -> Vec<String> {
-        self.sources.list().into_iter().map(|v| v.cfg.id).filter(|id| self.mgr.is_connected(id)).collect()
+        self.sources
+            .list()
+            .into_iter()
+            .map(|v| v.cfg.id)
+            .filter(|id| self.mgr.is_connected(id))
+            .collect()
     }
 
     // ------------------------------------------------------------ sessions
@@ -220,36 +270,63 @@ impl AppState {
 
     /// `init_sql`: statements run on the new connection before it is handed out (re-applies `SET search_path`,
     /// `USE db`, the isolation level, ... of a console that is reopened); if one fails, the session is not opened.
-    pub async fn open_session_with(&self, ds_id: &str, init_sql: &[String]) -> Result<String, String> {
-        let s = self.mgr.open_session_with(ds_id, init_sql).await.map_err(String::from)?;
-        self.sessions.lock().unwrap().insert(s.0.clone(), ds_id.to_string());
+    pub async fn open_session_with(
+        &self,
+        ds_id: &str,
+        init_sql: &[String],
+    ) -> Result<String, String> {
+        let s = self
+            .mgr
+            .open_session_with(ds_id, init_sql)
+            .await
+            .map_err(String::from)?;
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(s.0.clone(), ds_id.to_string());
         Ok(s.0)
     }
 
     pub async fn close_session(&self, session_id: &str) -> Result<(), String> {
-        self.mgr.close_session(&SessionId(session_id.to_string())).await;
+        self.mgr
+            .close_session(&SessionId(session_id.to_string()))
+            .await;
         self.sessions.lock().unwrap().remove(session_id);
-        self.executions.lock().unwrap().retain(|_, m| m.session_id != session_id);
+        self.executions
+            .lock()
+            .unwrap()
+            .retain(|_, m| m.session_id != session_id);
         Ok(())
     }
 
     pub async fn session_in_transaction(&self, session_id: &str) -> Result<bool, String> {
-        self.mgr.session_in_transaction(&SessionId(session_id.to_string())).map_err(String::from)
+        self.mgr
+            .session_in_transaction(&SessionId(session_id.to_string()))
+            .map_err(String::from)
     }
 
     /// `idle` / `active` / `failed` (see `dbcore::TxStatus`).
     pub async fn session_tx_status(&self, session_id: &str) -> Result<TxStatus, String> {
-        self.mgr.session_tx_status(&SessionId(session_id.to_string())).map_err(String::from)
+        self.mgr
+            .session_tx_status(&SessionId(session_id.to_string()))
+            .map_err(String::from)
     }
 
     /// Transaction status and connection health (see `dbcore::SessionState`).
     pub async fn session_state(&self, session_id: &str) -> Result<SessionState, String> {
-        self.mgr.session_state(&SessionId(session_id.to_string())).map_err(String::from)
+        self.mgr
+            .session_state(&SessionId(session_id.to_string()))
+            .map_err(String::from)
     }
 
     // ------------------------------------------------------------ introspection
 
-    pub async fn introspect(&self, ds_id: &str, path: Vec<String>, show_system: bool) -> Result<Vec<TreeNode>, String> {
+    pub async fn introspect(
+        &self,
+        ds_id: &str,
+        path: Vec<String>,
+        show_system: bool,
+    ) -> Result<Vec<TreeNode>, String> {
         self.mgr
             .introspect_with(ds_id, &path, &dbcore::IntrospectOptions { show_system })
             .await
@@ -260,8 +337,15 @@ impl AppState {
         self.mgr.ddl(ds_id, &object).await.map_err(String::from)
     }
 
-    pub async fn schema_snapshot(&self, ds_id: &str, schema: Option<String>) -> Result<Vec<SnapshotObject>, String> {
-        self.mgr.schema_snapshot(ds_id, schema.as_deref()).await.map_err(String::from)
+    pub async fn schema_snapshot(
+        &self,
+        ds_id: &str,
+        schema: Option<String>,
+    ) -> Result<Vec<SnapshotObject>, String> {
+        self.mgr
+            .schema_snapshot(ds_id, schema.as_deref())
+            .await
+            .map_err(String::from)
     }
 
     // ------------------------------------------------------------ execution
@@ -276,14 +360,30 @@ impl AppState {
         options: ExecOptions,
         sink: impl Fn(ExecEvent) + Send + 'static,
     ) -> Result<String, String> {
-        let ds_id = self.sessions.lock().unwrap().get(session_id).cloned().unwrap_or_default();
-        let mut handle = self.mgr.execute(&SessionId(session_id.to_string()), sql, options).await.map_err(String::from)?;
+        let ds_id = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut handle = self
+            .mgr
+            .execute(&SessionId(session_id.to_string()), sql, options)
+            .await
+            .map_err(String::from)?;
         let exec_id = handle.id.0.clone();
         {
             // a new execution on the session releases the previous (paging) one
             let mut ex = self.executions.lock().unwrap();
             ex.retain(|_, m| m.session_id != session_id);
-            ex.insert(exec_id.clone(), ExecMeta { ds_id: ds_id.clone(), session_id: session_id.to_string() });
+            ex.insert(
+                exec_id.clone(),
+                ExecMeta {
+                    ds_id: ds_id.clone(),
+                    session_id: session_id.to_string(),
+                },
+            );
         }
 
         let history = self.history.clone();
@@ -320,8 +420,16 @@ impl AppState {
         Ok(exec_id)
     }
 
-    pub async fn fetch_more(&self, execution_id: &str, result_index: usize, count: usize) -> Result<FetchedRows, String> {
-        self.mgr.fetch_more(&ExecutionId(execution_id.to_string()), result_index, count).await.map_err(String::from)
+    pub async fn fetch_more(
+        &self,
+        execution_id: &str,
+        result_index: usize,
+        count: usize,
+    ) -> Result<FetchedRows, String> {
+        self.mgr
+            .fetch_more(&ExecutionId(execution_id.to_string()), result_index, count)
+            .await
+            .map_err(String::from)
     }
 
     /// Cancelling an execution that already finished is not an error.
@@ -331,7 +439,9 @@ impl AppState {
     }
 
     pub async fn close_execution(&self, execution_id: &str) -> Result<(), String> {
-        let _ = self.mgr.close_execution(&ExecutionId(execution_id.to_string()));
+        let _ = self
+            .mgr
+            .close_execution(&ExecutionId(execution_id.to_string()));
         Ok(())
     }
 
@@ -342,25 +452,57 @@ impl AppState {
 
     // ------------------------------------------------------------ table data
 
-    pub async fn table_data(&self, ds_id: &str, table: ObjectRef, req: TableDataRequest) -> Result<ResultSet, String> {
-        self.mgr.table_data(ds_id, &table, &req).await.map_err(String::from)
+    pub async fn table_data(
+        &self,
+        ds_id: &str,
+        table: ObjectRef,
+        req: TableDataRequest,
+    ) -> Result<ResultSet, String> {
+        self.mgr
+            .table_data(ds_id, &table, &req)
+            .await
+            .map_err(String::from)
     }
 
     /// Always `Ok` when the statements could be attempted: inspect `committed` and
     /// `results[i].error` (the server message of the failing change).
-    pub async fn apply_changes(&self, ds_id: &str, table: ObjectRef, changes: Vec<RowChange>) -> Result<ApplyResult, String> {
-        self.mgr.apply_changes(ds_id, &table, &changes).await.map_err(String::from)
+    pub async fn apply_changes(
+        &self,
+        ds_id: &str,
+        table: ObjectRef,
+        changes: Vec<RowChange>,
+    ) -> Result<ApplyResult, String> {
+        self.mgr
+            .apply_changes(ds_id, &table, &changes)
+            .await
+            .map_err(String::from)
     }
 
     /// `table_data` on a session's connection: sees the session's uncommitted changes (manual transaction).
-    pub async fn table_data_in_session(&self, session_id: &str, table: ObjectRef, req: TableDataRequest) -> Result<ResultSet, String> {
-        self.mgr.table_data_in_session(&SessionId(session_id.to_string()), &table, &req).await.map_err(String::from)
+    pub async fn table_data_in_session(
+        &self,
+        session_id: &str,
+        table: ObjectRef,
+        req: TableDataRequest,
+    ) -> Result<ResultSet, String> {
+        self.mgr
+            .table_data_in_session(&SessionId(session_id.to_string()), &table, &req)
+            .await
+            .map_err(String::from)
     }
 
     /// `apply_changes` on a session's connection: inside the session's open transaction the changes stay
     /// uncommitted (`committed == true` then means "applied").
-    pub async fn apply_changes_in_session(&self, session_id: &str, table: ObjectRef, changes: Vec<RowChange>) -> Result<ApplyResult, String> {
-        self.mgr.apply_changes_in_session(&SessionId(session_id.to_string()), &table, &changes).await.map_err(String::from)
+    pub async fn apply_changes_in_session(
+        &self,
+        session_id: &str,
+        table: ObjectRef,
+        changes: Vec<RowChange>,
+    ) -> Result<ApplyResult, String> {
+        self.mgr
+            .apply_changes_in_session(&SessionId(session_id.to_string()), &table, &changes)
+            .await
+            .map_err(String::from)
     }
 
     // ------------------------------------------------------------ export
@@ -389,12 +531,21 @@ impl AppState {
 
     /// Stream every row of `sql` to `path` (a path from [`allow_export_path`](Self::allow_export_path)).
     /// Returns the number of rows written.
-    pub async fn export_query(&self, ds_id: &str, sql: &str, opts: ExportOptions, path: &Path) -> Result<usize, String> {
+    pub async fn export_query(
+        &self,
+        ds_id: &str,
+        sql: &str,
+        opts: ExportOptions,
+        path: &Path,
+    ) -> Result<usize, String> {
         self.take_export_path(path)?;
-        let file = File::create(path).map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
+        let file =
+            File::create(path).map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
         let mut w = BufWriter::new(file);
         let res = self.mgr.export_query(ds_id, sql, &opts, &mut w).await;
-        let res = res.map_err(String::from).and_then(|n| w.flush().map(|_| n).map_err(|e| format!("I/O error: {e}")));
+        let res = res
+            .map_err(String::from)
+            .and_then(|n| w.flush().map(|_| n).map_err(|e| format!("I/O error: {e}")));
         if res.is_err() {
             drop(w);
             let _ = std::fs::remove_file(path);
@@ -402,16 +553,30 @@ impl AppState {
         res
     }
 
-    pub async fn export_query_to_string(&self, ds_id: &str, sql: &str, opts: ExportOptions) -> Result<String, String> {
+    pub async fn export_query_to_string(
+        &self,
+        ds_id: &str,
+        sql: &str,
+        opts: ExportOptions,
+    ) -> Result<String, String> {
         let mut buf = Vec::new();
-        self.mgr.export_query(ds_id, sql, &opts, &mut buf).await.map_err(String::from)?;
+        self.mgr
+            .export_query(ds_id, sql, &opts, &mut buf)
+            .await
+            .map_err(String::from)?;
         Ok(String::from_utf8_lossy(&buf).into_owned())
     }
 
-    pub async fn export_result(&self, rs: ResultSet, opts: ExportOptions, path: PathBuf) -> Result<usize, String> {
+    pub async fn export_result(
+        &self,
+        rs: ResultSet,
+        opts: ExportOptions,
+        path: PathBuf,
+    ) -> Result<usize, String> {
         self.take_export_path(&path)?;
         blocking(move || {
-            let file = File::create(&path).map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
+            let file = File::create(&path)
+                .map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
             let mut w = BufWriter::new(file);
             let n = export_result(&rs, &opts, &mut w).map_err(String::from)?;
             w.flush().map_err(|e| format!("I/O error: {e}"))?;
@@ -420,7 +585,11 @@ impl AppState {
         .await
     }
 
-    pub async fn export_to_string(&self, rs: ResultSet, opts: ExportOptions) -> Result<String, String> {
+    pub async fn export_to_string(
+        &self,
+        rs: ResultSet,
+        opts: ExportOptions,
+    ) -> Result<String, String> {
         export_to_string(&rs, &opts).map_err(String::from)
     }
 
@@ -436,14 +605,32 @@ impl AppState {
 
     // ------------------------------------------------------------ history
 
-    pub async fn history_list(&self, ds_id: Option<String>, offset: usize, limit: usize) -> Result<Vec<HistoryEntry>, String> {
+    pub async fn history_list(
+        &self,
+        ds_id: Option<String>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<HistoryEntry>, String> {
         let h = self.history.clone();
-        blocking(move || h.list(ds_id.as_deref(), offset, limit).map_err(String::from)).await
+        blocking(move || {
+            h.list(ds_id.as_deref(), offset, limit)
+                .map_err(String::from)
+        })
+        .await
     }
 
-    pub async fn history_search(&self, text: String, ds_id: Option<String>, limit: usize) -> Result<Vec<HistoryEntry>, String> {
+    pub async fn history_search(
+        &self,
+        text: String,
+        ds_id: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<HistoryEntry>, String> {
         let h = self.history.clone();
-        blocking(move || h.search(&text, ds_id.as_deref(), limit).map_err(String::from)).await
+        blocking(move || {
+            h.search(&text, ds_id.as_deref(), limit)
+                .map_err(String::from)
+        })
+        .await
     }
 
     pub async fn history_clear(&self) -> Result<(), String> {
@@ -494,7 +681,12 @@ impl AppState {
     }
 
     pub async fn rename_console(&self, ds_id: &str, from: &str, to: &str) -> Result<(), String> {
-        let (c, ds, a, b) = (self.consoles.clone(), ds_id.to_string(), from.to_string(), to.to_string());
+        let (c, ds, a, b) = (
+            self.consoles.clone(),
+            ds_id.to_string(),
+            from.to_string(),
+            to.to_string(),
+        );
         blocking(move || c.rename(&ds, &a, &b)).await
     }
 }

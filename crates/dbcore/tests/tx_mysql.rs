@@ -63,19 +63,43 @@ const COMMIT_CASES: &[(&str, &str, bool)] = &[
     ("", "create table {T} select 1 as i", true),
     ("", "CREATE TABLE {T} AS SELECT 1 AS i", true),
     ("", "CREATE TEMPORARY TABLE {T} SELECT 1 AS i", false),
-    ("", "create temporary /* x */ table {T} select 1 as i", false),
+    (
+        "",
+        "create temporary /* x */ table {T} select 1 as i",
+        false,
+    ),
     ("", "create # x\n temporary table {T}(i int)", false),
     ("", "create -- x\n temporary table {T}(i int)", false),
     ("", "create /*!50001 temporary */ table {T}(i int)", false),
     ("", "/*!50001 create temporary table {T}(i int) */", false),
-    ("create temporary table {U}(i int)", "DROP TEMPORARY TABLE {U}", false),
-    ("create temporary table {U}(i int)", "drop /* x */ temporary /* y */ table {U}", false),
+    (
+        "create temporary table {U}(i int)",
+        "DROP TEMPORARY TABLE {U}",
+        false,
+    ),
+    (
+        "create temporary table {U}(i int)",
+        "drop /* x */ temporary /* y */ table {U}",
+        false,
+    ),
     ("create temporary table {U}(i int)", "drop table {U}", true),
-    ("create temporary table {U}(i int)", "alter table {U} add j int", true),
-    ("create temporary table {U}(i int)", "alter /* x */ table {U} add j int", true),
+    (
+        "create temporary table {U}(i int)",
+        "alter table {U} add j int",
+        true,
+    ),
+    (
+        "create temporary table {U}(i int)",
+        "alter /* x */ table {U} add j int",
+        true,
+    ),
     ("create table {U}(i int)", "alter table {U} add j int", true),
     ("", "select 1 -- create table {T}(i int)", false),
-    ("", "select 'create table {T}(i int)' # create table {T}(i int)", false),
+    (
+        "",
+        "select 'create table {T}(i int)' # create table {T}(i int)",
+        false,
+    ),
     ("", "/* create table {T}(i int) */ select 1", false),
     ("", "select 1 /* ' */ , 2 -- '", false),
 ];
@@ -97,13 +121,32 @@ async fn comments_in_statements_commit_exactly_as_the_server_does() {
         if !setup.is_empty() {
             assert_ok(&run(&mgr, &s, &setup).await);
         }
-        assert_ok(&run(&mgr, &s, &format!("start transaction; insert into base values ({n})")).await);
-        assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Active, "{sql}");
+        assert_ok(
+            &run(
+                &mgr,
+                &s,
+                &format!("start transaction; insert into base values ({n})"),
+            )
+            .await,
+        );
+        assert_eq!(
+            mgr.session_tx_status(&s).unwrap(),
+            TxStatus::Active,
+            "{sql}"
+        );
         // the statement itself may fail (an empty statement after a skipped comment): it still ran or not on the server
         let _ = run(&mgr, &s, &sql).await;
-        let want = if *commits { TxStatus::Idle } else { TxStatus::Active };
+        let want = if *commits {
+            TxStatus::Idle
+        } else {
+            TxStatus::Active
+        };
         assert_eq!(truth(&mgr, &s).await, want, "the server, for {sql:?}");
-        assert_eq!(mgr.session_tx_status(&s).unwrap(), want, "the tracker, for {sql:?}");
+        assert_eq!(
+            mgr.session_tx_status(&s).unwrap(),
+            want,
+            "the tracker, for {sql:?}"
+        );
         mgr.close_session(&s).await;
     }
     assert_ok(&run(&mgr, &admin, &format!("drop database {db}")).await);
@@ -119,23 +162,54 @@ async fn set_autocommit_forms_behind_comments() {
     let admin = mgr.open_session("my").await.unwrap();
     assert_ok(&run(&mgr, &admin, &format!("drop database if exists {db}; create database {db}; create table {db}.base (i int primary key) engine=innodb")).await);
     let off = [
-        "set autocommit = 0 -- manual", "SET @@session.autocommit=0", "SET autocommit=OFF /* x */", "set /* a */ autocommit /* b */ = /* c */ 0",
-        "set # x\n session autocommit = false", "set @@local.autocommit = 'OFF'", "set @x = 1, autocommit = 0", "/*!50001 set autocommit = 0 */",
+        "set autocommit = 0 -- manual",
+        "SET @@session.autocommit=0",
+        "SET autocommit=OFF /* x */",
+        "set /* a */ autocommit /* b */ = /* c */ 0",
+        "set # x\n session autocommit = false",
+        "set @@local.autocommit = 'OFF'",
+        "set @x = 1, autocommit = 0",
+        "/*!50001 set autocommit = 0 */",
     ];
-    let on = ["set autocommit = 1 -- x", "SET @@autocommit=ON /* x */", "set /* a */ autocommit /* b */ = TRUE", "set # x\n autocommit = 1"];
+    let on = [
+        "set autocommit = 1 -- x",
+        "SET @@autocommit=ON /* x */",
+        "set /* a */ autocommit /* b */ = TRUE",
+        "set # x\n autocommit = 1",
+    ];
     for (n, a) in off.iter().enumerate() {
         let b = &on[n % on.len()];
         let s = mgr.open_session("my").await.unwrap();
         assert_ok(&run(&mgr, &s, &format!("use {db}")).await);
         assert_ok(&run(&mgr, &s, a).await);
         assert_ok(&run(&mgr, &s, &format!("insert into base values ({n})")).await);
-        assert_eq!(truth(&mgr, &s).await, TxStatus::Active, "the server, after {a:?}");
-        assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Active, "the tracker, after {a:?}");
+        assert_eq!(
+            truth(&mgr, &s).await,
+            TxStatus::Active,
+            "the server, after {a:?}"
+        );
+        assert_eq!(
+            mgr.session_tx_status(&s).unwrap(),
+            TxStatus::Active,
+            "the tracker, after {a:?}"
+        );
         let ev = run(&mgr, &s, b).await;
         assert_ok(&ev);
-        assert_eq!(tx_ended(&ev), vec![(true, "IMPLICIT COMMIT".to_string())], "{b:?}");
-        assert_eq!(truth(&mgr, &s).await, TxStatus::Idle, "the server, after {b:?}");
-        assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Idle, "the tracker, after {b:?}");
+        assert_eq!(
+            tx_ended(&ev),
+            vec![(true, "IMPLICIT COMMIT".to_string())],
+            "{b:?}"
+        );
+        assert_eq!(
+            truth(&mgr, &s).await,
+            TxStatus::Idle,
+            "the server, after {b:?}"
+        );
+        assert_eq!(
+            mgr.session_tx_status(&s).unwrap(),
+            TxStatus::Idle,
+            "the tracker, after {b:?}"
+        );
         mgr.close_session(&s).await;
     }
     assert_ok(&run(&mgr, &admin, &format!("drop database {db}")).await);
@@ -150,29 +224,76 @@ async fn no_hidden_statements_between_user_statements() {
     assert_ok(&run(&mgr, &s, "drop table if exists demo.scratch_trk_w; create table demo.scratch_trk_w (id int primary key, v int)").await);
 
     // show warnings after a plain statement is empty (the old probe left its own 1305 warning there)
-    assert_ok(&run(&mgr, &s, "create table if not exists demo.scratch_trk_w (id int primary key, v int)").await);
+    assert_ok(
+        &run(
+            &mgr,
+            &s,
+            "create table if not exists demo.scratch_trk_w (id int primary key, v int)",
+        )
+        .await,
+    );
     let ev = run(&mgr, &s, "show warnings").await;
     let w = rows(&ev);
     assert_eq!(w.len(), 1, "{w:?}");
-    assert_eq!(w[0][1], json!(1050), "the note of `create table if not exists`, nothing else: {w:?}");
+    assert_eq!(
+        w[0][1],
+        json!(1050),
+        "the note of `create table if not exists`, nothing else: {w:?}"
+    );
     assert_ok(&run(&mgr, &s, "select 1").await);
     assert!(rows(&run(&mgr, &s, "show warnings").await).is_empty());
 
-    assert_ok(&run(&mgr, &s, "insert into demo.scratch_trk_w values (1,1),(2,2),(3,3)").await);
+    assert_ok(
+        &run(
+            &mgr,
+            &s,
+            "insert into demo.scratch_trk_w values (1,1),(2,2),(3,3)",
+        )
+        .await,
+    );
     assert_ok(&run(&mgr, &s, "start transaction").await);
     assert_ok(&run(&mgr, &s, "update demo.scratch_trk_w set v = v + 1").await);
-    assert_eq!(rows(&run(&mgr, &s, "select row_count()").await), vec![vec![json!(3)]], "row_count() of the UPDATE");
+    assert_eq!(
+        rows(&run(&mgr, &s, "select row_count()").await),
+        vec![vec![json!(3)]],
+        "row_count() of the UPDATE"
+    );
     // insert ignore: the warning (duplicate) must survive until the user asks
-    assert_ok(&run(&mgr, &s, "insert ignore into demo.scratch_trk_w values (1, 9)").await);
+    assert_ok(
+        &run(
+            &mgr,
+            &s,
+            "insert ignore into demo.scratch_trk_w values (1, 9)",
+        )
+        .await,
+    );
     let w = rows(&run(&mgr, &s, "show warnings").await);
     assert_eq!(w.len(), 1, "{w:?}");
     assert_eq!(w[0][1], json!(1062));
-    assert_eq!(rows(&run(&mgr, &s, "select row_count()").await), vec![vec![json!(-1)]]);
+    assert_eq!(
+        rows(&run(&mgr, &s, "select row_count()").await),
+        vec![vec![json!(-1)]]
+    );
     // found_rows() after a SELECT with SQL_CALC_FOUND_ROWS
-    assert_ok(&run(&mgr, &s, "select sql_calc_found_rows * from demo.scratch_trk_w limit 1").await);
-    assert_eq!(rows(&run(&mgr, &s, "select found_rows()").await), vec![vec![json!(3)]]);
+    assert_ok(
+        &run(
+            &mgr,
+            &s,
+            "select sql_calc_found_rows * from demo.scratch_trk_w limit 1",
+        )
+        .await,
+    );
+    assert_eq!(
+        rows(&run(&mgr, &s, "select found_rows()").await),
+        vec![vec![json!(3)]]
+    );
     // as one script, too
-    let ev = run(&mgr, &s, "update demo.scratch_trk_w set v = 0 where id = 1; select row_count()").await;
+    let ev = run(
+        &mgr,
+        &s,
+        "update demo.scratch_trk_w set v = 0 where id = 1; select row_count()",
+    )
+    .await;
     assert_eq!(rows(&ev), vec![vec![json!(1)]]);
     assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Active);
     assert_eq!(truth(&mgr, &s).await, TxStatus::Active);
@@ -191,7 +312,10 @@ async fn autocommit_zero_is_followed_without_probing() {
     assert_ok(&run(&mgr, &s, "drop table if exists demo.scratch_trk_ac; create table demo.scratch_trk_ac (id int primary key, v int); insert into demo.scratch_trk_ac values (1,1)").await);
 
     let ev = run(&mgr, &s, "set autocommit = 0").await;
-    assert!(tx_statuses(&ev).is_empty() && tx_ended(&ev).is_empty(), "{ev:?}");
+    assert!(
+        tx_statuses(&ev).is_empty() && tx_ended(&ev).is_empty(),
+        "{ev:?}"
+    );
     assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Idle);
     // COMMIT with nothing open, SELECT 1 (no table), SET: nothing starts
     let ev = run(&mgr, &s, "commit").await;
@@ -201,7 +325,12 @@ async fn autocommit_zero_is_followed_without_probing() {
     assert_eq!(truth(&mgr, &s).await, TxStatus::Idle);
     // `set autocommit = 1` with nothing open must not claim an implicit commit
     let ev = run(&mgr, &s, "set autocommit = 1").await;
-    assert!(tx_ended(&ev).is_empty() && tx_statuses(&ev).is_empty() && !ev.iter().any(|e| matches!(e, ExecEvent::Message { .. })), "{ev:?}");
+    assert!(
+        tx_ended(&ev).is_empty()
+            && tx_statuses(&ev).is_empty()
+            && !ev.iter().any(|e| matches!(e, ExecEvent::Message { .. })),
+        "{ev:?}"
+    );
     let ev = run(&mgr, &s, "set autocommit = 0").await;
     assert!(tx_statuses(&ev).is_empty());
 
@@ -220,15 +349,24 @@ async fn autocommit_zero_is_followed_without_probing() {
     assert_eq!(tx_ended(&ev), vec![(true, "IMPLICIT COMMIT".to_string())]);
     assert_eq!(tx_statuses(&ev), vec![TxStatus::Idle]);
     assert_eq!(truth(&mgr, &s).await, TxStatus::Idle);
-    assert_eq!(rows(&run(&mgr, &s, "select v from demo.scratch_trk_ac").await), vec![vec![json!(3)]]);
+    assert_eq!(
+        rows(&run(&mgr, &s, "select v from demo.scratch_trk_ac").await),
+        vec![vec![json!(3)]]
+    );
 
     // a session that starts with autocommit off (read once at open)
-    let s2 = mgr.open_session_with("my", &["set autocommit = 0".to_string()]).await.unwrap();
+    let s2 = mgr
+        .open_session_with("my", &["set autocommit = 0".to_string()])
+        .await
+        .unwrap();
     assert_eq!(mgr.session_tx_status(&s2).unwrap(), TxStatus::Idle);
     assert_ok(&run(&mgr, &s2, "update demo.scratch_trk_ac set v = 4").await);
     assert_eq!(mgr.session_tx_status(&s2).unwrap(), TxStatus::Active);
     assert_ok(&run(&mgr, &s2, "rollback").await);
-    assert_eq!(rows(&run(&mgr, &s, "select v from demo.scratch_trk_ac").await), vec![vec![json!(3)]]);
+    assert_eq!(
+        rows(&run(&mgr, &s, "select v from demo.scratch_trk_ac").await),
+        vec![vec![json!(3)]]
+    );
     mgr.close_session(&s2).await;
 
     assert_ok(&run(&mgr, &s, "drop table demo.scratch_trk_ac").await);
@@ -236,7 +374,13 @@ async fn autocommit_zero_is_followed_without_probing() {
 }
 
 /// (name, setup statements, statement under test, expected state, expected `TxEnded`)
-type Case = (&'static str, Vec<&'static str>, &'static str, TxStatus, Option<(bool, &'static str)>);
+type Case = (
+    &'static str,
+    Vec<&'static str>,
+    &'static str,
+    TxStatus,
+    Option<(bool, &'static str)>,
+);
 
 /// Every case: setup statements (one `execute` each), the statement under test, then tracker vs the server
 /// (`truth`) and the documented behaviour (`expect`, `ended`).
@@ -351,7 +495,11 @@ async fn tracker_matches_the_server_after_every_kind_of_statement() {
         for st in setup.iter().map(|s| q(s)).collect::<Vec<_>>() {
             run(&mgr, &s, &st).await;
         }
-        if name.contains("drop table") || name.contains("rename") || name.contains("truncate") || name.contains("ddl alone") {
+        if name.contains("drop table")
+            || name.contains("rename")
+            || name.contains("truncate")
+            || name.contains("ddl alone")
+        {
             run(&mgr, &admin, "create table if not exists demo.scratch_trk_c1 (i int); create table if not exists demo.scratch_trk_c2 (i int); create table if not exists demo.scratch_trk_c3 (i int); create table if not exists demo.scratch_trk_c4 (i int)").await;
         }
         let stmt = q(stmt);
@@ -359,14 +507,24 @@ async fn tracker_matches_the_server_after_every_kind_of_statement() {
         let tracked = mgr.session_tx_status(&s).unwrap();
         let real = truth(&mgr, &s).await;
         let ended = tx_ended(&ev);
-        println!("{name:45} tracker={tracked:?} server={real:?} ended={ended:?} err={:?}", errors(&ev).first().map(|m| m.chars().take(60).collect::<String>()));
+        println!(
+            "{name:45} tracker={tracked:?} server={real:?} ended={ended:?} err={:?}",
+            errors(&ev)
+                .first()
+                .map(|m| m.chars().take(60).collect::<String>())
+        );
         if real != expect {
-            bad.push(format!("{name}: the case expects {expect:?} but the server says {real:?} (fix the case)"));
+            bad.push(format!(
+                "{name}: the case expects {expect:?} but the server says {real:?} (fix the case)"
+            ));
         }
         if tracked != real {
             bad.push(format!("{name}: tracker {tracked:?} != server {real:?}"));
         }
-        let want: Vec<(bool, String)> = expect_ended.map(|(c, t)| (c, t.to_string())).into_iter().collect();
+        let want: Vec<(bool, String)> = expect_ended
+            .map(|(c, t)| (c, t.to_string()))
+            .into_iter()
+            .collect();
         if ended != want {
             bad.push(format!("{name}: TxEnded {ended:?}, expected {want:?}"));
         }
@@ -384,40 +542,93 @@ async fn cancel_inside_a_transaction_keeps_it_active() {
     let (_cfg, mgr) = setup!();
     let s = mgr.open_session("my").await.unwrap();
     assert_ok(&run(&mgr, &s, "drop table if exists demo.scratch_trk_k; create table demo.scratch_trk_k (id int primary key, v int); insert into demo.scratch_trk_k values (1,1),(2,2),(3,3)").await);
-    let o = ExecOptions { max_rows: 100, stop_on_error: true, keep_open_secs: 600 };
-    assert_ok(&mgr.execute_collect(&s, "begin; insert into demo.scratch_trk_k values (4,4)", o.clone()).await.unwrap());
+    let o = ExecOptions {
+        max_rows: 100,
+        stop_on_error: true,
+        keep_open_secs: 600,
+    };
+    assert_ok(
+        &mgr.execute_collect(
+            &s,
+            "begin; insert into demo.scratch_trk_k values (4,4)",
+            o.clone(),
+        )
+        .await
+        .unwrap(),
+    );
 
     // 1. cancel a paged result
-    let mut h = mgr.execute(&s, "select * from demo.big_table", o.clone()).await.unwrap();
+    let mut h = mgr
+        .execute(&s, "select * from demo.big_table", o.clone())
+        .await
+        .unwrap();
     let first = wait_done(&mut h).await;
-    assert!(first.iter().any(|e| matches!(e, ExecEvent::ResultSet { has_more: true, .. })));
+    assert!(first
+        .iter()
+        .any(|e| matches!(e, ExecEvent::ResultSet { has_more: true, .. })));
     mgr.cancel(&h.id).unwrap();
     tokio::time::sleep(Duration::from_millis(1000)).await;
     assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Active);
     assert_eq!(truth(&mgr, &s).await, TxStatus::Active);
 
     // 2. cancel a running UPDATE: the statement is rolled back, the transaction is not
-    let mut h = mgr.execute(&s, "update demo.scratch_trk_k set v = v + 100 + sleep(2)", o.clone()).await.unwrap();
+    let mut h = mgr
+        .execute(
+            &s,
+            "update demo.scratch_trk_k set v = v + 100 + sleep(2)",
+            o.clone(),
+        )
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(700)).await;
     mgr.cancel(&h.id).unwrap();
     let ev = wait_done(&mut h).await;
     assert_eq!(errors(&ev).len(), 1, "{ev:?}");
-    assert!(tx_statuses(&ev).is_empty(), "the transaction state did not change: {ev:?}");
+    assert!(
+        tx_statuses(&ev).is_empty(),
+        "the transaction state did not change: {ev:?}"
+    );
     assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Active);
     assert_eq!(truth(&mgr, &s).await, TxStatus::Active);
     // the UPDATE is gone, the earlier INSERT is not
-    assert_eq!(rows(&run(&mgr, &s, "select id, v from demo.scratch_trk_k order by id").await).len(), 4);
-    assert_eq!(scalar(&run(&mgr, &s, "select sum(v) from demo.scratch_trk_k").await), json!("10"));
+    assert_eq!(
+        rows(&run(&mgr, &s, "select id, v from demo.scratch_trk_k order by id").await).len(),
+        4
+    );
+    assert_eq!(
+        scalar(&run(&mgr, &s, "select sum(v) from demo.scratch_trk_k").await),
+        json!("10")
+    );
 
     let ev = run(&mgr, &s, "commit").await;
-    assert_eq!(tx_ended(&ev), vec![(true, "COMMIT".to_string())], "the COMMIT really commits: {ev:?}");
-    assert_eq!(scalar(&run(&mgr, &s, "select count(*) from demo.scratch_trk_k").await), json!(4));
+    assert_eq!(
+        tx_ended(&ev),
+        vec![(true, "COMMIT".to_string())],
+        "the COMMIT really commits: {ev:?}"
+    );
+    assert_eq!(
+        scalar(&run(&mgr, &s, "select count(*) from demo.scratch_trk_k").await),
+        json!(4)
+    );
     assert_ok(&run(&mgr, &s, "drop table demo.scratch_trk_k").await);
     mgr.close_session(&s).await;
 }
 
 fn lost_flags(ev: &[ExecEvent]) -> Vec<(String, bool)> {
-    ev.iter().filter_map(|e| if let ExecEvent::Error { message, connection_lost, .. } = e { Some((message.clone(), *connection_lost)) } else { None }).collect()
+    ev.iter()
+        .filter_map(|e| {
+            if let ExecEvent::Error {
+                message,
+                connection_lost,
+                ..
+            } = e
+            {
+                Some((message.clone(), *connection_lost))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Item 0 for MySQL: `KILL <connection id>` from a second session.
@@ -444,7 +655,9 @@ async fn lost_connection_inside_a_transaction() {
     assert!(st.connection_lost && st.transaction_lost, "{st:?}");
 
     for sql in ["select 3", "rollback", "commit"] {
-        let ev = tokio::time::timeout(Duration::from_secs(5), run(&mgr, &s, sql)).await.expect("must not hang");
+        let ev = tokio::time::timeout(Duration::from_secs(5), run(&mgr, &s, sql))
+            .await
+            .expect("must not hang");
         let l = lost_flags(&ev);
         assert_eq!(l.len(), 1, "{sql}: {ev:?}");
         assert!(l[0].0.starts_with("[08S01] ") && l[0].1, "{sql}: {l:?}");
@@ -482,9 +695,17 @@ async fn lock_timeout_and_deadlock_are_not_lost_connections() {
     assert_ok(&run(&mgr, &s, "drop table if exists demo.scratch_lost_a; create table demo.scratch_lost_a (id int primary key, v int) engine=innodb; insert into demo.scratch_lost_a values (1, 0), (2, 0)").await);
     assert_ok(&run(&mgr, &s, "set innodb_lock_wait_timeout = 1; begin; update demo.scratch_lost_a set v = 1 where id = 1").await);
     assert_ok(&run(&mgr, &o, "set innodb_lock_wait_timeout = 1; begin").await);
-    let ev = run(&mgr, &o, "update demo.scratch_lost_a set v = 2 where id = 1").await;
+    let ev = run(
+        &mgr,
+        &o,
+        "update demo.scratch_lost_a set v = 2 where id = 1",
+    )
+    .await;
     let l = lost_flags(&ev);
-    assert!(l.len() == 1 && l[0].0.contains("[1205]") && !l[0].1, "{l:?}");
+    assert!(
+        l.len() == 1 && l[0].0.contains("[1205]") && !l[0].1,
+        "{l:?}"
+    );
     assert_ok(&run(&mgr, &o, "rollback").await);
     assert_ok(&run(&mgr, &s, "rollback").await);
 
@@ -492,15 +713,36 @@ async fn lock_timeout_and_deadlock_are_not_lost_connections() {
     assert_ok(&run(&mgr, &o, "set innodb_lock_wait_timeout = 10; begin; update demo.scratch_lost_a set v = 2 where id = 2").await);
     let waiter = {
         let (mgr, s) = (mgr.clone(), s.clone());
-        tokio::spawn(async move { run(&mgr, &s, "update demo.scratch_lost_a set v = 1 where id = 2").await })
+        tokio::spawn(async move {
+            run(
+                &mgr,
+                &s,
+                "update demo.scratch_lost_a set v = 1 where id = 2",
+            )
+            .await
+        })
     };
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let ev_o = run(&mgr, &o, "update demo.scratch_lost_a set v = 2 where id = 1").await;
+    let ev_o = run(
+        &mgr,
+        &o,
+        "update demo.scratch_lost_a set v = 2 where id = 1",
+    )
+    .await;
     let ev_s = waiter.await.unwrap();
-    let all: Vec<(String, bool)> = lost_flags(&ev_o).into_iter().chain(lost_flags(&ev_s)).collect();
-    assert!(all.iter().any(|(m, _)| m.contains("[1213]")), "one side is the deadlock victim: {all:?}");
+    let all: Vec<(String, bool)> = lost_flags(&ev_o)
+        .into_iter()
+        .chain(lost_flags(&ev_s))
+        .collect();
+    assert!(
+        all.iter().any(|(m, _)| m.contains("[1213]")),
+        "one side is the deadlock victim: {all:?}"
+    );
     assert!(all.iter().all(|(_, lost)| !lost), "{all:?}");
-    assert!(!mgr.session_state(&s).unwrap().connection_lost && !mgr.session_state(&o).unwrap().connection_lost);
+    assert!(
+        !mgr.session_state(&s).unwrap().connection_lost
+            && !mgr.session_state(&o).unwrap().connection_lost
+    );
     assert_ok(&run(&mgr, &o, "rollback").await);
     assert_ok(&run(&mgr, &s, "rollback").await);
     assert_ok(&run(&mgr, &s, "drop table demo.scratch_lost_a").await);
@@ -527,7 +769,12 @@ async fn lost_connection_outside_a_transaction_reconnects_on_the_next_execute() 
 
     let ev = run(&mgr, &s, "select connection_id(), database()").await;
     assert_ok(&ev);
-    assert!(ev.iter().any(|e| matches!(e, ExecEvent::Message { text, .. } if text.contains("new connection"))), "{ev:?}");
+    assert!(
+        ev.iter().any(
+            |e| matches!(e, ExecEvent::Message { text, .. } if text.contains("new connection"))
+        ),
+        "{ev:?}"
+    );
     let (_, r, _) = first_rs(&ev);
     assert_ne!(r[0][0], id);
     assert_ne!(r[0][1], json!("information_schema"));

@@ -91,7 +91,10 @@ fn pick(raws: &[Raw], caret: usize) -> Option<usize> {
     if raws.is_empty() {
         return None;
     }
-    if let Some(i) = raws.iter().position(|r| caret >= r.start && caret < r.full_end) {
+    if let Some(i) = raws
+        .iter()
+        .position(|r| caret >= r.start && caret < r.full_end)
+    {
         return Some(i);
     }
     if let Some(i) = raws.iter().position(|r| caret == r.full_end) {
@@ -187,7 +190,11 @@ pub(crate) struct Scanner<'a> {
 impl<'a> Scanner<'a> {
     /// A scanner over `sql` with the default `;` delimiter (also used by the transaction tracker's tokenizer).
     pub(crate) fn new(sql: &'a str, d: Driver) -> Self {
-        Scanner { b: sql.as_bytes(), d, delimiter: vec![b';'] }
+        Scanner {
+            b: sql.as_bytes(),
+            d,
+            delimiter: vec![b';'],
+        }
     }
 
     /// Skip a quoted run starting at `i` (which points at the opening quote). Handles the
@@ -296,7 +303,11 @@ impl<'a> Scanner<'a> {
 fn split_raw(sql: &str, d: Driver) -> Vec<Raw> {
     let b = sql.as_bytes();
     let n = b.len();
-    let mut sc = Scanner { b, d, delimiter: vec![b';'] };
+    let mut sc = Scanner {
+        b,
+        d,
+        delimiter: vec![b';'],
+    };
     let mut out = Vec::new();
 
     let mut i = 0usize;
@@ -315,7 +326,11 @@ fn split_raw(sql: &str, d: Driver) -> Vec<Raw> {
                 while e > s && b[e - 1].is_ascii_whitespace() {
                     e -= 1;
                 }
-                out.push(Raw { start: s, end: e, full_end: $full });
+                out.push(Raw {
+                    start: s,
+                    end: e,
+                    full_end: $full,
+                });
             }
             first_words.clear();
             compound = false;
@@ -461,7 +476,8 @@ fn split_raw(sql: &str, d: Driver) -> Vec<Raw> {
                 if sc.delimiter == b";" && compound {
                     match upper.as_str() {
                         "BEGIN" => {
-                            if d != Driver::Postgres || sc.peek_word(e).as_deref() == Some("ATOMIC") {
+                            if d != Driver::Postgres || sc.peek_word(e).as_deref() == Some("ATOMIC")
+                            {
                                 depth += 1;
                             }
                         }
@@ -496,7 +512,10 @@ mod tests {
     use super::*;
 
     fn texts(sql: &str, d: Driver) -> Vec<String> {
-        split_statements(sql, d).into_iter().map(|s| s.text).collect()
+        split_statements(sql, d)
+            .into_iter()
+            .map(|s| s.text)
+            .collect()
     }
 
     #[test]
@@ -618,7 +637,14 @@ mod tests {
 
     #[test]
     fn unterminated_constructs_do_not_panic() {
-        for sql in ["select 'abc", "select \"abc", "select /* abc", "select $$ abc", "select $a$ x", "select `a"] {
+        for sql in [
+            "select 'abc",
+            "select \"abc",
+            "select /* abc",
+            "select $$ abc",
+            "select $a$ x",
+            "select `a",
+        ] {
             for d in [Driver::Postgres, Driver::MySql, Driver::Sqlite] {
                 let s = split_statements(sql, d);
                 assert_eq!(s.len(), 1, "{sql} {d:?}");
@@ -680,22 +706,47 @@ mod tests {
         // unbalanced ')' must not make the depth negative
         assert_eq!(texts("select 1); select 2", Driver::Postgres).len(), 2);
         // parentheses inside strings / comments / dollar quotes do not count
-        assert_eq!(texts("select '(' ; select 2 -- (\n; select 3", Driver::Postgres).len(), 3);
+        assert_eq!(
+            texts("select '(' ; select 2 -- (\n; select 3", Driver::Postgres).len(),
+            3
+        );
         assert_eq!(texts("select $$(;$$; select 2", Driver::Postgres).len(), 2);
     }
 
     #[test]
     fn mysql_column_named_begin_or_event_is_not_a_compound_body() {
-        let t = texts("create table t (event int, begin int); select 1; select 2", Driver::MySql);
-        assert_eq!(t, vec!["create table t (event int, begin int)", "select 1", "select 2"]);
-        let t = texts("create table `trigger` (function int, begin int, procedure int); select 1", Driver::MySql);
+        let t = texts(
+            "create table t (event int, begin int); select 1; select 2",
+            Driver::MySql,
+        );
+        assert_eq!(
+            t,
+            vec![
+                "create table t (event int, begin int)",
+                "select 1",
+                "select 2"
+            ]
+        );
+        let t = texts(
+            "create table `trigger` (function int, begin int, procedure int); select 1",
+            Driver::MySql,
+        );
         assert_eq!(t.len(), 2, "{t:?}");
-        let t = texts("alter table t add column begin int; select 1; select 2", Driver::MySql);
+        let t = texts(
+            "alter table t add column begin int; select 1; select 2",
+            Driver::MySql,
+        );
         assert_eq!(t.len(), 3, "{t:?}");
         // sqlite / pg: same rule
-        let t = texts("create table t (trigger int, begin int); select 1", Driver::Sqlite);
+        let t = texts(
+            "create table t (trigger int, begin int); select 1",
+            Driver::Sqlite,
+        );
         assert_eq!(t.len(), 2, "{t:?}");
-        let t = texts("create table t (function int, begin int); select 1", Driver::Postgres);
+        let t = texts(
+            "create table t (function int, begin int); select 1",
+            Driver::Postgres,
+        );
         assert_eq!(t.len(), 2, "{t:?}");
         // a plain BEGIN / START TRANSACTION is a transaction statement
         assert_eq!(texts("begin; select 1; commit", Driver::MySql).len(), 3);
@@ -722,9 +773,55 @@ mod tests {
     #[test]
     fn random_input_never_panics() {
         const TOKENS: &[&str] = &[
-            "select", " ", "\n", ";", "'", "\"", "`", "$$", "$a$", "$1", "--", "-- ", "/*", "*/", "#", "(", ")", "[", "]", "begin",
-            "end", "atomic", "case", "if", "loop", "create", "or", "replace", "definer", "=", "@", "root", "procedure", "function",
-            "trigger", "event", "table", "delimiter //\n", "//", "delimiter ;\n", "E'", "\\", "é", "😀", "x", "1", ",", "/*!40101", ".",
+            "select",
+            " ",
+            "\n",
+            ";",
+            "'",
+            "\"",
+            "`",
+            "$$",
+            "$a$",
+            "$1",
+            "--",
+            "-- ",
+            "/*",
+            "*/",
+            "#",
+            "(",
+            ")",
+            "[",
+            "]",
+            "begin",
+            "end",
+            "atomic",
+            "case",
+            "if",
+            "loop",
+            "create",
+            "or",
+            "replace",
+            "definer",
+            "=",
+            "@",
+            "root",
+            "procedure",
+            "function",
+            "trigger",
+            "event",
+            "table",
+            "delimiter //\n",
+            "//",
+            "delimiter ;\n",
+            "E'",
+            "\\",
+            "é",
+            "😀",
+            "x",
+            "1",
+            ",",
+            "/*!40101",
+            ".",
         ];
         let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut next = move || {
@@ -735,7 +832,9 @@ mod tests {
         };
         for _ in 0..4000 {
             let len = (next() % 24) as usize;
-            let sql: String = (0..len).map(|_| TOKENS[(next() % TOKENS.len() as u64) as usize]).collect();
+            let sql: String = (0..len)
+                .map(|_| TOKENS[(next() % TOKENS.len() as u64) as usize])
+                .collect();
             for d in [Driver::Postgres, Driver::MySql, Driver::Sqlite] {
                 let stmts = split_statements(&sql, d);
                 for s in &stmts {

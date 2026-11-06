@@ -69,7 +69,7 @@ typecheck: ## Type-check the frontend (strict TypeScript)
 clippy: ## Lint the Rust code (warnings are errors)
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 
-lint: typecheck clippy ## Type-check and lint everything
+lint: typecheck clippy fmt-check ## Type-check, lint and check the Rust formatting
 
 fmt: ## Format the Rust code
 	$(CARGO) fmt --all

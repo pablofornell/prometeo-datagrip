@@ -50,22 +50,50 @@ async fn setup() -> (tempfile::TempDir, DataSourceConfig, ConnectionManager) {
 }
 
 fn change(kind: ChangeKind, key: Value, values: Value) -> RowChange {
-    let m = |v: Value| v.as_object().cloned().unwrap_or_default().into_iter().collect::<BTreeMap<_, _>>();
-    RowChange { kind, key: m(key), values: m(values), row_locator: None }
+    let m = |v: Value| {
+        v.as_object()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+    };
+    RowChange {
+        kind,
+        key: m(key),
+        values: m(values),
+        row_locator: None,
+    }
 }
 
 #[tokio::test]
 async fn connection_errors() {
     let dir = tempfile::tempdir().unwrap();
     let mgr = ConnectionManager::new();
-    let missing = DataSourceConfig { id: "x".into(), driver: Driver::Sqlite, file: dir.path().join("nope.db").to_string_lossy().into(), ..Default::default() };
+    let missing = DataSourceConfig {
+        id: "x".into(),
+        driver: Driver::Sqlite,
+        file: dir.path().join("nope.db").to_string_lossy().into(),
+        ..Default::default()
+    };
     let r = mgr.test_connection(&missing).await;
     assert!(!r.ok);
     println!("missing sqlite file: {}", r.message);
-    assert!(r.message.contains("unable to open database file"), "{}", r.message);
-    let r = mgr.test_connection(&DataSourceConfig { id: "x".into(), driver: Driver::Sqlite, ..Default::default() }).await;
+    assert!(
+        r.message.contains("unable to open database file"),
+        "{}",
+        r.message
+    );
+    let r = mgr
+        .test_connection(&DataSourceConfig {
+            id: "x".into(),
+            driver: Driver::Sqlite,
+            ..Default::default()
+        })
+        .await;
     assert!(!r.ok && r.message.contains("file is not set"));
-    let r = mgr.test_connection(&lite_cfg(&dir.path().join("new.db"))).await;
+    let r = mgr
+        .test_connection(&lite_cfg(&dir.path().join("new.db")))
+        .await;
     assert!(r.ok, "{r:?}");
     assert!(r.server_version.unwrap().starts_with("SQLite 3."));
 }
@@ -75,15 +103,44 @@ async fn introspection_and_ddl() {
     let (_d, _cfg, mgr) = setup().await;
     assert_eq!(names(&children(&mgr, "lite", &[]).await), ["main"]);
     let folders = children(&mgr, "lite", &["main"]).await;
-    let f: Vec<_> = folders.iter().map(|f| (f.name.as_str(), f.hint.clone().unwrap())).collect();
-    assert_eq!(f, vec![("tables", "6".to_string()), ("views", "1".to_string())]);
-    assert_eq!(names(&children(&mgr, "lite", &["main", "tables"]).await), ["all_types", "audit", "categories", "nums", "order_items", "products"]);
-    let with_sys = mgr.introspect_with("lite", &["main".into(), "tables".into()], &IntrospectOptions { show_system: true }).await.unwrap();
+    let f: Vec<_> = folders
+        .iter()
+        .map(|f| (f.name.as_str(), f.hint.clone().unwrap()))
+        .collect();
+    assert_eq!(
+        f,
+        vec![("tables", "6".to_string()), ("views", "1".to_string())]
+    );
+    assert_eq!(
+        names(&children(&mgr, "lite", &["main", "tables"]).await),
+        [
+            "all_types",
+            "audit",
+            "categories",
+            "nums",
+            "order_items",
+            "products"
+        ]
+    );
+    let with_sys = mgr
+        .introspect_with(
+            "lite",
+            &["main".into(), "tables".into()],
+            &IntrospectOptions { show_system: true },
+        )
+        .await
+        .unwrap();
     assert!(names(&with_sys).contains(&"sqlite_sequence".to_string()));
-    assert_eq!(names(&children(&mgr, "lite", &["main", "views"]).await), ["v_products"]);
+    assert_eq!(
+        names(&children(&mgr, "lite", &["main", "views"]).await),
+        ["v_products"]
+    );
 
     let sub = children(&mgr, "lite", &["main", "tables", "products"]).await;
-    let sub: Vec<_> = sub.iter().map(|f| (f.name.as_str(), f.hint.clone().unwrap())).collect();
+    let sub: Vec<_> = sub
+        .iter()
+        .map(|f| (f.name.as_str(), f.hint.clone().unwrap()))
+        .collect();
     assert_eq!(
         sub,
         vec![
@@ -95,9 +152,31 @@ async fn introspection_and_ddl() {
         ]
     );
     let cols = children(&mgr, "lite", &["main", "tables", "products", "columns"]).await;
-    assert_eq!(names(&cols), ["id", "sku", "name", "category_id", "price", "stock", "created_at"]);
+    assert_eq!(
+        names(&cols),
+        [
+            "id",
+            "sku",
+            "name",
+            "category_id",
+            "price",
+            "stock",
+            "created_at"
+        ]
+    );
     let hints: Vec<_> = cols.iter().map(|c| c.hint.clone().unwrap()).collect();
-    assert_eq!(hints, ["INTEGER", "varchar(32)", "varchar(255)", "INTEGER", "numeric(10,2)", "INTEGER", "datetime"]);
+    assert_eq!(
+        hints,
+        [
+            "INTEGER",
+            "varchar(32)",
+            "varchar(255)",
+            "INTEGER",
+            "numeric(10,2)",
+            "INTEGER",
+            "datetime"
+        ]
+    );
     assert_eq!(cols[0].extra["isPk"], json!(true));
     assert_eq!(cols[1].extra["nullable"], json!(false));
     assert_eq!(cols[6].extra["nullable"], json!(true));
@@ -105,48 +184,97 @@ async fn introspection_and_ddl() {
 
     let keys = children(&mgr, "lite", &["main", "tables", "products", "keys"]).await;
     assert_eq!(names(&keys), ["products_pk", "sqlite_autoindex_products_1"]);
-    assert_eq!((keys[0].kind, keys[1].kind), (NodeKind::PrimaryKey, NodeKind::UniqueKey));
+    assert_eq!(
+        (keys[0].kind, keys[1].kind),
+        (NodeKind::PrimaryKey, NodeKind::UniqueKey)
+    );
     assert_eq!(keys[1].hint.as_deref(), Some("(sku)"));
-    let fks = children(&mgr, "lite", &["main", "tables", "products", "foreign_keys"]).await;
+    let fks = children(
+        &mgr,
+        "lite",
+        &["main", "tables", "products", "foreign_keys"],
+    )
+    .await;
     assert_eq!(fks.len(), 1);
-    assert_eq!(fks[0].hint.as_deref(), Some("(category_id) -> categories(id)"));
+    assert_eq!(
+        fks[0].hint.as_deref(),
+        Some("(category_id) -> categories(id)")
+    );
     assert_eq!(fks[0].extra["onDelete"], "CASCADE");
     let idx = children(&mgr, "lite", &["main", "tables", "products", "indexes"]).await;
     assert_eq!(names(&idx), ["idx_products_category"]);
     assert_eq!(idx[0].hint.as_deref(), Some("(category_id)"));
     let trg = children(&mgr, "lite", &["main", "tables", "products", "triggers"]).await;
-    assert_eq!((trg[0].name.as_str(), trg[0].hint.as_deref()), ("trg_products_audit", Some("AFTER INSERT")));
+    assert_eq!(
+        (trg[0].name.as_str(), trg[0].hint.as_deref()),
+        ("trg_products_audit", Some("AFTER INSERT"))
+    );
     // composite PK
     let keys = children(&mgr, "lite", &["main", "tables", "order_items", "keys"]).await;
     assert_eq!(keys[0].hint.as_deref(), Some("(order_id, line_no)"));
     let v = children(&mgr, "lite", &["main", "views", "v_products"]).await;
     assert_eq!(names(&v), ["columns"]);
-    assert!(mgr.introspect("lite", &["main".into(), "bogus".into()]).await.is_err());
+    assert!(mgr
+        .introspect("lite", &["main".into(), "bogus".into()])
+        .await
+        .is_err());
 
     // DDL = sqlite_master.sql
-    let t = |name: &str, kind: NodeKind| ObjectRef { schema: Some("main".into()), name: name.into(), kind, table: None, signature: None };
-    let ddl = mgr.ddl("lite", &t("products", NodeKind::Table)).await.unwrap();
+    let t = |name: &str, kind: NodeKind| ObjectRef {
+        schema: Some("main".into()),
+        name: name.into(),
+        kind,
+        table: None,
+        signature: None,
+    };
+    let ddl = mgr
+        .ddl("lite", &t("products", NodeKind::Table))
+        .await
+        .unwrap();
     assert!(ddl.starts_with("CREATE TABLE products ("), "{ddl}");
     assert!(ddl.ends_with(");"));
-    let v = mgr.ddl("lite", &t("v_products", NodeKind::View)).await.unwrap();
+    let v = mgr
+        .ddl("lite", &t("v_products", NodeKind::View))
+        .await
+        .unwrap();
     assert!(v.starts_with("CREATE VIEW v_products"));
-    let i = mgr.ddl("lite", &t("idx_products_category", NodeKind::Index)).await.unwrap();
-    assert_eq!(i, "CREATE INDEX idx_products_category on products (category_id);");
-    let tr = mgr.ddl("lite", &t("trg_products_audit", NodeKind::Trigger)).await.unwrap();
-    assert!(tr.starts_with("CREATE TRIGGER trg_products_audit") && tr.trim_end().ends_with("end;"), "{tr}");
+    let i = mgr
+        .ddl("lite", &t("idx_products_category", NodeKind::Index))
+        .await
+        .unwrap();
+    assert_eq!(
+        i,
+        "CREATE INDEX idx_products_category on products (category_id);"
+    );
+    let tr = mgr
+        .ddl("lite", &t("trg_products_audit", NodeKind::Trigger))
+        .await
+        .unwrap();
+    assert!(
+        tr.starts_with("CREATE TRIGGER trg_products_audit") && tr.trim_end().ends_with("end;"),
+        "{tr}"
+    );
     assert!(mgr.ddl("lite", &t("nope", NodeKind::Table)).await.is_err());
 
     // the stored trigger DDL (BEGIN .. END with inner semicolons and CASE) survives the splitter
     let s = mgr.open_session("lite").await.unwrap();
     let ev = run(&mgr, &s, &format!("drop trigger trg_products_audit; {tr}")).await;
     assert_ok(&ev);
-    assert_eq!(ev.iter().filter(|e| matches!(e, ExecEvent::Statement { .. })).count(), 2);
+    assert_eq!(
+        ev.iter()
+            .filter(|e| matches!(e, ExecEvent::Statement { .. }))
+            .count(),
+        2
+    );
     mgr.close_session(&s).await;
 
     let snap = mgr.schema_snapshot("lite", None).await.unwrap();
     let p = snap.iter().find(|o| o.name == "products").unwrap();
     assert_eq!((p.columns.len(), p.columns[0].is_pk), (7, true));
-    assert_eq!(snap.iter().find(|o| o.name == "v_products").unwrap().kind, NodeKind::View);
+    assert_eq!(
+        snap.iter().find(|o| o.name == "v_products").unwrap().kind,
+        NodeKind::View
+    );
 }
 
 #[tokio::test]
@@ -159,44 +287,113 @@ async fn execute_types_errors_and_state() {
     let (cols, rows, _) = first_rs(&ev);
     assert_eq!(
         rows[0],
-        vec![json!(1), json!(42), json!(2.5), json!("héllo 😀"), json!({"$bin": "deadbeef", "len": 4}), json!(7), json!("9223372036854775807"), Value::Null]
+        vec![
+            json!(1),
+            json!(42),
+            json!(2.5),
+            json!("héllo 😀"),
+            json!({"$bin": "deadbeef", "len": 4}),
+            json!(7),
+            json!("9223372036854775807"),
+            Value::Null
+        ]
     );
     assert_eq!(cols[1].type_name, "integer");
     assert_eq!(cols[3].type_name, "text");
 
     let ev = run(&mgr, &s, "select id, name from products where 0").await;
     let (cols, rows, _) = first_rs(&ev);
-    assert_eq!(cols.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["id", "name"]);
+    assert_eq!(
+        cols.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        ["id", "name"]
+    );
     assert!(rows.is_empty());
     let ev = run(&mgr, &s, "update products set stock = stock where id < 0").await;
-    assert!(ev.iter().any(|e| matches!(e, ExecEvent::Update { index: 0, rows_affected: 0 })), "{ev:?}");
-    let ev = run(&mgr, &s, "pragma table_info(products); explain query plan select 1").await;
+    assert!(
+        ev.iter().any(|e| matches!(
+            e,
+            ExecEvent::Update {
+                index: 0,
+                rows_affected: 0
+            }
+        )),
+        "{ev:?}"
+    );
+    let ev = run(
+        &mgr,
+        &s,
+        "pragma table_info(products); explain query plan select 1",
+    )
+    .await;
     assert_ok(&ev);
-    assert_eq!(ev.iter().filter(|e| matches!(e, ExecEvent::ResultSet { .. })).count(), 2);
+    assert_eq!(
+        ev.iter()
+            .filter(|e| matches!(e, ExecEvent::ResultSet { .. }))
+            .count(),
+        2
+    );
 
     // trigger fired by an insert (the statement splitter keeps the trigger body intact)
     let ev = run(&mgr, &s, "insert into products (sku, name, category_id, price, stock) values ('C3', 'Gamma', 1, 1, -4); select msg from audit where msg like '%Gamma'; select stock from products where sku = 'C3'").await;
     assert_ok(&ev);
-    let rs: Vec<_> = ev.iter().filter_map(|e| if let ExecEvent::ResultSet { rows, .. } = e { Some(rows[0][0].clone()) } else { None }).collect();
+    let rs: Vec<_> = ev
+        .iter()
+        .filter_map(|e| {
+            if let ExecEvent::ResultSet { rows, .. } = e {
+                Some(rows[0][0].clone())
+            } else {
+                None
+            }
+        })
+        .collect();
     assert_eq!(rs, vec![json!("added Gamma"), json!(0)]);
 
     // errors
     let ev = run(&mgr, &s, "select * from nonexistent_table_xyz").await;
-    assert_eq!(errors(&ev), vec!["[SQLITE_ERROR] SQL error or missing database (no such table: nonexistent_table_xyz)".to_string()]);
+    assert_eq!(
+        errors(&ev),
+        vec![
+            "[SQLITE_ERROR] SQL error or missing database (no such table: nonexistent_table_xyz)"
+                .to_string()
+        ]
+    );
     let ev = run(&mgr, &s, "insert into categories (name) values ('Books')").await;
     assert_eq!(errors(&ev), vec!["[SQLITE_CONSTRAINT_UNIQUE] A UNIQUE constraint failed (UNIQUE constraint failed: categories.name)".to_string()]);
-    let ev = run(&mgr, &s, "insert into products (sku, name, category_id, price) values ('Z', 'Z', 99, 1)").await;
-    assert!(errors(&ev)[0].contains("FOREIGN KEY constraint failed"), "{:?}", errors(&ev));
+    let ev = run(
+        &mgr,
+        &s,
+        "insert into products (sku, name, category_id, price) values ('Z', 'Z', 99, 1)",
+    )
+    .await;
+    assert!(
+        errors(&ev)[0].contains("FOREIGN KEY constraint failed"),
+        "{:?}",
+        errors(&ev)
+    );
     let ev = run(&mgr, &s, "select 1; select * from nope; select 3").await;
-    assert_eq!(ev.iter().filter(|e| matches!(e, ExecEvent::ResultSet { .. })).count(), 1);
+    assert_eq!(
+        ev.iter()
+            .filter(|e| matches!(e, ExecEvent::ResultSet { .. }))
+            .count(),
+        1
+    );
 
     // transactions live on the session connection
     let s2 = mgr.open_session("lite").await.unwrap();
     assert_ok(&run(&mgr, &s, "begin; insert into audit (msg) values ('in tx')").await);
-    assert_eq!(scalar(&run(&mgr, &s, "select count(*) from audit where msg = 'in tx'").await), json!(1));
-    assert_eq!(scalar(&run(&mgr, &s2, "select count(*) from audit where msg = 'in tx'").await), json!(0));
+    assert_eq!(
+        scalar(&run(&mgr, &s, "select count(*) from audit where msg = 'in tx'").await),
+        json!(1)
+    );
+    assert_eq!(
+        scalar(&run(&mgr, &s2, "select count(*) from audit where msg = 'in tx'").await),
+        json!(0)
+    );
     assert_ok(&run(&mgr, &s, "rollback").await);
-    assert_eq!(scalar(&run(&mgr, &s, "select count(*) from audit where msg = 'in tx'").await), json!(0));
+    assert_eq!(
+        scalar(&run(&mgr, &s, "select count(*) from audit where msg = 'in tx'").await),
+        json!(0)
+    );
     mgr.close_session(&s).await;
     mgr.close_session(&s2).await;
 }
@@ -205,7 +402,18 @@ async fn execute_types_errors_and_state() {
 async fn paging_and_cancellation() {
     let (_d, _cfg, mgr) = setup().await;
     let s = mgr.open_session("lite").await.unwrap();
-    let mut h = mgr.execute(&s, "select n from nums order by n", ExecOptions { max_rows: 500, stop_on_error: true, ..Default::default() }).await.unwrap();
+    let mut h = mgr
+        .execute(
+            &s,
+            "select n from nums order by n",
+            ExecOptions {
+                max_rows: 500,
+                stop_on_error: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     let mut events = Vec::new();
     while let Some(e) = h.events.recv().await {
         let done = matches!(e, ExecEvent::Done { .. });
@@ -230,7 +438,18 @@ async fn paging_and_cancellation() {
     assert_eq!(total, 20_000);
 
     // abandon a half-read result
-    let h = mgr.execute(&s, "select n from nums", ExecOptions { max_rows: 10, stop_on_error: true, ..Default::default() }).await.unwrap();
+    let h = mgr
+        .execute(
+            &s,
+            "select n from nums",
+            ExecOptions {
+                max_rows: 10,
+                stop_on_error: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     let mut ev = h.events;
     while let Some(e) = ev.recv().await {
         if matches!(e, ExecEvent::Done { .. }) {
@@ -258,7 +477,10 @@ async fn paging_and_cancellation() {
         }
     }
     let msg = msg.expect("error event");
-    assert!(msg.contains("SQLITE_INTERRUPT") && msg.contains("interrupted"), "{msg}");
+    assert!(
+        msg.contains("SQLITE_INTERRUPT") && msg.contains("interrupted"),
+        "{msg}"
+    );
     println!("sqlite cancel: returned after {:?}", t.elapsed());
     assert!(t.elapsed() < Duration::from_secs(5));
     assert_eq!(scalar(&run(&mgr, &s, "select 5").await), json!(5));
@@ -272,44 +494,122 @@ async fn session_scoped_edit_and_read() {
     let (_d, _cfg, mgr) = setup().await;
     let s = mgr.open_session("lite").await.unwrap();
     let products = ObjectRef::table(Some("main"), "products");
-    let req = TableDataRequest { order_by: Some("id".into()), limit: 10, ..Default::default() };
+    let req = TableDataRequest {
+        order_by: Some("id".into()),
+        limit: 10,
+        ..Default::default()
+    };
     let name_of = |rs: &ResultSet| rs.rows.iter().map(|r| r[2].clone()).collect::<Vec<_>>();
 
     // auto: committed at once (the pool sees it)
-    let r = mgr.apply_changes_in_session(&s, &products, &[change(ChangeKind::Update, json!({"id": 1}), json!({"name": "Auto"}))]).await.unwrap();
+    let r = mgr
+        .apply_changes_in_session(
+            &s,
+            &products,
+            &[change(
+                ChangeKind::Update,
+                json!({"id": 1}),
+                json!({"name": "Auto"}),
+            )],
+        )
+        .await
+        .unwrap();
     assert!(r.committed && r.applied == 1, "{r:?}");
-    assert_eq!(name_of(&mgr.table_data("lite", &products, &req).await.unwrap())[0], json!("Auto"));
+    assert_eq!(
+        name_of(&mgr.table_data("lite", &products, &req).await.unwrap())[0],
+        json!("Auto")
+    );
 
     // manual: applied inside the open transaction
     assert_ok(&run(&mgr, &s, "begin").await);
     assert!(mgr.session_in_transaction(&s).unwrap());
-    let r = mgr.apply_changes_in_session(&s, &products, &[change(ChangeKind::Update, json!({"id": 1}), json!({"name": "Manual"}))]).await.unwrap();
+    let r = mgr
+        .apply_changes_in_session(
+            &s,
+            &products,
+            &[change(
+                ChangeKind::Update,
+                json!({"id": 1}),
+                json!({"name": "Manual"}),
+            )],
+        )
+        .await
+        .unwrap();
     assert!(r.committed, "{r:?}");
-    assert!(mgr.session_in_transaction(&s).unwrap(), "still in the transaction");
-    assert_eq!(name_of(&mgr.table_data_in_session(&s, &products, &req).await.unwrap())[0], json!("Manual"));
+    assert!(
+        mgr.session_in_transaction(&s).unwrap(),
+        "still in the transaction"
+    );
+    assert_eq!(
+        name_of(
+            &mgr.table_data_in_session(&s, &products, &req)
+                .await
+                .unwrap()
+        )[0],
+        json!("Manual")
+    );
 
     // a failing batch rolls back to the savepoint only: "Manual" survives, the second row stays untouched
     let r = mgr
         .apply_changes_in_session(
             &s,
             &products,
-            &[change(ChangeKind::Update, json!({"id": 2}), json!({"name": "Lost"})), change(ChangeKind::Update, json!({"id": 999}), json!({"name": "x"}))],
+            &[
+                change(
+                    ChangeKind::Update,
+                    json!({"id": 2}),
+                    json!({"name": "Lost"}),
+                ),
+                change(ChangeKind::Update, json!({"id": 999}), json!({"name": "x"})),
+            ],
         )
         .await
         .unwrap();
-    assert!(!r.committed && r.applied == 0 && r.results[1].error.is_some(), "{r:?}");
-    let rs = mgr.table_data_in_session(&s, &products, &req).await.unwrap();
-    assert_eq!((name_of(&rs)[0].clone(), name_of(&rs)[1].clone()), (json!("Manual"), json!("Beta")));
+    assert!(
+        !r.committed && r.applied == 0 && r.results[1].error.is_some(),
+        "{r:?}"
+    );
+    let rs = mgr
+        .table_data_in_session(&s, &products, &req)
+        .await
+        .unwrap();
+    assert_eq!(
+        (name_of(&rs)[0].clone(), name_of(&rs)[1].clone()),
+        (json!("Manual"), json!("Beta"))
+    );
 
     // rollback undoes the batch of the transaction
     assert_ok(&run(&mgr, &s, "rollback").await);
-    assert_eq!(name_of(&mgr.table_data_in_session(&s, &products, &req).await.unwrap())[0], json!("Auto"));
+    assert_eq!(
+        name_of(
+            &mgr.table_data_in_session(&s, &products, &req)
+                .await
+                .unwrap()
+        )[0],
+        json!("Auto")
+    );
 
     // an open paging result of the session is released first
-    let mut h = mgr.execute(&s, "select n from nums", ExecOptions { max_rows: 10, ..Default::default() }).await.unwrap();
+    let mut h = mgr
+        .execute(
+            &s,
+            "select n from nums",
+            ExecOptions {
+                max_rows: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     let ev = wait_done(&mut h).await;
-    assert!(matches!(ev.iter().find(|e| matches!(e, ExecEvent::ResultSet { .. })), Some(ExecEvent::ResultSet { has_more: true, .. })));
-    let rs = mgr.table_data_in_session(&s, &products, &req).await.unwrap();
+    assert!(matches!(
+        ev.iter().find(|e| matches!(e, ExecEvent::ResultSet { .. })),
+        Some(ExecEvent::ResultSet { has_more: true, .. })
+    ));
+    let rs = mgr
+        .table_data_in_session(&s, &products, &req)
+        .await
+        .unwrap();
     assert_eq!(rs.rows.len(), 2);
     mgr.close_session(&s).await;
 }
@@ -319,15 +619,43 @@ async fn table_data_edit_export() {
     let (_d, _cfg, mgr) = setup().await;
     let nums = ObjectRef::table(Some("main"), "nums");
     let t = Instant::now();
-    let rs = mgr.table_data("lite", &nums, &TableDataRequest { order_by: Some("n desc".into()), limit: 500, count_total: true, ..Default::default() }).await.unwrap();
+    let rs = mgr
+        .table_data(
+            "lite",
+            &nums,
+            &TableDataRequest {
+                order_by: Some("n desc".into()),
+                limit: 500,
+                count_total: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     println!("BENCH sqlite first 500 rows: {:?}", t.elapsed());
-    assert_eq!((rs.rows.len(), rs.has_more, rs.total_hint), (500, true, Some(20000)));
+    assert_eq!(
+        (rs.rows.len(), rs.has_more, rs.total_hint),
+        (500, true, Some(20000))
+    );
     assert_eq!(rs.rows[0][0], json!(20000));
 
     let products = ObjectRef::table(None, "products");
-    let rs = mgr.table_data("lite", &products, &TableDataRequest { limit: 10, ..Default::default() }).await.unwrap();
+    let rs = mgr
+        .table_data(
+            "lite",
+            &products,
+            &TableDataRequest {
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(rs.rows.len(), 2);
-    assert_eq!((rs.columns[0].is_pk, rs.columns[0].table_ref.as_deref()), (true, Some("products")));
+    assert_eq!(
+        (rs.columns[0].is_pk, rs.columns[0].table_ref.as_deref()),
+        (true, Some("products"))
+    );
     assert!(!rs.columns[1].nullable);
 
     let r = mgr
@@ -343,7 +671,18 @@ async fn table_data_edit_export() {
         .await
         .unwrap();
     assert!(r.committed && r.applied == 3, "{r:?}");
-    let rs = mgr.table_data("lite", &products, &TableDataRequest { limit: 10, order_by: Some("id".into()), ..Default::default() }).await.unwrap();
+    let rs = mgr
+        .table_data(
+            "lite",
+            &products,
+            &TableDataRequest {
+                limit: 10,
+                order_by: Some("id".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(rs.rows.len(), 2);
     assert_eq!(rs.rows[0][2], json!("Renamed"));
     assert_eq!(rs.rows[0][4], json!(11.25));
@@ -355,48 +694,125 @@ async fn table_data_edit_export() {
             "lite",
             &products,
             &[
-                change(ChangeKind::Insert, json!({}), json!({"sku": "ROLLED", "name": "x", "category_id": 1, "price": 1})),
-                change(ChangeKind::Insert, json!({}), json!({"sku": "NEW", "name": "dup", "category_id": 1, "price": 1})),
+                change(
+                    ChangeKind::Insert,
+                    json!({}),
+                    json!({"sku": "ROLLED", "name": "x", "category_id": 1, "price": 1}),
+                ),
+                change(
+                    ChangeKind::Insert,
+                    json!({}),
+                    json!({"sku": "NEW", "name": "dup", "category_id": 1, "price": 1}),
+                ),
             ],
         )
         .await
         .unwrap();
     assert!(!r.committed);
-    assert!(r.results[1].error.as_deref().unwrap().contains("SQLITE_CONSTRAINT_UNIQUE"), "{r:?}");
+    assert!(
+        r.results[1]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("SQLITE_CONSTRAINT_UNIQUE"),
+        "{r:?}"
+    );
     let s = mgr.open_session("lite").await.unwrap();
-    assert_eq!(scalar(&run(&mgr, &s, "select count(*) from products where sku = 'ROLLED'").await), json!(0));
+    assert_eq!(
+        scalar(
+            &run(
+                &mgr,
+                &s,
+                "select count(*) from products where sku = 'ROLLED'"
+            )
+            .await
+        ),
+        json!(0)
+    );
     mgr.close_session(&s).await;
 
     // blobs round trip as $bin
     let at = ObjectRef::table(Some("main"), "all_types");
-    mgr.apply_changes("lite", &at, &[change(ChangeKind::Insert, json!({}), json!({"id": 2, "b": {"$bin": "0001ff"}, "big": "9223372036854775806"}))]).await.unwrap();
-    let rs = mgr.table_data("lite", &at, &TableDataRequest { limit: 10, order_by: Some("id".into()), ..Default::default() }).await.unwrap();
+    mgr.apply_changes(
+        "lite",
+        &at,
+        &[change(
+            ChangeKind::Insert,
+            json!({}),
+            json!({"id": 2, "b": {"$bin": "0001ff"}, "big": "9223372036854775806"}),
+        )],
+    )
+    .await
+    .unwrap();
+    let rs = mgr
+        .table_data(
+            "lite",
+            &at,
+            &TableDataRequest {
+                limit: 10,
+                order_by: Some("id".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(rs.rows[1][4], json!({"$bin": "0001ff", "len": 3}));
 
     // export
     let mut buf = Vec::new();
-    let n = mgr.export_query("lite", "select id, name from categories order by id", &ExportOptions { format: ExportFormat::Markdown, ..Default::default() }, &mut buf).await.unwrap();
+    let n = mgr
+        .export_query(
+            "lite",
+            "select id, name from categories order by id",
+            &ExportOptions {
+                format: ExportFormat::Markdown,
+                ..Default::default()
+            },
+            &mut buf,
+        )
+        .await
+        .unwrap();
     assert_eq!(n, 2);
-    assert_eq!(String::from_utf8(buf).unwrap(), "| id | name |\n| --- | --- |\n| 1 | Books |\n| 2 | Garden |\n");
+    assert_eq!(
+        String::from_utf8(buf).unwrap(),
+        "| id | name |\n| --- | --- |\n| 1 | Books |\n| 2 | Garden |\n"
+    );
     let mut buf = Vec::new();
     mgr.export_query(
         "lite",
         "select id, name from categories order by id",
-        &ExportOptions { format: ExportFormat::SqlInsert, dialect: Driver::Sqlite, table_name: Some("categories".into()), rows_per_insert: 10, ..Default::default() },
+        &ExportOptions {
+            format: ExportFormat::SqlInsert,
+            dialect: Driver::Sqlite,
+            table_name: Some("categories".into()),
+            rows_per_insert: 10,
+            ..Default::default()
+        },
         &mut buf,
     )
     .await
     .unwrap();
-    assert_eq!(String::from_utf8(buf).unwrap(), "insert into \"categories\" (\"id\", \"name\") values (1, 'Books'),\n    (2, 'Garden');\n");
+    assert_eq!(
+        String::from_utf8(buf).unwrap(),
+        "insert into \"categories\" (\"id\", \"name\") values (1, 'Books'),\n    (2, 'Garden');\n"
+    );
 }
 
 #[tokio::test]
 async fn read_only_and_reconnect() {
     let (dir, cfg, mgr) = setup().await;
-    let ro = DataSourceConfig { id: "lite-ro".into(), read_only: true, options: Default::default(), ..cfg.clone() };
+    let ro = DataSourceConfig {
+        id: "lite-ro".into(),
+        read_only: true,
+        options: Default::default(),
+        ..cfg.clone()
+    };
     mgr.connect(&ro).await.unwrap();
     let s = mgr.open_session("lite-ro").await.unwrap();
-    assert_eq!(scalar(&run(&mgr, &s, "select count(*) from categories").await), json!(2));
+    assert_eq!(
+        scalar(&run(&mgr, &s, "select count(*) from categories").await),
+        json!(2)
+    );
     let ev = run(&mgr, &s, "insert into categories (name) values ('x')").await;
     assert!(errors(&ev)[0].contains("readonly"), "{:?}", errors(&ev));
     mgr.disconnect("lite-ro").await;
@@ -415,21 +831,37 @@ async fn multi_result_set_export_does_not_panic() {
     let (_d, _cfg, mgr) = setup().await;
     let m2 = mgr.clone();
     let r = tokio::spawn(async move {
-        m2.export_query("lite", "select 1 as a; select 1 as a, 2 as b", &ExportOptions::default(), Vec::<u8>::new()).await
+        m2.export_query(
+            "lite",
+            "select 1 as a; select 1 as a, 2 as b",
+            &ExportOptions::default(),
+            Vec::<u8>::new(),
+        )
+        .await
     })
     .await;
     // must not panic (a JoinError would mean the task panicked); the rows are exported
     let out = r.expect("export task panicked");
     assert!(out.is_ok(), "{out:?}");
     let mut buf = Vec::new();
-    let o = ExportOptions { format: ExportFormat::Json, ..Default::default() };
-    mgr.export_query("lite", "select 1 as a; select 1 as a, 2 as b", &o, &mut buf).await.unwrap();
+    let o = ExportOptions {
+        format: ExportFormat::Json,
+        ..Default::default()
+    };
+    mgr.export_query("lite", "select 1 as a; select 1 as a, 2 as b", &o, &mut buf)
+        .await
+        .unwrap();
     let v: Value = serde_json::from_slice(&buf).unwrap();
     // rows of a later result set with other columns are skipped, equally shaped ones appended
     assert_eq!(v, json!([{"a": 1}]));
     let mut buf = Vec::new();
-    mgr.export_query("lite", "select 1 as a; select 2 as a", &o, &mut buf).await.unwrap();
-    assert_eq!(serde_json::from_slice::<Value>(&buf).unwrap(), json!([{"a": 1}, {"a": 2}]));
+    mgr.export_query("lite", "select 1 as a; select 2 as a", &o, &mut buf)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&buf).unwrap(),
+        json!([{"a": 1}, {"a": 2}])
+    );
 }
 
 /// Defect 3: a statement separator in the where / order by fragment is rejected.
@@ -437,19 +869,40 @@ async fn multi_result_set_export_does_not_panic() {
 async fn table_data_rejects_statement_separators() {
     let (_d, _cfg, mgr) = setup().await;
     let t = ObjectRef::table(Some("main"), "categories");
-    for (w, o) in [("1=1; select 1,2,3", None), ("1=1;", None), ("1=1", Some("id; drop table audit"))] {
-        let req = TableDataRequest { where_clause: Some(w.into()), order_by: o.map(String::from), ..Default::default() };
+    for (w, o) in [
+        ("1=1; select 1,2,3", None),
+        ("1=1;", None),
+        ("1=1", Some("id; drop table audit")),
+    ] {
+        let req = TableDataRequest {
+            where_clause: Some(w.into()),
+            order_by: o.map(String::from),
+            ..Default::default()
+        };
         let err = mgr.table_data("lite", &t, &req).await.unwrap_err();
         assert!(err.to_string().contains("statement separator"), "{err}");
     }
     // a ';' inside quotes is fine
-    let req = TableDataRequest { where_clause: Some("name <> 'a;b'".into()), ..Default::default() };
-    assert_eq!(mgr.table_data("lite", &t, &req).await.unwrap().rows.len(), 2);
+    let req = TableDataRequest {
+        where_clause: Some("name <> 'a;b'".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        mgr.table_data("lite", &t, &req).await.unwrap().rows.len(),
+        2
+    );
 }
 
 async fn nopk_setup(mgr: &ConnectionManager) {
     let s = mgr.open_session("lite").await.unwrap();
-    assert_ok(&run(mgr, &s, "create table nopk (a int, b text); insert into nopk values (1,'x'),(1,'x'),(2,'y')").await);
+    assert_ok(
+        &run(
+            mgr,
+            &s,
+            "create table nopk (a int, b text); insert into nopk values (1,'x'),(1,'x'),(2,'y')",
+        )
+        .await,
+    );
     mgr.close_session(&s).await;
 }
 
@@ -459,26 +912,82 @@ async fn nopk_rows_are_addressed_by_rowid_locator() {
     let (_d, _cfg, mgr) = setup().await;
     nopk_setup(&mgr).await;
     let t = ObjectRef::table(Some("main"), "nopk");
-    let rs = mgr.table_data("lite", &t, &TableDataRequest { order_by: Some("rowid".into()), ..Default::default() }).await.unwrap();
-    let loc = rs.row_locators.clone().expect("row locators for a table without PK");
+    let rs = mgr
+        .table_data(
+            "lite",
+            &t,
+            &TableDataRequest {
+                order_by: Some("rowid".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let loc = rs
+        .row_locators
+        .clone()
+        .expect("row locators for a table without PK");
     assert_eq!(loc.len(), rs.rows.len());
     assert_eq!(rs.columns.len(), 2, "the locator is not a column");
     assert!(rs.rows.iter().all(|r| r.len() == 2));
     // a table with a PK gets none
-    let rs_pk = mgr.table_data("lite", &ObjectRef::table(Some("main"), "categories"), &TableDataRequest::default()).await.unwrap();
+    let rs_pk = mgr
+        .table_data(
+            "lite",
+            &ObjectRef::table(Some("main"), "categories"),
+            &TableDataRequest::default(),
+        )
+        .await
+        .unwrap();
     assert!(rs_pk.row_locators.is_none());
 
-    let mut upd = change(ChangeKind::Update, json!({"a": 1, "b": "x"}), json!({"b": "changed"}));
+    let mut upd = change(
+        ChangeKind::Update,
+        json!({"a": 1, "b": "x"}),
+        json!({"b": "changed"}),
+    );
     upd.row_locator = Some(loc[1].clone());
     let r = mgr.apply_changes("lite", &t, &[upd]).await.unwrap();
     assert!(r.committed, "{r:?}");
-    let rs = mgr.table_data("lite", &t, &TableDataRequest { order_by: Some("rowid".into()), ..Default::default() }).await.unwrap();
-    assert_eq!(rs.rows, vec![vec![json!(1), json!("x")], vec![json!(1), json!("changed")], vec![json!(2), json!("y")]]);
+    let rs = mgr
+        .table_data(
+            "lite",
+            &t,
+            &TableDataRequest {
+                order_by: Some("rowid".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rs.rows,
+        vec![
+            vec![json!(1), json!("x")],
+            vec![json!(1), json!("changed")],
+            vec![json!(2), json!("y")]
+        ]
+    );
 
     let mut del = change(ChangeKind::Delete, json!({"a": 1, "b": "x"}), json!({}));
     del.row_locator = Some(loc[0].clone());
-    assert!(mgr.apply_changes("lite", &t, &[del]).await.unwrap().committed);
-    let rs = mgr.table_data("lite", &t, &TableDataRequest { order_by: Some("rowid".into()), ..Default::default() }).await.unwrap();
+    assert!(
+        mgr.apply_changes("lite", &t, &[del])
+            .await
+            .unwrap()
+            .committed
+    );
+    let rs = mgr
+        .table_data(
+            "lite",
+            &t,
+            &TableDataRequest {
+                order_by: Some("rowid".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(rs.rows.len(), 2);
 }
 
@@ -488,9 +997,23 @@ async fn nopk_duplicates_without_locator_touch_one_row() {
     let (_d, _cfg, mgr) = setup().await;
     nopk_setup(&mgr).await;
     let t = ObjectRef::table(Some("main"), "nopk");
-    let r = mgr.apply_changes("lite", &t, &[change(ChangeKind::Delete, json!({"a": 1, "b": "x"}), json!({}))]).await.unwrap();
+    let r = mgr
+        .apply_changes(
+            "lite",
+            &t,
+            &[change(
+                ChangeKind::Delete,
+                json!({"a": 1, "b": "x"}),
+                json!({}),
+            )],
+        )
+        .await
+        .unwrap();
     assert!(r.committed && r.results[0].rows_affected == 1, "{r:?}");
-    let rs = mgr.table_data("lite", &t, &TableDataRequest::default()).await.unwrap();
+    let rs = mgr
+        .table_data("lite", &t, &TableDataRequest::default())
+        .await
+        .unwrap();
     assert_eq!(rs.rows.len(), 2);
 }
 
@@ -507,7 +1030,11 @@ async fn unexpected_update_count_rolls_back() {
             "lite",
             &t,
             &[
-                change(ChangeKind::Insert, json!({}), json!({"k": "new", "v": "rolled back"})),
+                change(
+                    ChangeKind::Insert,
+                    json!({}),
+                    json!({"k": "new", "v": "rolled back"}),
+                ),
                 change(ChangeKind::Update, json!({"k": null}), json!({"v": "z"})),
             ],
         )
@@ -516,20 +1043,49 @@ async fn unexpected_update_count_rolls_back() {
     assert!(!r.committed && r.applied == 0, "{r:?}");
     let e = r.first_error().unwrap();
     assert_eq!(e.index, 1);
-    assert!(e.error.as_deref().unwrap().contains("Unexpected update count: 2"), "{e:?}");
-    assert_eq!(scalar(&run(&mgr, &s, "select count(*) from nullpk where k = 'new' or v = 'z'").await), json!(0));
+    assert!(
+        e.error
+            .as_deref()
+            .unwrap()
+            .contains("Unexpected update count: 2"),
+        "{e:?}"
+    );
+    assert_eq!(
+        scalar(
+            &run(
+                &mgr,
+                &s,
+                "select count(*) from nullpk where k = 'new' or v = 'z'"
+            )
+            .await
+        ),
+        json!(0)
+    );
     // a locator that matches nothing: nothing is applied either
     let t = ObjectRef::table(Some("main"), "nopk_none");
     assert_ok(&run(&mgr, &s, "create table nopk_none (a int)").await);
     let mut bad = change(ChangeKind::Delete, json!({}), json!({}));
     bad.row_locator = Some(json!(987654));
     let r = mgr
-        .apply_changes("lite", &t, &[change(ChangeKind::Insert, json!({}), json!({"a": 10})), bad])
+        .apply_changes(
+            "lite",
+            &t,
+            &[change(ChangeKind::Insert, json!({}), json!({"a": 10})), bad],
+        )
         .await
         .unwrap();
     assert!(!r.committed && r.applied == 0, "{r:?}");
-    assert!(r.first_error().unwrap().error.as_deref().unwrap().contains("No row matched"));
-    assert_eq!(scalar(&run(&mgr, &s, "select count(*) from nopk_none").await), json!(0));
+    assert!(r
+        .first_error()
+        .unwrap()
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("No row matched"));
+    assert_eq!(
+        scalar(&run(&mgr, &s, "select count(*) from nopk_none").await),
+        json!(0)
+    );
     mgr.close_session(&s).await;
 }
 
@@ -538,14 +1094,26 @@ async fn unexpected_update_count_rolls_back() {
 async fn no_busy_right_after_done() {
     let (_d, _cfg, mgr) = setup().await;
     let s = mgr.open_session("lite").await.unwrap();
-    let opts = ExecOptions { max_rows: 1, ..Default::default() };
+    let opts = ExecOptions {
+        max_rows: 1,
+        ..Default::default()
+    };
     for i in 0..100 {
         // paged result left open, then a plain statement, then a one-shot statement
-        let mut h = mgr.execute(&s, "select n from nums", opts.clone()).await.unwrap_or_else(|e| panic!("run {i}: {e}"));
+        let mut h = mgr
+            .execute(&s, "select n from nums", opts.clone())
+            .await
+            .unwrap_or_else(|e| panic!("run {i}: {e}"));
         wait_done(&mut h).await;
-        let mut h = mgr.execute(&s, "select 1", opts.clone()).await.unwrap_or_else(|e| panic!("run {i}b: {e}"));
+        let mut h = mgr
+            .execute(&s, "select 1", opts.clone())
+            .await
+            .unwrap_or_else(|e| panic!("run {i}b: {e}"));
         wait_done(&mut h).await;
-        let mut h = mgr.execute(&s, "select 2", opts.clone()).await.unwrap_or_else(|e| panic!("run {i}c: {e}"));
+        let mut h = mgr
+            .execute(&s, "select 2", opts.clone())
+            .await
+            .unwrap_or_else(|e| panic!("run {i}c: {e}"));
         wait_done(&mut h).await;
     }
     mgr.close_session(&s).await;
@@ -556,7 +1124,17 @@ async fn no_busy_right_after_done() {
 async fn new_execution_closes_previous_open_result() {
     let (_d, _cfg, mgr) = setup().await;
     let s = mgr.open_session("lite").await.unwrap();
-    let mut h1 = mgr.execute(&s, "select n from nums", ExecOptions { max_rows: 5, ..Default::default() }).await.unwrap();
+    let mut h1 = mgr
+        .execute(
+            &s,
+            "select n from nums",
+            ExecOptions {
+                max_rows: 5,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     wait_done(&mut h1).await;
     assert_eq!(mgr.fetch_more(&h1.id, 0, 3).await.unwrap().rows.len(), 3);
     assert_eq!(scalar(&run(&mgr, &s, "select 1").await), json!(1));
@@ -570,7 +1148,18 @@ async fn new_execution_closes_previous_open_result() {
 async fn idle_open_result_is_closed_after_timeout() {
     let (_d, _cfg, mgr) = setup().await;
     let s = mgr.open_session("lite").await.unwrap();
-    let mut h = mgr.execute(&s, "select n from nums", ExecOptions { max_rows: 5, keep_open_secs: 1, ..Default::default() }).await.unwrap();
+    let mut h = mgr
+        .execute(
+            &s,
+            "select n from nums",
+            ExecOptions {
+                max_rows: 5,
+                keep_open_secs: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     wait_done(&mut h).await;
     // activity inside the window keeps it open
     tokio::time::sleep(Duration::from_millis(600)).await;
@@ -584,7 +1173,18 @@ async fn idle_open_result_is_closed_after_timeout() {
     // the session is usable again
     assert_eq!(scalar(&run(&mgr, &s, "select 7").await), json!(7));
     // keep_open_secs = 0 disables the timeout
-    let mut h = mgr.execute(&s, "select n from nums", ExecOptions { max_rows: 5, keep_open_secs: 0, ..Default::default() }).await.unwrap();
+    let mut h = mgr
+        .execute(
+            &s,
+            "select n from nums",
+            ExecOptions {
+                max_rows: 5,
+                keep_open_secs: 0,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     wait_done(&mut h).await;
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(mgr.fetch_more(&h.id, 0, 3).await.unwrap().rows.len(), 3);
@@ -595,34 +1195,68 @@ async fn idle_open_result_is_closed_after_timeout() {
 #[tokio::test]
 async fn memory_database_is_shared_per_data_source() {
     let mgr = ConnectionManager::new();
-    let cfg = DataSourceConfig { id: "m".into(), driver: Driver::Sqlite, file: ":memory:".into(), ..Default::default() };
+    let cfg = DataSourceConfig {
+        id: "m".into(),
+        driver: Driver::Sqlite,
+        file: ":memory:".into(),
+        ..Default::default()
+    };
     mgr.connect(&cfg).await.unwrap();
     let s = mgr.open_session("m").await.unwrap();
     assert_ok(&run(&mgr, &s, "create table t(a int); insert into t values (1)").await);
-    let rs = mgr.table_data("m", &ObjectRef::table(Some("main"), "t"), &TableDataRequest::default()).await.unwrap();
+    let rs = mgr
+        .table_data(
+            "m",
+            &ObjectRef::table(Some("main"), "t"),
+            &TableDataRequest::default(),
+        )
+        .await
+        .unwrap();
     assert_eq!(rs.rows, vec![vec![json!(1)]]);
     let s2 = mgr.open_session("m").await.unwrap();
-    assert_eq!(scalar(&run(&mgr, &s2, "select count(*) from t").await), json!(1));
+    assert_eq!(
+        scalar(&run(&mgr, &s2, "select count(*) from t").await),
+        json!(1)
+    );
     // closing every session keeps the database alive
     mgr.close_session(&s).await;
     mgr.close_session(&s2).await;
     let s3 = mgr.open_session("m").await.unwrap();
-    assert_eq!(scalar(&run(&mgr, &s3, "select count(*) from t").await), json!(1));
+    assert_eq!(
+        scalar(&run(&mgr, &s3, "select count(*) from t").await),
+        json!(1)
+    );
     // editing through the pool is visible to the console
-    let r = mgr.apply_changes("m", &ObjectRef::table(Some("main"), "t"), &[change(ChangeKind::Insert, json!({}), json!({"a": 2}))]).await.unwrap();
+    let r = mgr
+        .apply_changes(
+            "m",
+            &ObjectRef::table(Some("main"), "t"),
+            &[change(ChangeKind::Insert, json!({}), json!({"a": 2}))],
+        )
+        .await
+        .unwrap();
     assert!(r.committed, "{r:?}");
-    assert_eq!(scalar(&run(&mgr, &s3, "select count(*) from t").await), json!(2));
+    assert_eq!(
+        scalar(&run(&mgr, &s3, "select count(*) from t").await),
+        json!(2)
+    );
 
     // another data source has its own database, even in another manager with the same id
     let other = ConnectionManager::new();
     other.connect(&cfg).await.unwrap();
     let o = other.open_session("m").await.unwrap();
-    assert_eq!(scalar(&run(&other, &o, "select count(*) from sqlite_master").await), json!(0));
+    assert_eq!(
+        scalar(&run(&other, &o, "select count(*) from sqlite_master").await),
+        json!(0)
+    );
     // disconnect + connect gives a fresh database
     mgr.disconnect("m").await;
     mgr.connect(&cfg).await.unwrap();
     let s4 = mgr.open_session("m").await.unwrap();
-    assert_eq!(scalar(&run(&mgr, &s4, "select count(*) from sqlite_master").await), json!(0));
+    assert_eq!(
+        scalar(&run(&mgr, &s4, "select count(*) from sqlite_master").await),
+        json!(0)
+    );
 }
 
 /// The transaction state is read from the connection (`sqlite3_get_autocommit`), events report changes and ends.
@@ -649,8 +1283,17 @@ async fn transaction_status_events_and_init_sql() {
     mgr.close_session(&s).await;
 
     // init_sql
-    let s = mgr.open_session_with("lite", &["pragma foreign_keys = off".to_string()]).await.unwrap();
-    assert_eq!(scalar(&run(&mgr, &s, "pragma foreign_keys").await), json!(0));
+    let s = mgr
+        .open_session_with("lite", &["pragma foreign_keys = off".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(
+        scalar(&run(&mgr, &s, "pragma foreign_keys").await),
+        json!(0)
+    );
     mgr.close_session(&s).await;
-    assert!(mgr.open_session_with("lite", &["select * from nope_nope".to_string()]).await.is_err());
+    assert!(mgr
+        .open_session_with("lite", &["select * from nope_nope".to_string()])
+        .await
+        .is_err());
 }

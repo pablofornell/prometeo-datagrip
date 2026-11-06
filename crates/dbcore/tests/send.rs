@@ -6,7 +6,12 @@ use dbcore::*;
 fn is_send<T: Send>(_: T) {}
 
 #[allow(dead_code)]
-fn all_futures_are_send(m: &ConnectionManager, cfg: &DataSourceConfig, sid: &SessionId, eid: &ExecutionId) {
+fn all_futures_are_send(
+    m: &ConnectionManager,
+    cfg: &DataSourceConfig,
+    sid: &SessionId,
+    eid: &ExecutionId,
+) {
     let obj = ObjectRef::table(Some("s"), "t");
     is_send(m.test_connection(cfg));
     is_send(m.connect(cfg));

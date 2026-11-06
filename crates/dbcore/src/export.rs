@@ -63,7 +63,9 @@ fn cell_text(c: &Cell, null: &str) -> String {
         Value::String(s) => s.clone(),
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
-        Value::Object(m) if m.contains_key("$bin") => format!("0x{}", m["$bin"].as_str().unwrap_or("")),
+        Value::Object(m) if m.contains_key("$bin") => {
+            format!("0x{}", m["$bin"].as_str().unwrap_or(""))
+        }
         other => other.to_string(),
     }
 }
@@ -81,12 +83,17 @@ fn pg_array_element(c: &Cell) -> String {
     let quote = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
     match c {
         Value::Null => "NULL".into(),
-        Value::Array(a) => format!("{{{}}}", a.iter().map(pg_array_element).collect::<Vec<_>>().join(",")),
+        Value::Array(a) => format!(
+            "{{{}}}",
+            a.iter().map(pg_array_element).collect::<Vec<_>>().join(",")
+        ),
         Value::Bool(b) => if *b { "true" } else { "false" }.into(),
         Value::Number(n) => n.to_string(),
         Value::String(s) => quote(s),
         // bytea element: hex input form
-        Value::Object(m) if m.contains_key("$bin") => quote(&format!("\\x{}", m["$bin"].as_str().unwrap_or(""))),
+        Value::Object(m) if m.contains_key("$bin") => {
+            quote(&format!("\\x{}", m["$bin"].as_str().unwrap_or("")))
+        }
         other => quote(&other.to_string()),
     }
 }
@@ -125,7 +132,14 @@ pub struct Exporter<W: Write> {
 
 impl<W: Write> Exporter<W> {
     pub fn new(w: W, opts: ExportOptions) -> Self {
-        Exporter { w, o: opts, cols: Vec::new(), rows: 0, began: false, batch: Vec::new() }
+        Exporter {
+            w,
+            o: opts,
+            cols: Vec::new(),
+            rows: 0,
+            began: false,
+            batch: Vec::new(),
+        }
     }
 
     fn delim(&self) -> char {
@@ -146,16 +160,28 @@ impl<W: Write> Exporter<W> {
     }
 
     fn tsv_field(s: &str) -> String {
-        s.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n").replace('\r', "\\r")
+        s.replace('\\', "\\\\")
+            .replace('\t', "\\t")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
     }
 
     fn md_field(s: &str) -> String {
-        s.replace('|', "\\|").replace('\r', "").replace('\n', "<br>")
+        s.replace('|', "\\|")
+            .replace('\r', "")
+            .replace('\n', "<br>")
     }
 
     fn table(&self) -> String {
-        let name = self.o.table_name.clone().unwrap_or_else(|| "table_name".into());
-        name.split('.').map(|p| quote_ident(self.o.dialect, p)).collect::<Vec<_>>().join(".")
+        let name = self
+            .o
+            .table_name
+            .clone()
+            .unwrap_or_else(|| "table_name".into());
+        name.split('.')
+            .map(|p| quote_ident(self.o.dialect, p))
+            .collect::<Vec<_>>()
+            .join(".")
     }
 
     pub fn begin(&mut self, columns: &[ColumnMeta]) -> io::Result<()> {
@@ -167,7 +193,13 @@ impl<W: Write> Exporter<W> {
                     let line: Vec<String> = self
                         .cols
                         .iter()
-                        .map(|c| if self.o.format == ExportFormat::Tsv { Self::tsv_field(c) } else { self.csv_field(c) })
+                        .map(|c| {
+                            if self.o.format == ExportFormat::Tsv {
+                                Self::tsv_field(c)
+                            } else {
+                                self.csv_field(c)
+                            }
+                        })
                         .collect();
                     writeln!(self.w, "{}", line.join(&self.delim().to_string()))?;
                 }
@@ -176,7 +208,15 @@ impl<W: Write> Exporter<W> {
             ExportFormat::Markdown => {
                 let head: Vec<String> = self.cols.iter().map(|c| Self::md_field(c)).collect();
                 writeln!(self.w, "| {} |", head.join(" | "))?;
-                writeln!(self.w, "|{}|", self.cols.iter().map(|_| " --- ").collect::<Vec<_>>().join("|"))?;
+                writeln!(
+                    self.w,
+                    "|{}|",
+                    self.cols
+                        .iter()
+                        .map(|_| " --- ")
+                        .collect::<Vec<_>>()
+                        .join("|")
+                )?;
             }
             ExportFormat::SqlInsert => {}
         }
@@ -186,24 +226,40 @@ impl<W: Write> Exporter<W> {
     pub fn row(&mut self, row: &[Cell]) -> io::Result<()> {
         match self.o.format {
             ExportFormat::Csv => {
-                let line: Vec<String> = row.iter().map(|c| self.csv_field(&cell_text(c, &self.o.null_text))).collect();
+                let line: Vec<String> = row
+                    .iter()
+                    .map(|c| self.csv_field(&cell_text(c, &self.o.null_text)))
+                    .collect();
                 writeln!(self.w, "{}", line.join(&self.delim().to_string()))?;
             }
             ExportFormat::Tsv => {
                 let line: Vec<String> = row
                     .iter()
-                    .map(|c| if c.is_null() { self.o.null_text.clone() } else { Self::tsv_field(&cell_text(c, "")) })
+                    .map(|c| {
+                        if c.is_null() {
+                            self.o.null_text.clone()
+                        } else {
+                            Self::tsv_field(&cell_text(c, ""))
+                        }
+                    })
                     .collect();
                 writeln!(self.w, "{}", line.join("\t"))?;
             }
             ExportFormat::Markdown => {
-                let line: Vec<String> = row.iter().map(|c| Self::md_field(&cell_text(c, &self.o.null_text))).collect();
+                let line: Vec<String> = row
+                    .iter()
+                    .map(|c| Self::md_field(&cell_text(c, &self.o.null_text)))
+                    .collect();
                 writeln!(self.w, "| {} |", line.join(" | "))?;
             }
             ExportFormat::Json => {
                 let mut obj = serde_json::Map::new();
                 for (i, c) in row.iter().enumerate() {
-                    let mut key = self.cols.get(i).cloned().unwrap_or_else(|| format!("column{i}"));
+                    let mut key = self
+                        .cols
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("column{i}"));
                     while obj.contains_key(&key) {
                         key.push('_');
                     }
@@ -213,7 +269,8 @@ impl<W: Write> Exporter<W> {
                 serde_json::to_writer(&mut self.w, &Value::Object(obj))?;
             }
             ExportFormat::SqlInsert => {
-                let vals: Vec<String> = row.iter().map(|c| sql_literal(self.o.dialect, c)).collect();
+                let vals: Vec<String> =
+                    row.iter().map(|c| sql_literal(self.o.dialect, c)).collect();
                 self.batch.push(format!("({})", vals.join(", ")));
                 if self.batch.len() >= self.o.rows_per_insert.max(1) {
                     self.flush_batch()?;
@@ -228,8 +285,18 @@ impl<W: Write> Exporter<W> {
         if self.batch.is_empty() {
             return Ok(());
         }
-        let cols: Vec<String> = self.cols.iter().map(|c| quote_ident(self.o.dialect, c)).collect();
-        writeln!(self.w, "insert into {} ({}) values {};", self.table(), cols.join(", "), self.batch.join(",\n    "))?;
+        let cols: Vec<String> = self
+            .cols
+            .iter()
+            .map(|c| quote_ident(self.o.dialect, c))
+            .collect();
+        writeln!(
+            self.w,
+            "insert into {} ({}) values {};",
+            self.table(),
+            cols.join(", "),
+            self.batch.join(",\n    ")
+        )?;
         self.batch.clear();
         Ok(())
     }
@@ -274,7 +341,13 @@ impl ConnectionManager {
     /// size, binary values in full) into `w`. Returns the number of rows written. When the
     /// call produces several result sets, rows of those with a different column list than
     /// the first are skipped.
-    pub async fn export_query<W: Write + Send>(&self, ds_id: &str, sql: &str, opts: &ExportOptions, w: W) -> Result<usize> {
+    pub async fn export_query<W: Write + Send>(
+        &self,
+        ds_id: &str,
+        sql: &str,
+        opts: &ExportOptions,
+        w: W,
+    ) -> Result<usize> {
         let live = self.live(ds_id)?;
         let mut e = Exporter::new(w, opts.clone());
         let cols = query_pool(&live, sql, usize::MAX, |cols, row| {
@@ -304,11 +377,21 @@ mod tests {
     use serde_json::json;
 
     fn rs() -> ResultSet {
-        let col = |n: &str| ColumnMeta { name: n.into(), type_name: "text".into(), nullable: true, is_pk: false, table_ref: None };
+        let col = |n: &str| ColumnMeta {
+            name: n.into(),
+            type_name: "text".into(),
+            nullable: true,
+            is_pk: false,
+            table_ref: None,
+        };
         ResultSet {
             columns: vec![col("id"), col("name"), col("data")],
             rows: vec![
-                vec![json!(1), json!("a,b \"q\""), json!({"$bin": "ff00", "len": 2})],
+                vec![
+                    json!(1),
+                    json!("a,b \"q\""),
+                    json!({"$bin": "ff00", "len": 2}),
+                ],
                 vec![json!(2), Value::Null, json!(true)],
                 vec![json!("9007199254740993"), json!("l1\nl2|x"), json!([1, 2])],
             ],
@@ -319,7 +402,10 @@ mod tests {
     }
 
     fn run(f: ExportFormat, tweak: impl FnOnce(&mut ExportOptions)) -> String {
-        let mut o = ExportOptions { format: f, ..Default::default() };
+        let mut o = ExportOptions {
+            format: f,
+            ..Default::default()
+        };
         tweak(&mut o);
         export_to_string(&rs(), &o).unwrap()
     }
@@ -333,7 +419,10 @@ mod tests {
             o.header = false;
             o.null_text = "NULL".into();
         });
-        assert!(out.starts_with("1;a,b \"\"q\"\" ") || out.starts_with("1;\"a,b"), "{out}");
+        assert!(
+            out.starts_with("1;a,b \"\"q\"\" ") || out.starts_with("1;\"a,b"),
+            "{out}"
+        );
         assert!(out.contains("2;NULL;true"));
     }
 
@@ -351,10 +440,20 @@ mod tests {
     fn json() {
         let out = run(ExportFormat::Json, |_| {});
         let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v[0], json!({"id": 1, "name": "a,b \"q\"", "data": "0xff00"}));
+        assert_eq!(
+            v[0],
+            json!({"id": 1, "name": "a,b \"q\"", "data": "0xff00"})
+        );
         assert_eq!(v[1]["name"], Value::Null);
         assert_eq!(v.as_array().unwrap().len(), 3);
-        let empty = export_to_string(&ResultSet::default(), &ExportOptions { format: ExportFormat::Json, ..Default::default() }).unwrap();
+        let empty = export_to_string(
+            &ResultSet::default(),
+            &ExportOptions {
+                format: ExportFormat::Json,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(serde_json::from_str::<Value>(&empty).unwrap(), json!([]));
     }
 
@@ -366,15 +465,31 @@ mod tests {
         assert_eq!(lit(json!([1, null, "a"])), "'{1,NULL,\"a\"}'");
         assert_eq!(lit(json!([[1, 2], [3, 4]])), "'{{1,2},{3,4}}'");
         assert_eq!(lit(json!([true, false])), "'{true,false}'");
-        assert_eq!(lit(json!(["", "NULL", "x,y", "{b}", "q\"t", "back\\slash", "it's"])), "E'{\"\",\"NULL\",\"x,y\",\"{b}\",\"q\\\\\"t\",\"back\\\\\\\\slash\",\"it''s\"}'");
-        assert_eq!(lit(json!([{"$bin": "00ff", "len": 2}, null])), r#"E'{"\\\\x00ff",NULL}'"#);
+        assert_eq!(
+            lit(json!([
+                "",
+                "NULL",
+                "x,y",
+                "{b}",
+                "q\"t",
+                "back\\slash",
+                "it's"
+            ])),
+            "E'{\"\",\"NULL\",\"x,y\",\"{b}\",\"q\\\\\"t\",\"back\\\\\\\\slash\",\"it''s\"}'"
+        );
+        assert_eq!(
+            lit(json!([{"$bin": "00ff", "len": 2}, null])),
+            r#"E'{"\\\\x00ff",NULL}'"#
+        );
         // other dialects have no array type: JSON text as before
         assert_eq!(sql_literal(Driver::MySql, &json!([1, 2])), "'[1,2]'");
     }
 
     #[test]
     fn sql_insert() {
-        let out = run(ExportFormat::SqlInsert, |o| o.table_name = Some("public.t".into()));
+        let out = run(ExportFormat::SqlInsert, |o| {
+            o.table_name = Some("public.t".into())
+        });
         let first = out.lines().next().unwrap();
         assert_eq!(first, "insert into \"public\".\"t\" (\"id\", \"name\", \"data\") values (1, 'a,b \"q\"', '\\xff00'::bytea);");
         assert!(out.contains("(2, NULL, true)"));

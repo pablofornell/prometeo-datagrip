@@ -114,7 +114,12 @@ impl ObjectRef {
 
     /// Build a reference from a tree node produced by `introspect`.
     pub fn from_node(node: &TreeNode) -> ObjectRef {
-        let s = |k: &str| node.extra.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        let s = |k: &str| {
+            node.extra
+                .get(k)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
         ObjectRef {
             schema: s("schema"),
             name: node.name.clone(),
@@ -248,7 +253,11 @@ fn default_keep_open_secs() -> u64 {
 
 impl Default for ExecOptions {
     fn default() -> Self {
-        ExecOptions { max_rows: 500, stop_on_error: true, keep_open_secs: default_keep_open_secs() }
+        ExecOptions {
+            max_rows: 500,
+            stop_on_error: true,
+            keep_open_secs: default_keep_open_secs(),
+        }
     }
 }
 
@@ -303,13 +312,29 @@ pub struct SessionState {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum ExecEvent {
     /// A statement is about to run (use `range` to highlight it in the editor).
-    Statement { index: usize, sql: String, range: StatementRange },
+    Statement {
+        index: usize,
+        sql: String,
+        range: StatementRange,
+    },
     #[serde(rename = "resultset")]
-    ResultSet { index: usize, columns: Vec<ColumnMeta>, rows: Vec<Vec<Cell>>, has_more: bool },
-    Update { index: usize, rows_affected: u64 },
+    ResultSet {
+        index: usize,
+        columns: Vec<ColumnMeta>,
+        rows: Vec<Vec<Cell>>,
+        has_more: bool,
+    },
+    Update {
+        index: usize,
+        rows_affected: u64,
+    },
     /// `position` is the 1-based offset inside the statement **in Unicode code points** (PG reports
     /// it that way); `position_utf16` is the same place as a 1-based offset in UTF-16 code units
     /// (what JS strings / CodeMirror count), computed against the statement text that was sent.
@@ -317,19 +342,38 @@ pub enum ExecEvent {
     ///
     /// `connection_lost` is true when the statement failed because the connection is gone (message starts
     /// with `[08006]`, or `[08S01]` on MySQL); the session is then dead, see `ConnectionManager::session_state`.
-    Error { index: usize, message: String, position: Option<usize>, position_utf16: Option<usize>, connection_lost: bool },
-    Message { index: Option<usize>, text: String },
+    Error {
+        index: usize,
+        message: String,
+        position: Option<usize>,
+        position_utf16: Option<usize>,
+        connection_lost: bool,
+    },
+    Message {
+        index: Option<usize>,
+        text: String,
+    },
     /// The transaction state of the session changed (sent right after the statement that changed
     /// it, before `Done`). Also see `ConnectionManager::session_tx_status`.
-    TxStatus { status: TxStatus },
+    TxStatus {
+        status: TxStatus,
+    },
     /// A `COMMIT` / `ROLLBACK` / `END` / `ABORT` statement finished, or MySQL committed implicitly.
     /// `committed == false` for a `COMMIT` of a failed PostgreSQL transaction: the server rolled
     /// it back (command tag `ROLLBACK`) without reporting an error. `tag` is the command tag:
     /// `COMMIT`, `ROLLBACK` or `IMPLICIT COMMIT` (MySQL DDL & co. ended the transaction), or
     /// `CONNECTION LOST` (`committed == false`: the connection died with the transaction open, so the
     /// server rolled it back).
-    TxEnded { index: usize, committed: bool, tag: String },
-    Done { elapsed_ms: u64, execution_ms: u64, fetching_ms: u64 },
+    TxEnded {
+        index: usize,
+        committed: bool,
+        tag: String,
+    },
+    Done {
+        elapsed_ms: u64,
+        execution_ms: u64,
+        fetching_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
