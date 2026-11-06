@@ -32,3 +32,20 @@ cargo clippy -p prometeo-datagrip
 - `src-tauri/` Tauri app (commands, app state)
 - `crates/dbcore/` database core library (no Tauri dependency)
 - `src/` SolidJS UI (`api/` command wrappers, `styles/` shell CSS, `theme/` tokens)
+
+## Make targets
+
+Run `make help` to see all targets. The most used:
+
+| Target | What it does |
+|---|---|
+| `make install` | Install the frontend dependencies |
+| `make dev` | Run the app in development mode |
+| `make build` | Build the release binary (`target/release/prometeo-datagrip`) |
+| `make check` | Type-check, clippy and unit tests (no databases needed) |
+| `make db-up` | Start the PostgreSQL (54329) and MySQL (33069) test containers |
+| `make test-all` | All tests, including the database integration tests |
+| `make ci` | Lint, all tests and the frontend build |
+
+`make fmt-check` is not part of `check` or `ci` yet, because the Rust code is not rustfmt-formatted.
+Run `make fmt` once to format it.
