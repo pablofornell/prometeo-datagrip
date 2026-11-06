@@ -10,7 +10,7 @@
     <script>
       (function () {
         try {
-          var p = JSON.parse(localStorage.getItem("prometeo.ui.theme") || '"system"');
+          var p = JSON.parse(localStorage.getItem("prometeo.ui.theme") || '"dark"');
           var dark = p === "dark" || (p !== "light" && matchMedia("(prefers-color-scheme: dark)").matches);
           document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
         } catch (e) {}

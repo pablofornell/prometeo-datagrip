@@ -30,7 +30,9 @@ function infoLines(t: TestInfo): string[] {
 }
 
 function sslLine(t: TestInfo): string | null {
-  if (t.dbms === "sqlite" || !t.sslmode) return null;
+  if (t.dbms === "sqlite") return null;
+  if (t.ssl != null) return t.ssl ? "SSL: yes" : "SSL: no";
+  if (!t.sslmode) return null;
   if (/^(disable|disabled)$/.test(t.sslmode)) return "SSL: no";
   if (/^(require|required|verify)/.test(t.sslmode)) return "SSL: yes";
   return null;

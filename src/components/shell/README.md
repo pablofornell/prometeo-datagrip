@@ -64,7 +64,7 @@ handled (`preventDefault`) by a focused component (CodeMirror, Tree) is not disp
   Tool windows are declared in `TOOL_WINDOWS` (`explorer` Alt+1, `output` Alt+8).
 * `status.ts`: `setStatus({ path: [{label, icon}], caret: {line, col}, lineSeparator, encoding, readOnly, txMode, task })`
   feeds the status bar. Set `caret` from the editor, `path` from the explorer selection.
-* `theme.ts`: `theme()` ("dark"|"light"), `themePref()` ("system" default), `setThemePref()`; sets `<html data-theme>`.
+* `theme.ts`: `theme()` ("dark"|"light"), `themePref()` ("dark" default), `setThemePref()`; sets `<html data-theme>`.
 * `notify({ title, body, kind, actions })` (ui kit) shows a balloon bottom-right.
 
 ## 4. UI kit (`src/components/ui`, barrel `index.ts`)
@@ -74,7 +74,7 @@ handled (`preventDefault`) by a focused component (CodeMirror, Tree) is not disp
 `Button`, `TextField`, `Checkbox`, `ComboBox`, `Tabs` (`variant` editor | result | dialog), `Splitter`,
 `openMenu(items, { x, y } | { anchor })` (context menus, dropdowns, submenus, `title` + `compact` list popups),
 `tip(text, shortcut)` (tooltip attributes, delegated), `notify`, `Dialog`, `createSpeedSearch`/`Highlighted`,
-`Tree` (virtualized; `roots`, async `loadChildren`, `onActivate(item, "enter"|"f4"|"dblclick")`, `onContextMenu`,
+`Tree` (virtualized, speed search with the funnel filter mode (`controller.filterMode/setFilterMode`); `roots`, async `loadChildren`, `onActivate(item, "enter"|"f4"|"dblclick")`, `onContextMenu`,
 controller via `ref`: expand/collapse/expandAll/collapseAll/select/refresh/getExpanded).
 
 Dev only: `npm run dev` then open `/?demo=1&output` for demo tabs and status; `?notify` shows a balloon.

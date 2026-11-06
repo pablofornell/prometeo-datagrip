@@ -16,3 +16,4 @@ export type {
 } from "./types";
 export { splitStatements, statementAt, type Statement } from "./split";
 export { formatScript, formatStatement } from "./format";
+export { setCompletionExtrasProvider, type CompletionExtras, type ExtrasProvider, type ExtrasQuery } from "./extras";

@@ -17,10 +17,12 @@ import {
   tooltips,
 } from "@codemirror/view";
 import { type Component, createEffect, on, onCleanup, onMount } from "solid-js";
+import { getAction, isActionEnabled, runAction } from "../../state/actions";
 import { editorMetrics, settings } from "../../state/settings";
 import "./editor.css";
 import { duplicate, extendSelection, goToLine, moveLine, moveStatement, shiftTab, shrinkSelection, tabIndent, toggleBlock } from "./commands";
 import { sqlCompletion } from "./complete";
+import { completionExtras, withExtras } from "./extras";
 import { errorExtension } from "./errors";
 import { closeChooser, isChooserOpen, scriptRequest, selectionOrStatement, showChooser } from "./execute";
 import { formatScript } from "./format";
@@ -86,6 +88,13 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
 
   const emit = (req: ExecuteRequest): void => props.onExecute?.(req);
 
+  // `Customize` link of the statement chooser: the host's handler, else Settings > Database > Query Execution
+  // when the settings dialog is registered (no link otherwise: it would do nothing).
+  const customizeHandler = (): (() => void) | undefined => {
+    if (props.onCustomizeExecution) return props.onCustomizeExecution;
+    return isActionEnabled(getAction("app.settings")) ? () => void runAction("app.settings", "database.query-execution") : undefined;
+  };
+
   const execute: Command = (v) => {
     closeCompletion(v); // Ctrl+Enter does not accept the popup: leaving it open would hang over the running statement
     if (isChooserOpen(v)) return true;
@@ -96,7 +105,7 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
         v,
         r.candidates,
         (c) => emit({ sql: v.state.sliceDoc(c.range.from, c.range.to), ranges: [c.range], source: "statement" }),
-        props.onCustomizeExecution,
+        customizeHandler(),
       );
     } else emit(r.req);
     return true;
@@ -147,9 +156,13 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
     },
   };
 
+  // sequences / routines supplied by the host's extras provider (tracked: a late load re-configures the editor)
+  // Only editors whose host already supplies a schema ask: the provider may connect and introspect.
+  const extras = () => (props.schema ? completionExtras({ dialect: props.dialect, sourceLabel: props.sourceLabel }) : undefined);
+
   const configEffect = () => {
     const dialect = props.dialect;
-    const index = schemaIndexFor(props.schema, props.defaultSchema);
+    const index = schemaIndexFor(withExtras(props.schema, extras()), props.defaultSchema);
     const st = props.scopeTable;
     const table = st ? index.findTable([...(st.schema ? [st.schema.toLowerCase()] : []), st.name.toLowerCase()]) : undefined;
     return setConfig.of({
@@ -224,8 +237,10 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
         darkC.of(EditorView.darkTheme.of(isDark())),
         readOnlyC.of(EditorState.readOnly.of(!!props.readOnly)),
         drawSelection({ cursorBlinkRate: 1000 }),
-        // single line: the 30px host would clip the completion popup (WebKit) and scrollPastEnd would pad the line
-        ...(single ? [tooltips({ parent: document.body })] : [scrollPastEnd()]),
+        // Popups live on <body>: the editor host (30px single line, island overflow) would clip them, and they
+        // flip above the caret when there is no room below. scrollPastEnd would pad a single line.
+        tooltips({ parent: document.body }),
+        ...(single ? [] : [scrollPastEnd()]),
         previewFill,
         ...(single ? [] : [editorLayers(), highlightActiveLine(), indentGuides]),
         ...(single ? [stripNewlines, placeholder(props.placeholder ?? "")] : []),
@@ -277,7 +292,7 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
   );
   createEffect(
     on(
-      () => [props.dialect, props.schema, props.defaultSchema, props.sourceLabel, props.statementFrame, props.scopeTable?.name, props.scopeTable?.schema] as const,
+      () => [props.dialect, props.schema, extras(), props.defaultSchema, props.sourceLabel, props.statementFrame, props.scopeTable?.name, props.scopeTable?.schema] as const,
       () => view?.dispatch({ effects: configEffect() }),
       { defer: true },
     ),

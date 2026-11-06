@@ -18,6 +18,21 @@ const INITIAL_DELAY = 1200;
 const REUSE_DELAY = 80;
 const REUSE_WINDOW = 800;
 
+/**
+ * Native `title` attributes would show the WebView's own (black) tooltip: on first hover they are turned
+ * into `data-tip` so that every tooltip of the app looks like DataGrip's. `Text  Shortcut` (two spaces)
+ * becomes text + gray shortcut.
+ */
+function adoptTitle(t: Element | null): Element | null {
+  const title = t?.getAttribute("title");
+  if (!t || !title) return null;
+  t.removeAttribute("title");
+  const m = /^(.*\S) {2,}(\S.*)$/.exec(title);
+  (t as HTMLElement).dataset.tip = m && !title.includes("\n") ? m[1] : title;
+  if (m && !title.includes("\n")) (t as HTMLElement).dataset.tipShortcut = m[2];
+  return t;
+}
+
 export function TooltipHost(): JSX.Element {
   const [shown, setShown] = createSignal<{ text: string; shortcut?: string; x: number; y: number } | null>(null);
   const [pos, setPos] = createSignal<{ left: number; top: number } | null>(null);
@@ -36,7 +51,8 @@ export function TooltipHost(): JSX.Element {
   };
 
   const over = (e: MouseEvent) => {
-    const t = (e.target as Element | null)?.closest?.("[data-tip]") ?? null;
+    const el = e.target as Element | null;
+    const t = el?.closest?.("[data-tip]") ?? adoptTitle(el?.closest?.("[title]") ?? null);
     if (t === anchor) return;
     hide();
     anchor = t;

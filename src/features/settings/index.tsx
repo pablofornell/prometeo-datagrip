@@ -53,5 +53,5 @@ registerAction({
   title: "Settings…",
   shortcut: "Ctrl+Alt+S",
   icon: "settings",
-  run: () => openSettings(),
+  run: (ctx) => openSettings(typeof ctx === "string" ? ctx : undefined),
 });

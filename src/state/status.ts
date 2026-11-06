@@ -18,9 +18,11 @@ export interface StatusState {
   caret: { line: number; col: number } | null;
   lineSeparator: "LF" | "CRLF" | "CR" | null;
   encoding: string | null;
+  /** Indentation widget ("4 spaces"). undefined: derived (shown next to the caret, like DataGrip). */
+  indent?: string | null;
   /** Shows the lock icon. null hides it. */
   readOnly: boolean | null;
-  /** Transaction mode widget text, e.g. "Tx: Auto". null hides it. */
+  /** Transaction mode text, e.g. "Tx: Manual". The status bar only shows it in Manual mode (DataGrip has no Auto widget). */
   txMode: string | null;
   /** Background task: progress 0..1 (undefined = indeterminate). */
   task: { title: string; progress?: number; onCancel?: () => void } | null;

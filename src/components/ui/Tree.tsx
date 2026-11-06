@@ -62,6 +62,9 @@ export interface TreeController<T extends TreeItem = TreeItem> {
   focus: () => void;
   /** Current speed-search text. */
   searchQuery: () => string;
+  /** Speed-search filter mode (funnel toggle): only matching nodes and their parents are listed. */
+  filterMode: () => boolean;
+  setFilterMode: (on: boolean) => void;
 }
 
 export interface TreeProps<T extends TreeItem = TreeItem> {
@@ -112,6 +115,7 @@ export function Tree<T extends TreeItem = TreeItem>(props: TreeProps<T>): JSX.El
   const parentOf = new Map<string, string | undefined>();
 
   const search = createSpeedSearch((q) => props.onSpeedSearchChange?.(q));
+  const [filterMode, setFilterMode] = createSignal(false);
 
   createEffect(() => {
     if (props.selectedId !== undefined) setSelId(props.selectedId);
@@ -126,12 +130,25 @@ export function Tree<T extends TreeItem = TreeItem>(props: TreeProps<T>): JSX.El
     const loading = loadingIds();
     const errs = errors();
     const out: Row<T>[] = [];
+    // Filter mode: keep the nodes that match and the ones with a matching descendant (loaded nodes only).
+    const fq = filterMode() ? search.query() : "";
+    const keep = new Map<string, boolean>();
+    const kidMatch = (it: T): boolean => (childrenOf(it) ?? []).some(keeps);
+    const keeps = (it: T): boolean => {
+      let k = keep.get(it.id);
+      if (k === undefined) {
+        k = !!matchRanges(it.label, fq) || kidMatch(it);
+        keep.set(it.id, k);
+      }
+      return k;
+    };
     const walk = (list: T[], depth: number, parent: string | undefined) => {
       for (const item of list) {
         byId.set(item.id, item);
         parentOf.set(item.id, parent);
+        if (fq && !keeps(item)) continue;
         const hk = hasKids(item);
-        const isExp = hk && exp.has(item.id);
+        const isExp = hk && (exp.has(item.id) || (!!fq && kidMatch(item)));
         out.push({ item, depth, expanded: isExp, hasChildren: hk, loading: loading.has(item.id), error: errs.get(item.id) });
         if (isExp) {
           const kids = childrenOf(item);
@@ -287,6 +304,8 @@ export function Tree<T extends TreeItem = TreeItem>(props: TreeProps<T>): JSX.El
     getExpanded: () => [...expanded()],
     focus: () => scroller?.focus(),
     searchQuery: search.query,
+    filterMode,
+    setFilterMode,
   });
 
   // ---- speed search
@@ -320,6 +339,8 @@ export function Tree<T extends TreeItem = TreeItem>(props: TreeProps<T>): JSX.El
       e.preventDefault();
       return;
     }
+    // Ctrl / Alt / Meta combinations (Ctrl+F4, Ctrl+Enter, ...) belong to the global keymap, not to the tree.
+    if (e.ctrlKey || e.altKey || e.metaKey) return;
     const cur = indexOfId(selId());
     const go = (i: number) => {
       if (!rs.length) return;
@@ -427,7 +448,12 @@ export function Tree<T extends TreeItem = TreeItem>(props: TreeProps<T>): JSX.El
     >
       <Show when={props.speedSearchField !== false && search.active()}>
         <div class="dg-tree-search">
-          <SpeedSearchField query={search.query()} noMatch={noMatch()} />
+          <SpeedSearchField
+            query={search.query()}
+            noMatch={noMatch()}
+            filterMode={filterMode()}
+            onToggleFilter={() => setFilterMode(!filterMode())}
+          />
         </div>
       </Show>
       <div class="dg-tree-inner" style={{ height: rows().length * ROW_H + "px" }}>

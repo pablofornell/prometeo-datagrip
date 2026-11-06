@@ -655,7 +655,7 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     const tot = total();
     for (const g of ranges()) {
       if (g.c0 >= n || g.r0 >= tot) continue;
-      out.push({ k: "sel", ...rectOf(g.r0, g.r1, g.c0, Math.min(g.c1, n - 1)) });
+      out.push({ k: "sel", ...rectOf(g.r0, Math.min(g.r1, tot - 1), g.c0, Math.min(g.c1, n - 1)) });
     }
     return out;
   });
@@ -1560,6 +1560,24 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     setFindOpen(false);
     root.focus({ preventScroll: true });
   }
+  // rows can vanish under the selection (reverting inserted rows, a smaller page): clamp it to the rows that are left
+  createEffect(
+    on(
+      total,
+      (tot) => {
+        const rs = ranges();
+        const a = active();
+        if (!rs.some((g) => g.r1 >= tot) && !(a && a.r >= tot)) return;
+        batch(() => {
+          const next = rs.filter((g) => g.r0 < tot).map((g) => ({ ...g, r1: Math.min(g.r1, tot - 1) }));
+          const act = a && a.r >= tot ? (tot > 0 ? { r: tot - 1, c: a.c } : null) : a;
+          if (!next.length && act) next.push({ r0: act.r, r1: act.r, c0: act.c, c1: act.c });
+          setSelection(next, act);
+        });
+      },
+      { defer: true },
+    ),
+  );
   // a changed row filter re-numbers the rows: drop the selection and go back to the top
   createEffect(
     on(

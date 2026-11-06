@@ -5,8 +5,9 @@
  *   const objects = () => schemaSnapshotFor(dsId);   // tracked; [] until loaded
  */
 import { type Accessor, type Setter, createSignal } from "solid-js";
-import { type SnapshotObject, schemaSnapshot } from "../../api/db";
-import { ensureConnected } from "./core";
+import { type SnapshotObject, type TreeNode, schemaSnapshot } from "../../api/db";
+import type { CompletionExtras } from "../../components/editor";
+import { dataSources, dsOf, ensureConnected, rawIntrospect, showSystemObjects } from "./core";
 
 interface Entry {
   dsId: string;
@@ -74,4 +75,95 @@ export function loadSchemaSnapshot(dsId: string, schema?: string | null): Promis
 /** Reloads the snapshots of a data source that were requested before (called on refresh). */
 export function invalidateSnapshots(dsId: string): void {
   for (const e of entries.values()) if (e.dsId === dsId && e.get() !== undefined) void load(e);
+  const x = extrasEntries.get(dsId);
+  if (x && x.get() !== undefined) void loadExtras(dsId);
+}
+
+// ---------------------------------------------------------------- sequences and routines (completion extras)
+
+interface ExtrasEntry {
+  get: Accessor<CompletionExtras | undefined>;
+  set: Setter<CompletionExtras | undefined>;
+  loading?: Promise<void>;
+  failedAt?: number;
+}
+const extrasEntries = new Map<string, ExtrasEntry>();
+
+/** `(cid integer, name text): numeric` -> args `cid integer`, returns `numeric`. */
+export function splitSignature(hint: string | null | undefined): { args: string; returns?: string } {
+  const m = /^\((.*)\)\s*(?::\s*(.*))?$/s.exec((hint ?? "").trim());
+  return m ? { args: m[1].trim(), returns: m[2]?.trim() || undefined } : { args: "" };
+}
+
+const kids = (dsId: string, path: string[], showSystem: boolean): Promise<TreeNode[]> => rawIntrospect(dsId, path, showSystem).catch(() => []);
+
+async function buildExtras(dsId: string): Promise<CompletionExtras> {
+  await ensureConnected(dsId);
+  const driver = dsOf(dsId)?.driver;
+  // the schemas the table snapshot knows (non-system, like the tree shows them)
+  const wanted = new Set((await loadSchemaSnapshot(dsId)).map((o) => o.schema));
+  let level = await kids(dsId, [], driver === "postgres" ? showSystemObjects() : true);
+  if (driver === "postgres") {
+    const dbs = level.filter((n) => n.kind === "database" && (n.hasChildren || n.extra.current));
+    level = (await Promise.all(dbs.map((d) => kids(dsId, d.path, true)))).flat();
+  }
+  const out: CompletionExtras = { schemas: [] };
+  await Promise.all(
+    level
+      .filter((n) => n.kind === "schema" && wanted.has(n.name))
+      .map(async (schema) => {
+        const folders = await kids(dsId, schema.path, showSystemObjects());
+        const seq = folders.find((f) => f.extra.folder === "sequences");
+        const rou = folders.find((f) => f.extra.folder === "routines");
+        const [seqs, routs] = await Promise.all([
+          seq ? kids(dsId, seq.path, showSystemObjects()) : Promise.resolve([]),
+          rou ? kids(dsId, rou.path, showSystemObjects()) : Promise.resolve([]),
+        ]);
+        const routines = routs
+          .filter((r) => r.kind === "function" || r.kind === "procedure" || r.kind === "routine")
+          .map((r) => ({ name: r.name, ...splitSignature(r.hint) }));
+        if (seqs.length || routines.length) out.schemas.push({ name: schema.name, sequences: seqs.map((s) => s.name), routines });
+      }),
+  );
+  out.schemas.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
+function loadExtras(dsId: string): Promise<void> {
+  let e = extrasEntries.get(dsId);
+  if (!e) {
+    const [get, set] = createSignal<CompletionExtras | undefined>(undefined);
+    extrasEntries.set(dsId, (e = { get, set }));
+  }
+  if (e.loading) return e.loading;
+  const entry = e;
+  entry.loading = buildExtras(dsId)
+    .then((x) => {
+      entry.failedAt = undefined;
+      entry.set(x);
+    })
+    .catch(() => {
+      entry.failedAt = Date.now();
+    })
+    .finally(() => {
+      entry.loading = undefined;
+    });
+  return entry.loading;
+}
+
+/**
+ * Sequences and routines (with their signature) of the data source named `sourceLabel`, for the SQL editor's
+ * completion (registered as the editor's extras provider). Reactive; the first read starts the load.
+ */
+export function completionExtrasFor(sourceLabel: string | undefined): CompletionExtras | undefined {
+  const ds = dataSources().find((d) => d.name === sourceLabel);
+  if (!ds) return undefined;
+  let e = extrasEntries.get(ds.id);
+  if (!e) {
+    void loadExtras(ds.id);
+    e = extrasEntries.get(ds.id)!;
+  }
+  const v = e.get();
+  if (v === undefined && !e.loading && e.failedAt !== undefined && Date.now() - e.failedAt > RETRY_MS) void loadExtras(ds.id);
+  return v;
 }

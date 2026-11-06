@@ -66,6 +66,9 @@ export function DataSourceDialog(props: DialogProps) {
 
   const focusName = () =>
     setTimeout(() => {
+      // the user may already be typing in another field (fast input right after opening): never steal the focus
+      const cur = document.activeElement as HTMLElement | null;
+      if (cur?.closest(".ds-root") && cur.matches("input, textarea") && !cur.closest(".ds-name-field")) return;
       const el = document.querySelector<HTMLInputElement>(".ds-name-field input:not([type=color])");
       el?.focus();
       el?.setSelectionRange(el.value.length, el.value.length);

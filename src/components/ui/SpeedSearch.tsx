@@ -125,7 +125,13 @@ export function SpeedSearchField(props: {
       <Icon name="search" />
       <span class="dg-speedsearch-text">{props.query}</span>
       <Show when={props.onToggleFilter}>
-        <span class="dg-speedsearch-filter" classList={{ "dg-on": props.filterMode }} onClick={props.onToggleFilter}>
+        <span
+          class="dg-speedsearch-filter"
+          classList={{ "dg-on": props.filterMode }}
+          data-tip="Show Only Matching Elements"
+          onMouseDown={(e) => e.preventDefault() /* keep the focus in the list */}
+          onClick={props.onToggleFilter}
+        >
           <Icon name="filter" />
         </span>
       </Show>

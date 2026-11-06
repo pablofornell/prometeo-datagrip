@@ -11,7 +11,9 @@ import {
   executeCollect,
   getDdl,
   listConsoles,
+  listDataSources,
   openSession,
+  saveDataSource,
   writeConsole,
 } from "../../api/db";
 import { type MenuItem, notify, openMenu } from "../../components/ui";
@@ -30,6 +32,7 @@ import {
   selectedNode,
 } from "./core";
 import { type ENode, type NodeData, TABLE_CHILD, TABLE_LIKE, ddlRefOf, referenceOf, tabIconOf, tableRefOf } from "./model";
+import { canRenameNode, renameSqlOf } from "./rename";
 
 const errText = (e: unknown) => String((e as Error)?.message ?? e).replace(/^Error:\s*/, "");
 const fail = (title: string, e: unknown): void => {
@@ -239,6 +242,7 @@ export async function duplicateDs(dsId: string): Promise<void> {
 
 export type DialogState =
   | { kind: "drop"; node: ENode; sql: string; what: string }
+  | { kind: "rename"; node: ENode; sql: string; what: string; newName: string }
   | { kind: "removeDs"; ds: DataSource };
 
 export const [dialog, setDialog] = createSignal<DialogState | null>(null);
@@ -323,27 +327,102 @@ export function requestDrop(n: ENode | undefined): void {
 
 export const canDrop = (n: ENode | undefined): boolean => !!n && (n.data.kind === "dataSource" || dropSqlOf(n.data) !== null);
 
-export async function confirmDrop(s: Extract<DialogState, { kind: "drop" }>): Promise<void> {
-  const d = s.node.data;
-  setDialog(null);
+/** Runs one DDL statement on a session of its own. Throws the server message. */
+async function runDdl(dsId: string, sql: string): Promise<void> {
   let session: string | undefined;
   try {
-    await ensureConnected(d.dsId);
-    session = await openSession(d.dsId);
-    const events = await executeCollect(session, s.sql);
+    await ensureConnected(dsId);
+    session = await openSession(dsId);
+    const events = await executeCollect(session, sql);
     const err = events.find((e) => e.kind === "error");
     if (err && err.kind === "error") throw new Error(err.message);
-  } catch (e) {
-    fail(`Cannot drop ${s.what}`, e);
-    return;
   } finally {
     if (session) void closeSession(session).catch(() => {});
   }
-  // Reload the container (and its counts): the folder of the object sits one level below the schema.
+}
+
+/** Reloads the container of a node after DDL (the folder of the object sits one level below the schema). */
+function refreshContainerOf(d: NodeData): ENode | undefined {
   const parent = d.parentId ? nodes.get(d.parentId) : undefined;
   const target = (parent && parent.data.kind === "folder" && parent.data.parentId ? nodes.get(parent.data.parentId) : parent) ?? parent;
   if (target) refreshNode(target.id);
+  return target;
+}
+
+export async function confirmDrop(s: Extract<DialogState, { kind: "drop" }>): Promise<void> {
+  const d = s.node.data;
+  setDialog(null);
+  try {
+    await runDdl(d.dsId, s.sql);
+  } catch (e) {
+    fail(`Cannot drop ${s.what}`, e);
+    return;
+  }
+  const target = refreshContainerOf(d);
   controller()?.select(target?.id ?? null);
+}
+
+// ---------------------------------------------------------------- rename (Shift+F6)
+
+/** Id of the node whose label is being edited in place (the tree row shows a text field). */
+export const [renaming, setRenaming] = createSignal<string | null>(null);
+
+export const canRename = (n: ENode | undefined): boolean => !!n && n.data.kind !== "loading" && n.data.kind !== "error" && canRenameNode(n.data);
+
+/** Shift+F6: edit the name of the node in the tree. */
+export function startRename(n: ENode | undefined): void {
+  if (!n || !canRename(n)) return;
+  controller()?.select(n.id, { reveal: true });
+  setRenaming(n.id);
+}
+
+export function cancelRename(): void {
+  setRenaming(null);
+  controller()?.focus();
+}
+
+/** Enter in the inline editor: a data source is renamed at once, any other object asks first (the dialog shows the SQL). */
+export async function commitRename(n: ENode, text: string): Promise<void> {
+  const name = text.trim();
+  setRenaming(null);
+  controller()?.focus();
+  const d = n.data;
+  if (!name || name === d.name) return;
+  if (d.kind === "dataSource") {
+    try {
+      await updateDataSource(d.dsId, (c) => ({ ...c, name }));
+    } catch (e) {
+      fail("Cannot rename the data source", e);
+    }
+    return;
+  }
+  const sql = renameSqlOf(d, name);
+  if (!sql) return;
+  setDialog({ kind: "rename", node: n, sql, newName: name, what: `${KIND_WORD[d.kind] ?? d.kind} '${referenceOf(d)}'` });
+}
+
+export async function confirmRename(s: Extract<DialogState, { kind: "rename" }>): Promise<void> {
+  const d = s.node.data;
+  setDialog(null);
+  try {
+    await runDdl(d.dsId, s.sql);
+  } catch (e) {
+    fail(`Cannot rename ${s.what}`, e);
+    return;
+  }
+  const target = refreshContainerOf(d);
+  controller()?.select(target?.id ?? null);
+}
+
+/** Saves a change to the stored configuration of a data source, then reloads the explorer. The password is kept. */
+export async function updateDataSource(dsId: string, change: (cfg: Omit<DataSource, "hasPassword" | "passwordStorage">) => Omit<DataSource, "hasPassword" | "passwordStorage">): Promise<void> {
+  // the saved copy: another window or the dialog may have changed it meanwhile
+  const cur = (await listDataSources()).find((x) => x.id === dsId) ?? dsOf(dsId);
+  if (!cur) return;
+  const { hasPassword: _h, passwordStorage: _p, ...cfg } = cur;
+  await saveDataSource(change(cfg));
+  window.dispatchEvent(new CustomEvent("prometeo:datasources-changed"));
+  await reloadDataSources();
 }
 
 export async function confirmRemoveDs(ds: DataSource): Promise<void> {

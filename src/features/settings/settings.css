@@ -167,7 +167,7 @@
   align-items: center;
   gap: 6px;
   height: 20px;
-  margin: 0 0 7px 24px;
+  margin: 0 0 7px;
 }
 .st-section-title hr {
   flex: 1;
@@ -176,7 +176,7 @@
   border-top: 1px solid var(--dg-separator);
 }
 .st-section-body {
-  padding-left: 48px;
+  padding-left: 24px;
 }
 .st-row {
   display: flex;

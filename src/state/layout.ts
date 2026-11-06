@@ -34,8 +34,8 @@ export interface LayoutState {
 }
 
 export const DEFAULT_LAYOUT: LayoutState = {
-  leftWidth: 392,
-  bottomHeight: 380,
+  leftWidth: 490,
+  bottomHeight: 480,
   visible: { explorer: true, output: false },
 };
 

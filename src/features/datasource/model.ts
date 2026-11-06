@@ -58,6 +58,8 @@ export interface TestInfo {
   elapsedMs: number;
   /** SSL mode that was configured at the time of the test. */
   sslmode: string | null;
+  /** Negotiated SSL state when the backend reports it (`TestResult.ssl`), else null (derived from `sslmode`). */
+  ssl?: boolean | null;
   dbms: Dbms;
 }
 

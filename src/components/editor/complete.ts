@@ -61,7 +61,7 @@ function tableOption(t: TableIdx, cfg: { sourceLabel?: string; defaultSchema?: s
       type: view ? "view" : t.kind === "sequence" ? "sequence" : "table",
       detail: ` (${cfg.database ? `${cfg.database}.${t.schema}` : t.schema})`,
       apply: qualify ? `${quoteIdent(t.schema, cfg.dialect)}.${name}` : name,
-      boost: 30,
+      boost: t.kind === "sequence" ? 28 : 30,
     },
     cfg.sourceLabel ?? t.kind,
   );
@@ -207,6 +207,9 @@ function completionSource(ctx: CompletionContext): CompletionResult | null {
       }
       if (mult) options.push(mkOpt({ label: s.name, type: "schema", boost: 20, apply: quoteIdent(s.name, cfg.dialect) + "." }, cfg.sourceLabel));
     }
+    // routines (table functions) and the built-in `cast`, after the tables and sequences like DataGrip
+    for (const s of idx.list) for (const r of s.routines) options.push(routineOption(r));
+    options.push(mkOpt({ label: "cast", type: "keyword", boost: 8 }, KEYWORD_HINTS.cast));
     if (scope) for (const c of scope.ctes) options.push({ label: c, type: "table", boost: 35 });
   } else {
     // expression position: columns of the tables in scope, functions, keywords

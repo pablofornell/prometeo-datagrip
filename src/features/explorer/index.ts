@@ -9,15 +9,17 @@
  *   schemaSnapshotFor(dsId, s?)  reactive cached schemaSnapshot (tables + columns) for completion
  *   ensureConnected(dsId)        connects a data source if needed (tree spinner, connection state); idempotent
  */
-import { onRefreshed, reloadDataSources, loadSaved, refreshConnectionState, setLoaded, selectedNode, nodeInfo, dataSources } from "./core";
+import { crumbsOfTab, onRefreshed, reloadDataSources, loadSaved, refreshConnectionState, setLoaded, selectedNode, nodeInfo, dataSources } from "./core";
 import { closeStaleTabs } from "./restore";
 import { registerSlot } from "../../state/slots";
-import { activeTabId } from "../../state/tabs";
+import { activeTab, activeTabId } from "../../state/tabs";
+import { setStatus } from "../../state/status";
 import { createRoot, createEffect, on } from "solid-js";
 import { registerExplorerActions } from "./actions";
 import { ExplorerBody } from "./ExplorerBody";
 import { ExplorerHeaderActions, ExplorerToolbar } from "./ExplorerToolbar";
-import { invalidateSnapshots } from "./schema";
+import { completionExtrasFor, invalidateSnapshots } from "./schema";
+import { setCompletionExtrasProvider } from "../../components/editor";
 import "./explorer.css";
 
 export type { ExplorerNodeInfo } from "./model";
@@ -64,11 +66,23 @@ function start(): void {
   });
   createRoot(() => {
     createEffect(on(activeTabId, () => void refreshConnectionState(), { defer: true }));
+    // the breadcrumb follows the active tab (table / DDL tabs; consoles push their own path)
+    createEffect(
+      on(
+        activeTabId,
+        () => {
+          const path = crumbsOfTab(activeTab());
+          if (path) setStatus("path", path);
+        },
+        { defer: true },
+      ),
+    );
   });
 }
 
 let disposeActions: (() => void) | undefined;
 let disposeSlots: (() => void)[] = [];
+let disposeExtras: (() => void) | undefined;
 
 // The shell registers its action stubs when <App/> renders, right after the feature modules are imported;
 // registering on the next task makes the explorer's implementations the latest (winning) ones.
@@ -76,6 +90,8 @@ setTimeout(() => {
   disposeActions?.();
   disposeActions = registerExplorerActions();
   disposeSlots.forEach((d) => d());
+  disposeExtras?.();
+  disposeExtras = setCompletionExtrasProvider((q) => completionExtrasFor(q.sourceLabel));
   disposeSlots = [
     registerSlot("explorer.body", ExplorerBody),
     registerSlot("explorer.toolbar", ExplorerToolbar),
@@ -87,6 +103,7 @@ setTimeout(() => {
 if (import.meta.hot) {
   import.meta.hot.dispose(() => {
     disposeActions?.();
+    disposeExtras?.();
     disposeSlots.forEach((d) => d());
   });
 }

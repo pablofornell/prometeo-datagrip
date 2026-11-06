@@ -18,6 +18,7 @@ import {
   setUiState,
 } from "../../api/db";
 import { type TreeController, notify } from "../../components/ui";
+import { friendlyConnectionError } from "../../state/connection-errors";
 import { setStatus } from "../../state/status";
 import { localIconUrl } from "./icons";
 import {
@@ -34,6 +35,7 @@ import {
   tabIconOf,
 } from "./model";
 import { theme } from "../../state/theme";
+import { isSchemaVisible, visibleSchemas } from "../datasource/schemas";
 
 // ---------------------------------------------------------------- signals
 
@@ -205,7 +207,7 @@ export function markDisconnected(dsId: string): void {
 
 // ---------------------------------------------------------------- loading
 
-function rawIntrospect(dsId: string, path: string[], showSystem: boolean): Promise<TreeNode[]> {
+export function rawIntrospect(dsId: string, path: string[], showSystem: boolean): Promise<TreeNode[]> {
   const key = `${dsId}\u0000${showSystem ? 1 : 0}\u0000${path.join("\u0000")}`;
   let p = raw.get(key);
   if (!p) {
@@ -301,7 +303,14 @@ async function fetchChildren(node: ENode): Promise<ENode[]> {
   const tns = await rawIntrospect(d.dsId, d.path, schemaLevel || showSystemObjects());
   let list = tns;
   if (schemaLevel) {
-    const all = showSystemObjects() ? tns : tns.filter((t) => !t.extra.system);
+    // `options.visibleSchemas` (Data Sources > Schemas, or the badge popup) lists the schemas to show; without it
+    // every non-system schema is shown.
+    const explicit = ds ? visibleSchemas(ds) : null;
+    const all = explicit
+      ? tns.filter((t) => t.kind !== "schema" || isSchemaVisible(ds!, t.path))
+      : showSystemObjects()
+        ? tns
+        : tns.filter((t) => !t.extra.system);
     list = all;
     const hidden = tns.length - all.length;
     setBadge(node.id, hidden > 0 ? `${all.length} of ${tns.length}` : d.kind === "dataSource" ? String(all.length) : undefined);
@@ -329,7 +338,8 @@ export function startLoad(node: ENode): Promise<void> {
     try {
       kids = await fetchChildren(node);
     } catch (e) {
-      const msg = errMessage(e);
+      const ds = dsOf(dsId);
+      const msg = ds ? friendlyConnectionError(errMessage(e), { driver: ds.driver, host: ds.host, port: ds.port, file: ds.file }) : errMessage(e);
       notify({
         kind: "error",
         title: isDs ? `Connection to ${node.label} failed` : `Cannot load ${node.label}`,
@@ -443,6 +453,25 @@ function iconUrlOf(n: ENode): string | undefined {
   if (k === "dataSource" || k === "folder" || k === "loading" || k === "error") return undefined;
   const key = n.data.icon ?? tabIconOf(k);
   return key.startsWith("x:") ? localIconUrl(key.slice(2), theme()) : key;
+}
+
+/**
+ * Status bar breadcrumb of a table / DDL tab: `Database > ds > [db >] schema > tables > name`.
+ * (Consoles set their own `Database Consoles > ds > console` path.) Undefined for other tabs.
+ */
+export function crumbsOfTab(tab: { kind: string; data?: unknown } | undefined): { label: string; icon?: string }[] | undefined {
+  if (!tab || (tab.kind !== "table" && tab.kind !== "ddl")) return undefined;
+  const data = tab.data as { dsId?: string; objectRef?: ObjectRef } | undefined;
+  const ds = data?.dsId ? dsOf(data.dsId) : undefined;
+  const ref = data?.objectRef;
+  if (!ds || !ref) return undefined;
+  const out: { label: string; icon?: string }[] = [{ label: "Database" }, { label: ds.name }];
+  if (ds.driver === "postgres" && ds.database) out.push({ label: ds.database });
+  if (ref.schema) out.push({ label: ref.schema });
+  const folder = FOLDER_OF_KIND[ref.kind];
+  if (folder) out.push({ label: folder.replace(/_/g, " ") });
+  out.push({ label: ref.table ? ref.table : ref.name, icon: iconUrlOf({ data: { kind: ref.kind } } as ENode) });
+  return out;
 }
 
 export function onSelect(n: ENode | undefined): void {

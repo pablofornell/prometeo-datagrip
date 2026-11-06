@@ -3,10 +3,13 @@ import { Highlighted, Icon, Tree } from "../../components/ui";
 import { theme } from "../../state/theme";
 import { DRIVERS, showContextMenu } from "./actions";
 import {
+  cancelRename,
+  commitRename,
   dataSourceProperties,
   newDataSource,
   openDdl,
   openTable,
+  renaming,
 } from "./commands";
 import {
   badges,
@@ -25,6 +28,7 @@ import { DialogHost } from "./dialogs";
 import { LOCAL, localIconUrl, providerIcon } from "./icons";
 import { type ENode, TABLE_CHILD, TABLE_LIKE } from "./model";
 import { NodeIcon } from "./NodeIcon";
+import { openSchemaSelector } from "./SchemaSelector";
 
 /** Enter / F4 / double click. Returns true when handled; otherwise the tree toggles folders. */
 function activate(n: ENode, via: "enter" | "f4" | "dblclick"): boolean {
@@ -52,6 +56,43 @@ function onKey(e: KeyboardEvent, n: ENode | undefined): boolean {
     return true;
   }
   return false;
+}
+
+/** In-place name editor (Shift+F6). Enter asks for confirmation, Escape or leaving the field cancels. */
+function RenameInput(props: { node: ENode }): JSX.Element {
+  let done = false;
+  const finish = (commit: boolean, text: string) => {
+    if (done) return;
+    done = true;
+    if (commit) void commitRename(props.node, text);
+    else cancelRename();
+  };
+  return (
+    <input
+      class="dg-explorer-rename"
+      value={props.node.data.name}
+      spellcheck={false}
+      ref={(el) =>
+        queueMicrotask(() => {
+          el.focus();
+          el.select();
+        })
+      }
+      onMouseDown={(e) => e.stopPropagation()}
+      onDblClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => {
+        e.stopPropagation(); // not the tree's speed search nor the global keymap
+        if (e.key === "Enter") {
+          e.preventDefault();
+          finish(true, e.currentTarget.value);
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          finish(false, "");
+        }
+      }}
+      onBlur={() => finish(false, "")}
+    />
+  );
 }
 
 function DsIcon(props: { node: ENode }): JSX.Element {
@@ -86,11 +127,31 @@ function renderLabel(item: ENode, query: string): JSX.Element {
       <Show when={d.kind === "dataSource"} fallback={<NodeIcon name={d.icon} class="dg-tree-icon" />}>
         <DsIcon node={item} />
       </Show>
-      <span class={"dg-tree-label" + (d.synthetic ? " dg-explorer-synth" : "")}>
-        <Highlighted text={item.label} query={query} />
-      </span>
+      <Show
+        when={renaming() === item.id}
+        fallback={
+          <span class={"dg-tree-label" + (d.synthetic ? " dg-explorer-synth" : "")}>
+            <Highlighted text={item.label} query={query} />
+          </span>
+        }
+      >
+        <RenameInput node={item} />
+      </Show>
       <Show when={badge()}>
-        <span class="dg-tree-badge">{badge()}</span>
+        {/* the schema badge (`1`, `2 of 4`) opens the schema selector popup */}
+        <span
+          class="dg-tree-badge"
+          classList={{ "dg-schema-badge": d.kind === "dataSource" || d.kind === "database" }}
+          onMouseDown={(e) => (d.kind === "dataSource" || d.kind === "database") && e.stopPropagation()}
+          onDblClick={(e) => (d.kind === "dataSource" || d.kind === "database") && e.stopPropagation()}
+          onClick={(e) => {
+            if (d.kind !== "dataSource" && d.kind !== "database") return;
+            e.stopPropagation();
+            void openSchemaSelector(d.dsId, e.currentTarget);
+          }}
+        >
+          {badge()}
+        </span>
       </Show>
       <Show when={item.hint}>
         <span class={"dg-tree-hint" + (d.kind === "folder" ? " dg-explorer-count" : "")}>{item.hint}</span>

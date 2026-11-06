@@ -1,4 +1,4 @@
-/** Theme switch: "system" follows the OS color scheme (default), "dark"/"light" are explicit overrides. */
+/** Theme switch: Islands Dark is the default; "system" follows the OS color scheme, "dark"/"light" are explicit choices (kept once set). */
 import { createMemo, createRoot, createSignal } from "solid-js";
 import { loadLocal, saveUiState } from "./persist";
 
@@ -10,7 +10,7 @@ const mq =
     ? window.matchMedia("(prefers-color-scheme: dark)")
     : null;
 
-const [pref, setPrefSignal] = createSignal<ThemePref>(loadLocal<ThemePref>("theme", "system"));
+const [pref, setPrefSignal] = createSignal<ThemePref>(loadLocal<ThemePref>("theme", "dark"));
 const [systemDark, setSystemDark] = createSignal(mq ? mq.matches : true);
 mq?.addEventListener("change", (e) => setSystemDark(e.matches));
 

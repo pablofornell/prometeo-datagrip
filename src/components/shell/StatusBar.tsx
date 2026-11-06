@@ -1,5 +1,6 @@
 import { For, Show, type JSX } from "solid-js";
 import { status } from "../../state/status";
+import { activeTabId } from "../../state/tabs";
 import { Icon } from "../ui/Icon";
 
 /** 34px status bar on the window background: breadcrumbs left, operative widgets right. */
@@ -42,7 +43,8 @@ export function StatusBar(): JSX.Element {
         <Show when={status.aggregator}>
           <span class="dg-status-widget">{status.aggregator}</span>
         </Show>
-        <Show when={status.txMode}>
+        {/* DataGrip's status bar has no transaction widget in Auto mode; Manual is worth a reminder. */}
+        <Show when={status.txMode?.includes("Manual")}>
           <span class="dg-status-widget">{status.txMode}</span>
         </Show>
         <Show when={status.caret}>
@@ -52,11 +54,15 @@ export function StatusBar(): JSX.Element {
             </span>
           )}
         </Show>
-        <Show when={status.lineSeparator}>
+        {/* the editor widgets belong to an open editor tab */}
+        <Show when={activeTabId() && status.lineSeparator}>
           <span class="dg-status-widget">{status.lineSeparator}</span>
         </Show>
-        <Show when={status.encoding}>
+        <Show when={activeTabId() && status.encoding}>
           <span class="dg-status-widget">{status.encoding}</span>
+        </Show>
+        <Show when={activeTabId() && (status.indent ?? (status.caret ? "4 spaces" : null))}>
+          {(t) => <span class="dg-status-widget">{t()}</span>}
         </Show>
         <Show when={status.readOnly !== null}>
           <span class="dg-status-widget dg-status-icon" title={status.readOnly ? "Read-only" : "Writable"}>

@@ -6,6 +6,7 @@ import { type MenuItem, openMenu } from "../../components/ui";
 import { type Action, registerActions, runAction } from "../../state/actions";
 import {
   canDrop,
+  canRename,
   copyDdl,
   copyName,
   dataSourceDialogAvailable,
@@ -22,7 +23,9 @@ import {
   openDdl,
   openTable,
   requestDrop,
+  startRename,
 } from "./commands";
+import { showQuickDoc } from "./QuickDoc";
 import {
   connected,
   controller,
@@ -139,6 +142,22 @@ export function registerExplorerActions(): () => void {
       enabled: () => real(sel()),
       run: () => copyReference(sel()?.data),
     },
+    {
+      id: "db.rename",
+      title: "Rename…",
+      shortcut: "Shift+F6",
+      when: explorerFocused,
+      enabled: () => canRename(sel()),
+      run: () => startRename(sel()),
+    },
+    {
+      id: "db.quickDoc",
+      title: "Quick Documentation",
+      shortcut: "Ctrl+Q",
+      when: explorerFocused,
+      enabled: () => real(sel()),
+      run: () => showQuickDoc(sel()),
+    },
     { id: "db.copyName", title: "Copy Name", enabled: () => real(sel()), run: () => copyName(sel()?.data) },
     {
       id: "db.copyDdl",
@@ -226,6 +245,9 @@ export function contextMenuItems(n: ENode | undefined): MenuItem[] {
       { action: "db.refresh" },
       { action: "db.disconnect" },
       sep,
+      { action: "db.rename" },
+      sep,
+      { action: "db.quickDoc" },
       { label: "Navigation", children: [{ action: "db.jumpToConsole" }] },
       sep,
       { label: "Remove Data Source…", shortcut: "Delete", run: () => requestDrop(n) },
@@ -234,7 +256,9 @@ export function contextMenuItems(n: ENode | undefined): MenuItem[] {
 
   const items: MenuItem[] = [newSub(), { label: "Copy/Paste", children: [{ action: "db.copyReference" }, { action: "db.copyName" }] }];
   if (isTableLike(n)) items.push({ action: "db.editData" });
-  items.push({ action: "db.refresh" }, sep, navigation());
+  items.push({ action: "db.refresh" });
+  if (canRename(n)) items.push(sep, { action: "db.rename" });
+  items.push(sep, { action: "db.quickDoc" }, navigation());
   if (ddlRefOf(d)) {
     items.push(sep, {
       label: "SQL Scripts",
@@ -247,5 +271,6 @@ export function contextMenuItems(n: ENode | undefined): MenuItem[] {
 }
 
 export function showContextMenu(n: ENode | undefined, e: MouseEvent): void {
-  openMenu(contextMenuItems(n), { x: e.clientX, y: e.clientY });
+  // DataGrip's context menu is about 340px wide
+  openMenu(contextMenuItems(n), { x: e.clientX, y: e.clientY, minWidth: 340 });
 }

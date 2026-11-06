@@ -1,6 +1,6 @@
 import { Match, Switch, type JSX } from "solid-js";
 import { Dialog } from "../../components/ui";
-import { confirmDrop, confirmRemoveDs, dialog, setDialog } from "./commands";
+import { confirmDrop, confirmRemoveDs, confirmRename, dialog, setDialog } from "./commands";
 
 /** Confirmation dialogs (Drop, Remove Data Source). Mounted once by the explorer body. */
 export function DialogHost(): JSX.Element {
@@ -19,6 +19,22 @@ export function DialogHost(): JSX.Element {
             ]}
           >
             <div>Drop {s().what}?</div>
+            <pre class="dg-explorer-sql">{s().sql}</pre>
+          </Dialog>
+        )}
+      </Match>
+      <Match when={dialog()?.kind === "rename" && (dialog() as Extract<ReturnType<typeof dialog>, { kind: "rename" }>)}>
+        {(s) => (
+          <Dialog
+            title="Rename"
+            width={460}
+            onClose={close}
+            buttons={[
+              { label: "Rename", primary: true, run: () => void confirmRename(s()) },
+              { label: "Cancel", run: close },
+            ]}
+          >
+            <div>Rename {s().what} to '{s().newName}'?</div>
             <pre class="dg-explorer-sql">{s().sql}</pre>
           </Dialog>
         )}

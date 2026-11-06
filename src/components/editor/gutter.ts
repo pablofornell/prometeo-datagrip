@@ -59,19 +59,26 @@ class HintWidget extends WidgetType {
   }
 }
 
-/** Gray inline `23 ms` after the end of an executed statement. */
+/** Gray inline `23 ms` after the first line of an executed statement (after the `;` when it ends there). */
 const hints = EditorView.decorations.compute([execMarksField], (state): DecorationSet => {
   const marks = state.field(execMarksField).filter((m) => m.ms !== undefined);
   if (!marks.length) return Decoration.none;
   const b = new RangeSetBuilder<Decoration>();
-  const sorted = [...marks].sort((a, c) => a.to - c.to);
+  const placed = marks.map((m) => {
+    const line = state.doc.lineAt(Math.min(m.from, state.doc.length));
+    let pos = line.to;
+    if (m.to <= line.to) {
+      pos = Math.min(m.to, state.doc.length);
+      if (state.doc.sliceString(pos, pos + 1) === ";") pos += 1;
+    }
+    return { pos, ms: m.ms as number };
+  });
+  placed.sort((a, c) => a.pos - c.pos);
   let last = -1;
-  for (const m of sorted) {
-    let pos = Math.min(m.to, state.doc.length);
-    if (state.doc.sliceString(pos, pos + 1) === ";") pos += 1;
-    if (pos < last) continue;
-    last = pos;
-    b.add(pos, pos, Decoration.widget({ widget: new HintWidget(formatMs(m.ms as number)), side: 1 }));
+  for (const m of placed) {
+    if (m.pos < last) continue;
+    last = m.pos;
+    b.add(m.pos, m.pos, Decoration.widget({ widget: new HintWidget(formatMs(m.ms)), side: 1 }));
   }
   return b.finish();
 });

@@ -4,6 +4,7 @@
  */
 import { batch, createMemo, createSignal } from "solid-js";
 import { createStore, produce, unwrap } from "solid-js/store";
+import { friendlyConnectionError } from "../../state/connection-errors";
 import { deleteDataSource, listDataSources, saveDataSource, testConnection } from "../../api/db";
 import type { DataSource, DataSourceConfig } from "../../api/db";
 import { DBMS, type Dbms, buildUrl, parseUrl, sqliteFileOfUrl } from "./drivers";
@@ -308,13 +309,23 @@ export function createSession() {
     const cfg: Partial<DataSourceConfig> = { ...configFromForm(d.form, d.id), password: passwordToSend(d) };
     const sslmode = d.form.options.sslmode ?? null;
     const dbms = d.form.dbms;
+    const target = { driver: dbms, host: d.form.host, port: d.form.port, file: d.form.file };
     setDrafts(i, "test", "state", "running");
     let info: TestInfo;
     try {
       const r = await testConnection(cfg);
-      info = { ok: r.ok, version: r.serverVersion, message: r.message, elapsedMs: r.elapsedMs, sslmode, dbms };
+      info = {
+        ok: r.ok,
+        version: r.serverVersion,
+        message: r.ok ? r.message : friendlyConnectionError(r.message, target),
+        elapsedMs: r.elapsedMs,
+        sslmode,
+        // the backend reports the negotiated state when it knows it (`TestResult.ssl`)
+        ssl: (r as { ssl?: boolean | null }).ssl ?? null,
+        dbms,
+      };
     } catch (e) {
-      info = { ok: false, version: null, message: String(e), elapsedMs: 0, sslmode, dbms };
+      info = { ok: false, version: null, message: friendlyConnectionError(String(e), target), elapsedMs: 0, sslmode, ssl: null, dbms };
     }
     const j = indexOf(key);
     if (j < 0) return;

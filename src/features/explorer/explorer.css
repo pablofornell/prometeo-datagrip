@@ -105,3 +105,138 @@
 .dg-explorer-empty-btn:hover {
   background: var(--dg-layer-2-bg);
 }
+
+/* Schema selector popup (badge click) */
+.dg-schemasel {
+  position: fixed;
+  z-index: 2101;
+  display: flex;
+  flex-direction: column;
+  width: 320px;
+  max-height: 336px;
+  background: var(--dg-popup-bg);
+  border: 1px solid var(--dg-menu-border);
+  border-radius: var(--dg-popup-radius);
+  box-shadow: var(--dg-menu-shadow);
+}
+.dg-schemasel-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px 8px;
+}
+.dg-schemasel-row {
+  display: flex;
+  align-items: center;
+  height: 24px;
+  padding-left: 6px;
+}
+.dg-schemasel-child {
+  padding-left: 28px;
+}
+.dg-schemasel-db {
+  font-weight: 600;
+}
+.dg-schemasel-note {
+  color: var(--dg-text-secondary);
+}
+.dg-schemasel-foot {
+  height: 28px;
+  padding: 0 12px;
+  line-height: 28px;
+  font-size: var(--dg-font-size-small);
+  color: var(--dg-popup-advertiser-fg);
+  background: var(--dg-popup-advertiser-bg);
+  border-top: 1px solid var(--dg-menu-border);
+  border-radius: 0 0 var(--dg-popup-radius) var(--dg-popup-radius);
+}
+.dg-tree-badge.dg-schema-badge {
+  cursor: pointer;
+}
+.dg-tree-badge.dg-schema-badge:hover {
+  background: var(--dg-action-button-hover-bg);
+}
+
+/* in-place rename (Shift+F6) */
+.dg-explorer-rename {
+  flex: 1;
+  min-width: 60px;
+  height: 20px;
+  margin: 0 8px 0 0;
+  padding: 0 4px;
+  color: var(--dg-text);
+  background: var(--dg-input-bg, var(--dg-speedsearch-bg));
+  border: 1px solid var(--dg-accent);
+  border-radius: 3px;
+  outline: none;
+  font: inherit;
+}
+
+/* Quick Documentation popup (Ctrl+Q) */
+.dg-quickdoc {
+  position: fixed;
+  z-index: 2101;
+  box-sizing: border-box;
+  width: 540px;
+  max-height: 360px;
+  overflow: auto;
+  padding: 10px 14px 12px;
+  background: var(--dg-editor-tooltip-bg);
+  border: 1px solid var(--dg-editor-tooltip-border);
+  border-radius: 8px;
+  box-shadow: var(--dg-menu-shadow);
+  color: var(--dg-text);
+  line-height: 18px;
+}
+.dg-quickdoc-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.dg-quickdoc-title {
+  font-weight: 600;
+  font-size: 14px;
+}
+.dg-quickdoc-kind,
+.dg-quickdoc-where {
+  color: var(--dg-text-secondary);
+}
+.dg-quickdoc-comment {
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+}
+.dg-quickdoc-facts,
+.dg-quickdoc-cols {
+  margin-top: 8px;
+  border-collapse: collapse;
+}
+.dg-quickdoc-facts td {
+  padding: 0 14px 0 0;
+}
+.dg-quickdoc-k,
+.dg-quickdoc-type,
+.dg-quickdoc-def,
+.dg-quickdoc-colcomment {
+  color: var(--dg-text-secondary);
+}
+.dg-quickdoc-sect {
+  margin-top: 10px;
+  padding-bottom: 3px;
+  border-bottom: 1px solid var(--dg-separator);
+  color: var(--dg-text-secondary);
+}
+.dg-quickdoc-cols td {
+  padding: 1px 14px 1px 0;
+  white-space: nowrap;
+}
+.dg-quickdoc-tag {
+  margin-left: 6px;
+  padding: 0 3px;
+  border: 1px solid var(--dg-tree-badge-border);
+  border-radius: 3px;
+  color: var(--dg-text-secondary);
+  font-size: var(--dg-font-size-small);
+}
+.dg-quickdoc-loading {
+  color: var(--dg-text-secondary);
+}
