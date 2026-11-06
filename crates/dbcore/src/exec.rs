@@ -22,7 +22,19 @@
 //! PG: `pg_cancel_backend(pid)` from a side connection. MySQL: `KILL QUERY id`.
 //! SQLite: `sqlite3_interrupt`. Closing a partially read result cancels the query,
 //! except inside an open transaction (see [`crate::tx`]) where the remaining rows are drained so
-//! the transaction is not aborted.
+//! the transaction is not aborted. A *user* cancel inside a transaction does cancel: PostgreSQL then
+//! aborts the transaction (`57014` surfaces while the rest is drained, the session becomes `failed` and
+//! `TxStatus` is sent, so a later `COMMIT` reports `committed: false`); MySQL only rolls the statement back
+//! (error 1317), the transaction stays `active`.
+//!
+//! # Lost connection
+//! When a statement fails because the connection is gone (see [`DbError::ConnectionLost`]) the `Error` event
+//! has `connection_lost: true` and a message starting with `[08006]` (`[08S01]` on MySQL); the script stops;
+//! the session is marked dead (`ConnectionManager::session_state`), its transaction status becomes `Idle` and,
+//! if a transaction was open, `TxEnded { committed: false, tag: "CONNECTION LOST" }` and `TxStatus { idle }`
+//! follow the error. The next `execute` on a dead session without a lost transaction opens a new connection
+//! first (a `Message` says so; `SET`/`USE` settings are gone); with a lost transaction it fails with the same
+//! error until the session is closed.
 //!
 //! # Transaction events
 //! After every statement the session's [`TxStatus`] is updated from the server (see `tx.rs`);
@@ -242,6 +254,8 @@ struct Task {
     fetch: Duration,
     started: Instant,
     done_sent: bool,
+    /// Error found while closing the stream of an earlier statement of the script (not reported on its own).
+    abort_err: Option<DbError>,
 }
 
 impl Task {
@@ -260,6 +274,64 @@ impl Task {
         }
         if u.changed {
             self.sh.send(ExecEvent::TxStatus { status: u.status });
+        }
+    }
+
+    /// A statement (or the cleanup after it) failed with `e`, already tagged with the driver. Sends the
+    /// `Error` event when `report` (or the connection is lost); returns true if the connection is gone:
+    /// the session is dead then, the script must stop and the caller drops the connection.
+    async fn statement_failed(
+        &mut self,
+        conn: Option<&mut Conn>,
+        idx: usize,
+        sql: &str,
+        e: &DbError,
+        report: bool,
+    ) -> bool {
+        if report || e.is_connection_lost() {
+            self.send_error(idx, sql, e);
+        }
+        if let Some(had_tx) = self.sh.session.lose(e) {
+            self.lost_events(idx, had_tx);
+            return true;
+        }
+        self.tx_after(conn, idx, sql, tx::Outcome::from_error(e)).await;
+        false
+    }
+
+    fn send_error(&self, idx: usize, sql: &str, e: &DbError) {
+        self.sh.send(ExecEvent::Error {
+            index: idx,
+            message: e.to_string(),
+            position: e.position(),
+            position_utf16: e.position().map(|p| utf16_position(sql, p)),
+            connection_lost: e.is_connection_lost(),
+        });
+    }
+
+    /// The connection died: the open transaction (if any) is gone.
+    fn lost_events(&self, idx: usize, had_tx: bool) {
+        if had_tx {
+            self.sh.send(ExecEvent::TxEnded { index: idx, committed: false, tag: "CONNECTION LOST".to_string() });
+            self.sh.send(ExecEvent::TxStatus { status: TxStatus::Idle });
+        }
+    }
+
+    /// An error that surfaced after the statement's `Done` (paging, closing the stream): account for it and
+    /// tell the UI directly, `tx_after` is silent then.
+    fn stream_failed(&self, idx: usize, sql: &str, e: &DbError, report: bool) {
+        let before = self.sh.session.tx_status();
+        if let Some(had_tx) = self.sh.session.lose(e) {
+            if report {
+                self.send_error(idx, sql, e);
+            }
+            self.lost_events(idx, had_tx);
+            return;
+        }
+        tx::note_stream_error(&self.sh.session, e);
+        let after = self.sh.session.tx_status();
+        if after != before {
+            self.sh.send(ExecEvent::TxStatus { status: after });
         }
     }
 
@@ -291,7 +363,7 @@ async fn pull(stream: &mut ItemStream<'_>, sh: &Shared, st: &mut StreamState, t0
         }
         match item {
             None => return Pull::End,
-            Some(Err(e)) => return Pull::Err(e.into()),
+            Some(Err(e)) => return Pull::Err(DbError::from(e).for_driver(sh.session.live.driver())),
             Some(Ok(Item::Done(n))) => {
                 st.block_done = true;
                 st.rows_affected = n;
@@ -307,19 +379,27 @@ async fn pull(stream: &mut ItemStream<'_>, sh: &Shared, st: &mut StreamState, t0
 }
 
 /// Stop reading a stream that still has rows: cancel the query on the server (unless that
-/// would abort an open transaction) and consume what is left so the connection is reusable.
-async fn abort_stream(mut stream: ItemStream<'_>, sh: &Shared) {
+/// would abort an open transaction) and consume what is left so the connection is reusable. Returns the
+/// error the server ended the stream with: after a cancel inside a PostgreSQL transaction this is `57014`,
+/// and it means the transaction is aborted.
+async fn abort_stream(mut stream: ItemStream<'_>, sh: &Shared) -> Option<DbError> {
     let in_tx = sh.session.in_tx();
     let user = sh.token.is_cancelled();
     let cancel = !in_tx || user;
     if cancel {
         sh.session.cancel_running().await;
     }
-    if matches!(sh.session.cancel, CancelTarget::Lite(_)) {
+    if matches!(sh.session.cancel_target(), CancelTarget::Lite(_)) {
         drop(stream);
-        return;
+        return None;
     }
-    while stream.next().await.is_some() {}
+    let mut err = None;
+    while let Some(item) = stream.next().await {
+        if let Err(e) = item {
+            err.get_or_insert(DbError::from(e).for_driver(sh.session.live.driver()));
+        }
+    }
+    err
 }
 
 /// Convert a 1-based position in Unicode code points (what PostgreSQL reports) into a 1-based offset in
@@ -407,14 +487,18 @@ async fn run_statement(
         // never see the session as busy
         task.sh.ctl.running.store(false, Ordering::Relaxed);
         task.send_done();
-        let exhausted = page_loop(task, &mut stream, &decoder, &mut st, pending, idx, t0).await;
+        let exhausted = page_loop(task, &mut stream, &decoder, &mut st, pending, idx, sql, t0).await;
         if !exhausted {
-            abort_stream(stream, &task.sh).await;
+            if let Some(e) = abort_stream(stream, &task.sh).await {
+                task.stream_failed(idx, sql, &e, true);
+            }
         } else {
             drop(stream);
         }
         // the stream is gone: ask the server (silently, `Done` was sent long ago)
-        tx::refresh(&task.sh.session, conn).await;
+        if !task.sh.session.is_lost() {
+            tx::refresh(&task.sh.session, conn).await;
+        }
         return Ok(Flow::Paged);
     } else {
         task.sh.send(ExecEvent::ResultSet { index: idx, columns: cols, rows, has_more: false });
@@ -426,13 +510,14 @@ async fn run_statement(
                 max
             ),
         });
-        abort_stream(stream, &task.sh).await;
+        task.abort_err = abort_stream(stream, &task.sh).await;
     }
     Ok(Flow::Next)
 }
 
 /// Serve `fetch_more` requests for the open stream. Returns true if the stream was
 /// exhausted, false if the result was closed early.
+#[allow(clippy::too_many_arguments)]
 async fn page_loop(
     task: &mut Task,
     stream: &mut ItemStream<'_>,
@@ -440,6 +525,7 @@ async fn page_loop(
     st: &mut StreamState,
     mut pending: Option<Vec<Cell>>,
     idx: usize,
+    sql: &str,
     t0: Instant,
 ) -> bool {
     // idle limit for the open result: every request restarts it
@@ -488,7 +574,7 @@ async fn page_loop(
                             break;
                         }
                         Pull::Err(e) => {
-                            tx::note_stream_error(&task.sh.session, &e);
+                            task.stream_failed(idx, sql, &e, false);
                             err = Some(e);
                             exhausted = true;
                             break;
@@ -500,7 +586,7 @@ async fn page_loop(
                         Pull::Row(r) => pending = Some(dec.decode(&r)),
                         Pull::End => exhausted = true,
                         Pull::Err(e) => {
-                            tx::note_stream_error(&task.sh.session, &e);
+                            task.stream_failed(idx, sql, &e, false);
                             err = Some(e);
                             exhausted = true;
                         }
@@ -537,35 +623,51 @@ async fn exec_task(
         fetch: Duration::ZERO,
         started: Instant::now(),
         done_sent: false,
+        abort_err: None,
     };
     let mut guard = sess.conn.clone().lock_owned().await;
-    match guard.as_mut() {
-        None => {
-            task.sh.send(ExecEvent::Error { index: 0, message: "Session is closed".into(), position: None, position_utf16: None });
+    match sess.ensure_conn(&mut guard).await {
+        Err(e) => {
+            let first = stmts.first().map(|s| s.text.as_str()).unwrap_or("");
+            task.send_error(0, first, &e);
         }
-        Some(conn) => {
+        Ok(reopened) => {
+            if reopened {
+                task.sh.send(ExecEvent::Message {
+                    index: None,
+                    text: "The connection to the server had been lost: a new connection was opened. Session settings \
+                           (current database / schema, search_path, SET variables) were reset."
+                        .to_string(),
+                });
+            }
             let n = stmts.len();
             for (i, st) in stmts.iter().enumerate() {
                 if task.sh.token.is_cancelled() {
                     break;
                 }
+                let Some(conn) = guard.as_mut() else { break };
                 task.sh.send(ExecEvent::Statement { index: i, sql: st.text.clone(), range: st.range() });
                 ctl.running.store(true, Ordering::Relaxed);
+                let mut lost = false;
                 match run_statement(&mut task, conn, i, &st.text, i + 1 == n).await {
-                    Ok(Flow::Next) => task.tx_after(Some(&mut *conn), i, &st.text, tx::Outcome::Ok).await,
-                    Ok(Flow::Paged) => {}
+                    Ok(Flow::Next) => match task.abort_err.take() {
+                        None => task.tx_after(Some(&mut *conn), i, &st.text, tx::Outcome::Ok).await,
+                        // the statement itself finished; closing its stream hit an error (a cancel)
+                        Some(e) => lost = task.statement_failed(Some(&mut *conn), i, &st.text, &e, false).await,
+                    },
+                    Ok(Flow::Paged) => lost = sess.is_lost(),
                     Err(e) => {
-                        task.sh.send(ExecEvent::Error {
-                            index: i,
-                            message: e.to_string(),
-                            position: e.position(),
-                            position_utf16: e.position().map(|p| utf16_position(&st.text, p)),
-                        });
-                        task.tx_after(Some(&mut *conn), i, &st.text, tx::Outcome::from_error(&e)).await;
-                        if task.opts.stop_on_error {
+                        let e = e.for_driver(sess.live.driver());
+                        lost = task.statement_failed(Some(&mut *conn), i, &st.text, &e, true).await;
+                        if !lost && task.opts.stop_on_error {
                             break;
                         }
                     }
+                }
+                if lost {
+                    // the connection is gone: drop it, the rest of the script cannot run
+                    *guard = None;
+                    break;
                 }
             }
         }

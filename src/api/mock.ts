@@ -857,7 +857,7 @@ async function runExecution(
       const q = parseSelect(st.text);
       if (q.unknown) {
         firstError = `ERROR: relation "${q.unknown.name}" does not exist`;
-        send({ kind: "error", index: i, message: `[42P01] ${firstError}`, position: q.unknown.offset, positionUtf16: q.unknown.offset });
+        send({ kind: "error", index: i, message: `[42P01] ${firstError}`, position: q.unknown.offset, positionUtf16: q.unknown.offset, connectionLost: false });
         if (opts.stopOnError) break;
         continue;
       }
@@ -883,7 +883,7 @@ async function runExecution(
           rows = r;
         } catch (e) {
           firstError = typeof e === "string" ? e : String(e);
-          send({ kind: "error", index: i, message: firstError, position: null, positionUtf16: null });
+          send({ kind: "error", index: i, message: firstError, position: null, positionUtf16: null, connectionLost: false });
           if (opts.stopOnError) break;
           continue;
         }
@@ -922,7 +922,7 @@ async function runExecution(
   }
   if (ex.cancelled) {
     firstError = "Statement cancelled by user";
-    send({ kind: "error", index: 0, message: "[57014] ERROR: canceling statement due to user request", position: null, positionUtf16: null });
+    send({ kind: "error", index: 0, message: "[57014] ERROR: canceling statement due to user request", position: null, positionUtf16: null, connectionLost: false });
   }
   const elapsed = Math.round(performance.now() - t0);
   send({ kind: "done", elapsedMs: elapsed, executionMs: Math.round(execMs), fetchingMs: Math.round(fetchMs) });
@@ -1092,6 +1092,10 @@ export const mockHandlers: Record<string, MockHandler> = {
   }),
   session_in_transaction: h((a) => (state.sessions.get(a.sessionId) ?? fail(`Session '${a.sessionId}' does not exist`)).tx),
   session_tx_status: h((a) => ((state.sessions.get(a.sessionId) ?? fail(`Session '${a.sessionId}' does not exist`)).tx ? "active" : "idle")),
+  session_state: h((a) => {
+    const tx = (state.sessions.get(a.sessionId) ?? fail(`Session '${a.sessionId}' does not exist`)).tx;
+    return { txStatus: tx ? "active" : "idle", inTransaction: tx, connectionLost: false, transactionLost: false };
+  }),
 
   // ---- introspection
   introspect: h(async (a) => {

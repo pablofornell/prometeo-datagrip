@@ -147,8 +147,12 @@ impl ConnectionManager {
     pub async fn table_data_in_session(&self, session: &SessionId, table: &ObjectRef, req: &TableDataRequest) -> Result<ResultSet> {
         let sess = self.session(session)?;
         let mut guard = self.lock_session_conn(&sess).await?;
-        let conn = guard.as_mut().ok_or_else(|| DbError::NoSession(session.0.clone()))?;
-        table_data_with(&sess.live, table, req, Some(conn)).await
+        let res = {
+            let conn = guard.as_mut().ok_or_else(|| DbError::NoSession(session.0.clone()))?;
+            table_data_with(&sess.live, table, req, Some(conn)).await
+        };
+        // a dead connection kills the session (see `Session::fail`)
+        res.map_err(|e| sess.fail(&mut guard, e))
     }
 
     /// Apply edits in a single transaction. Values are bound as parameters and identifiers
@@ -196,7 +200,6 @@ impl ConnectionManager {
         let sess = self.session(session)?;
         let mut guard = self.lock_session_conn(&sess).await?;
         let conn = guard.as_mut().ok_or_else(|| DbError::NoSession(session.0.clone()))?;
-        // the user's statements may have ended the transaction behind our back (MySQL implicit commit)
         crate::tx::refresh(&sess, conn).await;
         if sess.tx_status() == TxStatus::Failed {
             return Err(DbError::InvalidArgument(
@@ -204,7 +207,9 @@ impl ConnectionManager {
             ));
         }
         let in_tx = sess.in_tx();
-        let (results, failed) = run_on_conn(conn, d, in_tx, &stmts).await?;
+        let res = run_on_conn(conn, d, in_tx, &stmts).await;
+        // a dead connection kills the session (see `Session::fail`)
+        let (results, failed) = res.map_err(|e| sess.fail(&mut guard, e))?;
         Ok(ApplyResult { applied: if failed { 0 } else { changes.len() }, committed: !failed, results })
     }
 }

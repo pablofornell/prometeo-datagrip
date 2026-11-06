@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use dbcore::{
     export_result, export_to_string, ApplyResult, ConnectInfo, ConnectionManager, DataSourceConfig, Driver, ExecEvent,
     ExecOptions, ExecutionId, ExportOptions, FetchedRows, HistoryEntry, ObjectRef, QueryHistory, ResultSet, RowChange,
-    SessionId, SnapshotObject, Statement, TableDataRequest, TestResult, TreeNode, TxStatus,
+    SessionId, SessionState, SnapshotObject, Statement, TableDataRequest, TestResult, TreeNode, TxStatus,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -223,6 +223,11 @@ impl AppState {
     /// `idle` / `active` / `failed` (see `dbcore::TxStatus`).
     pub async fn session_tx_status(&self, session_id: &str) -> Result<TxStatus, String> {
         self.mgr.session_tx_status(&SessionId(session_id.to_string())).map_err(String::from)
+    }
+
+    /// Transaction status and connection health (see `dbcore::SessionState`).
+    pub async fn session_state(&self, session_id: &str) -> Result<SessionState, String> {
+        self.mgr.session_state(&SessionId(session_id.to_string())).map_err(String::from)
     }
 
     // ------------------------------------------------------------ introspection

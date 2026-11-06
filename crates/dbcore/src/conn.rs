@@ -10,7 +10,7 @@ use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions, PgRo
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::{ConnectOptions, Connection, Row};
 
-use crate::error::{DbError, Result};
+use crate::error::{connect_error, DbError, Result};
 use crate::model::{DataSourceConfig, Driver};
 use crate::value::PgTypeRow;
 
@@ -67,15 +67,15 @@ pub(crate) async fn connect_one(opts: &ConnOpts, cfg: &DataSourceConfig) -> Resu
     let timeout = connect_timeout(cfg);
     let fut = async {
         Ok::<Conn, DbError>(match opts {
-            ConnOpts::Pg(o) => Conn::Pg(o.connect().await?),
+            ConnOpts::Pg(o) => Conn::Pg(o.connect().await.map_err(connect_error)?),
             ConnOpts::My(o) => {
-                let mut c = o.connect().await?;
+                let mut c = o.connect().await.map_err(connect_error)?;
                 if cfg.read_only {
-                    sqlx::query("SET SESSION TRANSACTION READ ONLY").execute(&mut c).await?;
+                    sqlx::query("SET SESSION TRANSACTION READ ONLY").execute(&mut c).await.map_err(connect_error)?;
                 }
                 Conn::My(c)
             }
-            ConnOpts::Lite(o) => Conn::Lite(o.connect().await?),
+            ConnOpts::Lite(o) => Conn::Lite(o.connect().await.map_err(connect_error)?),
         })
     };
     match tokio::time::timeout(timeout, fut).await {
@@ -226,7 +226,8 @@ pub(crate) async fn open_pool(cfg: &DataSourceConfig, opts: &ConnOpts) -> Result
                 .acquire_timeout(timeout)
                 .idle_timeout(Duration::from_secs(300))
                 .connect_with(o.clone())
-                .await?,
+                .await
+                .map_err(connect_error)?,
         ),
         ConnOpts::My(o) => {
             let ro = cfg.read_only;
@@ -244,7 +245,8 @@ pub(crate) async fn open_pool(cfg: &DataSourceConfig, opts: &ConnOpts) -> Result
                         })
                     })
                     .connect_with(o.clone())
-                    .await?,
+                    .await
+                    .map_err(connect_error)?,
             )
         }
         ConnOpts::Lite(o) => {
@@ -253,7 +255,8 @@ pub(crate) async fn open_pool(cfg: &DataSourceConfig, opts: &ConnOpts) -> Result
                     .max_connections(4)
                     .acquire_timeout(timeout)
                     .connect_with(o.clone())
-                    .await?,
+                    .await
+                    .map_err(connect_error)?,
             )
         }
     })

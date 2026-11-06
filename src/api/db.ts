@@ -20,6 +20,7 @@ import type {
   ObjectRef,
   ResultSet,
   RowChange,
+  SessionState,
   SnapshotObject,
   Statement,
   TableDataRequest,
@@ -82,6 +83,14 @@ export const sessionInTransaction = (sessionId: string): Promise<boolean> =>
  */
 export const sessionTxStatus = (sessionId: string): Promise<TxStatus> =>
   invoke("session_tx_status", { sessionId });
+
+/**
+ * Transaction status plus connection health: tells a healthy idle session from one whose connection died
+ * (`connectionLost`, `transactionLost`). `txStatus` equals `sessionTxStatus`, `inTransaction` equals
+ * `sessionInTransaction`.
+ */
+export const sessionState = (sessionId: string): Promise<SessionState> =>
+  invoke("session_state", { sessionId });
 
 // ---------------------------------------------------------------- introspection
 

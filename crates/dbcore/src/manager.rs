@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::conn::{build_opts, connect_one, is_memory, open_pool, Conn, ConnOpts, Live};
-use crate::error::{DbError, Result};
+use crate::error::{ConnectionLost, DbError, Result};
 use crate::exec::conn_scalar;
 use crate::model::*;
 
@@ -36,7 +36,10 @@ impl std::fmt::Display for ExecutionId {
 }
 
 /// How to interrupt whatever a session is currently running.
+#[derive(Clone)]
 pub(crate) enum CancelTarget {
+    /// The connection is gone: nothing to cancel.
+    None,
     Pg(i32),
     My(u64),
     /// Raw `sqlite3*` as usize; `None` once the connection is closed.
@@ -59,12 +62,58 @@ pub(crate) struct Session {
     pub id: String,
     pub live: Arc<Live>,
     pub conn: Arc<tokio::sync::Mutex<Option<Conn>>>,
-    pub cancel: CancelTarget,
+    cancel: Mutex<CancelTarget>,
     /// [`TxStatus`] as a number (see `tx.rs` for how it is determined per driver).
     pub tx: AtomicU8,
     /// MySQL: `@@autocommit` is on (statements outside a transaction commit themselves).
     pub autocommit_on: AtomicBool,
+    /// MySQL: `LOCK TABLES` is in effect (`UNLOCK TABLES` then commits implicitly).
+    pub tables_locked: AtomicBool,
+    /// Set when the connection died; the connection itself is gone from `conn` then.
+    lost: Mutex<Option<Lost>>,
     pub current: Mutex<Option<(String, Arc<ExecCtl>)>>,
+}
+
+/// Why and how a session died.
+#[derive(Clone)]
+struct Lost {
+    info: ConnectionLost,
+    /// A transaction (active or failed) was open when the connection died: its work is gone and the
+    /// session does not reconnect on its own.
+    had_tx: bool,
+}
+
+/// A fresh dedicated connection plus what the session needs to know about it.
+pub(crate) struct Opened {
+    pub conn: Conn,
+    pub cancel: CancelTarget,
+    pub autocommit_on: bool,
+}
+
+/// Open a connection for a session: its cancel handle (backend pid / connection id / `sqlite3*`) and, for
+/// MySQL, `@@autocommit` (read once here, before any user statement: the tracker follows it from then on).
+pub(crate) async fn open_conn(live: &Live) -> Result<Opened> {
+    let mut conn = live.new_conn().await?;
+    let cancel = match &mut conn {
+        Conn::Pg(_) => {
+            let pid = conn_scalar(&mut conn, "select pg_backend_pid()::text").await?;
+            CancelTarget::Pg(pid.and_then(|p| p.parse().ok()).unwrap_or(0))
+        }
+        Conn::My(_) => {
+            let id = conn_scalar(&mut conn, "select connection_id()").await?;
+            CancelTarget::My(id.and_then(|p| p.parse().ok()).unwrap_or(0))
+        }
+        Conn::Lite(c) => {
+            let mut h = c.lock_handle().await?;
+            let ptr = h.as_raw_handle().as_ptr() as usize;
+            CancelTarget::Lite(Arc::new(Mutex::new(Some(ptr))))
+        }
+    };
+    let autocommit_on = match &mut conn {
+        Conn::My(_) => conn_scalar(&mut conn, "select @@autocommit").await?.map(|v| v != "0").unwrap_or(true),
+        _ => true,
+    };
+    Ok(Opened { conn, cancel, autocommit_on })
 }
 
 impl Session {
@@ -85,9 +134,92 @@ impl Session {
         self.tx_status().is_open()
     }
 
+    pub fn cancel_target(&self) -> CancelTarget {
+        self.cancel.lock().unwrap().clone()
+    }
+
+    pub fn is_lost(&self) -> bool {
+        self.lost.lock().unwrap().is_some()
+    }
+
+    pub fn state(&self) -> SessionState {
+        let lost = self.lost.lock().unwrap().clone();
+        let tx_status = self.tx_status();
+        SessionState {
+            tx_status,
+            in_transaction: tx_status.is_open(),
+            connection_lost: lost.is_some(),
+            transaction_lost: lost.is_some_and(|l| l.had_tx),
+        }
+    }
+
+    /// If `e` says the connection is gone, mark the session dead: the transaction tracker goes to `Idle`
+    /// (the server rolled the transaction back), there is nothing to cancel any more. Returns `None` when
+    /// `e` is not a lost connection, else `Some(had_tx)`: a transaction was open and is gone now (false when
+    /// the session was already dead). The caller drops the connection it holds.
+    pub fn lose(&self, e: &DbError) -> Option<bool> {
+        let DbError::ConnectionLost(info) = e else { return None };
+        let mut lost = self.lost.lock().unwrap();
+        if lost.is_some() {
+            return Some(false);
+        }
+        let had_tx = self.in_tx();
+        *lost = Some(Lost { info: info.clone(), had_tx });
+        drop(lost);
+        self.set_tx_status(TxStatus::Idle);
+        self.tables_locked.store(false, Ordering::Relaxed);
+        if let CancelTarget::Lite(h) = &self.cancel_target() {
+            *h.lock().unwrap() = None;
+        }
+        *self.cancel.lock().unwrap() = CancelTarget::None;
+        Some(had_tx)
+    }
+
+    /// A connection error of a session operation: tell it the driver, and mark the session dead when the
+    /// connection is gone (dropping `guard`'s connection).
+    pub fn fail(&self, guard: &mut Option<Conn>, e: DbError) -> DbError {
+        let e = e.for_driver(self.live.driver());
+        if self.lose(&e).is_some() {
+            *guard = None;
+        }
+        e
+    }
+
+    /// Make sure the guarded connection exists. A session that lost its connection **without** a transaction
+    /// open opens a new one (`Ok(true)`: settings like `search_path` / `USE db` are reset); one that died with a
+    /// transaction open keeps returning that error until it is closed. A session that was closed is an error.
+    pub async fn ensure_conn(&self, guard: &mut Option<Conn>) -> Result<bool> {
+        if guard.is_some() {
+            return Ok(false);
+        }
+        let Some(lost) = self.lost.lock().unwrap().clone() else {
+            return Err(DbError::InvalidArgument("Session is closed".into()));
+        };
+        if lost.had_tx {
+            return Err(DbError::ConnectionLost(lost.info));
+        }
+        match open_conn(&self.live).await {
+            Ok(o) => {
+                *guard = Some(o.conn);
+                *self.cancel.lock().unwrap() = o.cancel;
+                self.autocommit_on.store(o.autocommit_on, Ordering::Relaxed);
+                self.tables_locked.store(false, Ordering::Relaxed);
+                self.set_tx_status(TxStatus::Idle);
+                *self.lost.lock().unwrap() = None;
+                Ok(true)
+            }
+            Err(e) => Err(DbError::ConnectionLost(ConnectionLost {
+                driver: Some(self.live.driver()),
+                server: None,
+                cause: e.to_string(),
+            })),
+        }
+    }
+
     /// Ask the server to stop the statement currently running on this session.
     pub async fn cancel_running(&self) {
-        match &self.cancel {
+        match &self.cancel_target() {
+            CancelTarget::None => {}
             CancelTarget::Pg(pid) => {
                 let _ = self.live.pool.exec(&format!("select pg_cancel_backend({pid})")).await;
             }
@@ -255,34 +387,17 @@ impl ConnectionManager {
     /// fails, the connection is closed and its error is returned (no session is left behind).
     pub async fn open_session_with(&self, ds_id: &str, init_sql: &[String]) -> Result<SessionId> {
         let live = self.live(ds_id)?;
-        let mut conn = live.new_conn().await?;
-        let cancel = match &mut conn {
-            Conn::Pg(_) => {
-                let pid = conn_scalar(&mut conn, "select pg_backend_pid()::text").await?;
-                CancelTarget::Pg(pid.and_then(|p| p.parse().ok()).unwrap_or(0))
-            }
-            Conn::My(_) => {
-                let id = conn_scalar(&mut conn, "select connection_id()").await?;
-                CancelTarget::My(id.and_then(|p| p.parse().ok()).unwrap_or(0))
-            }
-            Conn::Lite(c) => {
-                let mut h = c.lock_handle().await?;
-                let ptr = h.as_raw_handle().as_ptr() as usize;
-                CancelTarget::Lite(Arc::new(Mutex::new(Some(ptr))))
-            }
-        };
+        let Opened { conn, cancel, autocommit_on } = open_conn(&live).await?;
         let id = uuid::Uuid::new_v4().to_string();
-        let autocommit_on = match &mut conn {
-            Conn::My(_) => conn_scalar(&mut conn, "select @@autocommit").await?.map(|v| v != "0").unwrap_or(true),
-            _ => true,
-        };
         let session = Arc::new(Session {
             id: id.clone(),
             live,
             conn: Arc::new(tokio::sync::Mutex::new(Some(conn))),
-            cancel,
+            cancel: Mutex::new(cancel),
             tx: AtomicU8::new(TxStatus::Idle as u8),
             autocommit_on: AtomicBool::new(autocommit_on),
+            tables_locked: AtomicBool::new(false),
+            lost: Mutex::new(None),
             current: Mutex::new(None),
         });
         if !init_sql.is_empty() {
@@ -298,7 +413,7 @@ impl ConnectionManager {
             }
             if let Some(e) = failed {
                 let conn = guard.take();
-                if let CancelTarget::Lite(h) = &session.cancel {
+                if let CancelTarget::Lite(h) = &session.cancel_target() {
                     *h.lock().unwrap() = None;
                 }
                 if let Some(c) = conn {
@@ -311,6 +426,7 @@ impl ConnectionManager {
         Ok(SessionId(id))
     }
 
+    /// Close the session. Always succeeds, also when its connection is already dead.
     pub async fn close_session(&self, id: &SessionId) {
         let Some(sess) = self.inner.sessions.lock().unwrap().remove(&id.0) else { return };
         if let Some((_, ctl)) = sess.current.lock().unwrap().take() {
@@ -319,7 +435,7 @@ impl ConnectionManager {
         }
         // waits for a running execution task to release the connection
         let conn = sess.conn.lock().await.take();
-        if let CancelTarget::Lite(h) = &sess.cancel {
+        if let CancelTarget::Lite(h) = &sess.cancel_target() {
             *h.lock().unwrap() = None;
         }
         if let Some(c) = conn {
@@ -340,7 +456,9 @@ impl ConnectionManager {
                 let _ = ctl.cmd.send(ExecCmd::Close);
             }
         }
-        Ok(sess.conn.clone().lock_owned().await)
+        let mut guard = sess.conn.clone().lock_owned().await;
+        sess.ensure_conn(&mut guard).await?;
+        Ok(guard)
     }
 
     /// Is there an open transaction on the session (`Active` or `Failed`)? Same source as
@@ -350,10 +468,19 @@ impl ConnectionManager {
     }
 
     /// Transaction state of the session: `Idle`, `Active`, or `Failed` (PostgreSQL: the transaction was
-    /// aborted by an error; `COMMIT` would roll back). Reflects the server, not the keywords the user
-    /// typed: MySQL DDL ends a transaction implicitly (see `tx.rs`). It is updated when a statement
-    /// finishes, so it can lag while a paged result keeps the connection busy.
+    /// aborted by an error; `COMMIT` would roll back). Follows what the server does with the transaction
+    /// (see `tx.rs`), not just the keywords the user typed: MySQL DDL ends a transaction implicitly. It is
+    /// updated when a statement finishes, so it can lag while a paged result keeps the connection busy.
+    /// A session whose connection died is `Idle` (the server rolled the transaction back); use
+    /// [`session_state`](Self::session_state) to tell that apart from a healthy idle session.
     pub fn session_tx_status(&self, id: &SessionId) -> Result<TxStatus> {
         Ok(self.session(id)?.tx_status())
+    }
+
+    /// Transaction status plus whether the connection is lost (and whether a transaction died with it).
+    /// `tx_status` / `in_transaction` equal [`session_tx_status`](Self::session_tx_status) /
+    /// [`session_in_transaction`](Self::session_in_transaction).
+    pub fn session_state(&self, id: &SessionId) -> Result<SessionState> {
+        Ok(self.session(id)?.state())
     }
 }

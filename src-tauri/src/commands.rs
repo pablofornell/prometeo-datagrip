@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use dbcore::{
     ApplyResult, ConnectInfo, DataSourceConfig, Driver, ExecEvent, ExecOptions, ExportFormat, ExportOptions, FetchedRows, HistoryEntry,
-    ObjectRef, ResultSet, RowChange, SnapshotObject, Statement, TableDataRequest, TestResult, TreeNode, TxStatus,
+    ObjectRef, ResultSet, RowChange, SessionState, SnapshotObject, Statement, TableDataRequest, TestResult, TreeNode, TxStatus,
 };
 use serde_json::Value;
 use tauri::ipc::Channel;
@@ -87,9 +87,19 @@ pub async fn session_in_transaction(state: State<'_, AppState>, session_id: Stri
 }
 
 /// `"idle"`, `"active"` or `"failed"` (PostgreSQL: the transaction was aborted; `COMMIT` would roll back).
+/// A session whose connection died is `"idle"` (the server rolled the transaction back): ask
+/// [`session_state`] to tell it from a healthy idle one.
 #[tauri::command]
 pub async fn session_tx_status(state: State<'_, AppState>, session_id: String) -> Res<TxStatus> {
     state.session_tx_status(&session_id).await
+}
+
+/// `{ txStatus, inTransaction, connectionLost, transactionLost }`: the transaction status plus whether the
+/// connection of the session is gone, and whether a transaction died with it (the session then refuses to
+/// reconnect on its own: close it and open a new one).
+#[tauri::command]
+pub async fn session_state(state: State<'_, AppState>, session_id: String) -> Res<SessionState> {
+    state.session_state(&session_id).await
 }
 
 // ---------------------------------------------------------------- introspection

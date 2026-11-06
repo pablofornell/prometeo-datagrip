@@ -17,6 +17,7 @@ mgr.connect(&cfg).await / mgr.disconnect(id).await // pool per data source id
 let s = mgr.open_session(id).await?;               // dedicated connection (console): tx state, SET/USE persist
 mgr.open_session_with(id, &init_sql).await?        // same, after running init_sql (re-apply search_path / USE / isolation)
 mgr.session_tx_status(&s)?                         // Idle | Active | Failed; session_in_transaction() = Active or Failed
+mgr.session_state(&s)?                             // SessionState { tx_status, in_transaction, connection_lost, transaction_lost }
 mgr.introspect(id, &path).await                    // -> Vec<TreeNode>, lazy; introspect_with(.., &IntrospectOptions{show_system})
 mgr.schema_snapshot(id, schema).await              // flat tables/views + columns for completion
 mgr.ddl(id, &ObjectRef).await                      // -> String
@@ -103,15 +104,59 @@ first column set (equally shaped result sets are appended, others skipped).
 
 ### Transaction state and events
 
-`ExecEvent` carries the transaction state of the session, which reflects the **server**, not the keywords typed
-(see `src/tx.rs`): `TxStatus { status: idle | active | failed }` after the statement that changed it, and
-`TxEnded { index, committed, tag }` when a `COMMIT` / `ROLLBACK` ended a transaction. MySQL is probed after each
-statement that can change it (DDL commits implicitly, `SET autocommit = 0`), SQLite uses `sqlite3_get_autocommit`,
-PostgreSQL is tracked (sqlx hides the `ReadyForQuery` status) from `BEGIN` / `COMMIT` / `ROLLBACK` /
-`SAVEPOINT` plus errors and corrected by SQLSTATE `25P02` / `25P01`; transaction control inside `DO` blocks or
-procedures is not seen. `COMMIT` of a failed PostgreSQL transaction succeeds without an error but the server
-rolls back (tag `ROLLBACK`): it is reported as `TxEnded { committed: false, tag: "ROLLBACK" }` plus a `message`.
+`ExecEvent` carries the transaction state of the session, which follows what the **server** does with the
+transaction, not just the keywords typed (see `src/tx.rs`): `TxStatus { status: idle | active | failed }` after the
+statement that changed it, and `TxEnded { index, committed, tag }` when a transaction ended (`tag`: `COMMIT`,
+`ROLLBACK`, `IMPLICIT COMMIT`, `PREPARE TRANSACTION`, `CONNECTION LOST`).
+
+* **MySQL**: no probe statement is ever sent (a probe changes `show warnings`, `row_count()`, `found_rows()` and, with
+  `autocommit = 0`, opens a transaction itself). The state is derived from the statements: `@@autocommit` is read once
+  when the session opens; `SET [SESSION] autocommit = 0|1|ON|OFF` / `SET @@autocommit` is followed; with
+  `autocommit = 0` every statement except `SET`, `USE`, `SHOW WARNINGS|ERRORS`, `SELECT` without `FROM`, `PREPARE`, `KILL`
+  and the like opens a transaction; `BEGIN` / `START TRANSACTION` / `XA START` commit what is open and start one;
+  `COMMIT` / `ROLLBACK` / `XA COMMIT|ROLLBACK` end it (`AND CHAIN` starts the next); the statements of the MySQL
+  manual 15.3.3 "Statements That Cause an Implicit Commit" (DDL, `GRANT`/`REVOKE`/`SET PASSWORD`, `LOCK TABLES`,
+  `UNLOCK TABLES` after a lock, `ANALYZE|CHECK|OPTIMIZE|REPAIR TABLE`, `FLUSH`, `RESET`, replication control, ...;
+  not `CREATE|DROP TEMPORARY TABLE`) end it with `TxEnded { committed: true, tag: "IMPLICIT COMMIT" }` (also when they
+  fail, except with a syntax error: they commit before they run); `SET autocommit = 1` commits only when it was 0;
+  a deadlock (1213) rolls it back. A `KILL QUERY` (cancel) rolls back the statement only: the transaction stays
+  `active`. Not seen: commits inside stored routines (`CALL p()`) and `SET autocommit = <expression>`.
+* **PostgreSQL**: tracked (sqlx hides the `ReadyForQuery` status) from `BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT`
+  plus errors and corrected by SQLSTATE `25P02` / `25P01`; verified against a real server for `COMMIT|ROLLBACK
+  AND CHAIN`, `END`, `ABORT`, `PREPARE TRANSACTION` (a failing one rolls back), `COMMIT|ROLLBACK PREPARED`, failing
+  deferred constraints and savepoint errors (`tests/tx_pg.rs`, with a test-only `SAVEPOINT` probe as ground truth).
+  `COMMIT` of a failed transaction succeeds without an error but the server rolls back (tag `ROLLBACK`): reported as
+  `TxEnded { committed: false, tag: "ROLLBACK" }` plus a `message`. A **user cancel** inside a transaction cancels the
+  query and PostgreSQL aborts the transaction: the session becomes `failed` (event `TxStatus`) and a later `COMMIT`
+  reports `committed: false`. Transaction control inside `DO` blocks / procedures is not seen.
+* **SQLite**: `sqlite3_get_autocommit` (exact).
+
 `apply_changes_in_session` refuses to edit in a `failed` transaction.
+
+### Lost connections
+
+When a statement or command fails because the connection is gone (sqlx I/O / TLS errors, a closed pool, a crashed
+worker, a protocol error from a closed socket; PostgreSQL `08xxx` and `57P01` / `57P02` / `57P03`; MySQL 2006 / 2013 /
+1927 / 1053), the error is a `DbError::ConnectionLost` and:
+
+1. its message starts with the SQLSTATE in brackets: `[08006] ` (PostgreSQL, SQLite) or `[08S01] ` (MySQL), e.g.
+   `[08006] An I/O error occurred while sending to the backend.` (+ a `Cause:` line), `[08006] FATAL: terminating
+   connection due to administrator command`, `[08S01] Communications link failure: the connection to the server was lost.`;
+2. the `Error` event has `connection_lost: true` (JSON `connectionLost`; `false` for every other error) and the script stops;
+3. the session is **dead**: its transaction status becomes `Idle`, `TxEnded { committed: false, tag: "CONNECTION LOST" }`
+   and `TxStatus { idle }` follow the error when a transaction was open (also for a failure found by `fetch_more`,
+   `table_data_in_session`, `apply_changes_in_session`), and `session_state` says `connection_lost` (and
+   `transaction_lost` when a transaction was open);
+4. later calls on the session return the same `[08006]` / `[08S01]` error at once instead of hanging (`execute`: an
+   `Error` event with `connection_lost: true`; `COMMIT` / `ROLLBACK` included; table calls: `Err`);
+5. `close_session` on a dead session succeeds; `session_tx_status` / `session_in_transaction` are `Idle` / `false`;
+6. if **no** transaction was open when the connection died, the next `execute` (or table call) on that session id
+   reopens a connection transparently (a `message` event says that session settings - `SET`, `USE`, `search_path` -
+   were reset); if one was open, the session keeps returning the error and the UI decides (`close_session`, then
+   `open_session`).
+
+Tests: `tests/tx_pg.rs` (`pg_terminate_backend` of the session pid from a second session) and `tests/tx_mysql.rs`
+(`KILL <connection id>`).
 
 `Error` events carry `position` (1-based, Unicode code points, as PostgreSQL reports it) and `position_utf16`
 (1-based UTF-16 code units, for the editor), the latter computed against the statement text that was sent.

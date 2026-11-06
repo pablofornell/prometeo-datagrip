@@ -504,5 +504,11 @@ async fn open_session_with_init_sql_and_tx_status() {
     assert_eq!(st.session_tx_status(&s).await.unwrap(), dbcore::TxStatus::Active);
     assert!(st.session_in_transaction(&s).await.unwrap());
     assert_eq!(serde_json::to_value(st.session_tx_status(&s).await.unwrap()).unwrap(), "active");
+    // session_state: same status / flag, plus the connection health
+    let state = st.session_state(&s).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(state).unwrap(),
+        serde_json::json!({"txStatus": "active", "inTransaction": true, "connectionLost": false, "transactionLost": false})
+    );
     assert!(st.open_session_with(&ds, &["select * from nope".to_string()]).await.is_err());
 }

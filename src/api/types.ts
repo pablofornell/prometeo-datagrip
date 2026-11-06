@@ -249,15 +249,33 @@ export type ExecEvent =
    * `positionUtf16`: the same place as a 1-based offset in UTF-16 code units (what JS strings and
    * CodeMirror count; computed against the statement text that was sent). They differ after any emoji:
    * use `positionUtf16` for the underline. Both `null` when the server gives no position (MySQL, SQLite).
+   *
+   * `connectionLost: true` when the statement failed because the connection is gone (socket closed / reset,
+   * the server terminated the backend or shut down, pool closed). The message then starts with the SQLSTATE in
+   * brackets, `[08006] ` for PostgreSQL and SQLite, `[08S01] ` for MySQL, e.g.
+   * `[08006] An I/O error occurred while sending to the backend.` The session is dead from then on (see
+   * `SessionState`): the script stops, a `txEnded` with tag "CONNECTION LOST" follows if a transaction was
+   * open, and every later call on the session returns the same error until it is closed - except when no
+   * transaction was open, then the next `execute` opens a new connection (a `message` event says so).
+   * `false` for every other error.
    */
-  | { kind: "error"; index: number; message: string; position: number | null; positionUtf16: number | null }
+  | {
+      kind: "error";
+      index: number;
+      message: string;
+      position: number | null;
+      positionUtf16: number | null;
+      connectionLost: boolean;
+    }
   | { kind: "message"; index: number | null; text: string }
   /** The session's transaction state changed (sent right after the statement that changed it, before `done`). */
   | { kind: "txStatus"; status: TxStatus }
   /**
    * A COMMIT / ROLLBACK (or a MySQL implicit commit) ended a transaction. `committed: false` with tag
    * "ROLLBACK" after a COMMIT means PostgreSQL rolled back a failed transaction without an error:
-   * warn the user that nothing was saved. `tag` is "COMMIT", "ROLLBACK" or "IMPLICIT COMMIT".
+   * warn the user that nothing was saved. `tag` is "COMMIT", "ROLLBACK", "IMPLICIT COMMIT",
+   * "PREPARE TRANSACTION" (PostgreSQL: the transaction was detached, not committed) or "CONNECTION LOST"
+   * (`committed: false`: the connection died with the transaction open; the server rolled it back).
    */
   | { kind: "txEnded"; index: number; committed: boolean; tag: string }
   | { kind: "done"; elapsedMs: number; executionMs: number; fetchingMs: number };
@@ -269,6 +287,24 @@ export type ExecEventKind = ExecEvent["kind"];
  * (PostgreSQL: aborted by an error; everything but ROLLBACK / ROLLBACK TO is refused and COMMIT rolls back).
  */
 export type TxStatus = "idle" | "active" | "failed";
+
+/**
+ * `sessionState` result. `txStatus` / `inTransaction` are what `sessionTxStatus` / `sessionInTransaction`
+ * return; a session whose connection died is `idle` there (the server rolled the transaction back).
+ */
+export interface SessionState {
+  txStatus: TxStatus;
+  /** `txStatus` is `active` or `failed`. */
+  inTransaction: boolean;
+  /** The connection died and was not re-established yet (calls fail with `[08006]` / `[08S01]`, `connectionLost: true`). */
+  connectionLost: boolean;
+  /**
+   * The connection died while a transaction was open: its work is gone and the session never reconnects on
+   * its own. `closeSession` it and `openSession` a new one. When `connectionLost` but not `transactionLost`,
+   * the next `execute` reopens the connection (session settings such as `search_path` / `USE db` are reset).
+   */
+  transactionLost: boolean;
+}
 
 // ---------------------------------------------------------------- export
 

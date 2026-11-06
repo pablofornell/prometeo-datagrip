@@ -66,10 +66,53 @@ impl fmt::Display for ServerError {
     }
 }
 
+/// The connection to the server is gone (socket closed / reset, server shut down or terminated the backend,
+/// pool closed). Shown as `[08006] ...` (`[08S01] ...` on MySQL), the way DataGrip reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionLost {
+    /// Unknown (`None`) until the error reaches code that knows the session's driver, see [`DbError::for_driver`].
+    pub driver: Option<Driver>,
+    /// What the server itself said when it announced the end (`FATAL: terminating connection due to
+    /// administrator command`); `None` when the socket just broke.
+    pub server: Option<String>,
+    /// The underlying client error (`error communicating with database: ...`), shown on a second line.
+    pub cause: String,
+}
+
+impl ConnectionLost {
+    /// `08S01` (communication link failure) for MySQL, `08006` (connection failure) otherwise.
+    pub fn sqlstate(&self) -> &'static str {
+        if self.driver == Some(Driver::MySql) {
+            "08S01"
+        } else {
+            "08006"
+        }
+    }
+}
+
+impl fmt::Display for ConnectionLost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[{}] ", self.sqlstate())?;
+        match (&self.server, self.driver) {
+            (Some(s), _) => f.write_str(s)?,
+            (None, Some(Driver::MySql)) => f.write_str("Communications link failure: the connection to the server was lost.")?,
+            (None, Some(Driver::Sqlite)) => f.write_str("The database connection is closed.")?,
+            (None, _) => f.write_str("An I/O error occurred while sending to the backend.")?,
+        }
+        if self.server.is_none() && !self.cause.is_empty() {
+            write!(f, "\n  Cause: {}", self.cause)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
     #[error("{0}")]
     Server(Box<ServerError>),
+    /// The connection died while a statement or command used it (see [`ConnectionLost`]).
+    #[error("{0}")]
+    ConnectionLost(ConnectionLost),
     /// Connection level failures (I/O, TLS, protocol, pool timeouts, bad options).
     #[error("{0}")]
     Connection(String),
@@ -110,6 +153,24 @@ impl DbError {
         }
     }
 
+    /// Did the connection die (as opposed to the statement failing)?
+    pub fn is_connection_lost(&self) -> bool {
+        matches!(self, DbError::ConnectionLost(_))
+    }
+
+    /// Tell a driver-less [`ConnectionLost`] which database it came from (sets the SQLSTATE and the text);
+    /// any other error is returned unchanged.
+    pub fn for_driver(self, driver: Driver) -> DbError {
+        match self {
+            DbError::ConnectionLost(mut l) if l.driver.is_none() => {
+                l.driver = Some(driver);
+                DbError::ConnectionLost(l)
+            }
+            DbError::Change { index, source } => DbError::Change { index, source: Box::new(source.for_driver(driver)) },
+            e => e,
+        }
+    }
+
     /// 1-based position of the error inside the offending statement, when known.
     pub fn position(&self) -> Option<usize> {
         self.server().and_then(|s| s.position)
@@ -136,8 +197,44 @@ impl From<sqlx::Error> for DbError {
             sqlx::Error::PoolTimedOut => {
                 DbError::Connection("Timed out waiting for a free connection from the pool".into())
             }
+            other if sqlx_connection_lost(&other) => {
+                DbError::ConnectionLost(ConnectionLost { driver: None, server: None, cause: other.to_string() })
+            }
             other => DbError::Connection(other.to_string()),
         }
+    }
+}
+
+/// Error of *opening* a connection (nothing was lost: the server was never reached): the plain client text.
+pub(crate) fn connect_error(e: sqlx::Error) -> DbError {
+    if sqlx_connection_lost(&e) {
+        DbError::Connection(e.to_string())
+    } else {
+        e.into()
+    }
+}
+
+/// Does this client error mean the connection is gone? (I/O and TLS failures, a closed pool, a dead worker
+/// thread, protocol errors caused by a socket that closed in the middle of a message.)
+pub(crate) fn sqlx_connection_lost(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::PoolClosed | sqlx::Error::WorkerCrashed => true,
+        sqlx::Error::Protocol(m) => {
+            let m = m.to_lowercase();
+            ["eof", "closed", "reset", "broken pipe", "unexpected end"].iter().any(|k| m.contains(k))
+        }
+        _ => false,
+    }
+}
+
+/// Server errors that announce the end of the connection: PG class `08` (connection exception) and
+/// `57P01` / `57P02` / `57P03` (admin shutdown, crash shutdown, cannot connect now); MySQL 2006 / 2013
+/// (gone away / lost connection), 1927 (connection was killed), 1053 (server shutdown in progress).
+fn server_error_ends_connection(s: &ServerError) -> bool {
+    match s.driver {
+        Driver::Postgres => s.code.starts_with("08") || matches!(s.code.as_str(), "57P01" | "57P02" | "57P03"),
+        Driver::MySql => matches!(s.native_code, Some(2006 | 2013 | 1927 | 1053)) || s.code == "08S01",
+        Driver::Sqlite => false,
     }
 }
 
@@ -147,7 +244,7 @@ fn from_database_error(db: &(dyn DatabaseError + 'static)) -> DbError {
             Some(PgErrorPosition::Original(p)) => Some(p),
             _ => None,
         };
-        return DbError::Server(Box::new(ServerError {
+        return server_error(ServerError {
             driver: Driver::Postgres,
             code: pg.code().to_string(),
             native_code: None,
@@ -156,10 +253,10 @@ fn from_database_error(db: &(dyn DatabaseError + 'static)) -> DbError {
             detail: pg.detail().map(str::to_string),
             hint: pg.hint().map(str::to_string),
             position,
-        }));
+        });
     }
     if let Some(my) = db.try_downcast_ref::<MySqlDatabaseError>() {
-        return DbError::Server(Box::new(ServerError {
+        return server_error(ServerError {
             driver: Driver::MySql,
             code: my.code().unwrap_or("HY000").to_string(),
             native_code: Some(my.number() as i64),
@@ -168,11 +265,11 @@ fn from_database_error(db: &(dyn DatabaseError + 'static)) -> DbError {
             detail: None,
             hint: None,
             position: None,
-        }));
+        });
     }
     if let Some(lite) = db.try_downcast_ref::<SqliteError>() {
         let native: i64 = lite.code().and_then(|c| c.parse().ok()).unwrap_or(0);
-        return DbError::Server(Box::new(ServerError {
+        return server_error(ServerError {
             driver: Driver::Sqlite,
             code: sqlite_name(native).map(str::to_string).unwrap_or_else(|| {
                 lite.code().map(|c| format!("SQLITE_{c}")).unwrap_or_else(|| "SQLITE_ERROR".into())
@@ -183,9 +280,21 @@ fn from_database_error(db: &(dyn DatabaseError + 'static)) -> DbError {
             detail: None,
             hint: None,
             position: None,
-        }));
+        });
     }
     DbError::Connection(db.message().to_string())
+}
+
+/// A server error, or a lost connection when the server said it is hanging up.
+fn server_error(s: ServerError) -> DbError {
+    if server_error_ends_connection(&s) {
+        let server = match s.driver {
+            Driver::Postgres => format!("{}: {}", s.severity.as_deref().unwrap_or("FATAL"), s.message),
+            _ => s.message.clone(),
+        };
+        return DbError::ConnectionLost(ConnectionLost { driver: Some(s.driver), server: Some(server), cause: String::new() });
+    }
+    DbError::Server(Box::new(s))
 }
 
 fn sqlite_name(code: i64) -> Option<&'static str> {
@@ -232,4 +341,71 @@ fn sqlite_description(code: i64) -> Option<&'static str> {
         2067 => "A UNIQUE constraint failed",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lost(driver: Option<Driver>, server: Option<&str>) -> DbError {
+        DbError::ConnectionLost(ConnectionLost { driver, server: server.map(str::to_string), cause: "boom".into() })
+    }
+
+    #[test]
+    fn connection_lost_text_and_sqlstate() {
+        let e = lost(None, None).for_driver(Driver::Postgres);
+        assert!(e.to_string().starts_with("[08006] An I/O error occurred while sending to the backend."), "{e}");
+        assert!(e.to_string().contains("Cause: boom"));
+        let e = lost(None, None).for_driver(Driver::MySql);
+        assert!(e.to_string().starts_with("[08S01] Communications link failure"), "{e}");
+        let e = lost(None, None).for_driver(Driver::Sqlite);
+        assert!(e.to_string().starts_with("[08006] The database connection is closed."), "{e}");
+        let e = lost(Some(Driver::Postgres), Some("FATAL: terminating connection due to administrator command"));
+        assert_eq!(e.to_string(), "[08006] FATAL: terminating connection due to administrator command");
+        // the driver sticks once known
+        assert!(lost(Some(Driver::MySql), None).for_driver(Driver::Postgres).to_string().starts_with("[08S01]"));
+        assert!(e.is_connection_lost() && !DbError::Cancelled.is_connection_lost());
+    }
+
+    #[test]
+    fn client_errors_that_mean_a_dead_connection() {
+        let io = |kind| sqlx::Error::Io(std::io::Error::new(kind, "x"));
+        for e in [
+            io(std::io::ErrorKind::BrokenPipe),
+            io(std::io::ErrorKind::ConnectionReset),
+            io(std::io::ErrorKind::UnexpectedEof),
+            sqlx::Error::PoolClosed,
+            sqlx::Error::WorkerCrashed,
+            sqlx::Error::Protocol("unexpected EOF".into()),
+        ] {
+            assert!(DbError::from(e).is_connection_lost());
+        }
+        for e in [sqlx::Error::PoolTimedOut, sqlx::Error::RowNotFound, sqlx::Error::Protocol("invalid utf8 in column".into())] {
+            assert!(!DbError::from(e).is_connection_lost());
+        }
+    }
+
+    fn server(driver: Driver, code: &str, native: Option<i64>) -> ServerError {
+        ServerError { driver, code: code.into(), native_code: native, severity: Some("FATAL".into()), message: "m".into(), detail: None, hint: None, position: None }
+    }
+
+    #[test]
+    fn server_errors_that_end_the_connection() {
+        for c in ["57P01", "57P02", "57P03", "08006", "08003", "08001"] {
+            assert!(server_error_ends_connection(&server(Driver::Postgres, c, None)), "{c}");
+        }
+        for c in ["57014", "42P01", "25P02", "40001"] {
+            assert!(!server_error_ends_connection(&server(Driver::Postgres, c, None)), "{c}");
+        }
+        for n in [2006, 2013, 1927, 1053] {
+            assert!(server_error_ends_connection(&server(Driver::MySql, "HY000", Some(n))), "{n}");
+        }
+        for n in [1317, 1205, 1213, 1064] {
+            assert!(!server_error_ends_connection(&server(Driver::MySql, "HY000", Some(n))), "{n}");
+        }
+        match server_error(server(Driver::Postgres, "57P01", None)) {
+            DbError::ConnectionLost(l) => assert_eq!(l.to_string(), "[08006] FATAL: m"),
+            other => panic!("{other:?}"),
+        }
+    }
 }

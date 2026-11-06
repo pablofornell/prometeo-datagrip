@@ -37,6 +37,7 @@ pub fn run() {
             commands::close_session,
             commands::session_in_transaction,
             commands::session_tx_status,
+            commands::session_state,
             commands::introspect,
             commands::get_ddl,
             commands::schema_snapshot,

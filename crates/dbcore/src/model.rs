@@ -285,6 +285,23 @@ impl TxStatus {
     }
 }
 
+/// Everything the UI needs to know about a session's transaction / connection (`session_state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionState {
+    /// Same value as `session_tx_status`. `idle` when the connection is lost (a lost connection has no
+    /// transaction any more: the server rolled it back).
+    pub tx_status: TxStatus,
+    /// Same value as `session_in_transaction` (`tx_status` is `active` or `failed`).
+    pub in_transaction: bool,
+    /// The connection died and was not re-established yet. Calls fail with `[08006]` / `[08S01]`
+    /// (`transaction_lost`), or the next `execute` reopens the connection (not `transaction_lost`).
+    pub connection_lost: bool,
+    /// The connection died while a transaction was open: its work is gone, and the session refuses to
+    /// reconnect on its own. Close it (`close_session`) and open a new one.
+    pub transaction_lost: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ExecEvent {
@@ -297,7 +314,10 @@ pub enum ExecEvent {
     /// it that way); `position_utf16` is the same place as a 1-based offset in UTF-16 code units
     /// (what JS strings / CodeMirror count), computed against the statement text that was sent.
     /// They differ after any character outside the BMP (emoji). Use `position_utf16` in the editor.
-    Error { index: usize, message: String, position: Option<usize>, position_utf16: Option<usize> },
+    ///
+    /// `connection_lost` is true when the statement failed because the connection is gone (message starts
+    /// with `[08006]`, or `[08S01]` on MySQL); the session is then dead, see `ConnectionManager::session_state`.
+    Error { index: usize, message: String, position: Option<usize>, position_utf16: Option<usize>, connection_lost: bool },
     Message { index: Option<usize>, text: String },
     /// The transaction state of the session changed (sent right after the statement that changed
     /// it, before `Done`). Also see `ConnectionManager::session_tx_status`.
@@ -305,7 +325,9 @@ pub enum ExecEvent {
     /// A `COMMIT` / `ROLLBACK` / `END` / `ABORT` statement finished, or MySQL committed implicitly.
     /// `committed == false` for a `COMMIT` of a failed PostgreSQL transaction: the server rolled
     /// it back (command tag `ROLLBACK`) without reporting an error. `tag` is the command tag:
-    /// `COMMIT`, `ROLLBACK` or `IMPLICIT COMMIT` (MySQL DDL & co. ended the transaction).
+    /// `COMMIT`, `ROLLBACK` or `IMPLICIT COMMIT` (MySQL DDL & co. ended the transaction), or
+    /// `CONNECTION LOST` (`committed == false`: the connection died with the transaction open, so the
+    /// server rolled it back).
     TxEnded { index: usize, committed: bool, tag: String },
     Done { elapsed_ms: u64, execution_ms: u64, fetching_ms: u64 },
 }

@@ -17,7 +17,7 @@ message) and use camelCase JSON; argument names are camelCase in JS (`ds_id` -> 
 | `duplicate_data_source(id)` | `duplicateDataSource(id)` | name `"<name> 1"` |
 | `test_connection(ds)` | `testConnection(ds)` | unsaved config OK; null password = stored one |
 | `connect(id)` / `disconnect(id)` | `connect` / `disconnect` | `connected_data_sources` -> `connectedDataSources()` |
-| `open_session(dsId, initSql?)` / `close_session(sessionId)` | `openSession(dsId, initSql?)` / `closeSession` | `initSql: string[]` runs on the new connection first (re-apply `SET search_path` / `USE` / isolation of a reopened console); `session_in_transaction` -> `sessionInTransaction` (open = active or failed); `session_tx_status` -> `sessionTxStatus` (`idle`/`active`/`failed`) |
+| `open_session(dsId, initSql?)` / `close_session(sessionId)` | `openSession(dsId, initSql?)` / `closeSession` | `initSql: string[]` runs on the new connection first (re-apply `SET search_path` / `USE` / isolation of a reopened console); `session_in_transaction` -> `sessionInTransaction` (open = active or failed); `session_tx_status` -> `sessionTxStatus` (`idle`/`active`/`failed`; `idle` when the connection died); `session_state` -> `sessionState` (`{ txStatus, inTransaction, connectionLost, transactionLost }`, consistent with the two previous ones). `close_session` of a dead session succeeds. See "Lost connection" below |
 | `introspect(dsId, path, showSystem)` | `introspect(dsId, path, showSystem?)` | paths: see `crates/dbcore/src/introspect.rs` |
 | `get_ddl(dsId, object)` | `getDdl` | `object: ObjectRef` |
 | `schema_snapshot(dsId, schema?)` | `schemaSnapshot` | completion data |
@@ -40,11 +40,25 @@ message) and use camelCase JSON; argument names are camelCase in JS (`ds_id` -> 
 
 `execute` returns the execution id immediately. Events are pushed through a
 `tauri::ipc::Channel<ExecEvent>` (ordered, no global events): `statement`, `resultset`,
-`update`, `error`, `message`, `txStatus`, `txEnded`, `done` (always last). The frontend helper `execute()` creates
+`update`, `error` (with `connectionLost`), `message`, `txStatus`, `txEnded`, `done` (always last; `txStatus`/`txEnded` can follow it after a user cancel inside a PostgreSQL transaction or a lost connection found while paging). The frontend helper `execute()` creates
 the channel, dispatches to `onStatement/onResultSet/...` callbacks and returns
 `{ executionId, cancel(), close(), fetchMore(resultIndex, count), done }`. A history entry
 is written when `done` passes through. The execution stays registered (for `fetchMore`)
 until dbcore's execution task ends.
+
+## Lost connection
+
+If a statement fails because the connection is gone (socket closed / reset, `pg_terminate_backend`, `KILL <id>`,
+server shutdown), the `error` event has `connectionLost: true` and a message starting with `[08006] ` (PostgreSQL,
+SQLite) or `[08S01] ` (MySQL), e.g. `[08006] An I/O error occurred while sending to the backend.`; every other error has
+`connectionLost: false`. The script stops. The session is then dead: `sessionTxStatus` is `idle`, and when a
+transaction was open `txEnded { committed: false, tag: "CONNECTION LOST" }` and `txStatus { idle }` follow the error
+(they also arrive, outside `done`, when the loss is found by `fetchMore`, which then fails with the same message).
+`sessionState` returns `{ txStatus, inTransaction, connectionLost, transactionLost }`. Later `execute` /
+`tableDataInSession` / `applyChangesInSession` calls on the dead session fail at once with the same error (`COMMIT` and
+`ROLLBACK` too) - except when no transaction was open: then the next `execute` opens a new connection first (a
+`message` event says settings like `search_path` / `USE db` were reset). With `transactionLost` the UI decides:
+`closeSession` (always succeeds) and `openSession` a new one.
 
 ## Persistence
 
