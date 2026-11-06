@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const sessions: unknown[] = [];
 const controllers: unknown[] = [];
@@ -16,7 +16,7 @@ vi.mock("../table/dialogs", () => ({
     return asked.length > 1 && next.length ? next.shift() : answer;
   },
 }));
-import { confirmEndTransactions, txDialogText } from "./txguard";
+import { STUCK_AFTER_MS, confirmEndTransactions, txDialogText } from "./txguard";
 
 const ended: string[] = [];
 let rollbackOk = false;
@@ -115,6 +115,67 @@ describe("confirmEndTransactions", () => {
     await confirmEndTransactions({ tabId: "c1", reason: "closing the console" });
     expect(asked[0].choices.map((c) => c.value)).toEqual(["rollback", "cancel"]);
     expect(asked[0].message).toMatch(/failed/);
+  });
+});
+
+describe("the COMMIT / ROLLBACK of the quit guard shows its progress", () => {
+  /** A progress dialog that records what happened to it. */
+  const progress = () => {
+    const log: string[] = [];
+    let quit!: () => void;
+    const quitAnyway = new Promise<void>((r) => (quit = r));
+    return { log, quit, p: { begin: (verb: string, title: string) => (log.push(`${verb} ${title}`), { stuck: () => void log.push("stuck"), close: () => void log.push("close"), quitAnyway }) } };
+  };
+  /** A console whose COMMIT only ends when `release` is called. */
+  const hanging = () => {
+    let release!: (ok: boolean) => void;
+    const s = { ...con("c1", "ds1", "active"), endTx: (k: string) => (ended.push(`c1:${k}`), new Promise<boolean>((r) => (release = r))) };
+    return { s, release: (ok = true) => release(ok) };
+  };
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("shows 'Committing' while it runs, then closes; a quick COMMIT never offers Quit anyway", async () => {
+    const { s, release } = hanging();
+    sessions.push(s);
+    const pr = progress();
+    const done = confirmEndTransactions({ reason: "quitting the application", progress: pr.p });
+    await vi.advanceTimersByTimeAsync(STUCK_AFTER_MS - 1);
+    expect(pr.log).toEqual(["Committing console c1"]);
+    release();
+    expect(await done).toBe(true);
+    await vi.advanceTimersByTimeAsync(STUCK_AFTER_MS * 2);
+    expect(pr.log).toEqual(["Committing console c1", "close"]); // no "stuck"
+  });
+  it("a ROLLBACK says 'Rolling back'", async () => {
+    sessions.push(con("c1", "ds1", "active"));
+    answer = "rollback";
+    const pr = progress();
+    await confirmEndTransactions({ reason: "quitting the application", progress: pr.p });
+    expect(pr.log[0]).toBe("Rolling back console c1");
+  });
+  it("a COMMIT that takes longer than 10 s turns the dialog to 'Quit anyway', which lets the quit go on", async () => {
+    const { s } = hanging();
+    sessions.push(s);
+    const pr = progress();
+    let result: boolean | undefined;
+    void confirmEndTransactions({ reason: "quitting the application", progress: pr.p }).then((r) => (result = r));
+    await vi.advanceTimersByTimeAsync(STUCK_AFTER_MS);
+    expect(pr.log).toEqual(["Committing console c1", "stuck"]);
+    expect(result).toBeUndefined(); // still waiting until the user decides
+    pr.quit();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(result).toBe(true);
+    expect(pr.log.at(-1)).toBe("close");
+    expect(asked).toHaveLength(1); // no "Cannot commit" dialog: the user already chose
+  });
+  it("a COMMIT that fails closes the progress before the failure dialog", async () => {
+    sessions.push(con("c1", "ds1", "active", false));
+    next.push("cancel");
+    const pr = progress();
+    expect(await confirmEndTransactions({ reason: "quitting", progress: pr.p })).toBe(false);
+    expect(pr.log).toEqual(["Committing console c1", "close"]);
+    expect(asked[1].title).toBe("Cannot commit the transaction");
   });
 });
 

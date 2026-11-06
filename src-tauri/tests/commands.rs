@@ -381,6 +381,47 @@ async fn sqlite_end_to_end_and_persistence() {
     assert!(st.list_consoles(&ds).await.unwrap().is_empty());
 }
 
+/// Options that only the UI reads (the legacy `visibleSchemas`, `showSystemSchemas`, `comment`, ...) are not part of
+/// the connection fingerprint: adding, changing or removing them keeps a live session; a key the backend reads does not.
+#[tokio::test]
+async fn view_only_options_do_not_disconnect_a_live_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(&dir);
+    let db_file = dir.path().join("v.sqlite");
+    let cfg = DataSourceConfig {
+        name: "v".into(),
+        driver: Driver::Sqlite,
+        file: db_file.display().to_string(),
+        options: [("create".to_string(), "true".to_string()), ("visibleSchemas".to_string(), "[[\"main\"]]".to_string())].into(),
+        ..Default::default()
+    };
+    let ds = st.save_data_source(cfg).await.unwrap().cfg.id;
+    st.connect(&ds).await.unwrap();
+    let sess = st.open_session(&ds).await.unwrap();
+    run(&st, &sess, "begin", 10).await;
+    let mut cfg = st.list_data_sources().await.unwrap()[0].cfg.clone();
+
+    // the frontend migration removes visibleSchemas; then every other UI-only key is added and changed
+    cfg.options.remove("visibleSchemas");
+    st.save_data_source(cfg.clone()).await.unwrap();
+    for (k, v) in [
+        ("visibleSchemas", "[[\"main\"]]"), ("showSystemSchemas", "true"), ("comment", "hello"), ("txMode", "manual"),
+        ("sessionControl", "single"), ("keepAliveSec", "30"), ("autoDisconnectSec", "60"), ("startupScript", "select 1"),
+    ] {
+        cfg.options.insert(k.to_string(), v.to_string());
+        st.save_data_source(cfg.clone()).await.unwrap();
+        cfg.options.insert(k.to_string(), format!("{v}2"));
+        st.save_data_source(cfg.clone()).await.unwrap();
+        assert!(st.connected_data_sources().contains(&ds), "{k} must not disconnect");
+    }
+    assert!(st.session_in_transaction(&sess).await.unwrap(), "the open session and its transaction survive");
+
+    // a key the backend reads still reconnects
+    cfg.options.insert("connectTimeout".into(), "5".into());
+    st.save_data_source(cfg).await.unwrap();
+    assert!(st.connected_data_sources().is_empty(), "connectTimeout changes the connection");
+}
+
 /// Uses the real OS keyring when there is one (skips otherwise) and cleans up after itself.
 #[tokio::test]
 async fn os_keyring_roundtrip_when_available() {

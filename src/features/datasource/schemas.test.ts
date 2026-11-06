@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it } from "vitest";
 import { resetVisibleSchemasCache } from "../../state/schema-filter";
-import { configFromForm, formFromDataSource, reconnectPart, reconnectsOnSave, savedPart } from "./model";
+import { configFromForm, formFromDataSource, normalizedForm, reconnectsOnApply, reconnectsOnSave, savedPart } from "./model";
 import { isSchemaVisible, parseVisibleSchemas, saveVisibleSchemas, visibleSchemas, visibleSchemasRaw } from "./schemas";
 
 const ds = (options: Record<string, string> = {}) =>
@@ -48,7 +48,7 @@ describe("the Data Sources dialog form", () => {
     form.options.visibleSchemas = '[["postgres","public"]]';
     const after = JSON.stringify(form);
     expect(savedPart(after)).toBe(savedPart(before));
-    expect(reconnectPart(after)).toBe(reconnectPart(before));
+    expect(reconnectsOnApply(JSON.parse(after), "d1", ds())).toBe(false);
     expect(after).not.toBe(before);
   });
   it("a rename needs a save but no reconnect; a host change needs both", () => {
@@ -56,9 +56,8 @@ describe("the Data Sources dialog form", () => {
     const before = JSON.stringify(form);
     const renamed = JSON.stringify({ ...form, name: "other" });
     expect(savedPart(renamed)).not.toBe(savedPart(before));
-    expect(reconnectPart(renamed)).toBe(reconnectPart(before));
-    const moved = JSON.stringify({ ...form, host: "db2" });
-    expect(reconnectPart(moved)).not.toBe(reconnectPart(before));
+    expect(reconnectsOnApply(JSON.parse(renamed), "d1", ds())).toBe(false);
+    expect(reconnectsOnApply({ ...form, host: "db2" }, "d1", ds())).toBe(true);
   });
 });
 
@@ -67,9 +66,49 @@ describe("reconnectsOnSave mirrors the backend's connection fingerprint", () => 
   it("name / color / password do not reconnect", () => {
     expect(reconnectsOnSave(base, { ...(base as object), name: "x", color: "#fff", password: "p" } as never)).toBe(false);
   });
-  it("any options key does: that is why visibleSchemas must not be one", () => {
-    expect(reconnectsOnSave(base, { ...(base as object), options: { a: "1", visibleSchemas: "[]" } } as never)).toBe(true);
+  it("any options key does, except the view-only ones (visibleSchemas)", () => {
+    expect(reconnectsOnSave(base, { ...(base as object), options: { a: "1", visibleSchemas: "[]" } } as never)).toBe(false);
+    expect(reconnectsOnSave(base, { ...(base as object), options: { a: "1", b: "2" } } as never)).toBe(true);
     expect(reconnectsOnSave(base, { ...(base as object), host: "h2" } as never)).toBe(true);
     expect(reconnectsOnSave(base, { ...(base as object), options: { a: "1" } } as never)).toBe(false);
+  });
+});
+
+describe("a legacy data source that still has options.visibleSchemas", () => {
+  const legacy = () => ds({ visibleSchemas: '[["postgres","public"]]', comment: "c", custom: "x" });
+  it("a rename sends the stored options unchanged and does not reconnect", () => {
+    const stored = legacy();
+    const form = formFromDataSource(stored);
+    const base = JSON.stringify(normalizedForm(form));
+    form.name = "pg renamed";
+    const now = JSON.stringify(normalizedForm(form));
+    expect(savedPart(now)).not.toBe(savedPart(base)); // needs a save
+    const sent = configFromForm(form, "d1", stored);
+    expect(sent.options).toEqual((stored as { options: object }).options);
+    expect(reconnectsOnSave(stored as never, sent)).toBe(false);
+    expect(reconnectsOnApply(form, "d1", stored)).toBe(false);
+  });
+  it("without the stored copy (a new source) the key is not sent", () => {
+    expect(configFromForm(formFromDataSource(legacy()), null).options).toEqual({ comment: "c", custom: "x" });
+  });
+  it("what is compared is what is sent: a changed option or host reconnects", () => {
+    const stored = legacy();
+    const form = formFromDataSource(stored);
+    form.options.custom = "y";
+    expect(reconnectsOnApply(form, "d1", stored)).toBe(true);
+    const moved = formFromDataSource(stored);
+    moved.host = "db2";
+    expect(reconnectsOnApply(moved, "d1", stored)).toBe(true);
+  });
+  it("a filter change in the form does not alter the legacy key that is sent", () => {
+    const stored = legacy();
+    const form = formFromDataSource(stored);
+    form.options.visibleSchemas = '[["postgres","sales"]]';
+    expect((configFromForm(form, "d1", stored).options as Record<string, string>).visibleSchemas).toBe('[["postgres","public"]]');
+    expect(reconnectsOnApply(form, "d1", stored)).toBe(false);
+  });
+  it("a stored empty option stays as stored (not dropped, so no reconnect)", () => {
+    const stored = ds({ empty: "" });
+    expect(reconnectsOnApply(formFromDataSource(stored), "d1", stored)).toBe(false);
   });
 });

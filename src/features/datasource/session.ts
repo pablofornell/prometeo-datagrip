@@ -18,7 +18,7 @@ import {
   type Problem,
   autoName,
   configFromForm,
-  reconnectPart,
+  reconnectsOnApply,
   savedPart,
   defaultForm,
   formFromDataSource,
@@ -111,7 +111,7 @@ export function createSession() {
   /** Saving reaches the backend (the schema filter alone is a UI-state setting and does not). */
   const needsSave = (d: Draft) => d.id != null && (savedPart(snapshot(d.form)) !== savedPart(d.base) || d.password.touched);
   /** Saving reconnects the data source (name / color / schema filter do not): open transactions would be lost. */
-  const reconnects = (d: Draft) => d.id != null && (reconnectPart(snapshot(d.form)) !== reconnectPart(d.base) || d.password.touched);
+  const reconnects = (d: Draft) => d.id != null && (reconnectsOnApply(d.form, d.id, d.saved) || d.password.touched);
   const hasChanges = () => deletedIds().length > 0 || drafts.some((d) => isNew(d) || isModified(d));
 
   const problems = createMemo<SessionProblem[]>(() => {
@@ -315,7 +315,7 @@ export function createSession() {
       return;
     }
     setError(null);
-    const cfg: Partial<DataSourceConfig> = { ...configFromForm(d.form, d.id), password: passwordToSend(d) };
+    const cfg: Partial<DataSourceConfig> = { ...configFromForm(d.form, d.id, d.saved), password: passwordToSend(d) };
     const sslmode = d.form.options.sslmode ?? null;
     const dbms = d.form.dbms;
     const target = { driver: dbms, host: d.form.host, port: d.form.port, file: d.form.file };
@@ -392,7 +392,7 @@ export function createSession() {
           // only the schema filter changed: a UI-state write, the backend (and its connection) is left alone
           saved = d.saved;
         } else {
-          const cfg = { ...configFromForm(d.form, d.id), password: passwordToSend(d) } as Partial<DataSourceConfig> & { name: string };
+          const cfg = { ...configFromForm(d.form, d.id, d.saved), password: passwordToSend(d) } as Partial<DataSourceConfig> & { name: string };
           saved = await saveDataSource(cfg);
         }
         saveVisibleSchemas(saved.id, d.form.options.visibleSchemas);

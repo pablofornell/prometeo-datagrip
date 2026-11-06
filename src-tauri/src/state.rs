@@ -71,12 +71,29 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, String> + Sen
     tokio::task::spawn_blocking(f).await.map_err(|e| format!("internal error: {e}"))?
 }
 
+/// `options` keys that only the UI reads (the backend takes none of them into account when it connects), so
+/// changing or removing them must not drop a live connection: `comment`; `visibleSchemas` (a legacy key the
+/// frontend migrates to its own state); `showSystemSchemas` (introspection takes `show_system` per call, a tree
+/// refresh is enough); `txMode` / `sessionControl` / `keepAliveSec` / `autoDisconnectSec` / `startupScript`
+/// (applied by the frontend when it opens sessions) and `passwordSave` (reserved). The keys dbcore reads
+/// (`sslmode`, `application_name`, `connectTimeout`, `create`, ...), `dbms`, `auth` and free driver
+/// properties stay in the fingerprint.
+const VIEW_ONLY_OPTIONS: [&str; 9] = [
+    "comment", "visibleSchemas", "showSystemSchemas", "txMode", "sessionControl", "keepAliveSec", "autoDisconnectSec",
+    "startupScript", "passwordSave",
+];
+
 /// Fields whose change invalidates a live pool.
 fn connection_fingerprint(c: &DataSourceConfig) -> Value {
     let mut v = serde_json::to_value(c).unwrap_or(Value::Null);
     if let Some(m) = v.as_object_mut() {
         for k in ["name", "color", "password"] {
             m.remove(k);
+        }
+        if let Some(opts) = m.get_mut("options").and_then(Value::as_object_mut) {
+            for k in VIEW_ONLY_OPTIONS {
+                opts.remove(k);
+            }
         }
     }
     v

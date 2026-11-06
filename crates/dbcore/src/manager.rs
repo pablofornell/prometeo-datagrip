@@ -2,7 +2,7 @@
 //! registry of running executions.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -14,6 +14,7 @@ use crate::conn::{build_opts, connect_one, is_memory, open_pool, Conn, ConnOpts,
 use crate::error::{ConnectionLost, DbError, Result};
 use crate::exec::conn_scalar;
 use crate::model::*;
+use crate::tx::ServerVer;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -67,6 +68,10 @@ pub(crate) struct Session {
     pub tx: AtomicU8,
     /// MySQL: `@@autocommit` is on (statements outside a transaction commit themselves).
     pub autocommit_on: AtomicBool,
+    /// MySQL: server version (`major * 10000 + minor * 100 + patch`) and flavour, read once when the connection
+    /// opened; the tracker needs it to tell which `/*!NNNNN ... */` comments the server executes.
+    pub server_version: AtomicU32,
+    pub mariadb: AtomicBool,
     /// MySQL: `LOCK TABLES` is in effect (`UNLOCK TABLES` then commits implicitly).
     pub tables_locked: AtomicBool,
     /// Set when the connection died; the connection itself is gone from `conn` then.
@@ -88,10 +93,12 @@ pub(crate) struct Opened {
     pub conn: Conn,
     pub cancel: CancelTarget,
     pub autocommit_on: bool,
+    pub server_ver: ServerVer,
 }
 
 /// Open a connection for a session: its cancel handle (backend pid / connection id / `sqlite3*`) and, for
-/// MySQL, `@@autocommit` (read once here, before any user statement: the tracker follows it from then on).
+/// MySQL, `@@autocommit` and `@@version` (read once here, before any user statement: the tracker follows
+/// autocommit from then on and needs the version to read `/*!NNNNN ... */` comments).
 pub(crate) async fn open_conn(live: &Live) -> Result<Opened> {
     let mut conn = live.new_conn().await?;
     let cancel = match &mut conn {
@@ -113,7 +120,11 @@ pub(crate) async fn open_conn(live: &Live) -> Result<Opened> {
         Conn::My(_) => conn_scalar(&mut conn, "select @@autocommit").await?.map(|v| v != "0").unwrap_or(true),
         _ => true,
     };
-    Ok(Opened { conn, cancel, autocommit_on })
+    let server_ver = match &mut conn {
+        Conn::My(_) => conn_scalar(&mut conn, "select @@version").await?.map(|v| ServerVer::parse(&v)).unwrap_or(ServerVer::UNKNOWN),
+        _ => ServerVer::UNKNOWN,
+    };
+    Ok(Opened { conn, cancel, autocommit_on, server_ver })
 }
 
 impl Session {
@@ -203,6 +214,8 @@ impl Session {
                 *guard = Some(o.conn);
                 *self.cancel.lock().unwrap() = o.cancel;
                 self.autocommit_on.store(o.autocommit_on, Ordering::Relaxed);
+                self.server_version.store(o.server_ver.num, Ordering::Relaxed);
+                self.mariadb.store(o.server_ver.mariadb, Ordering::Relaxed);
                 self.tables_locked.store(false, Ordering::Relaxed);
                 self.set_tx_status(TxStatus::Idle);
                 *self.lost.lock().unwrap() = None;
@@ -387,7 +400,7 @@ impl ConnectionManager {
     /// fails, the connection is closed and its error is returned (no session is left behind).
     pub async fn open_session_with(&self, ds_id: &str, init_sql: &[String]) -> Result<SessionId> {
         let live = self.live(ds_id)?;
-        let Opened { conn, cancel, autocommit_on } = open_conn(&live).await?;
+        let Opened { conn, cancel, autocommit_on, server_ver } = open_conn(&live).await?;
         let id = uuid::Uuid::new_v4().to_string();
         let session = Arc::new(Session {
             id: id.clone(),
@@ -396,6 +409,8 @@ impl ConnectionManager {
             cancel: Mutex::new(cancel),
             tx: AtomicU8::new(TxStatus::Idle as u8),
             autocommit_on: AtomicBool::new(autocommit_on),
+            server_version: AtomicU32::new(server_ver.num),
+            mariadb: AtomicBool::new(server_ver.mariadb),
             tables_locked: AtomicBool::new(false),
             lost: Mutex::new(None),
             current: Mutex::new(None),

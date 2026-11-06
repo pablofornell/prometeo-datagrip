@@ -73,6 +73,7 @@ vi.mock("../../api/db", () => ({
     };
   }),
   introspect: vi.fn(async () => []),
+  setUiState: vi.fn(async () => {}),
   applyChanges: vi.fn(),
   tableData: vi.fn(),
   listDataSources: vi.fn(async () => []),
@@ -183,5 +184,56 @@ describe("a paging fetch that finds the connection dead", () => {
     expect(s.sessionId).toBeUndefined();
     expect(s.inTx()).toBe(false);
     expect(lines(s)).toContain("The connection was lost. The transaction was rolled back.");
+  });
+});
+
+describe("the session state a reconnect resets", () => {
+  const BASE = "The connection was re-established. Session state was reset: temporary tables, session variables and SET commands you ran are lost; only the schema and isolation level were restored.";
+  const warned = () => notify.mock.calls.map((c) => c[0] as { kind: string; title: string; body: string }).filter((n) => n.body.includes("re-established"));
+
+  it("a reopen after a lost connection logs a warning and shows a balloon; the first open does not", async () => {
+    await s.run(req("select 1"));
+    expect(lines(s).some((l) => l.includes("re-established"))).toBe(false);
+    expect(warned()).toHaveLength(0);
+    kill(s.sessionId!);
+    await s.run(req("select 2")); // lost
+    expect(lines(s).some((l) => l.includes("re-established"))).toBe(false); // nothing reopened yet
+    await s.run(req("select 3")); // reopens
+    expect(lines(s)).toContain(BASE);
+    expect(warned()).toEqual([expect.objectContaining({ kind: "warning", body: BASE })]);
+    await s.run(req("select 4")); // says it once
+    expect(warned()).toHaveLength(1);
+    expect(lines(s).filter((l) => l.includes("re-established"))).toHaveLength(1);
+  });
+  it("names the SET commands the console had run (they are not replayed)", async () => {
+    await s.run(req("SET ROLE reporting"));
+    kill(s.sessionId!);
+    await s.run(req("select 2"));
+    be.ran.length = 0;
+    await s.run(req("select 3"));
+    const w = warned()[0].body;
+    expect(w.startsWith(BASE)).toBe(true);
+    expect(w).toContain("last: SET ROLE reporting");
+    expect(w).toContain("were not run again");
+    expect(lines(s).some((l) => l.startsWith(BASE) && l.length > BASE.length)).toBe(true);
+    expect(be.opened.at(-1)!.initSql.join(" ")).not.toMatch(/ROLE/); // not replayed
+  });
+  it("MySQL: SET autocommit=0 is called out (autocommit is on again)", async () => {
+    const my = new ConsoleSession("tab2", { id: "d2", name: "my", driver: "mysql", database: "shop", readOnly: false } as never, "console", () => "console [my]");
+    registerSession(my);
+    await my.run(req("SET autocommit=0"));
+    kill(my.sessionId!);
+    await my.run(req("select 2"));
+    await my.run(req("select 3"));
+    expect(warned().at(-1)!.body).toMatch(/autocommit/);
+    expect(lines(my).some((l) => /autocommit is on again/i.test(l))).toBe(true);
+    unregisterSession("tab2");
+  });
+  it("a plain reopen adds nothing about SET; SET search_path (restored) is not counted", async () => {
+    await s.run(req("SET search_path TO sales"));
+    kill(s.sessionId!);
+    await s.run(req("select 2"));
+    await s.run(req("select 3"));
+    expect(warned()[0].body).toBe(BASE);
   });
 });

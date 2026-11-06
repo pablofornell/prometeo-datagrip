@@ -199,3 +199,32 @@ export function ChoiceDialog(props: ChoiceDialogProps): JSX.Element {
     </Dialog>
   );
 }
+
+/**
+ * A wait that cannot be cancelled (the COMMIT / ROLLBACK of the quit guard). `stuck` adds the warning and the
+ * "Quit anyway" button; Esc and the close button do nothing meanwhile.
+ */
+export interface ProgressDialogProps {
+  title: string;
+  message: string;
+  stuck: boolean;
+  warning: string;
+  quitAnywayLabel: string;
+  onQuitAnyway: () => void;
+}
+
+export function ProgressDialog(props: ProgressDialogProps): JSX.Element {
+  return (
+    <Dialog
+      title={props.title}
+      width={440}
+      onClose={() => {}}
+      buttons={props.stuck ? [{ label: props.quitAnywayLabel, run: () => props.onQuitAnyway() }] : []}
+    >
+      <div class="dgt-choice">
+        {props.message}
+        <Show when={props.stuck}>{"\n\n" + props.warning}</Show>
+      </div>
+    </Dialog>
+  );
+}

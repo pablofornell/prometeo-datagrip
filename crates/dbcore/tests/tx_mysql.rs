@@ -40,6 +40,108 @@ fn rows(ev: &[ExecEvent]) -> Vec<Vec<serde_json::Value>> {
     }
 }
 
+/// `(setup, statement, commits)`: `setup` runs before the transaction starts; `commits` is what the *server* does
+/// (checked below with the 1568 probe, not assumed). `{T}` is a table name unique to the case, `{U}` a table
+/// created by `setup`. The first three are the cases proved by the re-check.
+const COMMIT_CASES: &[(&str, &str, bool)] = &[
+    ("", "create /* tmp */ temporary table {T}(i int)", false),
+    ("", "/*!50001 create table {T}(i int) */", true),
+    ("", "# hash comment\ncreate table {T}(i int)", true),
+    ("", "-- dash comment\ncreate table {T}(i int)", true),
+    ("", "/* a */ /* b */ create table {T}(i int)", true),
+    ("", "/*+ hint */ create table {T}(i int)", true),
+    ("", "CREATE/**/TABLE {T}(i int)", true),
+    ("", "create /* a */ table /* b */ {T}(i int)", true),
+    ("", "CrEaTe # x\n TaBlE {T}(i int)", true),
+    ("", "create -- x\n table {T}(i int)", true),
+    ("", "/*! create table {T}(i int) */", true),
+    ("", "/*!50001 create */ table {T}(i int)", true),
+    ("", "/*!80000 create table {T}(i int) */", true),
+    ("", "/*!080000 create table {T}(i int) */", true),
+    ("", "/*!999999 create table {T}(i int) */", false),
+    ("", "/*!99999 create table {T}(i int) */ select 1", false),
+    ("", "create table {T} select 1 as i", true),
+    ("", "CREATE TABLE {T} AS SELECT 1 AS i", true),
+    ("", "CREATE TEMPORARY TABLE {T} SELECT 1 AS i", false),
+    ("", "create temporary /* x */ table {T} select 1 as i", false),
+    ("", "create # x\n temporary table {T}(i int)", false),
+    ("", "create -- x\n temporary table {T}(i int)", false),
+    ("", "create /*!50001 temporary */ table {T}(i int)", false),
+    ("", "/*!50001 create temporary table {T}(i int) */", false),
+    ("create temporary table {U}(i int)", "DROP TEMPORARY TABLE {U}", false),
+    ("create temporary table {U}(i int)", "drop /* x */ temporary /* y */ table {U}", false),
+    ("create temporary table {U}(i int)", "drop table {U}", true),
+    ("create temporary table {U}(i int)", "alter table {U} add j int", true),
+    ("create temporary table {U}(i int)", "alter /* x */ table {U} add j int", true),
+    ("create table {U}(i int)", "alter table {U} add j int", true),
+    ("", "select 1 -- create table {T}(i int)", false),
+    ("", "select 'create table {T}(i int)' # create table {T}(i int)", false),
+    ("", "/* create table {T}(i int) */ select 1", false),
+    ("", "select 1 /* ' */ , 2 -- '", false),
+];
+
+/// The classifier's reading of comments must equal the server's: every statement is run inside a transaction and
+/// the 1568 probe says whether the server committed it; the tracker has to say the same.
+#[tokio::test]
+async fn comments_in_statements_commit_exactly_as_the_server_does() {
+    let (_cfg, mgr) = setup!();
+    let db = format!("scratch_cls_{}", std::process::id());
+    let admin = mgr.open_session("my").await.unwrap();
+    assert_ok(&run(&mgr, &admin, &format!("drop database if exists {db}; create database {db}; create table {db}.base (i int primary key) engine=innodb")).await);
+    for (n, (setup, sql, commits)) in COMMIT_CASES.iter().enumerate() {
+        let (t, u) = (format!("tc{n}"), format!("tu{n}"));
+        let fill = |x: &str| x.replace("{T}", &t).replace("{U}", &u);
+        let (setup, sql) = (fill(setup), fill(sql));
+        let s = mgr.open_session("my").await.unwrap();
+        assert_ok(&run(&mgr, &s, &format!("use {db}")).await);
+        if !setup.is_empty() {
+            assert_ok(&run(&mgr, &s, &setup).await);
+        }
+        assert_ok(&run(&mgr, &s, &format!("start transaction; insert into base values ({n})")).await);
+        assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Active, "{sql}");
+        // the statement itself may fail (an empty statement after a skipped comment): it still ran or not on the server
+        let _ = run(&mgr, &s, &sql).await;
+        let want = if *commits { TxStatus::Idle } else { TxStatus::Active };
+        assert_eq!(truth(&mgr, &s).await, want, "the server, for {sql:?}");
+        assert_eq!(mgr.session_tx_status(&s).unwrap(), want, "the tracker, for {sql:?}");
+        mgr.close_session(&s).await;
+    }
+    assert_ok(&run(&mgr, &admin, &format!("drop database {db}")).await);
+    mgr.close_session(&admin).await;
+}
+
+/// `SET autocommit` behind comments / in its spellings is followed (the next statement opens a transaction, the
+/// server agrees), and `SET autocommit = 1` commits it.
+#[tokio::test]
+async fn set_autocommit_forms_behind_comments() {
+    let (_cfg, mgr) = setup!();
+    let db = format!("scratch_ac_{}", std::process::id());
+    let admin = mgr.open_session("my").await.unwrap();
+    assert_ok(&run(&mgr, &admin, &format!("drop database if exists {db}; create database {db}; create table {db}.base (i int primary key) engine=innodb")).await);
+    let off = [
+        "set autocommit = 0 -- manual", "SET @@session.autocommit=0", "SET autocommit=OFF /* x */", "set /* a */ autocommit /* b */ = /* c */ 0",
+        "set # x\n session autocommit = false", "set @@local.autocommit = 'OFF'", "set @x = 1, autocommit = 0", "/*!50001 set autocommit = 0 */",
+    ];
+    let on = ["set autocommit = 1 -- x", "SET @@autocommit=ON /* x */", "set /* a */ autocommit /* b */ = TRUE", "set # x\n autocommit = 1"];
+    for (n, a) in off.iter().enumerate() {
+        let b = &on[n % on.len()];
+        let s = mgr.open_session("my").await.unwrap();
+        assert_ok(&run(&mgr, &s, &format!("use {db}")).await);
+        assert_ok(&run(&mgr, &s, a).await);
+        assert_ok(&run(&mgr, &s, &format!("insert into base values ({n})")).await);
+        assert_eq!(truth(&mgr, &s).await, TxStatus::Active, "the server, after {a:?}");
+        assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Active, "the tracker, after {a:?}");
+        let ev = run(&mgr, &s, b).await;
+        assert_ok(&ev);
+        assert_eq!(tx_ended(&ev), vec![(true, "IMPLICIT COMMIT".to_string())], "{b:?}");
+        assert_eq!(truth(&mgr, &s).await, TxStatus::Idle, "the server, after {b:?}");
+        assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Idle, "the tracker, after {b:?}");
+        mgr.close_session(&s).await;
+    }
+    assert_ok(&run(&mgr, &admin, &format!("drop database {db}")).await);
+    mgr.close_session(&admin).await;
+}
+
 /// Item 2, the reviewer's probe: no hidden statement between the user's statements.
 #[tokio::test]
 async fn no_hidden_statements_between_user_statements() {
@@ -350,6 +452,60 @@ async fn lost_connection_inside_a_transaction() {
     mgr.close_session(&s).await;
     mgr.close_session(&s).await;
     mgr.close_session(&other).await;
+}
+
+/// `wait_timeout` expiry: the server closes an idle connection; since 8.0.24 it says so (4031
+/// `ER_CLIENT_INTERACTION_TIMEOUT`) when the client talks next, older servers just drop the socket.
+#[tokio::test]
+async fn idle_timeout_is_a_lost_connection() {
+    let (_cfg, mgr) = setup!();
+    let s = mgr.open_session("my").await.unwrap();
+    assert_ok(&run(&mgr, &s, "set session wait_timeout = 2").await);
+    assert_ok(&run(&mgr, &s, "begin").await);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let ev = run(&mgr, &s, "select 1").await;
+    let l = lost_flags(&ev);
+    assert_eq!(l.len(), 1, "{ev:?}");
+    assert!(l[0].1, "connectionLost must be set: {l:?}");
+    assert_eq!(tx_ended(&ev), vec![(false, "CONNECTION LOST".to_string())]);
+    assert!(mgr.session_state(&s).unwrap().connection_lost);
+    mgr.close_session(&s).await;
+}
+
+/// Ordinary server errors (lock wait timeout 1205, deadlock 1213) do not lose the connection.
+#[tokio::test]
+async fn lock_timeout_and_deadlock_are_not_lost_connections() {
+    let (_cfg, mgr) = setup!();
+    let s = mgr.open_session("my").await.unwrap();
+    let o = mgr.open_session("my").await.unwrap();
+    assert_ok(&run(&mgr, &s, "drop table if exists demo.scratch_lost_a; create table demo.scratch_lost_a (id int primary key, v int) engine=innodb; insert into demo.scratch_lost_a values (1, 0), (2, 0)").await);
+    assert_ok(&run(&mgr, &s, "set innodb_lock_wait_timeout = 1; begin; update demo.scratch_lost_a set v = 1 where id = 1").await);
+    assert_ok(&run(&mgr, &o, "set innodb_lock_wait_timeout = 1; begin").await);
+    let ev = run(&mgr, &o, "update demo.scratch_lost_a set v = 2 where id = 1").await;
+    let l = lost_flags(&ev);
+    assert!(l.len() == 1 && l[0].0.contains("[1205]") && !l[0].1, "{l:?}");
+    assert_ok(&run(&mgr, &o, "rollback").await);
+    assert_ok(&run(&mgr, &s, "rollback").await);
+
+    assert_ok(&run(&mgr, &s, "set innodb_lock_wait_timeout = 10; begin; update demo.scratch_lost_a set v = 1 where id = 1").await);
+    assert_ok(&run(&mgr, &o, "set innodb_lock_wait_timeout = 10; begin; update demo.scratch_lost_a set v = 2 where id = 2").await);
+    let waiter = {
+        let (mgr, s) = (mgr.clone(), s.clone());
+        tokio::spawn(async move { run(&mgr, &s, "update demo.scratch_lost_a set v = 1 where id = 2").await })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let ev_o = run(&mgr, &o, "update demo.scratch_lost_a set v = 2 where id = 1").await;
+    let ev_s = waiter.await.unwrap();
+    let all: Vec<(String, bool)> = lost_flags(&ev_o).into_iter().chain(lost_flags(&ev_s)).collect();
+    assert!(all.iter().any(|(m, _)| m.contains("[1213]")), "one side is the deadlock victim: {all:?}");
+    assert!(all.iter().all(|(_, lost)| !lost), "{all:?}");
+    assert!(!mgr.session_state(&s).unwrap().connection_lost && !mgr.session_state(&o).unwrap().connection_lost);
+    assert_ok(&run(&mgr, &o, "rollback").await);
+    assert_ok(&run(&mgr, &s, "rollback").await);
+    assert_ok(&run(&mgr, &s, "drop table demo.scratch_lost_a").await);
+    mgr.close_session(&s).await;
+    mgr.close_session(&o).await;
 }
 
 #[tokio::test]

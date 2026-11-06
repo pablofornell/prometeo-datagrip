@@ -192,7 +192,7 @@ impl From<DbError> for String {
 impl From<sqlx::Error> for DbError {
     fn from(e: sqlx::Error) -> Self {
         match e {
-            sqlx::Error::Database(db) => from_database_error(db.as_ref()),
+            sqlx::Error::Database(db) => from_database_error(db.as_ref(), false),
             sqlx::Error::RowNotFound => DbError::NotFound("row not found".into()),
             sqlx::Error::PoolTimedOut => {
                 DbError::Connection("Timed out waiting for a free connection from the pool".into())
@@ -206,9 +206,12 @@ impl From<sqlx::Error> for DbError {
 }
 
 /// Error of *opening* a connection (nothing was lost: the server was never reached): the plain client text.
+/// A server refusal while connecting (FATAL `28P01`, `53300`, ...) is a plain server error, not a lost session.
 pub(crate) fn connect_error(e: sqlx::Error) -> DbError {
     if sqlx_connection_lost(&e) {
         DbError::Connection(e.to_string())
+    } else if let sqlx::Error::Database(db) = &e {
+        from_database_error(db.as_ref(), true)
     } else {
         e.into()
     }
@@ -229,22 +232,32 @@ pub(crate) fn sqlx_connection_lost(e: &sqlx::Error) -> bool {
 
 /// Server errors that announce the end of the connection: PG class `08` (connection exception) and
 /// `57P01` / `57P02` / `57P03` (admin shutdown, crash shutdown, cannot connect now); MySQL 2006 / 2013
-/// (gone away / lost connection), 1927 (connection was killed), 1053 (server shutdown in progress).
-fn server_error_ends_connection(s: &ServerError) -> bool {
+/// (gone away / lost connection), 1927 (connection was killed), 1053 (server shutdown in progress),
+/// 4031 (`ER_CLIENT_INTERACTION_TIMEOUT`: disconnected for inactivity, 8.0.24+).
+fn known_codes_end_connection(s: &ServerError) -> bool {
     match s.driver {
         Driver::Postgres => s.code.starts_with("08") || matches!(s.code.as_str(), "57P01" | "57P02" | "57P03"),
-        Driver::MySql => matches!(s.native_code, Some(2006 | 2013 | 1927 | 1053)) || s.code == "08S01",
+        Driver::MySql => matches!(s.native_code, Some(2006 | 2013 | 1927 | 1053 | 4031)) || s.code == "08S01",
         Driver::Sqlite => false,
     }
 }
 
-fn from_database_error(db: &(dyn DatabaseError + 'static)) -> DbError {
+/// Does this error, received on an established session, mean the session is over? Besides
+/// [`known_codes_end_connection`]: any PostgreSQL `FATAL` / `PANIC` (the backend exits after sending it:
+/// `25P03` idle_in_transaction_session_timeout, `57P04` database dropped, ...). Plain `ERROR`s such as
+/// `57014` (statement_timeout), `40P01` (deadlock) and `55P03` (lock_timeout) leave the session alive.
+fn server_error_ends_connection(s: &ServerError) -> bool {
+    known_codes_end_connection(s)
+        || (s.driver == Driver::Postgres && matches!(s.severity.as_deref(), Some("FATAL" | "PANIC")))
+}
+
+fn from_database_error(db: &(dyn DatabaseError + 'static), at_connect: bool) -> DbError {
     if let Some(pg) = db.try_downcast_ref::<PgDatabaseError>() {
         let position = match pg.position() {
             Some(PgErrorPosition::Original(p)) => Some(p),
             _ => None,
         };
-        return server_error(ServerError {
+        return server_error(at_connect, ServerError {
             driver: Driver::Postgres,
             code: pg.code().to_string(),
             native_code: None,
@@ -256,7 +269,7 @@ fn from_database_error(db: &(dyn DatabaseError + 'static)) -> DbError {
         });
     }
     if let Some(my) = db.try_downcast_ref::<MySqlDatabaseError>() {
-        return server_error(ServerError {
+        return server_error(at_connect, ServerError {
             driver: Driver::MySql,
             code: my.code().unwrap_or("HY000").to_string(),
             native_code: Some(my.number() as i64),
@@ -269,7 +282,7 @@ fn from_database_error(db: &(dyn DatabaseError + 'static)) -> DbError {
     }
     if let Some(lite) = db.try_downcast_ref::<SqliteError>() {
         let native: i64 = lite.code().and_then(|c| c.parse().ok()).unwrap_or(0);
-        return server_error(ServerError {
+        return server_error(at_connect, ServerError {
             driver: Driver::Sqlite,
             code: sqlite_name(native).map(str::to_string).unwrap_or_else(|| {
                 lite.code().map(|c| format!("SQLITE_{c}")).unwrap_or_else(|| "SQLITE_ERROR".into())
@@ -285,9 +298,10 @@ fn from_database_error(db: &(dyn DatabaseError + 'static)) -> DbError {
     DbError::Connection(db.message().to_string())
 }
 
-/// A server error, or a lost connection when the server said it is hanging up.
-fn server_error(s: ServerError) -> DbError {
-    if server_error_ends_connection(&s) {
+/// A server error, or a lost connection when the server said it is hanging up. While connecting only the
+/// known codes count: a FATAL refusal (bad password, too many connections) lost nothing.
+fn server_error(at_connect: bool, s: ServerError) -> DbError {
+    if if at_connect { known_codes_end_connection(&s) } else { server_error_ends_connection(&s) } {
         let server = match s.driver {
             Driver::Postgres => format!("{}: {}", s.severity.as_deref().unwrap_or("FATAL"), s.message),
             _ => s.message.clone(),
@@ -385,8 +399,12 @@ mod tests {
         }
     }
 
+    fn server_sev(driver: Driver, code: &str, native: Option<i64>, severity: &str) -> ServerError {
+        ServerError { driver, code: code.into(), native_code: native, severity: Some(severity.into()), message: "m".into(), detail: None, hint: None, position: None }
+    }
+
     fn server(driver: Driver, code: &str, native: Option<i64>) -> ServerError {
-        ServerError { driver, code: code.into(), native_code: native, severity: Some("FATAL".into()), message: "m".into(), detail: None, hint: None, position: None }
+        server_sev(driver, code, native, "ERROR")
     }
 
     #[test]
@@ -397,15 +415,26 @@ mod tests {
         for c in ["57014", "42P01", "25P02", "40001"] {
             assert!(!server_error_ends_connection(&server(Driver::Postgres, c, None)), "{c}");
         }
-        for n in [2006, 2013, 1927, 1053] {
+        for n in [2006, 2013, 1927, 1053, 4031] {
             assert!(server_error_ends_connection(&server(Driver::MySql, "HY000", Some(n))), "{n}");
         }
         for n in [1317, 1205, 1213, 1064] {
             assert!(!server_error_ends_connection(&server(Driver::MySql, "HY000", Some(n))), "{n}");
         }
-        match server_error(server(Driver::Postgres, "57P01", None)) {
+        // every PG FATAL / PANIC ends the session, whatever its code; ERROR never does (except the known codes)
+        for (c, sev) in [("25P03", "FATAL"), ("57P04", "FATAL"), ("53300", "FATAL"), ("XX000", "PANIC")] {
+            assert!(server_error_ends_connection(&server_sev(Driver::Postgres, c, None, sev)), "{c}");
+        }
+        for c in ["57014", "40P01", "55P03", "25P03"] {
+            assert!(!server_error_ends_connection(&server_sev(Driver::Postgres, c, None, "ERROR")), "{c} as ERROR");
+        }
+        assert!(!server_error_ends_connection(&server_sev(Driver::MySql, "HY000", Some(1205), "FATAL")));
+        match server_error(false, server_sev(Driver::Postgres, "57P01", None, "FATAL")) {
             DbError::ConnectionLost(l) => assert_eq!(l.to_string(), "[08006] FATAL: m"),
             other => panic!("{other:?}"),
         }
+        // while connecting a FATAL refusal is a plain server error
+        assert!(matches!(server_error(true, server_sev(Driver::Postgres, "28P01", None, "FATAL")), DbError::Server(_)));
+        assert!(matches!(server_error(true, server_sev(Driver::Postgres, "53300", None, "FATAL")), DbError::Server(_)));
     }
 }

@@ -15,7 +15,8 @@ import { activeTab, registerBeforeClose } from "../../state/tabs";
 import { registerConsoleActions } from "./actions";
 import { ConsoleView } from "./ConsoleView";
 import { createQuitHandler } from "./quit";
-import { confirmEndTransactions, openTransactions } from "./txguard";
+import { focusTopDialog, showProgress } from "../table/dialogs";
+import { type TxProgress, confirmEndTransactions, openTransactions } from "./txguard";
 import "./console.css";
 
 export { activeSession, sessionOf } from "./registry";
@@ -36,6 +37,17 @@ registerBeforeClose((tab) => (tab.kind === "console" ? confirmEndTransactions({ 
  * the native close path is untouched the rest of the time, and after the user's answer the handler is removed and the
  * window is closed natively.
  */
+/** The wait dialog of the COMMIT / ROLLBACK the user chose while quitting (Quit anyway after `STUCK_AFTER_MS`). */
+const quitProgress: TxProgress = {
+  begin: (verb, title) =>
+    showProgress({
+      title: `${verb}…`,
+      message: `${verb} the transaction of '${title}'…`,
+      warning: "The server has not answered yet. Quitting now leaves the outcome unknown: the transaction may or may not have been committed.",
+      quitAnywayLabel: "Quit anyway",
+    }),
+};
+
 function guardQuit(): void {
   if (!isTauri()) return;
   let unlisten: (() => void) | undefined;
@@ -47,7 +59,8 @@ function guardQuit(): void {
       const win = getCurrentWindow();
       const un: () => void = await win.onCloseRequested(
         createQuitHandler({
-          confirm: () => confirmEndTransactions({ reason: "quitting the application" }),
+          confirm: () => confirmEndTransactions({ reason: "quitting the application", progress: quitProgress }),
+          focus: focusTopDialog,
           quit: async () => {
             un();
             unlisten = undefined;

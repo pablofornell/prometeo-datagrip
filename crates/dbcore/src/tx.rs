@@ -17,6 +17,9 @@
 //!     `OPTIMIZE` / `REPAIR TABLE`, `CACHE INDEX`, `LOAD INDEX`, `FLUSH`, `RESET`, replication control, ...;
 //!     not `CREATE / DROP TEMPORARY TABLE`). They commit before they run, so they commit even when they
 //!     fail, unless they fail to parse (error 1064);
+//!   - statements are classified on a token stream without comments (`-- `, `#`, `/* */`, `/*+ hint */`);
+//!     `/*! ... */` and `/*!NNNNN ... */` are code when `NNNNN` is not above the server version (`@@version`, read
+//!     once with `@@autocommit`) and their content is classified like the rest of the statement;
 //!   - `SET [SESSION] autocommit = 0|1|ON|OFF` / `SET @@autocommit` is followed; `SET autocommit = 1` commits
 //!     an open transaction (only when it was 0);
 //!   - with `autocommit = 0` every other statement opens a transaction, except the ones that cannot touch
@@ -52,6 +55,7 @@ use crate::error::{DbError, Result};
 use crate::exec::open_stream;
 use crate::manager::Session;
 use crate::model::{Driver, TxStatus};
+use crate::split::Scanner;
 use futures_util::StreamExt;
 
 /// What a statement does to the transaction, judged from its text.
@@ -219,103 +223,177 @@ pub(crate) enum MyStmt {
     Other,
 }
 
-/// All words of a statement outside comments, string literals and quoted identifiers, upper-cased.
-fn all_words(sql: &str) -> Vec<String> {
+/// A token of a MySQL statement. Comments are gone; the content of executable comments is part of the stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Tok {
+    /// Bare word or number, upper-cased.
+    Word(String),
+    /// `` `quoted` `` identifier, upper-cased (never a keyword).
+    Ident(String),
+    /// `'...'` / `"..."`, the text between the quotes, lower-cased.
+    Str(String),
+    /// Any other single character.
+    Sym(u8),
+}
+
+/// The server a MySQL session runs on, as far as comment handling needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ServerVer {
+    /// `major * 10000 + minor * 100 + patch`, like `MYSQL_VERSION_ID` (`u32::MAX` when unknown: every
+    /// version-gated comment is then executed).
+    pub num: u32,
+    pub mariadb: bool,
+}
+
+impl ServerVer {
+    pub(crate) const UNKNOWN: ServerVer = ServerVer { num: u32::MAX, mariadb: false };
+
+    /// From `@@version`: `8.4.3`, `8.0.36-0ubuntu0.22.04.1`, `10.11.6-MariaDB-1:10.11.6+maria~ubu2204`,
+    /// `5.5.5-10.0.38-MariaDB` (the replication-compatible prefix of old MariaDB clients).
+    pub(crate) fn parse(v: &str) -> ServerVer {
+        let mariadb = v.contains("MariaDB");
+        let v = if mariadb { v.strip_prefix("5.5.5-").unwrap_or(v) } else { v };
+        let mut it = v.split(|c: char| !c.is_ascii_digit()).filter(|p| !p.is_empty()).map(|p| p.parse::<u32>().unwrap_or(0));
+        match (it.next(), it.next(), it.next()) {
+            (Some(a), Some(b), Some(c)) => ServerVer { num: a * 10000 + b * 100 + c, mariadb },
+            _ => ServerVer::UNKNOWN,
+        }
+    }
+}
+
+/// Tokens of a MySQL statement, the way the server's lexer sees them:
+/// * `-- ` (a space or control character must follow the dashes), `#` and `/* */` are comments, as are
+///   `/*+ ... */` optimizer hints;
+/// * `/*! ... */` and `/*!NNNNN ... */` (also `/*M!NNNNN ... */` on MariaDB) are *code* when `NNNNN` (five or six
+///   digits) is not above the server version: only the delimiters go, the content is tokenized. Above it, the
+///   whole comment is skipped.
+///
+/// The comment and quote scanning is the splitter's ([`Scanner`]).
+fn mysql_tokens(sql: &str, ver: ServerVer) -> Vec<Tok> {
+    let sc = Scanner::new(sql, Driver::MySql);
     let b = sql.as_bytes();
+    let n = b.len();
     let mut out = Vec::new();
     let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            q @ (b'\'' | b'"' | b'`') => {
-                i += 1;
-                while i < b.len() {
-                    if b[i] == b'\\' && q != b'`' {
-                        i += 2;
-                        continue;
-                    }
-                    if b[i] == q {
-                        if b.get(i + 1) == Some(&q) {
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
+    // executable comments that are open: their `*/` is skipped
+    let mut open = 0usize;
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
+    while i < n {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+        } else if c == b'*' && open > 0 && b.get(i + 1) == Some(&b'/') {
+            open -= 1;
+            i += 2;
+        } else if c == b'/' && b.get(i + 1) == Some(&b'*') && (b.get(i + 2) == Some(&b'!') || (ver.mariadb && b.get(i + 2..i + 4) == Some(&b"M!"[..]))) {
+            let mut j = i + if b[i + 2] == b'!' { 3 } else { 4 };
+            let digits = b[j..].iter().take_while(|d| d.is_ascii_digit()).count();
+            let mut run = true;
+            if digits == 5 || digits == 6 {
+                // a leading 0 is allowed in the six digit form (`080000`)
+                let v: u32 = sql[j..j + digits].parse().unwrap_or(u32::MAX);
+                run = v <= ver.num;
+                j += digits;
+            }
+            if run {
+                open += 1;
+                i = j;
+            } else {
+                i = sc.skip_block_comment(i);
+            }
+        } else if let Some(e) = sc.comment_end(i, false) {
+            i = e;
+        } else if matches!(c, b'\'' | b'"' | b'`') {
+            let e = sc.skip_quoted(i, c, c != b'`');
+            let text = &sql[i + 1..e.saturating_sub(1).max(i + 1)];
+            out.push(match c {
+                b'`' => Tok::Ident(text.to_ascii_uppercase()),
+                _ => Tok::Str(text.to_ascii_lowercase()),
+            });
+            i = e;
+        } else if is_word(c) {
+            let st = i;
+            while i < n && is_word(b[i]) {
                 i += 1;
             }
-            b'-' if b.get(i + 1) == Some(&b'-') => i = sql[i..].find('\n').map_or(b.len(), |n| i + n),
-            b'#' => i = sql[i..].find('\n').map_or(b.len(), |n| i + n),
-            b'/' if b.get(i + 1) == Some(&b'*') => i = sql[i + 2..].find("*/").map_or(b.len(), |n| i + 2 + n + 2),
-            c if c.is_ascii_alphanumeric() || c == b'_' => {
-                let st = i;
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
-                    i += 1;
-                }
-                out.push(sql[st..i].to_ascii_uppercase());
-            }
-            _ => i += 1,
+            out.push(Tok::Word(sql[st..i].to_ascii_uppercase()));
+        } else {
+            out.push(Tok::Sym(c));
+            i += 1;
         }
     }
     out
 }
 
-/// Split `s` at the commas that are outside quotes and parentheses.
-fn split_commas(s: &str) -> Vec<&str> {
-    let b = s.as_bytes();
-    let (mut parts, mut start, mut depth, mut i) = (Vec::new(), 0, 0i32, 0);
-    while i < b.len() {
-        match b[i] {
-            q @ (b'\'' | b'"' | b'`') => {
-                i += 1;
-                while i < b.len() && b[i] != q {
-                    if b[i] == b'\\' && q != b'`' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-            }
-            b'(' => depth += 1,
-            b')' => depth -= 1,
-            b',' if depth == 0 => {
-                parts.push(&s[start..i]);
-                start = i + 1;
+/// `SET [SESSION] autocommit = 0, @@autocommit = ON, ...`: `Some(value)` of the last assignment to the
+/// session variable `autocommit` (`Some(None)` when its value is not a plain 0 / 1 / ON / OFF / TRUE / FALSE).
+fn set_autocommit(toks: &[Tok]) -> Option<Option<bool>> {
+    let set = toks.iter().position(|t| matches!(t, Tok::Word(_)))?;
+    let body = &toks[set + 1..];
+    let (mut parts, mut from, mut depth) = (Vec::new(), 0, 0i32);
+    for (i, t) in body.iter().enumerate() {
+        match t {
+            Tok::Sym(b'(') => depth += 1,
+            Tok::Sym(b')') => depth -= 1,
+            Tok::Sym(b',') if depth == 0 => {
+                parts.push(&body[from..i]);
+                from = i + 1;
             }
             _ => {}
         }
-        i += 1;
     }
-    parts.push(&s[start..]);
-    parts
-}
-
-/// `SET [SESSION] autocommit = 0, @@autocommit = ON, ...`: `Some(value)` of the last assignment to the
-/// session variable `autocommit` (`Some(None)` when its value is not a plain 0 / 1 / ON / OFF / TRUE / FALSE).
-fn set_autocommit(sql: &str) -> Option<Option<bool>> {
-    let body = strip_comments(sql).trim_start();
-    let body = body.get(3..)?; // after SET
+    parts.push(&body[from..]);
     let mut found = None;
-    for part in split_commas(body) {
-        let Some((lhs, rhs)) = part.split_once('=') else { continue };
-        let lhs = lhs.trim_end_matches(':').trim().to_ascii_lowercase();
-        let lhs = lhs.trim_start_matches("session ").trim_start_matches("local ").trim_start();
-        let lhs = lhs.strip_prefix("@@session.").or_else(|| lhs.strip_prefix("@@local.")).or_else(|| lhs.strip_prefix("@@")).unwrap_or(lhs);
-        if lhs.trim() != "autocommit" {
+    for part in parts {
+        let Some(eq) = part.iter().position(|t| *t == Tok::Sym(b'=')) else { continue };
+        let mut lhs = &part[..eq];
+        let mut rhs = &part[eq + 1..];
+        if lhs.last() == Some(&Tok::Sym(b':')) {
+            lhs = &lhs[..lhs.len() - 1];
+        }
+        while rhs.last() == Some(&Tok::Sym(b';')) {
+            rhs = &rhs[..rhs.len() - 1];
+        }
+        let name: Vec<String> = lhs
+            .iter()
+            .map(|t| match t {
+                Tok::Word(w) | Tok::Ident(w) => w.clone(),
+                Tok::Str(_) => "'".into(),
+                Tok::Sym(c) => (*c as char).to_string(),
+            })
+            .collect();
+        let name: Vec<&str> = name.iter().map(String::as_str).collect();
+        let session_var = matches!(
+            name.as_slice(),
+            ["AUTOCOMMIT"]
+                | ["SESSION" | "LOCAL", "AUTOCOMMIT"]
+                | ["@", "@", "AUTOCOMMIT"]
+                | ["@", "@", "SESSION" | "LOCAL", ".", "AUTOCOMMIT"]
+        );
+        if !session_var {
             continue;
         }
-        let rhs = rhs.trim().trim_end_matches(';').trim().trim_matches(|c| c == '\'' || c == '"').to_ascii_lowercase();
-        found = Some(match rhs.as_str() {
-            "0" | "off" | "false" => Some(false),
-            "1" | "on" | "true" | "default" => Some(true),
+        found = Some(match rhs {
+            [Tok::Word(v)] | [Tok::Str(v)] => match v.to_ascii_lowercase().as_str() {
+                "0" | "off" | "false" => Some(false),
+                "1" | "on" | "true" | "default" => Some(true),
+                _ => None,
+            },
             _ => None,
         });
     }
     found
 }
 
-pub(crate) fn classify_mysql(sql: &str) -> MyStmt {
-    let w = words(sql, 6);
-    let w: Vec<&str> = w.iter().map(String::as_str).collect();
+/// Classify a MySQL statement. Everything is judged on the token stream (see [`mysql_tokens`]), so comments
+/// anywhere in the statement neither hide nor fake a keyword. `ver` is the server version of the session.
+pub(crate) fn classify_mysql(sql: &str, ver: ServerVer) -> MyStmt {
+    let toks = mysql_tokens(sql, ver);
+    let w: Vec<&str> = toks
+        .iter()
+        .filter_map(|t| if let Tok::Word(w) = t { Some(w.as_str()) } else { None })
+        .take(6)
+        .collect();
     let w1 = w.get(1).copied();
     let chain = w.windows(2).any(|p| p == ["AND", "CHAIN"]);
     let no_chain = chain && !w.windows(3).any(|p| p == ["AND", "NO", "CHAIN"]);
@@ -335,7 +413,7 @@ pub(crate) fn classify_mysql(sql: &str) -> MyStmt {
             Some("ROLLBACK") => MyStmt::End { commit: false, chain: false },
             _ => MyStmt::Passive,
         },
-        Some("SET") => match set_autocommit(sql) {
+        Some("SET") => match set_autocommit(&toks) {
             Some(v) => MyStmt::SetAutocommit(v),
             None if w1 == Some("PASSWORD") => MyStmt::ImplicitCommit,
             None => MyStmt::Passive,
@@ -350,7 +428,7 @@ pub(crate) fn classify_mysql(sql: &str) -> MyStmt {
         Some("UNLOCK") if w1 == Some("TABLES") || w1 == Some("TABLE") => MyStmt::UnlockTables,
         Some("USE" | "PREPARE" | "DEALLOCATE" | "KILL" | "HELP" | "DO" | "VALUES") => MyStmt::Passive,
         Some("SHOW") if matches!(w1, Some("WARNINGS" | "ERRORS")) || w1 == Some("COUNT") => MyStmt::Passive,
-        Some("SELECT") if !all_words(sql).iter().any(|x| x == "FROM") => MyStmt::Passive,
+        Some("SELECT") if !toks.iter().any(|t| matches!(t, Tok::Word(w) if w == "FROM")) => MyStmt::Passive,
         _ => MyStmt::Other,
     }
 }
@@ -540,7 +618,8 @@ fn after_mysql(sess: &Session, prev: TxStatus, sql: &str, outcome: &Outcome) -> 
         autocommit: sess.autocommit_on.load(Ordering::Relaxed),
         locked: sess.tables_locked.load(Ordering::Relaxed),
     };
-    let step = track_mysql(state, classify_mysql(sql), outcome);
+    let ver = ServerVer { num: sess.server_version.load(Ordering::Relaxed), mariadb: sess.mariadb.load(Ordering::Relaxed) };
+    let step = track_mysql(state, classify_mysql(sql, ver), outcome);
     sess.autocommit_on.store(step.next.autocommit, Ordering::Relaxed);
     sess.tables_locked.store(step.next.locked, Ordering::Relaxed);
     sess.set_tx_status(step.next.status);
@@ -642,6 +721,13 @@ mod tests {
         assert_eq!(track_pg(Failed, TxKind::Other, ok), Active);
     }
 
+    /// A MySQL 8.4 server.
+    const V84: ServerVer = ServerVer { num: 80400, mariadb: false };
+
+    fn cm(sql: &str) -> MyStmt {
+        classify_mysql(sql, V84)
+    }
+
     fn my_err(native: i64, state: &str) -> Outcome {
         Outcome::Err { state: Some(state.into()), native: Some(native) }
     }
@@ -653,16 +739,16 @@ mod tests {
     #[test]
     fn mysql_classification() {
         use MyStmt::*;
-        assert_eq!(classify_mysql("  /* c */ begin work"), Begin);
-        assert_eq!(classify_mysql("START TRANSACTION READ ONLY"), Begin);
-        assert_eq!(classify_mysql("xa start 'a'"), Begin);
-        assert_eq!(classify_mysql("commit"), End { commit: true, chain: false });
-        assert_eq!(classify_mysql("commit and chain"), End { commit: true, chain: true });
-        assert_eq!(classify_mysql("commit and no chain"), End { commit: true, chain: false });
-        assert_eq!(classify_mysql("rollback and chain"), End { commit: false, chain: true });
-        assert_eq!(classify_mysql("xa rollback 'a'"), End { commit: false, chain: false });
-        assert_eq!(classify_mysql("rollback to savepoint a"), RollbackTo);
-        assert_eq!(classify_mysql("end"), Other, "END is not MySQL");
+        assert_eq!(cm("  /* c */ begin work"), Begin);
+        assert_eq!(cm("START TRANSACTION READ ONLY"), Begin);
+        assert_eq!(cm("xa start 'a'"), Begin);
+        assert_eq!(cm("commit"), End { commit: true, chain: false });
+        assert_eq!(cm("commit and chain"), End { commit: true, chain: true });
+        assert_eq!(cm("commit and no chain"), End { commit: true, chain: false });
+        assert_eq!(cm("rollback and chain"), End { commit: false, chain: true });
+        assert_eq!(cm("xa rollback 'a'"), End { commit: false, chain: false });
+        assert_eq!(cm("rollback to savepoint a"), RollbackTo);
+        assert_eq!(cm("end"), Other, "END is not MySQL");
         // implicit commits (15.3.3) and their exceptions
         for sql in [
             "create table t (i int)", "alter table t add x int", "drop database d", "truncate t", "rename table a to b",
@@ -672,27 +758,27 @@ mod tests {
             "start replica", "stop slave", "change replication source to source_host='h'", "install plugin p soname 'x'",
             "alter instance rotate innodb master key", "create spatial reference system 1 definition 'x'",
         ] {
-            assert_eq!(classify_mysql(sql), ImplicitCommit, "{sql}");
+            assert_eq!(cm(sql), ImplicitCommit, "{sql}");
         }
-        assert_eq!(classify_mysql("create temporary table t (i int)"), Other);
-        assert_eq!(classify_mysql("drop temporary table t"), Other);
-        assert_eq!(classify_mysql("reset persist x"), Other);
-        assert_eq!(classify_mysql("lock tables t write"), LockTables);
-        assert_eq!(classify_mysql("unlock tables"), UnlockTables);
+        assert_eq!(cm("create temporary table t (i int)"), Other);
+        assert_eq!(cm("drop temporary table t"), Other);
+        assert_eq!(cm("reset persist x"), Other);
+        assert_eq!(cm("lock tables t write"), LockTables);
+        assert_eq!(cm("unlock tables"), UnlockTables);
         // passive statements
         for sql in ["set @a = 1", "set names utf8mb4", "set transaction isolation level serializable", "use d", "show warnings",
             "show errors", "select 1", "select now(), @@version", "select 'from'", "select 1 -- from t", "prepare s from 'select 1'", "kill 3"]
         {
-            assert_eq!(classify_mysql(sql), Passive, "{sql}");
+            assert_eq!(cm(sql), Passive, "{sql}");
         }
         for sql in ["select * from t", "select 1 from dual", "show tables", "insert into t values (1)", "call p()", "execute s", "with x as (select 1) select * from x"] {
-            assert_eq!(classify_mysql(sql), Other, "{sql}");
+            assert_eq!(cm(sql), Other, "{sql}");
         }
     }
 
     #[test]
     fn mysql_set_autocommit_forms() {
-        let v = |sql: &str| set_autocommit(sql);
+        let v = |sql: &str| set_autocommit(&mysql_tokens(sql, V84));
         assert_eq!(v("set autocommit = 0"), Some(Some(false)));
         assert_eq!(v("SET AUTOCOMMIT=1"), Some(Some(true)));
         assert_eq!(v("set autocommit := off;"), Some(Some(false)));
@@ -709,6 +795,98 @@ mod tests {
         assert_eq!(v("set @@global.autocommit = 0"), None);
         assert_eq!(v("set sql_mode = 'autocommit=0'"), None);
         assert_eq!(v("set names utf8mb4"), None);
+    }
+
+    #[test]
+    fn mysql_comments_are_not_tokens_and_version_comments_are_code() {
+        use MyStmt::*;
+        let c = |sql: &str, ver: ServerVer| classify_mysql(sql, ver);
+        // (statement, implicit commit?) The first three are the cases proved against a real server by the re-check.
+        let cases: &[(&str, bool)] = &[
+            ("create /* tmp */ temporary table tt(i int)", false),
+            ("/*!50001 create table t_ver(i int) */", true),
+            ("# hash comment\ncreate table t_hash(i int)", true),
+            ("-- c\ncreate table t(i int)", true),
+            ("/* a */ /* b */ create table t(i int)", true),
+            ("/*+ hint */ create table t(i int)", true),
+            ("create/**/table t(i int)", true),
+            ("CREATE /* x */ TABLE /* y */ t(i int)", true),
+            ("create /* x */ or /* y */ replace /* z */ view v as select 1", true),
+            ("create # x\n table t(i int)", true),
+            ("create -- x\n table t(i int)", true),
+            ("create table t2 select 1 as i", true),
+            ("create table t2 as select 1 as i", true),
+            ("CREATE TEMPORARY TABLE t2 SELECT 1 AS i", false),
+            ("create temporary /* x */ table t2 select 1", false),
+            ("create # x\n temporary table t2(i int)", false),
+            ("create -- x\n temporary table t2(i int)", false),
+            ("create /*!50001 temporary */ table t2(i int)", false),
+            ("/*!50001 create temporary table t2(i int) */", false),
+            ("DROP TEMPORARY TABLE t2", false),
+            ("drop /* x */ temporary /* y */ table t2", false),
+            ("drop table t2", true),
+            ("alter table t2 add j int", true),
+            ("alter /* x */ table t2 add j int", true),
+            ("/*! create table t(i int) */", true),
+            ("/*!80000 create table t(i int) */", true),
+            ("/*!080000 create table t(i int) */", true),
+            ("/*!80400 create table t(i int) */", true),
+            // above the server version: a comment, the statement is empty
+            ("/*!80401 create table t(i int) */", false),
+            ("/*!999999 create table t(i int) */", false),
+            ("/*!99999 create table t(i int) */ select 1", false),
+            // the closing */ ends the executable comment, the rest is ordinary
+            ("/*!50001 create */ table t(i int)", true),
+            ("/*!50001 select 1 */ ; drop table t", false),
+            // keywords that only live in comments, strings and quoted identifiers
+            ("select 1 -- create table t(i int)", false),
+            ("select 1 # create table t(i int)", false),
+            ("select 'create table t(i int)'", false),
+            ("select \"drop table t\"", false),
+            ("select 1 as `create`", false),
+            ("/* create table t(i int) */ select 1", false),
+            ("/* create table t(i int) */", false),
+            ("select 1 /* ' */ , 2 -- '\n", false),
+            // `--` needs a space after it in MySQL: this is not a comment, the minus signs stay
+            ("select 1 --1", false),
+        ];
+        for (sql, commits) in cases {
+            let got = c(sql, V84) == ImplicitCommit;
+            assert_eq!(got, *commits, "{sql:?}");
+        }
+        // a gated comment follows the server version
+        assert_eq!(c("/*!80500 create table t(i int) */", V84), Other);
+        assert_eq!(c("/*!80500 create table t(i int) */", ServerVer { num: 80500, mariadb: false }), ImplicitCommit);
+        assert_eq!(c("/*!80500 create table t(i int) */", ServerVer::UNKNOWN), ImplicitCommit);
+        // MariaDB's own marker is a plain comment on MySQL
+        let maria = ServerVer { num: 101106, mariadb: true };
+        assert_eq!(c("/*M!100100 create table t(i int) */", maria), ImplicitCommit);
+        assert_eq!(c("/*M!100100 create table t(i int) */", ServerVer { num: 101000, mariadb: true }), ImplicitCommit);
+        assert_eq!(c("/*M!999999 create table t(i int) */", maria), Other);
+        assert_eq!(c("/*M!100100 create table t(i int) */", V84), Other);
+        // transaction control and SET behind comments
+        assert_eq!(c("/* a */ commit /* b */ and /* c */ chain", V84), End { commit: true, chain: true });
+        assert_eq!(c("rollback # x\n to savepoint a", V84), RollbackTo);
+        assert_eq!(c("/*!50001 start transaction */", V84), Begin);
+        assert_eq!(c("set autocommit = 0 -- manual", V84), SetAutocommit(Some(false)));
+        assert_eq!(c("set /* a */ @@session.autocommit /* b */ = /* c */ 0", V84), SetAutocommit(Some(false)));
+        assert_eq!(c("SET @@session.autocommit=0", V84), SetAutocommit(Some(false)));
+        assert_eq!(c("SET autocommit=OFF /* x */", V84), SetAutocommit(Some(false)));
+        assert_eq!(c("set sql_mode = '' # autocommit = 0", V84), Passive);
+        assert_eq!(c("set /*!50001 autocommit = 0 */", V84), SetAutocommit(Some(false)));
+        assert_eq!(c("set /*!99999 autocommit = 0 */", V84), Passive);
+        assert_eq!(c("set `autocommit` = 1", V84), SetAutocommit(Some(true)));
+    }
+
+    #[test]
+    fn server_versions_parse() {
+        let p = ServerVer::parse;
+        assert_eq!(p("8.4.3"), ServerVer { num: 80403, mariadb: false });
+        assert_eq!(p("8.0.36-0ubuntu0.22.04.1"), ServerVer { num: 80036, mariadb: false });
+        assert_eq!(p("5.7.44-log"), ServerVer { num: 50744, mariadb: false });
+        assert_eq!(p("10.11.6-MariaDB-1:10.11.6+maria~ubu2204"), ServerVer { num: 101106, mariadb: true });
+        assert_eq!(p("5.5.5-10.0.38-MariaDB"), ServerVer { num: 100038, mariadb: true });
+        assert_eq!(p("unknown"), ServerVer::UNKNOWN);
     }
 
     #[test]

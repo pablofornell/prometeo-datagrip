@@ -316,6 +316,73 @@ async fn lost_connection_outside_a_transaction_reconnects_on_the_next_execute() 
     mgr.close_session(&other).await;
 }
 
+/// A server-side `FATAL` ends the session: `idle_in_transaction_session_timeout` (25P03) closes the connection
+/// under an open transaction. The statement that finds out is reported as a lost connection.
+#[tokio::test]
+async fn idle_in_transaction_timeout_is_a_lost_connection() {
+    let (_cfg, mgr) = setup!();
+    let s = mgr.open_session("pg").await.unwrap();
+    assert_ok(&run(&mgr, &s, "set idle_in_transaction_session_timeout = '1s'").await);
+    assert_ok(&run(&mgr, &s, "begin").await);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let ev = run(&mgr, &s, "select 1").await;
+    let l = lost_flags(&ev);
+    assert_eq!(l.len(), 1, "{ev:?}");
+    assert!(l[0].1, "connectionLost must be set: {l:?}");
+    assert!(l[0].0.contains("idle-in-transaction timeout"), "{}", l[0].0);
+    assert_eq!(tx_ended(&ev), vec![(false, "CONNECTION LOST".to_string())]);
+    assert_eq!(tx_statuses(&ev), vec![TxStatus::Idle]);
+    let st = mgr.session_state(&s).unwrap();
+    assert!(st.connection_lost && st.transaction_lost, "{st:?}");
+    mgr.close_session(&s).await;
+}
+
+/// Plain `ERROR`s stay ordinary errors that leave the session alive: statement_timeout (57014), lock_timeout
+/// (55P03) and a deadlock (40P01).
+#[tokio::test]
+async fn timeouts_and_deadlocks_are_not_lost_connections() {
+    let (_cfg, mgr) = setup!();
+    let s = mgr.open_session("pg").await.unwrap();
+    let o = mgr.open_session("pg").await.unwrap();
+
+    assert_ok(&run(&mgr, &s, "set statement_timeout = '200ms'").await);
+    let ev = run(&mgr, &s, "select pg_sleep(2)").await;
+    let l = lost_flags(&ev);
+    assert!(l.len() == 1 && l[0].0.starts_with("[57014]") && !l[0].1, "{l:?}");
+    assert_ok(&run(&mgr, &s, "set statement_timeout = 0").await);
+    assert!(!mgr.session_state(&s).unwrap().connection_lost);
+
+    assert_ok(&run(&mgr, &s, "drop table if exists public.scratch_lost_a; create table public.scratch_lost_a (id int primary key, v int); insert into public.scratch_lost_a values (1, 0), (2, 0)").await);
+    assert_ok(&run(&mgr, &s, "set lock_timeout = '200ms'; begin; update public.scratch_lost_a set v = 1 where id = 1").await);
+    assert_ok(&run(&mgr, &o, "set lock_timeout = '200ms'; begin").await);
+    let ev = run(&mgr, &o, "update public.scratch_lost_a set v = 2 where id = 1").await;
+    let l = lost_flags(&ev);
+    assert!(l.len() == 1 && l[0].0.starts_with("[55P03]") && !l[0].1, "{l:?}");
+    assert_ok(&run(&mgr, &o, "rollback").await);
+    assert_ok(&run(&mgr, &s, "rollback").await);
+
+    // deadlock: s locks 1, o locks 2, s wants 2 (waits), o wants 1 -> one of them is the victim
+    assert_ok(&run(&mgr, &s, "set lock_timeout = 0; set deadlock_timeout = '100ms'; begin; update public.scratch_lost_a set v = 1 where id = 1").await);
+    assert_ok(&run(&mgr, &o, "set lock_timeout = 0; set deadlock_timeout = '100ms'; begin; update public.scratch_lost_a set v = 2 where id = 2").await);
+    let waiter = {
+        let (mgr, s) = (mgr.clone(), s.clone());
+        tokio::spawn(async move { run(&mgr, &s, "update public.scratch_lost_a set v = 1 where id = 2").await })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let ev_o = run(&mgr, &o, "update public.scratch_lost_a set v = 2 where id = 1").await;
+    let ev_s = waiter.await.unwrap();
+    let all: Vec<(String, bool)> = lost_flags(&ev_o).into_iter().chain(lost_flags(&ev_s)).collect();
+    assert!(all.iter().any(|(m, _)| m.starts_with("[40P01]")), "one side is the deadlock victim: {all:?}");
+    assert!(all.iter().all(|(_, lost)| !lost), "{all:?}");
+    assert!(!mgr.session_state(&s).unwrap().connection_lost && !mgr.session_state(&o).unwrap().connection_lost);
+    assert_ok(&run(&mgr, &o, "rollback").await);
+    assert_ok(&run(&mgr, &s, "rollback").await);
+    assert_ok(&run(&mgr, &s, "drop table public.scratch_lost_a").await);
+    mgr.close_session(&s).await;
+    mgr.close_session(&o).await;
+}
+
 /// The connection dies while a paged result is open: `fetch_more` fails with the lost error and the session is dead.
 #[tokio::test]
 async fn lost_connection_while_paging() {

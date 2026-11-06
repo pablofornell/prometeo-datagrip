@@ -65,6 +65,27 @@ const cap = (s: string): string => s.replace(/\b\w/g, (c) => c.toUpperCase());
 const errText = (e: unknown): string => String((e as Error)?.message ?? e).replace(/^Error:\s*/, "");
 const DEFAULT_ISOLATION = (driver: DataSource["driver"]): Isolation => (driver === "mysql" ? "repeatable read" : "read committed");
 
+/** What the user changed in the session with their own statements; a new session does not have it. */
+interface SessionSettings {
+  /** The `SET ...` statements (single line), oldest first; `SET search_path` is left out (restored from the schema pref). */
+  sets: string[];
+  /** MySQL: the last `SET autocommit` of the user turned autocommit off. */
+  autocommitOff: boolean;
+}
+const noSettings = (): SessionSettings => ({ sets: [], autocommitOff: false });
+
+/** The text of the balloon / Output line that follows a reconnect. */
+export const SESSION_RESET_LOG =
+  "The connection was re-established. Session state was reset: temporary tables, session variables and SET commands you ran are lost; only the schema and isolation level were restored.";
+
+/** `SET ...` statements (after leading comments) and whether they turn autocommit off; null for any other statement. */
+export function sessionSetting(sql: string): { text: string; autocommit?: boolean } | null {
+  const text = sql.replace(/^(?:\s+|\/\*[\s\S]*?\*\/|--[^\n]*(?:\n|$))+/, "").trim();
+  if (!/^set\b/i.test(text) || /^set\s+(?:session\s+|local\s+)?search_path\b/i.test(text)) return null;
+  const ac = /\bautocommit\s*(?:=|:=|\s+to\s+)\s*'?(\w+)/i.exec(text);
+  return { text: text.replace(/\s+/g, " ").replace(/;+$/, ""), autocommit: ac ? /^(?:0|false|off)$/i.test(ac[1]) : undefined };
+}
+
 export interface RunOptions {
   /** Result tab to replace in place (Reload Page). */
   replace?: ResultTab;
@@ -85,6 +106,9 @@ export class ConsoleSession implements OutputHost {
   sessionId?: string;
   private opening?: Promise<string>;
   private disposed = false;
+  /** SET commands etc. of the live session, and (after the session was lost) of the dead one, until the reopen says so. */
+  private userSettings = noSettings();
+  private lostSettings?: SessionSettings;
   private connectedLogged = false;
   private curHandle?: Promise<ExecHandle>;
   /** A result was edited inside the open transaction (the editable result is reloaded when it is rolled back). */
@@ -216,10 +240,37 @@ export class ConsoleSession implements OutputHost {
       this.sessionId = sid;
       this.connectedLogged = false;
       this.setTxStatus("idle");
+      this.reportReset();
       await this.detectSchema(sid);
       return sid;
     })().finally(() => (this.opening = undefined));
     return this.opening;
+  }
+
+  /**
+   * A session replaced the one that was lost: everything the user set in it is gone (the backend's own "settings were
+   * reset" message never shows, the dead session is closed). Say so; the user's SET commands are not run again.
+   */
+  private reportReset(): void {
+    const lost = this.lostSettings;
+    this.lostSettings = undefined;
+    if (!lost) return;
+    let text = SESSION_RESET_LOG;
+    if (this.driver === "mysql" && lost.autocommitOff) text += " SET autocommit=0 was run in this console: autocommit is on again.";
+    if (lost.sets.length) {
+      const last = lost.sets[lost.sets.length - 1];
+      text += ` The SET commands run in this console (last: ${last.length > 60 ? `${last.slice(0, 60)}…` : last}) are not in effect and were not run again.`;
+    }
+    this.out.log("error", text);
+    notify({ kind: "warning", title: "Session state was reset", body: text });
+  }
+
+  /** Remembers what a statement of the user changes in the session (reported when a reconnect loses it). */
+  private noteSetting(sql: string): void {
+    const set = sessionSetting(sql);
+    if (!set) return;
+    this.userSettings.sets = [...this.userSettings.sets.filter((x) => x !== set.text), set.text];
+    if (set.autocommit !== undefined) this.userSettings.autocommitOff = set.autocommit;
   }
 
   /**
@@ -299,7 +350,11 @@ export class ConsoleSession implements OutputHost {
     this.editedInTx = false;
     this.connectedLogged = false;
     this.schemaDirty = false;
-    if (old) void closeSession(old).catch(() => {}); // releases a dead session (the backend accepts that)
+    if (old) {
+      this.lostSettings = this.userSettings; // the next session starts without them: tell the user when it opens
+      this.userSettings = noSettings();
+      void closeSession(old).catch(() => {}); // releases a dead session (the backend accepts that)
+    }
     if (o.closed) {
       if (had) {
         this.out.log("error", "the transaction was rolled back: connection closed");
@@ -463,6 +518,7 @@ export class ConsoleSession implements OutputHost {
         executed++;
         const from = this.docOffset(req, e.range.startUtf16);
         const to = this.docOffset(req, e.range.endUtf16);
+        this.noteSetting(e.sql);
         cur = { sql: e.sql, t0: nowMs(), from, to, errored: false, schema: schemaChange(e.sql, this.driver) ?? undefined };
         out.log("sql", e.sql, this.prompt());
         if (req.ranges.length) {

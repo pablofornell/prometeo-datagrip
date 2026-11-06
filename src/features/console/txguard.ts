@@ -19,6 +19,18 @@ export interface TxScope {
   reason: string;
   /** The session stays alive afterwards (switching to Auto): a transaction that cannot be ended must not be abandoned. */
   keepsSession?: boolean;
+  /**
+   * Shows that the COMMIT / ROLLBACK the user chose is running (quit guard). After `STUCK_AFTER_MS` without an answer
+   * it is told so (`stuck`) and may resolve `quitAnyway`: the outcome is then unknown, but the user is not trapped.
+   */
+  progress?: TxProgress;
+}
+
+/** A COMMIT / ROLLBACK that takes longer than this offers "Quit anyway" (`TxScope.progress`). */
+export const STUCK_AFTER_MS = 10_000;
+
+export interface TxProgress {
+  begin(verb: "Committing" | "Rolling back", title: string): { stuck(): void; close(): void; quitAnyway: Promise<void> };
 }
 
 interface OpenTx {
@@ -106,6 +118,21 @@ export async function confirmEndTransactions(scope: TxScope): Promise<boolean> {
   return true;
 }
 
+/** `o.end(kind)`, with the progress dialog of `scope` while it runs; "quitAnyway" when the user gave up waiting. */
+async function endWithProgress(o: OpenTx, kind: "commit" | "rollback", scope: TxScope): Promise<boolean | "quitAnyway"> {
+  const ending = o.end(kind);
+  ending.catch(() => {}); // when the user quits anyway nobody awaits it any more
+  const p = scope.progress?.begin(kind === "commit" ? "Committing" : "Rolling back", o.title);
+  if (!p) return ending;
+  const timer = setTimeout(() => p.stuck(), STUCK_AFTER_MS);
+  try {
+    return await Promise.race([ending, p.quitAnyway.then(() => "quitAnyway" as const)]);
+  } finally {
+    clearTimeout(timer);
+    p.close();
+  }
+}
+
 /**
  * Ends one transaction. When that fails (not a lost connection: `end` resolves true for those), the user always gets a
  * way out: after a failed COMMIT Roll Back / Close anyway / Cancel, after a failed ROLLBACK Close anyway / Cancel.
@@ -115,7 +142,8 @@ export async function confirmEndTransactions(scope: TxScope): Promise<boolean> {
 async function endOne(o: OpenTx, first: "commit" | "rollback", scope: TxScope): Promise<boolean> {
   let kind = first;
   for (;;) {
-    if (await o.end(kind)) return true;
+    const ended = await endWithProgress(o, kind, scope);
+    if (ended === "quitAnyway" || ended === true) return true;
     const why = o.error() ?? "the server did not answer";
     const verb = kind === "commit" ? "commit" : "roll back";
     const choices = [

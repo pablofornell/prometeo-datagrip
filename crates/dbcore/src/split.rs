@@ -178,17 +178,22 @@ fn create_is_compound(words: &[String], d: Driver) -> Option<bool> {
     None
 }
 
-struct Scanner<'a> {
+pub(crate) struct Scanner<'a> {
     b: &'a [u8],
     d: Driver,
     delimiter: Vec<u8>,
 }
 
 impl<'a> Scanner<'a> {
+    /// A scanner over `sql` with the default `;` delimiter (also used by the transaction tracker's tokenizer).
+    pub(crate) fn new(sql: &'a str, d: Driver) -> Self {
+        Scanner { b: sql.as_bytes(), d, delimiter: vec![b';'] }
+    }
+
     /// Skip a quoted run starting at `i` (which points at the opening quote). Handles the
     /// doubled-quote escape and optionally backslash escapes. Returns the index after the
     /// closing quote (or EOF).
-    fn skip_quoted(&self, mut i: usize, q: u8, backslash: bool) -> usize {
+    pub(crate) fn skip_quoted(&self, mut i: usize, q: u8, backslash: bool) -> usize {
         i += 1;
         let n = self.b.len();
         while i < n {
@@ -216,7 +221,7 @@ impl<'a> Scanner<'a> {
         i
     }
 
-    fn skip_block_comment(&self, mut i: usize) -> usize {
+    pub(crate) fn skip_block_comment(&self, mut i: usize) -> usize {
         // i points at "/*"
         let n = self.b.len();
         let nested = self.d == Driver::Postgres;
@@ -240,7 +245,7 @@ impl<'a> Scanner<'a> {
     }
 
     /// If a comment starts at `i`, return the index after it.
-    fn comment_end(&self, i: usize, at_stmt_start: bool) -> Option<usize> {
+    pub(crate) fn comment_end(&self, i: usize, at_stmt_start: bool) -> Option<usize> {
         let b = self.b;
         let n = b.len();
         let c = b[i];

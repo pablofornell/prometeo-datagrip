@@ -162,41 +162,62 @@ export function savedPart(snapshot: string): string {
 }
 
 /**
- * The part that makes the backend reconnect when it changes (its connection fingerprint leaves out the name and the
- * color; the schema filter is not saved there at all). Only these changes can end open transactions.
+ * Option keys that are view settings: the backend leaves them out of its connection fingerprint (they never reconnect).
+ * `visibleSchemas` is the legacy copy of the schema filter, which lives in the UI state now.
  */
-export function reconnectPart(snapshot: string): string {
-  const f = JSON.parse(snapshot) as Partial<Form>;
-  delete f.options?.visibleSchemas;
-  delete f.name;
-  delete f.color;
-  return JSON.stringify(f);
+/** Option keys the form does not own: sent back as stored (a legacy `visibleSchemas`). */
+export const VIEW_ONLY_OPTION_KEYS: readonly string[] = ["visibleSchemas"];
+
+/**
+ * Option keys the backend connection fingerprint ignores: changing them does not reconnect.
+ * Same list as VIEW_ONLY_OPTIONS in src-tauri/src/state.rs (fingerprint.test.ts checks it).
+ */
+export const FINGERPRINT_IGNORED_OPTION_KEYS: readonly string[] = [
+  "comment", "visibleSchemas", "showSystemSchemas", "txMode", "sessionControl", "keepAliveSec", "autoDisconnectSec",
+  "startupScript", "passwordSave",
+];
+
+/**
+ * THE rule for "does this save reconnect": the connection fingerprint of the backend (`connection_fingerprint` in
+ * src-tauri/src/state.rs). The whole config except the name, the color and the password (and the view-only option keys,
+ * `FINGERPRINT_IGNORED_OPTION_KEYS`). Keep it in step with that function: it is the only copy on this side.
+ */
+function connectionFingerprint(c: Partial<DataSourceConfig>): string {
+  const { name: _n, color: _c, password: _p, hasPassword: _h, passwordStorage: _s, options, ...rest } = c as Record<string, unknown> & { options?: Record<string, string> };
+  const opts = Object.fromEntries(Object.entries(options ?? {}).filter(([k]) => !FINGERPRINT_IGNORED_OPTION_KEYS.includes(k)).sort(([x], [y]) => (x < y ? -1 : 1)));
+  return JSON.stringify(Object.entries({ ...rest, options: opts }).sort(([x], [y]) => (x < y ? -1 : 1)));
+}
+
+/** Whether saving `after` over the stored `before` makes the backend reconnect the data source (see `connectionFingerprint`). */
+export function reconnectsOnSave(before: Partial<DataSourceConfig>, after: Partial<DataSourceConfig>): boolean {
+  return connectionFingerprint(before) !== connectionFingerprint(after);
 }
 
 /**
- * Whether saving `after` over `before` makes the backend reconnect the data source: its connection fingerprint is the
- * whole config except the name, the color and the password (src-tauri `connection_fingerprint`). So an options key
- * does reconnect, and that is why view settings do not live there.
+ * Whether applying `form` over the stored data source `saved` reconnects it: compares exactly what `configFromForm`
+ * will send with what is stored. A new data source (no `saved`) has nothing to reconnect.
  */
-export function reconnectsOnSave(before: Partial<DataSourceConfig>, after: Partial<DataSourceConfig>): boolean {
-  const stable = (c: Partial<DataSourceConfig>): string => {
-    const { name: _n, color: _c, password: _p, hasPassword: _h, passwordStorage: _s, options, ...rest } = c as Record<string, unknown> & { options?: Record<string, string> };
-    const opts = Object.fromEntries(Object.entries(options ?? {}).sort(([x], [y]) => (x < y ? -1 : 1)));
-    return JSON.stringify(Object.entries({ ...rest, options: opts }).sort(([x], [y]) => (x < y ? -1 : 1)));
-  };
-  return stable(before) !== stable(after);
+export function reconnectsOnApply(form: Form, id: string | null, saved: DataSource | null): boolean {
+  return !!id && !!saved && reconnectsOnSave(saved, configFromForm(form, id, saved));
 }
 
-/** Form -> backend config (without `password`, which the caller adds). */
-export function configFromForm(f: Form, id: string | null): Partial<DataSourceConfig> & { name: string } {
+/**
+ * Form -> backend config (without `password`, which the caller adds). `saved` is the stored data source: the option
+ * keys the form does not own (`VIEW_ONLY_OPTION_KEYS`, e.g. a legacy `visibleSchemas`) are sent back as stored, so
+ * that a rename sends the same connection settings. Empty values the stored config has itself are kept as well.
+ */
+export function configFromForm(f: Form, id: string | null, saved?: DataSource | null): Partial<DataSourceConfig> & { name: string } {
   const info = DBMS[f.dbms];
   const options = { ...f.options };
-  delete options.visibleSchemas; // a view filter (UI state), not part of the connection
+  for (const k of VIEW_ONLY_OPTION_KEYS) {
+    delete options[k]; // the form carries the schema filter (UI state), not the connection's copy of it
+    if (saved?.options[k] !== undefined) options[k] = saved.options[k];
+  }
   if (f.dbms === "mariadb") options.dbms = "mariadb";
   else delete options.dbms;
   if (f.auth === "none") options.auth = "none";
   else delete options.auth;
-  for (const k of Object.keys(options)) if (options[k] === "") delete options[k];
+  for (const k of Object.keys(options)) if (options[k] === "" && saved?.options[k] !== "") delete options[k];
 
   const cfg: Partial<DataSourceConfig> & { name: string } = {
     name: f.name.trim(),
