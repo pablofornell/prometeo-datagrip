@@ -23,7 +23,7 @@ DB_ENV := PROMETEO_PG_URL=postgres://postgres:$(PG_PASSWORD)@127.0.0.1:$(PG_PORT
           PROMETEO_MYSQL_URL=mysql://root:$(MYSQL_PASSWORD)@127.0.0.1:$(MYSQL_PORT)/demo \
           PROMETEO_NO_KEYRING=1
 
-.PHONY: help install dev build bundle \
+.PHONY: help install dev build bundle run \
         test test-ui test-rust test-rust-db test-all \
         lint typecheck clippy fmt fmt-check check ci \
         db-up db-down db-reset db-status clean
@@ -45,6 +45,9 @@ build: ## Build the optimized release binary (no installer bundles)
 
 bundle: ## Build the release binary and the installer bundles (deb, AppImage, ...)
 	$(NPX) tauri build
+
+run: build ## Build the release binary (if changed) and start the app
+	./target/release/prometeo-datagrip
 
 ## ---- Tests ----
 

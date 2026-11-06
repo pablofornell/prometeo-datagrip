@@ -40,6 +40,7 @@ Run `make help` to see all targets. The most used:
 | Target | What it does |
 |---|---|
 | `make install` | Install the frontend dependencies |
+| `make run` | Build the release binary (if changed) and start the app |
 | `make dev` | Run the app in development mode |
 | `make build` | Build the release binary (`target/release/prometeo-datagrip`) |
 | `make check` | Type-check, clippy, Rust format check and unit tests (no databases needed) |
