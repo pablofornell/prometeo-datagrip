@@ -1,5 +1,6 @@
-/* Standalone demo of the data grid. Open http://localhost:1433/demo/grid.html (vite dev, see docs).
+/* Standalone demo of the data grid. Open http://localhost:1464/demo/grid.html (vite dev, see docs).
  * Query params: rows=100000  cols=30  theme=dark|light  editable=1|0  paged=0|1  ref=53|57  view=table|text
+ *   offset=500  rowNumberOffset (paged table editor)   null=NULL  settings.gridNullText   transpose=1  record=1
  *   bench=<port>  run the scroll benchmark and POST the result to http://localhost:<port>/ (for engines without devtools) */
 import { Show, createSignal, onMount } from "solid-js";
 import { render } from "solid-js/web";
@@ -7,15 +8,18 @@ import "../src/theme/fonts.css";
 import "../src/theme/metrics.css";
 import "../src/theme/dark.css";
 import "../src/theme/light.css";
+import { updateSettings } from "../src/state/settings";
 import {
   DataGrid,
   GridFilterBar,
   GridPagingPill,
   GridToolbar,
+  PendingSqlPreview,
   type Cell,
   type DataGridApi,
   type GridChange,
   type GridColumn,
+  type GridViewState,
   type SelectionInfo,
   type SortSpec,
   type ViewMode,
@@ -28,6 +32,22 @@ const ref = q.get("ref");
 const ROWS = Number(q.get("rows") ?? 100000);
 const EDITABLE = q.get("editable") !== "0";
 const PAGED = q.get("paged") === "1";
+const OFFSET = Number(q.get("offset") ?? 0);
+if (q.get("null") !== null) updateSettings({ gridNullText: q.get("null")! });
+
+/** Demo SQL of the pending changes (the table feature builds the real one). */
+function previewSql(changes: GridChange[], table: string): string {
+  const lit = (v: Cell) => (v === null ? "null" : typeof v === "number" ? String(v) : "'" + String(v).replace(/'/g, "''") + "'");
+  return changes
+    .map((c) => {
+      if (c.kind === "delete") return `DELETE\nFROM ${table}\nWHERE ${Object.entries(c.key).map(([k, v]) => `${k} = ${lit(v)}`).join(" AND ")};`;
+      if (c.kind === "update")
+        return `UPDATE ${table}\nSET ${Object.entries(c.values).map(([k, v]) => `${k} = ${lit(v as Cell)}`).join(", ")}\nWHERE ${Object.entries(c.key).map(([k, v]) => `${k} = ${lit(v)}`).join(" AND ")};`;
+      const cols = Object.keys(c.values);
+      return `INSERT INTO ${table} (${cols.join(", ")})\nVALUES (${cols.map((k) => lit(c.values[k] as Cell)).join(", ")});`;
+    })
+    .join("\n\n");
+}
 
 // ---------------------------------------------------------------------------------------------
 // data
@@ -194,10 +214,14 @@ function Demo() {
   const [orderBy, setOrderBy] = createSignal("");
   const [log, setLog] = createSignal<string>("");
   const [pageSize, setPageSize] = createSignal<number | "all">(500);
+  const [view, setView] = createSignal<GridViewState>({ transposed: false, findOpen: false, sidePanel: null, localFilterActive: false, localFilterEnabled: true, hiddenColumns: 0 });
+  const [preview, setPreview] = createSignal<string | null>(null);
   let api!: DataGridApi;
 
   onMount(() => {
     (window as unknown as Record<string, unknown>).__grid = api;
+    if (q.get("transpose") === "1") api.setTransposed(true);
+    if (q.get("record") === "1") api.showSidePanel("record");
   });
 
   const onSubmit = (changes: GridChange[]) => {
@@ -220,10 +244,11 @@ function Demo() {
         sort={sort()}
         onSortChange={setSort}
         sortMode={ref ? "external" : "local"}
+        rowNumberOffset={OFFSET}
+        onViewChange={setView}
         viewMode={viewMode()}
         onSelectionChange={setSel}
         apiRef={(a) => (api = a)}
-        onColumnFilter={(c) => setLog(`filter column ${c}`)}
       >
         <GridPagingPill
           rowCount={ref ? total : loaded()}
@@ -248,13 +273,23 @@ function Demo() {
       onDeleteRows={() => api.deleteRows()}
       onRevert={() => api.revertSelected()}
       onSubmit={() => api.submit()}
-      onPreview={() => setLog("preview " + JSON.stringify(api.getChanges()).slice(0, 300))}
+      onPreview={() => setPreview(previewSql(api.getChanges(), "public.customers"))}
       onDDL={() => setLog("ddl")}
-      onFind={() => setLog("find")}
+      onFind={() => api.openFind()}
+      findOpen={view().findOpen}
+      onLocalFilterEnabledChange={(on) => api.setLocalFilterEnabled(on)}
+      onClearLocalFilter={() => api.clearLocalFilter()}
+      localFilterEnabled={view().localFilterEnabled}
+      localFilterActive={view().localFilterActive}
+      onRecordView={() => api.toggleRecordView()}
+      recordViewOpen={view().sidePanel !== null}
+      transposed={view().transposed}
+      onTransposeChange={(on) => api.setTransposed(on)}
+      columnsHidden={view().hiddenColumns > 0}
       onSql={() => setLog("sql")}
       onExport={() => setLog("export")}
       onExtractorMenu={() => setLog("extractor")}
-      onManageColumns={() => api.showAllColumns()}
+      onManageColumns={(anchor) => api.openManageColumns(anchor)}
       onOptions={() => setLog("options")}
     />
   );
@@ -269,6 +304,9 @@ function Demo() {
             <GridFilterBar where={where()} orderBy={orderBy()} onWhereChange={setWhere} onOrderByChange={setOrderBy} onApply={() => setLog(`apply WHERE ${where()} ORDER BY ${orderBy()}`)} />
             {grid}
           </div>
+          <Show when={preview()}>
+            {(sql) => <PendingSqlPreview sql={sql()} onSubmit={() => (api.submit(), setPreview(null))} onCancel={() => setPreview(null)} />}
+          </Show>
           <div class="demo-status">
             <span>
               rows loaded: {loaded().toLocaleString()} / {total.toLocaleString()}

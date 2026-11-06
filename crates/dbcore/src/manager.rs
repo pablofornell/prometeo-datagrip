@@ -272,6 +272,22 @@ impl ConnectionManager {
         }
     }
 
+    /// Exclusive use of the session connection for a one-off operation (table read / edit). An open paging
+    /// result of the session is released first (inside a transaction its rest is drained, like a new
+    /// `execute` does); `Busy` while a statement is running.
+    pub(crate) async fn lock_session_conn(&self, sess: &Arc<Session>) -> Result<tokio::sync::OwnedMutexGuard<Option<Conn>>> {
+        {
+            let cur = sess.current.lock().unwrap();
+            if let Some((_, ctl)) = cur.as_ref() {
+                if ctl.running.load(Ordering::Relaxed) {
+                    return Err(DbError::Busy("The session is busy executing another statement".into()));
+                }
+                let _ = ctl.cmd.send(ExecCmd::Close);
+            }
+        }
+        Ok(sess.conn.clone().lock_owned().await)
+    }
+
     pub fn session_in_transaction(&self, id: &SessionId) -> Result<bool> {
         Ok(self.session(id)?.in_tx.load(Ordering::Relaxed))
     }

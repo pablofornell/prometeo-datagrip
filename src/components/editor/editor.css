@@ -7,6 +7,11 @@
  */
 
 .sql-editor {
+  /* editor metrics: set on <html> by src/state/settings.ts (Settings > Editor > Font); defaults = DataGrip 13 / 1.2 */
+  --ed-fs: var(--dg-editor-font-size, 13px);
+  --ed-pitch: var(--dg-editor-line-pitch, 22px);
+  --ed-cell: var(--dg-editor-cell, 8px);
+  --ed-line: calc(var(--ed-pitch) - 1px);
   position: relative;
   display: flex;
   flex-direction: column;
@@ -16,8 +21,14 @@
   background: var(--dg-editor-bg);
   color: var(--dg-editor-fg);
   font-family: var(--dg-font-mono);
-  font-size: 13px;
+  font-size: var(--ed-fs);
   overflow: hidden;
+}
+/* the single-line WHERE / ORDER BY fields keep the fixed 13px metrics */
+.sql-editor.sql-editor-single {
+  --ed-fs: 13px;
+  --ed-pitch: 22px;
+  --ed-cell: 8px;
 }
 
 .sql-editor .cm-editor {
@@ -34,8 +45,8 @@
 
 .sql-editor .cm-scroller {
   font-family: var(--dg-font-mono);
-  font-size: 13px;
-  line-height: 22px;
+  font-size: var(--ed-fs);
+  line-height: var(--ed-pitch);
   overflow: auto;
   scrollbar-width: none;
 }
@@ -68,14 +79,14 @@
   padding: 0;
   caret-color: var(--dg-editor-caret);
   font-family: var(--dg-font-mono);
-  letter-spacing: calc(8px - 1ch); /* force the 8px cell of the IDE whatever advance the engine gives */
+  letter-spacing: calc(var(--ed-cell) - 1ch); /* force the 8px cell of the IDE whatever advance the engine gives */
   font-variant-ligatures: none;
   font-feature-settings: "liga" 0, "calt" 0;
   min-height: 100%;
 }
 .sql-editor .cm-line {
   padding: 1px 0 0 2px; /* 1px + 21px line box = the 22px pitch, with the baseline where the IDE draws it */
-  line-height: 21px;
+  line-height: var(--ed-line);
 }
 .sql-editor .cm-cursor,
 .sql-editor .cm-dropCursor {
@@ -185,13 +196,13 @@
   border-right: 1px solid var(--dg-editor-indent-guide);
   padding: 0;
   font-family: var(--dg-font-mono);
-  font-size: 12px;
+  font-size: calc(var(--ed-fs) - 1px);
   z-index: 200;
 }
 .sql-editor .cm-gutterElement {
   box-sizing: border-box;
   padding-top: 1px;
-  line-height: 21px;
+  line-height: var(--ed-line);
 }
 .sql-editor .cm-lineNumbers .cm-gutterElement {
   padding: 1px 0 0;

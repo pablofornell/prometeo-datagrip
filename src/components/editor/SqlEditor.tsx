@@ -17,6 +17,7 @@ import {
   tooltips,
 } from "@codemirror/view";
 import { type Component, createEffect, on, onCleanup, onMount } from "solid-js";
+import { editorMetrics, settings } from "../../state/settings";
 import "./editor.css";
 import { duplicate, extendSelection, goToLine, moveLine, moveStatement, shiftTab, shrinkSelection, tabIndent, toggleBlock } from "./commands";
 import { sqlCompletion } from "./complete";
@@ -71,6 +72,17 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
   let view: EditorView | undefined;
   const darkC = new Compartment();
   const readOnlyC = new Compartment();
+  const numbersC = new Compartment();
+  const metricsC = new Compartment();
+  const showNumbers = (): boolean => props.lineNumbers ?? settings.editorLineNumbers;
+  const fontSize = (): number => props.fontSize ?? settings.editorFontSize;
+  const lineHeight = (): number => props.lineHeight ?? settings.editorLineHeight;
+  /** Only editors with an explicit override set the metrics themselves; the others inherit them from <html>. */
+  const metricsStyle = () => {
+    if (props.fontSize === undefined && props.lineHeight === undefined) return undefined;
+    const m = editorMetrics(fontSize(), lineHeight());
+    return { "--dg-editor-font-size": `${m.fontSize}px`, "--dg-editor-line-pitch": `${m.pitch}px`, "--dg-editor-cell": `${m.cell}px` };
+  };
 
   const emit = (req: ExecuteRequest): void => props.onExecute?.(req);
 
@@ -217,7 +229,8 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
         previewFill,
         ...(single ? [] : [editorLayers(), highlightActiveLine(), indentGuides]),
         ...(single ? [stripNewlines, placeholder(props.placeholder ?? "")] : []),
-        ...(showGutter ? [lineNumbers(), highlightActiveLineGutter(), statusGutterExtension()] : []),
+        ...(showGutter ? [numbersC.of(showNumbers() ? lineNumbers() : []), highlightActiveLineGutter(), statusGutterExtension()] : []),
+        metricsC.of([]),
         history(),
         bracketMatching(),
         closeBrackets(),
@@ -270,10 +283,22 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
     ),
   );
   createEffect(on(() => props.readOnly, (ro) => view?.dispatch({ effects: readOnlyC.reconfigure(EditorState.readOnly.of(!!ro)) }), { defer: true }));
+  // Settings > Editor: line numbers and font metrics apply to every open editor at once
+  createEffect(on(showNumbers, (on) => view?.dispatch({ effects: numbersC.reconfigure(on ? lineNumbers() : []) }), { defer: true }));
+  createEffect(
+    on(
+      () => [fontSize(), lineHeight()] as const,
+      ([fs, lh]) => {
+        // a changed theme facet makes CodeMirror re-measure line height and character width (the CSS variables already changed)
+        view?.dispatch({ effects: metricsC.reconfigure(EditorView.theme({ ".cm-scroller": { "--ed-measured": `${fs}/${lh}` } })) });
+      },
+      { defer: true },
+    ),
+  );
   createEffect(on(() => props.errors, (e) => view?.dispatch({ effects: setErrors.of(e ?? []) })));
   createEffect(on(() => props.execMarks, (m) => view?.dispatch({ effects: setExecMarks.of(m ?? []) })));
 
-  return <div ref={host} class={`sql-editor${props.readOnly ? " sql-editor-readonly" : ""}${props.singleLine ? " sql-editor-single" : ""}${props.class ? ` ${props.class}` : ""}`} />;
+  return <div ref={host} style={metricsStyle()} class={`sql-editor${props.readOnly ? " sql-editor-readonly" : ""}${props.singleLine ? " sql-editor-single" : ""}${props.class ? ` ${props.class}` : ""}`} />;
 };
 
 export default SqlEditor;

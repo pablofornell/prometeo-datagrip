@@ -1,0 +1,184 @@
+/* Search Everywhere / Go to Database Object. Geometry measured on docs/ux/screens/90, 91 (1:1 CSS px). */
+.dgn-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1900;
+}
+.dgn-popup {
+  position: absolute;
+  left: 50%;
+  top: min(195px, max(20px, calc(100vh - 640px)));
+  transform: translateX(-50%);
+  box-sizing: content-box;
+  width: 700px;
+  height: 600px;
+  display: flex;
+  flex-direction: column;
+  background: var(--dg-popup-bg);
+  border: 1px solid var(--dg-popup-border);
+  border-radius: 8px;
+  box-shadow: var(--dg-popup-shadow);
+  color: var(--dg-text);
+  font: var(--dg-font-size) / 16px var(--dg-font-ui);
+  overflow: hidden;
+}
+
+/* ---- tabs row: 42px + 1px separator */
+.dgn-header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  height: 42px;
+  padding: 0 8px;
+  gap: 4px;
+  border-bottom: 1px solid var(--dg-separator);
+}
+.dgn-tab {
+  height: 28px;
+  padding: 0 11px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dg-text);
+  font: inherit;
+  cursor: default;
+}
+.dgn-tab:hover:not(.dgn-on) { background: var(--dg-hover-bg); }
+.dgn-tab.dgn-on {
+  background: var(--dg-tab-selected-bg);
+  border-color: var(--dg-tab-selected-border);
+}
+.dgn-header-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-right: 6px;
+}
+.dgn-scope {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 4px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dg-text);
+  font: inherit;
+  cursor: default;
+}
+.dgn-scope:hover, .dgn-iconbtn:hover { background: var(--dg-hover-bg); }
+.dgn-iconbtn {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  cursor: default;
+}
+.dgn-dot {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--dg-text-success);
+}
+
+/* ---- search field: 33px with a 2px focus border, 5px under the separator, 7px side margins */
+.dgn-field {
+  flex: none;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  height: 33px;
+  margin: 5px 7px 0;
+  padding: 0 8px 0 7px;
+  border: 2px solid var(--dg-input-focus-border);
+  border-radius: 6px;
+  background: var(--dg-popup-bg);
+}
+.dgn-search-icon { flex: none; color: var(--dg-text-muted); margin-right: 8px; }
+.dgn-field input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--dg-input-fg);
+  font: inherit;
+  caret-color: var(--dg-input-fg);
+}
+
+/* ---- list: 24px rows, selection inset 8px */
+.dgn-list {
+  flex: 1;
+  min-height: 0;
+  margin-top: 9px;
+  padding: 0 8px;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.dgn-row {
+  display: flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 8px 0 10px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+.dgn-row:hover:not(.dgn-sel) { background: var(--dg-row-hover-bg); }
+.dgn-row.dgn-sel { background: var(--dg-list-selection-bg); }
+.dgn-ico { flex: none; width: 16px; height: 16px; margin-right: 5px; display: flex; }
+.dgn-name { flex: none; max-width: 70%; overflow: hidden; text-overflow: ellipsis; }
+.dgn-loc {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-left: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--dg-text-secondary);
+}
+.dgn-row.dgn-sel .dgn-loc { color: var(--dg-text); }
+.dgn-right {
+  flex: none;
+  margin-left: auto;
+  padding-left: 12px;
+  color: var(--dg-text-secondary);
+}
+.dgn-row.dgn-dis .dgn-name { color: var(--dg-text-secondary); }
+.dgn-row.dgn-dis .dgn-right { color: var(--dg-text-disabled); }
+.dgn-row .dg-icon { width: 16px; height: 16px; }
+.dgn-empty { padding: 4px 9px; color: var(--dg-text-secondary); }
+
+/* ---- footer */
+.dgn-footer {
+  flex: none;
+  display: flex;
+  align-items: center;
+  height: 28px;
+  padding: 0 16px 4px 12px;
+  font-size: 12px;
+}
+.dgn-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dg-text-secondary);
+}
+.dgn-link { flex: none; font-size: 13px; margin-left: 24px; color: var(--dg-link); cursor: default; }
+.dgn-link:hover { text-decoration: underline; }
+
+/* the shared match mark is white-on-yellow: unreadable on the light popup */
+:root[data-theme="light"] .dgn-popup mark.dg-search-match { color: inherit; }

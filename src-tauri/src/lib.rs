@@ -45,6 +45,8 @@ pub fn run() {
             commands::close_execution,
             commands::table_data,
             commands::apply_changes,
+            commands::table_data_in_session,
+            commands::apply_changes_in_session,
             commands::export_query,
             commands::export_query_to_string,
             commands::export_result,

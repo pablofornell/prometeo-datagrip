@@ -1,0 +1,374 @@
+/**
+ * What Search Everywhere searches: database objects of the connected data sources (from the schema snapshots,
+ * plus routines / sequences / schemas through `introspect`), the data sources themselves, the query consoles and
+ * the registered actions. Entries are built once per snapshot and cached; searching never calls the backend.
+ */
+import { createEffect, createMemo, createRoot, createSignal, untrack } from "solid-js";
+import { type DataSource, type NodeKind, type SnapshotObject, type TreeNode, introspect, listConsoles } from "../../api/db";
+import { MAIN_MENU, GEAR_MENU } from "../../components/shell/menus";
+import type { MenuItem } from "../../components/ui";
+import * as registry from "../../state/actions";
+import { ACTION_IDS } from "../../state/core-actions";
+import { connectedDataSourceIds, explorerDataSources, loadSchemaSnapshot, schemaSnapshotFor } from "../explorer";
+import { type PreparedQuery, type Range, matchName, prepareQuery } from "./match";
+
+export type EntryKind = "dataSource" | "schema" | "table" | "view" | "materializedView" | "routine" | "function" | "procedure" | "sequence" | "column" | "console" | "action";
+export type Group = "db" | "console" | "action";
+
+export interface Entry {
+  group: Group;
+  kind: EntryKind;
+  name: string;
+  lower: string;
+  dsId?: string;
+  schema?: string;
+  /** Column: its table. */
+  table?: string;
+  /** Column: kind of its table. */
+  tableKind?: NodeKind;
+  /** Routines: identity arguments as the backend reports them. */
+  signature?: string;
+  actionId?: string;
+  /** Actions: gray text at the right (shortcut or menu group). */
+  right?: string;
+}
+
+const RANK: Record<EntryKind, number> = {
+  table: 0,
+  view: 1,
+  materializedView: 2,
+  routine: 3,
+  function: 3,
+  procedure: 3,
+  sequence: 4,
+  schema: 5,
+  dataSource: 6,
+  column: 8,
+  console: 0,
+  action: 0,
+};
+
+const mk = (group: Group, kind: EntryKind, name: string, rest: Partial<Entry> = {}): Entry => ({ group, kind, name, lower: name.toLowerCase(), ...rest });
+
+// ---------------------------------------------------------------- database objects
+
+const snapshotEntries = new WeakMap<SnapshotObject[], Entry[]>();
+const columnEntries = new WeakMap<SnapshotObject[], Entry[]>();
+
+function entriesOfSnapshot(dsId: string, snap: SnapshotObject[]): Entry[] {
+  let e = snapshotEntries.get(snap);
+  if (!e) {
+    e = snap.map((o) => mk("db", o.kind as EntryKind, o.name, { dsId, schema: o.schema }));
+    snapshotEntries.set(snap, e);
+  }
+  return e;
+}
+
+/** Column entries are built on first use (they are by far the most numerous). */
+function entriesOfColumns(dsId: string, snap: SnapshotObject[]): Entry[] {
+  let e = columnEntries.get(snap);
+  if (!e) {
+    e = [];
+    for (const o of snap) for (const c of o.columns) e.push(mk("db", "column", c.name, { dsId, schema: o.schema, table: o.name, tableKind: o.kind }));
+    columnEntries.set(snap, e);
+  }
+  return e;
+}
+
+interface Extras {
+  snap: SnapshotObject[];
+  entries: Entry[];
+}
+const [extras, setExtras] = createSignal<ReadonlyMap<string, Extras>>(new Map());
+const inFlight = new Map<string, SnapshotObject[]>();
+
+const ROUTINE_KINDS: NodeKind[] = ["routine", "function", "procedure"];
+
+/** Routines, sequences and schemas of a data source, through the lazy introspection API (a few calls per schema). */
+async function loadExtras(ds: DataSource): Promise<Entry[]> {
+  const top = await introspect(ds.id, []);
+  let schemas: TreeNode[];
+  if (top.some((n) => n.kind === "database")) {
+    const db = top.find((n) => n.extra.current) ?? top[0];
+    schemas = db ? (await introspect(ds.id, db.path)).filter((n) => n.kind === "schema") : [];
+  } else schemas = top.filter((n) => n.kind === "schema");
+  const out: Entry[] = [];
+  for (const s of schemas) {
+    out.push(mk("db", "schema", s.name, { dsId: ds.id, schema: s.name }));
+    const folders = (await introspect(ds.id, s.path)).filter((f) => f.kind === "folder" && (f.extra.folder === "routines" || f.extra.folder === "sequences"));
+    for (const f of folders) {
+      for (const n of await introspect(ds.id, f.path)) {
+        if (n.kind === "sequence") out.push(mk("db", "sequence", n.name, { dsId: ds.id, schema: s.name }));
+        else if (ROUTINE_KINDS.includes(n.kind)) out.push(mk("db", n.kind as EntryKind, n.name, { dsId: ds.id, schema: s.name, signature: String(n.extra.signature ?? "") }));
+      }
+    }
+  }
+  return out;
+}
+
+function refreshExtras(ds: DataSource, snap: SnapshotObject[]): void {
+  if (extras().get(ds.id)?.snap === snap || inFlight.get(ds.id) === snap) return;
+  inFlight.set(ds.id, snap);
+  void loadExtras(ds)
+    .then((entries) => {
+      if (inFlight.get(ds.id) !== snap) return;
+      setExtras((m) => new Map(m).set(ds.id, { snap, entries }));
+    })
+    .catch(() => {})
+    .finally(() => {
+      if (inFlight.get(ds.id) === snap) inFlight.delete(ds.id);
+    });
+}
+
+let started = false;
+let dbEntries: () => Entry[] = () => [];
+let colEntries: () => Entry[] = () => [];
+
+/** Starts the (lazy, once) reactive index: call when the popup opens. */
+export function ensureIndex(): void {
+  if (started) return;
+  started = true;
+  createRoot(() => {
+    // Keep the extras (routines / sequences / schemas) in step with the snapshots of the connected data sources.
+    createEffect(() => {
+      const connected = connectedDataSourceIds();
+      for (const ds of explorerDataSources()) {
+        if (!connected.has(ds.id)) continue;
+        const snap = schemaSnapshotFor(ds.id);
+        void loadSchemaSnapshot(ds.id).then((loaded) => untrack(() => refreshExtras(ds, loaded)));
+        void snap;
+      }
+    });
+    dbEntries = createMemo(() => {
+      const connected = connectedDataSourceIds();
+      const ex = extras();
+      const out: Entry[] = [];
+      for (const ds of explorerDataSources()) {
+        out.push(mk("db", "dataSource", ds.name, { dsId: ds.id }));
+        if (!connected.has(ds.id)) continue;
+        const snap = schemaSnapshotFor(ds.id);
+        out.push(...entriesOfSnapshot(ds.id, snap));
+        const e = ex.get(ds.id);
+        if (e) out.push(...e.entries);
+        else for (const s of new Set(snap.map((o) => o.schema))) out.push(mk("db", "schema", s, { dsId: ds.id, schema: s }));
+      }
+      return out;
+    });
+    colEntries = createMemo(() => {
+      const connected = connectedDataSourceIds();
+      const out: Entry[] = [];
+      for (const ds of explorerDataSources()) if (connected.has(ds.id)) out.push(...entriesOfColumns(ds.id, schemaSnapshotFor(ds.id)));
+      return out;
+    });
+  });
+}
+
+export const databaseEntries = (): Entry[] => dbEntries();
+export const databaseColumnEntries = (): Entry[] => colEntries();
+
+// ---------------------------------------------------------------- consoles
+
+const [consoles, setConsoles] = createSignal<Entry[]>([]);
+export { consoles as consoleEntries };
+
+/** Re-reads the console names of every data source (cheap, no connection needed). */
+export async function reloadConsoles(): Promise<void> {
+  const out: Entry[] = [];
+  await Promise.all(
+    explorerDataSources().map(async (ds) => {
+      try {
+        for (const n of await listConsoles(ds.id)) out.push(mk("console", "console", n, { dsId: ds.id }));
+      } catch {
+        /* no consoles */
+      }
+    }),
+  );
+  out.sort((a, b) => a.lower.localeCompare(b.lower, undefined, { numeric: true }));
+  setConsoles(out);
+}
+
+// ---------------------------------------------------------------- actions
+
+function groupsOfActions(): Map<string, string> {
+  const map = new Map<string, string>();
+  const walk = (items: MenuItem[], group: string) => {
+    for (const it of items) {
+      if ("action" in it && it.action && !map.has(it.action)) map.set(it.action, group);
+      if ("children" in it && it.children) walk(it.children, group);
+    }
+  };
+  for (const m of MAIN_MENU) walk(m.items, m.label);
+  walk(GEAR_MENU, "Settings");
+  return map;
+}
+
+const KNOWN_ACTIONS = [
+  ...Object.values(ACTION_IDS),
+  "app.exit", "window.minimize", "window.maximize", "window.resetLayout", "help.about", "tab.close", "tab.closeOthers", "tab.closeAll",
+  "tab.next", "tab.prev", "toolwindow.hideActive", "toolwindow.hideAll", "toolwindow.explorer", "toolwindow.output",
+  "theme.system", "theme.dark", "theme.light", "db.properties", "db.disconnect", "db.drop", "db.copyReference", "db.copyName",
+  "db.copyDdl", "db.ddlToConsole", "db.duplicateDataSource", "explorer.locate", "explorer.expandAll", "explorer.collapseAll",
+  "sql.executeScript", "table.addRow", "table.deleteRows", "table.submit", "table.revert", "table.reload", "table.nextPage",
+  "table.prevPage", "table.ddl",
+  "edit.undo", "edit.redo", "edit.cut", "edit.copy", "edit.paste", "edit.selectAll", "edit.find", "edit.replace",
+  "code.complete", "code.reformat", "code.comment",
+];
+
+/** The actions Search Everywhere offers. Uses `listActions()` of the registry when it exists, else the known ids + menus. */
+export function collectActions(): Entry[] {
+  const groups = groupsOfActions();
+  const lister = (registry as Record<string, unknown>)["list" + "Actions"] as (() => registry.Action[]) | undefined;
+  const all: registry.Action[] = [];
+  const seen = new Set<string>();
+  const add = (a: registry.Action | undefined) => {
+    if (a && !seen.has(a.id) && a.title) {
+      seen.add(a.id);
+      all.push(a);
+    }
+  };
+  if (typeof lister === "function") for (const a of lister()) add(registry.getAction(a.id));
+  for (const id of [...KNOWN_ACTIONS, ...groups.keys()]) add(registry.getAction(id));
+  return all
+    .filter((a) => a.id !== ACTION_IDS.searchEverywhere && a.id !== ACTION_IDS.gotoObject)
+    .map((a) => {
+      const sc = registry.actionShortcut(a);
+      return mk("action", "action", a.title.replace(/[…]+$|\.\.\.$/, "").trim(), { actionId: a.id, right: sc ?? groups.get(a.id) });
+    });
+}
+
+// ---------------------------------------------------------------- searching
+
+export interface Hit {
+  entry: Entry;
+  ranges: Range[];
+  score: number;
+}
+
+export interface Query {
+  /** Qualifier parts of a dotted query (`sales.inv`): matched against the object's path. */
+  quals: PreparedQuery[];
+  name: PreparedQuery;
+  /** The whole query without dots (non-database entries). */
+  whole: PreparedQuery;
+}
+
+export function parseQuery(text: string): Query {
+  const t = text.trim();
+  const parts = t.split(".");
+  const last = parts.pop() ?? "";
+  return { quals: parts.filter((p) => p.trim()).map(prepareQuery), name: prepareQuery(last), whole: prepareQuery(t) };
+}
+
+/** Path segments of a database entry, outermost first (used for dotted queries and the footer). */
+export function pathOf(e: Entry, ds: DataSource | undefined): string[] {
+  const out: string[] = [];
+  if (ds) out.push(ds.name);
+  if (ds?.driver === "postgres") out.push(ds.database || "postgres");
+  if (e.schema && e.kind !== "schema") out.push(e.schema);
+  if (e.table) out.push(e.table);
+  return out;
+}
+
+export interface SearchOptions {
+  limit: number;
+  /** Database kinds to leave out. */
+  hideKinds?: ReadonlySet<EntryKind>;
+  dsId?: string | null;
+  dsById: (id: string) => DataSource | undefined;
+}
+
+/** Best matches first: tier (exact / prefix / word start / substring), fewer chunks, kind, shorter name, name. */
+export function search(entries: Entry[], q: Query, opts: SearchOptions): Hit[] {
+  const buckets = new Map<number, Entry[]>();
+  const info = new Map<Entry, number>();
+  for (const e of entries) {
+    if (opts.hideKinds?.has(e.kind)) continue;
+    if (opts.dsId && e.dsId !== opts.dsId) continue;
+    const pq = e.group === "db" ? q.name : q.whole;
+    let score: number;
+    if (!pq.raw) {
+      if (e.group === "db" && q.quals.length === 0) continue;
+      score = 5000;
+    } else {
+      const r = matchName(e.name, e.lower, pq);
+      if (!r) continue;
+      score = r.score;
+    }
+    if (e.group === "db" && q.quals.length) {
+      const segs = pathOf(e, e.dsId ? opts.dsById(e.dsId) : undefined);
+      let at = 0;
+      for (const qq of q.quals) {
+        while (at < segs.length && !matchName(segs[at], segs[at].toLowerCase(), qq)) at++;
+        if (at++ >= segs.length) {
+          score = -1;
+          break;
+        }
+      }
+      if (score < 0) continue;
+    }
+    let b = buckets.get(score);
+    if (!b) buckets.set(score, (b = []));
+    b.push(e);
+    info.set(e, score);
+  }
+  const out: Hit[] = [];
+  for (const score of [...buckets.keys()].sort((a, b) => b - a)) {
+    const b = buckets.get(score)!;
+    b.sort((x, y) => RANK[x.kind] - RANK[y.kind] || x.name.length - y.name.length || x.lower.localeCompare(y.lower));
+    for (const e of b) {
+      const pq = e.group === "db" ? q.name : q.whole;
+      out.push({ entry: e, score, ranges: pq.raw ? (matchName(e.name, e.lower, pq, true)?.ranges ?? []) : [] });
+      if (out.length >= opts.limit) return out;
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- display
+
+/** Routine signature as DataGrip shows it in lists: argument types only, `(integer, text)`. */
+export function signatureText(sig: string | undefined): string {
+  if (sig == null) return "";
+  const args: string[] = [];
+  let depth = 0;
+  let cur = "";
+  for (const ch of sig) {
+    if (ch === "(") depth++;
+    if (ch === ")") depth--;
+    if (ch === "," && depth === 0) (args.push(cur), (cur = ""));
+    else cur += ch;
+  }
+  if (cur.trim()) args.push(cur);
+  const TYPE_FIRST = new Set(["double", "character", "timestamp", "time", "bit", "national", "interval", "long", "unsigned"]);
+  const types = args.map((a) => {
+    let t = a.trim().replace(/^(IN|OUT|INOUT|VARIADIC)\s+/i, "");
+    const sp = t.indexOf(" ");
+    if (sp > 0 && !TYPE_FIRST.has(t.slice(0, sp).toLowerCase())) t = t.slice(sp + 1);
+    return t;
+  });
+  return `(${types.join(", ")})`;
+}
+
+/** Gray location text after the name: `postgres.sales [postgres@localhost]`. */
+export function locationOf(e: Entry, ds: DataSource | undefined): string {
+  if (e.group === "console") return `Database Consoles/${ds?.name ?? ""}`;
+  if (e.group === "action" || e.kind === "dataSource") return "";
+  const segs = pathOf(e, ds).slice(1);
+  const dsPart = ds ? `[${ds.name}]` : "";
+  return [segs.join("."), dsPart].filter(Boolean).join(" ");
+}
+
+/** Gray path in the popup footer for a database object (DataGrip shows the internal node path). */
+export function footerPath(e: Entry, ds: DataSource | undefined): string {
+  if (e.group === "console") return `Database Consoles/${ds?.name ?? ""}/${e.name}`;
+  if (e.group !== "db" || !ds) return "";
+  const seg = (k: string, v: string) => `${k}/${v}`;
+  const parts = [ds.id];
+  if (e.kind === "dataSource") return ds.id;
+  if (ds.driver === "postgres") parts.push(seg("database", ds.database || "postgres"));
+  if (e.schema) parts.push(seg("schema", e.schema));
+  const folder: Partial<Record<EntryKind, string>> = { table: "table", view: "view", materializedView: "materialized-view", routine: "routine", function: "routine", procedure: "routine", sequence: "sequence" };
+  if (e.kind === "column") parts.push(seg(folder[e.tableKind as EntryKind] ?? "table", e.table ?? ""), seg("column", e.name));
+  else if (folder[e.kind]) parts.push(seg(folder[e.kind]!, e.name));
+  return parts.join("/");
+}

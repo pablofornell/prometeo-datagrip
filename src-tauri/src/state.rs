@@ -288,6 +288,17 @@ impl AppState {
         self.mgr.apply_changes(ds_id, &table, &changes).await.map_err(String::from)
     }
 
+    /// `table_data` on a session's connection: sees the session's uncommitted changes (manual transaction).
+    pub async fn table_data_in_session(&self, session_id: &str, table: ObjectRef, req: TableDataRequest) -> Result<ResultSet, String> {
+        self.mgr.table_data_in_session(&SessionId(session_id.to_string()), &table, &req).await.map_err(String::from)
+    }
+
+    /// `apply_changes` on a session's connection: inside the session's open transaction the changes stay
+    /// uncommitted (`committed == true` then means "applied").
+    pub async fn apply_changes_in_session(&self, session_id: &str, table: ObjectRef, changes: Vec<RowChange>) -> Result<ApplyResult, String> {
+        self.mgr.apply_changes_in_session(&SessionId(session_id.to_string()), &table, &changes).await.map_err(String::from)
+    }
+
     // ------------------------------------------------------------ export
 
     /// Stream every row of `sql` to `path`. Returns the number of rows written.

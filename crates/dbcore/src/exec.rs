@@ -170,6 +170,35 @@ pub(crate) async fn query_pool(
     Ok(first)
 }
 
+/// Same as [`query_pool`] on a dedicated connection (a console / editor session).
+pub(crate) async fn query_conn(
+    live: &Live,
+    conn: &mut Conn,
+    sql: &str,
+    bin_limit: usize,
+    mut on_row: impl FnMut(&[ColumnMeta], Vec<Cell>) -> Result<()>,
+) -> Result<Option<Vec<ColumnMeta>>> {
+    let opts = DecodeOpts { bin_limit };
+    let mut stream = open_stream(conn, sql);
+    let mut dec: Option<(RowDecoder, Vec<ColumnMeta>)> = None;
+    let mut first: Option<Vec<ColumnMeta>> = None;
+    while let Some(item) = stream.next().await {
+        if let Item::Row(raw) = item? {
+            if !dec.as_ref().is_some_and(|d| d.0.fits(&raw)) {
+                let built = RowDecoder::build(live, &raw, opts).await?;
+                if first.is_none() {
+                    first = Some(built.1.clone());
+                }
+                dec = Some(built);
+            }
+            if let Some(d) = dec.as_ref() {
+                on_row(&d.1, d.0.decode(&raw))?;
+            }
+        }
+    }
+    Ok(first)
+}
+
 // ------------------------------------------------------------------ pulling
 
 #[derive(Default)]

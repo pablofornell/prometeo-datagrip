@@ -1,5 +1,9 @@
 /** `table.*` actions (focus-guarded shortcuts) and the guard that asks before a tab with pending changes closes. */
-import type { Action } from "../../state/actions";
+import type { ObjectRef } from "../../api/types";
+import { notify } from "../../components/ui";
+import { type Action } from "../../state/actions";
+import { exportCurrentResult } from "../output";
+import { openTableExport } from "./exportData";
 import { registerBeforeClose } from "../../state/tabs";
 import { type TableController, activeController, controllerOf, focusedController } from "./controller";
 
@@ -72,6 +76,42 @@ export function tableActions(): Action[] {
       run: act((c) => c.prevPage()),
     },
     {
+      id: "table.commit",
+      title: "Commit",
+      shortcut: "Ctrl+Alt+Shift+Enter",
+      icon: "dg/commit",
+      when: focused,
+      enabled: () => {
+        const c = activeController();
+        return !!c && c.txMode() === "manual" && c.inTx();
+      },
+      run: act((c) => c.commit()),
+    },
+    {
+      id: "table.rollback",
+      title: "Roll Back",
+      icon: "dg/rollback",
+      enabled: () => {
+        const c = activeController();
+        return !!c && c.txMode() === "manual" && c.inTx();
+      },
+      run: act((c) => c.rollback()),
+    },
+    {
+      // Explorer "Export Data…" passes `{ dsId, objectRef }`; without it (main menu) the active table editor exports.
+      id: "grid.export",
+      title: "Export Data…",
+      icon: "export",
+      // always enabled: the explorer passes the target in the context, which `enabled()` cannot see
+      run: (ctx) => {
+        const t = ctx as { dsId?: string; objectRef?: ObjectRef } | undefined;
+        if (t?.dsId && t.objectRef) return openTableExport(t.dsId, t.objectRef);
+        const c = activeController();
+        if (c) return c.exportData();
+        if (!exportCurrentResult()) notify({ kind: "info", title: "Nothing to export", body: "Open a table or select a result first." });
+      },
+    },
+    {
       id: "table.ddl",
       title: "Go to DDL",
       shortcut: "Ctrl+B",
@@ -91,6 +131,6 @@ export function tableActions(): Action[] {
 export function installCloseGuard(): () => void {
   return registerBeforeClose((tab) => {
     const c = tab.kind === "table" ? controllerOf(tab.id) : undefined;
-    return c && c.pendingCount() > 0 ? c.confirmClose() : true;
+    return c && (c.pendingCount() > 0 || c.inTx()) ? c.confirmClose() : true;
   });
 }

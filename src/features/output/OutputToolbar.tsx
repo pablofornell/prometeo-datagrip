@@ -2,6 +2,7 @@
 import { Show, type JSX } from "solid-js";
 import { GridToolbar } from "../../components/grid";
 import { ActionButton, type MenuItem, openMenu } from "../../components/ui";
+import { TxBar } from "../table/TxBar";
 import { FORMATS, copyResult, exportResultToFile, formatLabel } from "./export";
 import { currentOutput, type ConsoleOutput, type ResultTab } from "./model";
 
@@ -11,10 +12,21 @@ function ResultToolbar(props: { out: ConsoleOutput; tab: ResultTab }): JSX.Eleme
   const at = (items: MenuItem[], anchor: DOMRect | HTMLElement) =>
     openMenu(items, anchor instanceof HTMLElement ? { anchor } : { x: anchor.left, y: anchor.bottom + 2 });
 
+  const api = () => tab().gridApi;
+  const edit = () => !!tab().edit();
   return (
     <div>
       <GridToolbar
-        running={props.out.running()}
+        running={props.out.running() || tab().applying()}
+        editable={edit()}
+        hasChanges={tab().pending() > 0}
+        txMode={host()?.txMode() === "manual" ? "Manual" : "Auto"}
+        onTxMenu={(r) => host()?.openTxMenu(r)}
+        onAddRow={() => api()?.addRow()}
+        onDeleteRows={() => api()?.deleteRows()}
+        onRevert={() => api()?.revertSelected()}
+        onPreview={() => tab().setPreview(true)}
+        onSubmit={() => api()?.submit()}
         viewMode={tab().viewMode()}
         onViewModeChange={tab().setViewMode}
         onReload={() => host()?.rerun(tab())}
@@ -50,6 +62,9 @@ function ResultToolbar(props: { out: ConsoleOutput; tab: ResultTab }): JSX.Eleme
           )
         }
       />
+      <Show when={edit() && host()?.txMode() === "manual"}>
+        <TxBar inTx={!!host()?.inTx()} onCommit={() => void host()?.endTx("commit")} onRollback={() => void host()?.endTx("rollback")} shortcut="Ctrl+Alt+Shift+Enter" />
+      </Show>
     </div>
   );
 }

@@ -1,11 +1,15 @@
 //! Table data browsing and editing.
 
+use std::sync::atomic::Ordering;
+
+use futures_util::StreamExt;
 use serde_json::Value;
 
 use crate::error::{DbError, Result};
-use crate::exec::query_pool;
+use crate::conn::{Conn, Live};
+use crate::exec::{conn_scalar, open_stream, query_conn, query_pool};
 use crate::introspect::{row_addr, table_columns, ColInfo};
-use crate::manager::ConnectionManager;
+use crate::manager::{ConnectionManager, SessionId};
 use crate::model::*;
 use crate::quote::{hex_decode, hex_encode, qualified, quote_ident};
 use crate::split::has_statement_separator;
@@ -24,9 +28,10 @@ pub(crate) enum RowAddr {
 /// Name of the hidden column `table_data` appends to select the row locator.
 const LOCATOR_COL: &str = "__prometeo_row_locator";
 
-macro_rules! run_tx {
-    ($pool:expr, $stmts:expr, |$bq:ident, $bv:ident| $bind_u64:expr) => {{
-        let mut tx = $pool.begin().await?;
+/// Runs the statements one after another on `$conn` (anything `&mut *$conn` can execute on). Stops at the
+/// first failure. Returns `(results, failed)`; transaction control is the caller's.
+macro_rules! run_stmts {
+    ($conn:expr, $stmts:expr, |$bq:ident, $bv:ident| $bind_u64:expr) => {{
         let mut results: Vec<ChangeResult> = Vec::new();
         let mut failed = false;
         for (i, st) in $stmts.iter().enumerate() {
@@ -45,7 +50,7 @@ macro_rules! run_tx {
                     Bind::Bytes(v) => q.bind(v.clone()),
                 };
             }
-            match q.execute(&mut *tx).await {
+            match q.execute(&mut *$conn).await {
                 Ok(r) => {
                     let n = r.rows_affected();
                     if st.expects_row && n != 1 {
@@ -68,6 +73,14 @@ macro_rules! run_tx {
                 }
             }
         }
+        (results, failed)
+    }};
+}
+
+macro_rules! run_tx {
+    ($pool:expr, $stmts:expr, |$bq:ident, $bv:ident| $bind_u64:expr) => {{
+        let mut tx = $pool.begin().await?;
+        let (results, failed) = run_stmts!(tx, $stmts, |$bq, $bv| $bind_u64);
         if failed {
             let _ = tx.rollback().await;
         } else {
@@ -75,6 +88,29 @@ macro_rules! run_tx {
         }
         (results, !failed)
     }};
+}
+
+// one plain function per driver: inlining the macro in the async method above defeats the compiler's
+// `Send` inference for the sqlx executor lifetimes
+async fn run_stmts_pg(c: &mut sqlx::PgConnection, stmts: &[Stmt]) -> (Vec<ChangeResult>, bool) {
+    run_stmts!(c, stmts, |q, v| q.bind(v.to_string()))
+}
+
+async fn run_stmts_my(c: &mut sqlx::MySqlConnection, stmts: &[Stmt]) -> (Vec<ChangeResult>, bool) {
+    run_stmts!(c, stmts, |q, v| q.bind(v))
+}
+
+async fn run_stmts_lite(c: &mut sqlx::SqliteConnection, stmts: &[Stmt]) -> (Vec<ChangeResult>, bool) {
+    run_stmts!(c, stmts, |q, v| q.bind(v.to_string()))
+}
+
+/// Runs one statement without reading rows on a dedicated connection.
+async fn conn_run(conn: &mut Conn, sql: &str) -> Result<()> {
+    let mut stream = open_stream(conn, sql);
+    while let Some(item) = stream.next().await {
+        item?;
+    }
+    Ok(())
 }
 
 fn table_ref_string(schema: Option<&str>, name: &str) -> String {
@@ -103,90 +139,17 @@ impl ConnectionManager {
     /// PG `tableoid:ctid`, SQLite `rowid`) that must be passed back in `RowChange.row_locator`.
     pub async fn table_data(&self, ds_id: &str, table: &ObjectRef, req: &TableDataRequest) -> Result<ResultSet> {
         let live = self.live(ds_id)?;
-        let d = live.driver();
-        let schema = table.schema.as_deref();
-        reject_separator("where clause", req.where_clause.as_deref(), d)?;
-        reject_separator("order by clause", req.order_by.as_deref(), d)?;
-        let info = table_columns(&live, schema, &table.name).await?;
-        let addr = row_addr(&live, schema, &table.name, &info).await?;
-        let q = qualified(d, schema, &table.name);
-        let limit = if req.limit == 0 { 500 } else { req.limit };
+        table_data_with(&live, table, req, None).await
+    }
 
-        let loc_col = quote_ident(d, LOCATOR_COL);
-        let select_list = match &addr {
-            RowAddr::None => "*".to_string(),
-            RowAddr::PgCtid => format!("*, tableoid::text || ':' || ctid::text as {loc_col}"),
-            RowAddr::SqliteRowid(a) => format!("*, {a} as {loc_col}"),
-        };
-        let mut sql = format!("select {select_list} from {q}");
-        if let Some(w) = req.where_clause.as_deref().map(str::trim).filter(|w| !w.is_empty()) {
-            sql.push_str(&format!(" where {w}"));
-        }
-        if let Some(o) = req.order_by.as_deref().map(str::trim).filter(|o| !o.is_empty()) {
-            sql.push_str(&format!(" order by {o}"));
-        }
-        sql.push_str(&format!(" limit {} offset {}", limit.saturating_add(1), req.offset));
-
-        let mut rows: Vec<Vec<Cell>> = Vec::new();
-        let cols = query_pool(&live, &sql, 256, |_, r| {
-            rows.push(r);
-            Ok(())
-        })
-        .await?;
-        let has_more = rows.len() as u64 > limit;
-        rows.truncate(limit as usize);
-
-        // split the hidden locator column off the rows
-        let mut cols = cols;
-        let mut row_locators: Option<Vec<Cell>> = None;
-        if addr != RowAddr::None {
-            let mut locs = Vec::with_capacity(rows.len());
-            if cols.as_ref().is_some_and(|c| c.last().is_some_and(|l| l.name == LOCATOR_COL)) {
-                if let Some(c) = cols.as_mut() {
-                    c.pop();
-                }
-                for r in rows.iter_mut() {
-                    locs.push(r.pop().unwrap_or(Cell::Null));
-                }
-            }
-            row_locators = Some(locs);
-        }
-
-        let tref = table_ref_string(schema, &table.name);
-        let columns: Vec<ColumnMeta> = match cols {
-            Some(c) => c
-                .into_iter()
-                .map(|mut m| {
-                    if let Some(i) = info.iter().find(|i| i.name == m.name) {
-                        m.nullable = i.nullable;
-                        m.is_pk = i.is_pk;
-                    }
-                    m.table_ref = Some(tref.clone());
-                    m
-                })
-                .collect(),
-            None => info
-                .iter()
-                .map(|i| ColumnMeta {
-                    name: i.name.clone(),
-                    type_name: i.type_name.clone(),
-                    nullable: i.nullable,
-                    is_pk: i.is_pk,
-                    table_ref: Some(tref.clone()),
-                })
-                .collect(),
-        };
-
-        let mut total_hint = None;
-        if req.count_total {
-            let mut csql = format!("select count(*) from {q}");
-            if let Some(w) = req.where_clause.as_deref().map(str::trim).filter(|w| !w.is_empty()) {
-                csql.push_str(&format!(" where {w}"));
-            }
-            let r = live.pool.query_strings(&csql).await?;
-            total_hint = r.first().and_then(|r| r.first().cloned().flatten()).and_then(|v| v.parse::<i64>().ok());
-        }
-        Ok(ResultSet { columns, rows, has_more, total_hint, row_locators })
+    /// Like [`table_data`](Self::table_data) but reads on the **session's** connection, so rows changed
+    /// inside the session's open transaction (manual mode) are visible. An open paging result of the
+    /// session is released first; `Busy` while a statement runs.
+    pub async fn table_data_in_session(&self, session: &SessionId, table: &ObjectRef, req: &TableDataRequest) -> Result<ResultSet> {
+        let sess = self.session(session)?;
+        let mut guard = self.lock_session_conn(&sess).await?;
+        let conn = guard.as_mut().ok_or_else(|| DbError::NoSession(session.0.clone()))?;
+        table_data_with(&sess.live, table, req, Some(conn)).await
     }
 
     /// Apply edits in a single transaction. Values are bound as parameters and identifiers
@@ -213,6 +176,164 @@ impl ConnectionManager {
         };
         Ok(ApplyResult { applied: if committed { changes.len() } else { 0 }, committed, results })
     }
+
+    /// Apply edits on the **session's** connection. Inside an open transaction (`session_in_transaction`)
+    /// the changes run in a savepoint and stay uncommitted: success releases it, a failing change rolls back
+    /// to it (the transaction itself survives, also on PostgreSQL where an error would abort it) and
+    /// `committed == false`. Outside a transaction the batch gets its own transaction like `apply_changes`.
+    /// `committed == true` therefore means "applied", not necessarily "committed" while the session is in a
+    /// transaction. Same exactly-one-row rule as `apply_changes`.
+    pub async fn apply_changes_in_session(&self, session: &SessionId, table: &ObjectRef, changes: &[RowChange]) -> Result<ApplyResult> {
+        let live = self.session(session)?.live.clone();
+        let d = live.driver();
+        let info = table_columns(&live, table.schema.as_deref(), &table.name).await?;
+        let addr = row_addr(&live, table.schema.as_deref(), &table.name, &info).await?;
+        let q = qualified(d, table.schema.as_deref(), &table.name);
+        let mut stmts = Vec::with_capacity(changes.len());
+        for (i, ch) in changes.iter().enumerate() {
+            stmts.push(build_stmt(d, &q, &info, &addr, ch).map_err(|e| DbError::Change { index: i, source: Box::new(e) })?);
+        }
+
+        let sess = self.session(session)?;
+        let mut guard = self.lock_session_conn(&sess).await?;
+        let conn = guard.as_mut().ok_or_else(|| DbError::NoSession(session.0.clone()))?;
+        let in_tx = sess.in_tx.load(Ordering::Relaxed);
+        let (results, failed) = run_on_conn(conn, d, in_tx, &stmts).await?;
+        Ok(ApplyResult { applied: if failed { 0 } else { changes.len() }, committed: !failed, results })
+    }
+}
+
+/// Shared body of `table_data` / `table_data_in_session`: `conn` is the session connection, `None` = pool.
+async fn table_data_with(live: &Live, table: &ObjectRef, req: &TableDataRequest, mut conn: Option<&mut Conn>) -> Result<ResultSet> {
+    let d = live.driver();
+    let schema = table.schema.as_deref();
+    reject_separator("where clause", req.where_clause.as_deref(), d)?;
+    reject_separator("order by clause", req.order_by.as_deref(), d)?;
+    let info = table_columns(live, schema, &table.name).await?;
+    let addr = row_addr(live, schema, &table.name, &info).await?;
+    let q = qualified(d, schema, &table.name);
+    let limit = if req.limit == 0 { 500 } else { req.limit };
+
+    let loc_col = quote_ident(d, LOCATOR_COL);
+    let select_list = match &addr {
+        RowAddr::None => "*".to_string(),
+        RowAddr::PgCtid => format!("*, tableoid::text || ':' || ctid::text as {loc_col}"),
+        RowAddr::SqliteRowid(a) => format!("*, {a} as {loc_col}"),
+    };
+    let mut sql = format!("select {select_list} from {q}");
+    if let Some(w) = req.where_clause.as_deref().map(str::trim).filter(|w| !w.is_empty()) {
+        sql.push_str(&format!(" where {w}"));
+    }
+    if let Some(o) = req.order_by.as_deref().map(str::trim).filter(|o| !o.is_empty()) {
+        sql.push_str(&format!(" order by {o}"));
+    }
+    sql.push_str(&format!(" limit {} offset {}", limit.saturating_add(1), req.offset));
+
+    let mut rows: Vec<Vec<Cell>> = Vec::new();
+    let cols = match conn.as_mut() {
+        None => {
+            query_pool(live, &sql, 256, |_, r| {
+                rows.push(r);
+                Ok(())
+            })
+            .await?
+        }
+        Some(c) => {
+            query_conn(live, c, &sql, 256, |_, r| {
+                rows.push(r);
+                Ok(())
+            })
+            .await?
+        }
+    };
+    let has_more = rows.len() as u64 > limit;
+    rows.truncate(limit as usize);
+
+    // split the hidden locator column off the rows
+    let mut cols = cols;
+    let mut row_locators: Option<Vec<Cell>> = None;
+    if addr != RowAddr::None {
+        let mut locs = Vec::with_capacity(rows.len());
+        if cols.as_ref().is_some_and(|c| c.last().is_some_and(|l| l.name == LOCATOR_COL)) {
+            if let Some(c) = cols.as_mut() {
+                c.pop();
+            }
+            for r in rows.iter_mut() {
+                locs.push(r.pop().unwrap_or(Cell::Null));
+            }
+        }
+        row_locators = Some(locs);
+    }
+
+    let tref = table_ref_string(schema, &table.name);
+    let columns: Vec<ColumnMeta> = match cols {
+        Some(c) => c
+            .into_iter()
+            .map(|mut m| {
+                if let Some(i) = info.iter().find(|i| i.name == m.name) {
+                    m.nullable = i.nullable;
+                    m.is_pk = i.is_pk;
+                }
+                m.table_ref = Some(tref.clone());
+                m
+            })
+            .collect(),
+        None => info
+            .iter()
+            .map(|i| ColumnMeta {
+                name: i.name.clone(),
+                type_name: i.type_name.clone(),
+                nullable: i.nullable,
+                is_pk: i.is_pk,
+                table_ref: Some(tref.clone()),
+            })
+            .collect(),
+    };
+
+    let mut total_hint = None;
+    if req.count_total {
+        let mut csql = format!("select count(*) from {q}");
+        if let Some(w) = req.where_clause.as_deref().map(str::trim).filter(|w| !w.is_empty()) {
+            csql.push_str(&format!(" where {w}"));
+        }
+        let n = match conn.as_mut() {
+            None => live.pool.query_strings(&csql).await?.first().and_then(|r| r.first().cloned().flatten()),
+            Some(c) => conn_scalar(c, &csql).await?,
+        };
+        total_hint = n.and_then(|v| v.parse::<i64>().ok());
+    }
+    Ok(ResultSet { columns, rows, has_more, total_hint, row_locators })
+}
+
+/// The statements of `apply_changes_in_session` on the session connection: in a savepoint when the session is in
+/// a transaction, else in a transaction of their own. Returns `(results, failed)`.
+async fn run_on_conn(conn: &mut Conn, d: Driver, in_tx: bool, stmts: &[Stmt]) -> Result<(Vec<ChangeResult>, bool)> {
+        let open = if in_tx {
+            "savepoint prometeo_apply"
+        } else if d == Driver::MySql {
+            "start transaction"
+        } else {
+            "begin"
+        };
+        conn_run(conn, open).await?;
+        let (results, failed) = match conn {
+            Conn::Pg(c) => run_stmts_pg(c, stmts).await,
+            Conn::My(c) => run_stmts_my(c, stmts).await,
+            Conn::Lite(c) => run_stmts_lite(c, stmts).await,
+        };
+        if failed {
+            if in_tx {
+                conn_run(conn, "rollback to savepoint prometeo_apply").await?;
+                conn_run(conn, "release savepoint prometeo_apply").await?;
+            } else {
+                let _ = conn_run(conn, "rollback").await;
+            }
+        } else if in_tx {
+            conn_run(conn, "release savepoint prometeo_apply").await?;
+        } else {
+            conn_run(conn, "commit").await?;
+        }
+    Ok((results, failed))
 }
 
 impl ApplyResult {

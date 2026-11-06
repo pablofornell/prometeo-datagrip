@@ -41,12 +41,14 @@ function Btn(props: {
   disabled?: boolean;
   selected?: boolean;
   green?: boolean;
+  /** Blue state dot (e.g. hidden columns). */
+  dot?: boolean;
   onClick?: (e: MouseEvent) => void;
 }): JSX.Element {
   return (
     <button
       class="dgg-tbtn"
-      classList={{ selected: props.selected, green: props.green }}
+      classList={{ selected: props.selected, green: props.green, dot: props.dot }}
       disabled={props.disabled}
       title={props.shortcut ? `${props.title}  ${props.shortcut}` : props.title}
       onClick={(e) => props.onClick?.(e)}
@@ -89,13 +91,30 @@ export interface GridToolbarProps {
   pinned?: boolean;
   onPin?: () => void;
   onFind?: () => void;
+  /** The Find bar is open (button shown pressed). */
+  findOpen?: boolean;
+  /** Plain click handler of the local filter button. Ignored when `onLocalFilterEnabledChange` is given (menu instead). */
   onLocalFilter?: () => void;
+  /** Local filter menu (`Enable Local Filter` check + `Clear Local Filter For All Columns`), like DataGrip. */
+  localFilterEnabled?: boolean;
+  /** A column filter is active (button shown pressed). */
+  localFilterActive?: boolean;
+  onLocalFilterEnabledChange?: (on: boolean) => void;
+  onClearLocalFilter?: () => void;
   onRecordView?: () => void;
+  /** The record view side panel is open (button shown pressed). */
+  recordViewOpen?: boolean;
   onSql?: () => void;
   onOpenInEditor?: () => void;
   /** Gets the export button, so the menu / dialog can open under it. */
   onExport?: (anchor: HTMLElement) => void;
-  onManageColumns?: () => void;
+  /** Receives the button rectangle (open the column list under it: `api.openManageColumns(anchor)`). */
+  onManageColumns?: (anchor: DOMRect) => void;
+  /** Some columns are hidden: the button gets a blue dot. */
+  columnsHidden?: boolean;
+  /** `View as > Transpose` check; the item is enabled when `onTransposeChange` is given. */
+  transposed?: boolean;
+  onTransposeChange?: (on: boolean) => void;
   onOptions?: (anchor: DOMRect) => void;
 }
 
@@ -111,11 +130,23 @@ export function GridToolbar(props: GridToolbarProps): JSX.Element {
       x: r.right,
       y: r.bottom + 2,
       items: [
-        { label: "Transpose", primary: true, disabled: true },
+        { label: "Transpose", primary: true, checked: !!props.transposed, disabled: !props.onTransposeChange, onSelect: () => props.onTransposeChange?.(!props.transposed) },
         { separator: true },
         { label: "Table", checked: mode() === "table", onSelect: pick("table") },
         { label: "Tree", disabled: true },
         { label: "Text", checked: mode() === "text", onSelect: pick("text") },
+      ],
+    });
+  };
+
+  const openLocalFilterMenu = (e: MouseEvent) => {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    setMenu({
+      x: r.left,
+      y: r.bottom + 2,
+      items: [
+        { label: "Enable Local Filter", checked: props.localFilterEnabled !== false, onSelect: () => props.onLocalFilterEnabledChange?.(props.localFilterEnabled === false) },
+        { label: "Clear Local Filter For All Columns", disabled: !props.onClearLocalFilter, onSelect: props.onClearLocalFilter },
       ],
     });
   };
@@ -151,9 +182,15 @@ export function GridToolbar(props: GridToolbarProps): JSX.Element {
         <Btn icon={props.pinned ? "pinOn" : "pin"} title={props.pinned ? "Unpin Tab" : "Pin Tab"} selected={props.pinned} onClick={() => props.onPin?.()} />
       </Show>
       <Sep />
-      <Btn icon="find" title="Find on Current Page" shortcut="Ctrl+F" disabled={!props.onFind} onClick={props.onFind} />
-      <Btn icon="filter" title="Table Result Local Filter" disabled={!props.onLocalFilter} onClick={props.onLocalFilter} />
-      <Btn icon="record" title="Record View" shortcut="Ctrl+Shift+Enter" disabled={!props.onRecordView} onClick={props.onRecordView} />
+      <Btn icon="find" title="Find on Current Page" shortcut="Ctrl+F" disabled={!props.onFind} selected={props.findOpen} onClick={() => props.onFind?.()} />
+      <Btn
+        icon="filter"
+        title="Table Result Local Filter"
+        disabled={!props.onLocalFilter && !props.onLocalFilterEnabledChange}
+        selected={props.localFilterActive}
+        onClick={(e) => (props.onLocalFilterEnabledChange ? openLocalFilterMenu(e) : props.onLocalFilter?.())}
+      />
+      <Btn icon="record" title="Record View" shortcut="Ctrl+Shift+Enter" disabled={!props.onRecordView} selected={props.recordViewOpen} onClick={() => props.onRecordView?.()} />
 
       <span class="dgg-tspacer" />
 
@@ -174,7 +211,14 @@ export function GridToolbar(props: GridToolbarProps): JSX.Element {
       <Sep />
       <Btn icon="export" title="Export Data" disabled={!props.onExport} onClick={(e) => props.onExport?.(e.currentTarget as HTMLElement)} />
       <Sep />
-      <Btn icon="columns" title="Manage Columns" shortcut="Ctrl+F12" disabled={!props.onManageColumns} onClick={props.onManageColumns} />
+      <Btn
+        icon="columns"
+        title="Manage Columns"
+        shortcut="Ctrl+F12"
+        disabled={!props.onManageColumns}
+        dot={props.columnsHidden}
+        onClick={(e) => props.onManageColumns?.((e.currentTarget as HTMLElement).getBoundingClientRect())}
+      />
       <Btn icon="viewAs" title="View as" onClick={openViewAs} />
       <Btn icon="gear" title="Show Options Menu" disabled={!props.onOptions} onClick={(e) => props.onOptions?.((e.currentTarget as HTMLElement).getBoundingClientRect())} />
 

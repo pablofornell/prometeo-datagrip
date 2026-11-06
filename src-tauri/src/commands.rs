@@ -146,6 +146,21 @@ pub async fn apply_changes(state: State<'_, AppState>, ds_id: String, table: Obj
     state.apply_changes(&ds_id, table, changes).await
 }
 
+#[tauri::command]
+pub async fn table_data_in_session(
+    state: State<'_, AppState>,
+    session_id: String,
+    table: ObjectRef,
+    request: Option<TableDataRequest>,
+) -> Res<ResultSet> {
+    state.table_data_in_session(&session_id, table, request.unwrap_or_default()).await
+}
+
+#[tauri::command]
+pub async fn apply_changes_in_session(state: State<'_, AppState>, session_id: String, table: ObjectRef, changes: Vec<RowChange>) -> Res<ApplyResult> {
+    state.apply_changes_in_session(&session_id, table, changes).await
+}
+
 // ---------------------------------------------------------------- export
 
 #[tauri::command]

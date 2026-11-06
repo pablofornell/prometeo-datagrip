@@ -9,10 +9,13 @@
  */
 import { batch, createSignal } from "solid-js";
 import { type Cell, type ColumnMeta, type ObjectRef, type ResultSet, tableData } from "../../api/db";
+import { settings } from "../../state/settings";
+import { tableDataInSession } from "./session";
 
 export type PageSize = number | "all";
 
-export const DEFAULT_PAGE_SIZE = 500;
+/** The page size of Settings (`gridPageSize`, 0 = all). Read it when needed, never cache it. */
+export const defaultPageSize = (): PageSize => (settings.gridPageSize > 0 ? settings.gridPageSize : "all");
 const ALL_CHUNK = 500;
 const MAX_CHUNKS = 400;
 
@@ -28,8 +31,14 @@ interface Chunk {
   locators?: Cell[];
 }
 
-export function createTableSource(dsId: string, ref: ObjectRef, initial: Partial<Query> = {}) {
-  let query: Query = { where: "", orderBy: "", page: 0, pageSize: DEFAULT_PAGE_SIZE, ...initial };
+/**
+ * `sessionId` (manual transaction mode) makes every read go through that session's connection, so the rows of its
+ * open transaction are visible.
+ */
+export function createTableSource(dsId: string, ref: ObjectRef, initial: Partial<Query> = {}, sessionId: () => string | undefined = () => undefined) {
+  /** The page size the user picked in the pill; `null` follows the Settings page size. */
+  let sizeOverride: PageSize | null = initial.pageSize ?? null;
+  let query: Query = { where: "", orderBy: "", page: 0, ...initial, pageSize: sizeOverride ?? defaultPageSize() };
   const chunks = new Map<number, Chunk>();
   const inflight = new Set<number>();
   let gen = 0;
@@ -47,8 +56,13 @@ export function createTableSource(dsId: string, ref: ObjectRef, initial: Partial
   const chunkSizeOf = (q: Query) => (q.pageSize === "all" ? ALL_CHUNK : q.pageSize);
   const offsetOf = (q: Query) => (q.pageSize === "all" ? 0 : q.page * q.pageSize);
 
+  const read = (req: Parameters<typeof tableData>[2]): Promise<ResultSet> => {
+    const sid = sessionId();
+    return sid ? tableDataInSession(dsId, sid, ref, req) : tableData(dsId, ref, req);
+  };
+
   const request = (q: Query, chunk: number, countTotal: boolean): Promise<ResultSet> =>
-    tableData(dsId, ref, {
+    read({
       whereClause: q.where.trim() || null,
       orderBy: q.orderBy.trim() || null,
       offset: offsetOf(q) + chunk * chunkSizeOf(q),
@@ -61,16 +75,18 @@ export function createTableSource(dsId: string, ref: ObjectRef, initial: Partial
 
   /**
    * Loads the page of `next` (merged into the current query) and, on success, makes it current. The previous rows
-   * stay visible meanwhile and after a failure (the promise rejects with the server message).
+   * stay visible meanwhile and after a failure (the promise rejects with the server message). Resolves false when
+   * the result was dropped (`cancel()`, or a newer load took over).
    */
-  async function load(next: Partial<Query> = {}, opts: { keepTotal?: boolean } = {}): Promise<void> {
-    const q: Query = { ...query, ...next };
+  async function load(next: Partial<Query> = {}, opts: { keepTotal?: boolean } = {}): Promise<boolean> {
+    if (next.pageSize !== undefined) sizeOverride = next.pageSize;
+    const q: Query = { ...query, ...next, pageSize: sizeOverride ?? defaultPageSize() };
     const my = ++gen;
     setLoading(true);
     try {
       const all = q.pageSize === "all";
       const rs = await request(q, 0, all);
-      if (my !== gen) return;
+      if (my !== gen) return false;
       batch(() => {
         query = q;
         setApplied(q);
@@ -90,9 +106,20 @@ export function createTableSource(dsId: string, ref: ObjectRef, initial: Partial
         }
         bump();
       });
+      return true;
     } finally {
       if (my === gen) setLoading(false);
     }
+  }
+
+  /**
+   * Stops waiting for the page being loaded: its result is dropped when it arrives (the server keeps running the
+   * query, there is no server-side cancel for `table_data`).
+   */
+  function cancel(): void {
+    ++gen;
+    inflight.clear();
+    setLoading(false);
   }
 
   async function loadChunk(c: number): Promise<void> {
@@ -129,7 +156,7 @@ export function createTableSource(dsId: string, ref: ObjectRef, initial: Partial
   /** Counts the rows matching the WHERE (the pill then reads `500 of 100,000 rows`). */
   async function countRows(): Promise<number> {
     const q = query;
-    const rs = await tableData(dsId, ref, { whereClause: q.where.trim() || null, orderBy: null, offset: 0, limit: 1, countTotal: true });
+    const rs = await read({ whereClause: q.where.trim() || null, orderBy: null, offset: 0, limit: 1, countTotal: true });
     const n = rs.totalHint ?? rs.rows.length;
     if (q === query) setTotal(n);
     return n;
@@ -160,7 +187,12 @@ export function createTableSource(dsId: string, ref: ObjectRef, initial: Partial
     loading,
     applied,
     query: () => query,
+    /** Rows before the first row of the page (for absolute row numbers). */
+    rowOffset: () => offsetOf(applied()),
+    /** Whether the page size follows Settings (the pill's choice overrides it). */
+    followsDefaultSize: () => sizeOverride === null,
     load,
+    cancel,
     getRow,
     countRows,
     locatorOf,

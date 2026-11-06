@@ -23,6 +23,8 @@ fn all_futures_are_send(m: &ConnectionManager, cfg: &DataSourceConfig, sid: &Ses
     is_send(m.fetch_more(eid, 0, 10));
     is_send(m.table_data("x", &obj, &TableDataRequest::default()));
     is_send(m.apply_changes("x", &obj, &[]));
+    is_send(m.table_data_in_session(sid, &obj, &TableDataRequest::default()));
+    is_send(m.apply_changes_in_session(sid, &obj, &[]));
     is_send(m.export_query("x", "select 1", &ExportOptions::default(), Vec::<u8>::new()));
 }
 

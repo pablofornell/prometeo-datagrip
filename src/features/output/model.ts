@@ -6,9 +6,11 @@
 import { type Accessor, createMemo, createSignal } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import type { Cell, ColumnMeta, Driver, ExecHandle, ExportFormat } from "../../api/db";
-import type { GridColumn, ViewMode } from "../../components/grid";
+import type { DataGridApi, GridChange, GridColumn, ViewMode } from "../../components/grid";
 import type { PageSize } from "../../components/grid";
+import { settings } from "../../state/settings";
 import { activeTab } from "../../state/tabs";
+import type { EditTarget } from "./edit";
 
 export type LogKind = "text" | "sql" | "error";
 
@@ -29,12 +31,25 @@ export interface OutputHost {
   /** Execute the statement of a result again (Reload Page); `pageSize` overrides the page size. */
   rerun(tab: ResultTab, pageSize?: PageSize): void;
   txMode(): "auto" | "manual";
+  /** A manual-mode transaction is open on the console's session. */
+  inTx(): boolean;
+  endTx(kind: "commit" | "rollback"): Promise<void>;
   openTxMenu(anchor: HTMLElement | DOMRect): void;
+  /**
+   * Submits the pending changes of an editable result (inside the console's transaction when Tx is Manual) and
+   * reloads the result. Resolves false (changes stay pending) after showing the error.
+   */
+  applyEdits(tab: ResultTab, changes: GridChange[]): Promise<boolean>;
+  /** SQL of the pending changes (Preview Pending Changes). */
+  previewEdits(tab: ResultTab, changes: GridChange[]): string;
   /** Bring the console editor tab to the front. */
   focusEditor(): void;
 }
 
-export const DEFAULT_PAGE_SIZE = 500;
+/** The page size of Settings (`gridPageSize`, 0 = all). Read it when needed, never cache it. */
+export const defaultPageSize = (): PageSize => (settings.gridPageSize > 0 ? settings.gridPageSize : "all");
+/** Rows of the first `resultset` event when the page size is "all" (the rest is pulled with `fetch_more`). */
+export const ALL_FIRST_CHUNK = 500;
 const FETCH_CHUNK = 5000;
 
 let resultSeq = 0;
@@ -64,6 +79,20 @@ export class ResultTab {
   readonly setExtractor: (f: ExportFormat) => void;
   readonly pageSize: Accessor<PageSize>;
   readonly setPageSize: (p: PageSize) => void;
+  /** Table and key of an editable result (null: read-only); set once the metadata is resolved. */
+  readonly edit: Accessor<EditTarget | null>;
+  readonly setEdit: (e: EditTarget | null) => void;
+  /** Number of pending changes of the grid. */
+  readonly pending: Accessor<number>;
+  readonly setPending: (n: number) => void;
+  /** A submit is running. */
+  readonly applying: Accessor<boolean>;
+  readonly setApplying: (b: boolean) => void;
+  /** The "Preview Pending Changes" popup is open. */
+  readonly preview: Accessor<boolean>;
+  readonly setPreview: (b: boolean) => void;
+  /** Handle of the mounted grid (set by the result view). */
+  gridApi?: DataGridApi;
   /** Duration of the execution that produced it (header `648 ms`). */
   ms = 0;
   closed = false;
@@ -79,7 +108,7 @@ export class ResultTab {
     readonly resultIndex: number,
     /** Resolves the execution handle that can page this result (only the last statement of a script). */
     private readonly handle: () => Promise<ExecHandle>,
-    pageSize: PageSize = DEFAULT_PAGE_SIZE,
+    pageSize: PageSize = defaultPageSize(),
   ) {
     this.rows = rows;
     this.columns = meta.map((c) => ({ name: c.name, typeName: c.typeName, nullable: c.nullable, isPk: c.isPk }));
@@ -96,6 +125,10 @@ export class ResultTab {
     [this.viewMode, this.setViewMode] = sig<ViewMode>("table");
     [this.extractor, this.setExtractor] = sig<ExportFormat>("csv");
     [this.pageSize, this.setPageSize] = sig<PageSize>(pageSize);
+    [this.edit, this.setEdit] = sig<EditTarget | null>(null);
+    [this.pending, this.setPending] = sig(0);
+    [this.applying, this.setApplying] = sig(false);
+    [this.preview, this.setPreview] = sig(false);
   }
 
   /** `fetch_more` of the next rows (scroll). No-op while loading or when everything is loaded. */

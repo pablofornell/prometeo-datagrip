@@ -23,6 +23,8 @@ mgr.fetch_more(&h.id, result_index, count).await   // rows from the still-open s
 mgr.cancel(&h.id)                                  // pg_cancel_backend / KILL QUERY / sqlite3_interrupt
 mgr.table_data(id, &ObjectRef, &TableDataRequest).await   // -> ResultSet (+ total_hint)
 mgr.apply_changes(id, &ObjectRef, &[RowChange]).await     // one transaction -> ApplyResult
+mgr.table_data_in_session(&s, &ObjectRef, &req).await     // same, on the session connection (sees its open transaction)
+mgr.apply_changes_in_session(&s, &ObjectRef, &[RowChange]).await // same, inside the session's transaction (savepoint)
 mgr.export_query(id, sql, &ExportOptions, writer).await   // stream every row; export_result()/export_to_string() for a ResultSet
 split_statements(sql, driver) / statement_at(sql, caret_byte, driver) / statement_at_utf16(..)
 QueryHistory::new(path).append/list/search/clear   // JSON lines
@@ -48,6 +50,19 @@ and a truncated binary preview is left out of the key. Without a locator PG / SQ
 `ctid = (select ctid .. where <key> limit 1)` / `rowid = (select rowid ..)`, so a change never
 touches more than one row. Every update / delete must affect **exactly one** row: 0 gives
 `No row matched ...`, more gives `Unexpected update count: n`, and the whole batch rolls back.
+
+### Editing on a session (manual transaction mode)
+
+`apply_changes_in_session` / `table_data_in_session` run on the **session's** connection (Tauri commands of the
+same names). Inside an open transaction (`session_in_transaction`, i.e. after `BEGIN` / `START TRANSACTION` was
+executed on the session) the batch runs in a `SAVEPOINT`: success releases it and the changes stay uncommitted
+until the caller runs `COMMIT` / `ROLLBACK`; a failing change rolls back to the savepoint, so the transaction
+survives (also on PostgreSQL, where an error would otherwise abort it) and `committed == false`. Outside a
+transaction the batch gets a transaction of its own, like `apply_changes`. `committed == true` therefore means
+"applied". The same exactly-one-row rule applies. An open paging result of the session is released first (inside
+a transaction its remaining rows are drained, like a new `execute`); `Busy` while a statement runs. Row
+locators (`ctid`, `rowid`) come only from `table_data`, never from an ad-hoc query, so editing a console result
+uses the table's PK / unique key.
 
 PG values are cast to the column's base type **without** length / precision
 (`format_type(oid, NULL)`, domains resolved, `character` -> `bpchar`, `bit` -> `bit varying`),

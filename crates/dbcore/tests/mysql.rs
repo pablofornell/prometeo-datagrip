@@ -313,6 +313,39 @@ fn change(kind: ChangeKind, key: Value, values: Value) -> RowChange {
     RowChange { kind, key: m(key), values: m(values), row_locator: None }
 }
 
+/// Session-scoped editing: uncommitted inside `begin`, invisible to the pool until `commit`.
+#[tokio::test]
+async fn session_scoped_edit_stays_in_the_transaction() {
+    let (_cfg, mgr) = setup!();
+    let s = mgr.open_session("my").await.unwrap();
+    assert_ok(&run(&mgr, &s, "drop table if exists demo.scratch_sess; create table demo.scratch_sess (id int primary key, v varchar(3)); insert into demo.scratch_sess values (1,'a'),(2,'b')").await);
+    let t = ObjectRef::table(Some("demo"), "scratch_sess");
+    let req = TableDataRequest { order_by: Some("id".into()), ..Default::default() };
+    let vs = |rs: &ResultSet| rs.rows.iter().map(|r| r[1].clone()).collect::<Vec<_>>();
+
+    assert_ok(&run(&mgr, &s, "start transaction").await);
+    let r = mgr.apply_changes_in_session(&s, &t, &[change(ChangeKind::Update, json!({"id": 1}), json!({"v": "one"}))]).await.unwrap();
+    assert!(r.committed, "{r:?}");
+    assert!(mgr.session_in_transaction(&s).unwrap());
+    assert_eq!(vs(&mgr.table_data_in_session(&s, &t, &req).await.unwrap()), vec![json!("one"), json!("b")]);
+    assert_eq!(vs(&mgr.table_data("my", &t, &req).await.unwrap()), vec![json!("a"), json!("b")], "not visible to other connections");
+
+    let r = mgr.apply_changes_in_session(&s, &t, &[change(ChangeKind::Update, json!({"id": 2}), json!({"v": "x"})), change(ChangeKind::Delete, json!({"id": 99}), json!({}))]).await.unwrap();
+    assert!(!r.committed, "{r:?}");
+    assert_eq!(vs(&mgr.table_data_in_session(&s, &t, &req).await.unwrap()), vec![json!("one"), json!("b")]);
+
+    assert_ok(&run(&mgr, &s, "rollback").await);
+    assert_eq!(vs(&mgr.table_data_in_session(&s, &t, &req).await.unwrap()), vec![json!("a"), json!("b")]);
+
+    // outside a transaction: its own transaction, committed
+    let r = mgr.apply_changes_in_session(&s, &t, &[change(ChangeKind::Update, json!({"id": 2}), json!({"v": "two"}))]).await.unwrap();
+    assert!(r.committed, "{r:?}");
+    assert_eq!(vs(&mgr.table_data("my", &t, &req).await.unwrap()), vec![json!("a"), json!("two")]);
+
+    assert_ok(&run(&mgr, &s, "drop table demo.scratch_sess").await);
+    mgr.close_session(&s).await;
+}
+
 #[tokio::test]
 async fn table_data_and_edit() {
     let (_cfg, mgr) = setup!();

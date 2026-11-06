@@ -201,3 +201,15 @@ export function installKeymap(): () => void {
   window.addEventListener("keydown", onKeyDown);
   return () => window.removeEventListener("keydown", onKeyDown);
 }
+
+/**
+ * Reactive list of all registered actions, one per id. For each id, the implemented action (with `run`)
+ * wins over a stub, the same rule as `getAction`. Order: first registration of each id.
+ */
+export function listActions(): Action[] {
+  version();
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const a of stack) if (!seen.has(a.id)) { seen.add(a.id); ids.push(a.id); }
+  return ids.map((id) => getAction(id)!).filter(Boolean);
+}

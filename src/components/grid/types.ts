@@ -87,6 +87,25 @@ export interface CellPos {
   c: number;
 }
 
+/** Tabs of the docked side panel (Record view). */
+export type SideTab = "record" | "value" | "aggregates";
+
+/** Snapshot of the grid view state, reported through `onViewChange` (for toolbar toggles). */
+export interface GridViewState {
+  /** "View as > Transpose" is on: rows are drawn as columns. */
+  transposed: boolean;
+  /** The Find bar (Ctrl+F) is open. */
+  findOpen: boolean;
+  /** The side panel (Record view) is open, with its active tab. */
+  sidePanel: SideTab | null;
+  /** Local filter: at least one column has an active value filter and filtering is enabled. */
+  localFilterActive: boolean;
+  /** "Enable Local Filter" check (on by default). */
+  localFilterEnabled: boolean;
+  /** Number of hidden columns (Manage Columns). */
+  hiddenColumns: number;
+}
+
 /** Imperative handle handed out through `apiRef`. */
 export interface DataGridApi {
   /** Pending changes in dbcore shape. */
@@ -113,4 +132,22 @@ export interface DataGridApi {
   openValueEditor(): void;
   showAllColumns(): void;
   clearSort(): void;
+
+  /** View as > Transpose. */
+  setTransposed(on: boolean): void;
+  toggleTranspose(): void;
+  /** Open / switch the side panel (Record view, default tab `record`); `null` closes it. */
+  showSidePanel(tab?: SideTab | null): void;
+  toggleRecordView(): void;
+  /** Ctrl+F: opens the Find bar (prefilled with the active cell text) and focuses it. */
+  openFind(): void;
+  closeFind(): void;
+  /** Move to the next / previous match of the current Find query. */
+  findNext(): void;
+  findPrevious(): void;
+  /** Ctrl+F12: the column list popup. `anchor` = rectangle of the toolbar button (otherwise centred over the grid). */
+  openManageColumns(anchor?: DOMRect): void;
+  setLocalFilterEnabled(on: boolean): void;
+  clearLocalFilter(): void;
+  getViewState(): GridViewState;
 }

@@ -1,5 +1,6 @@
 /** "View as > Text": the result as an aligned plain-text table (psql style), virtualized by lines. */
 import { For, createMemo, createSignal, onMount, type JSX } from "solid-js";
+import { settings } from "../../state/settings";
 import { classifyType, displayCell, displayLength } from "./format";
 import type { Cell, GridColumn } from "./types";
 
@@ -35,7 +36,7 @@ export function TextView(props: Props): JSX.Element {
       let w = c.name.length;
       for (let i = 0; i < n; i++) {
         const row = props.getRow(i);
-        if (row) w = Math.max(w, displayLength(row[ci], kinds()[ci]));
+        if (row) w = Math.max(w, displayLength(row[ci], kinds()[ci], settings.gridNullText));
       }
       return Math.min(w, MAX_COL_CHARS);
     });
@@ -53,7 +54,7 @@ export function TextView(props: Props): JSX.Element {
     if (!row) return "";
     return props.columns
       .map((_, ci) => {
-        const d = displayCell(row[ci] ?? null, kinds()[ci]);
+        const d = displayCell(row[ci] ?? null, kinds()[ci], undefined, settings.gridNullText);
         return fit(d.text, widths()[ci], kinds()[ci] === "number");
       })
       .join(" | ");

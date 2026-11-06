@@ -44,8 +44,8 @@ export interface CellDisplay {
  * Display text of a value, always single-line and cut to `maxChars` (callers pass what fits the column + a few,
  * so shaping cost does not depend on the value length; CSS adds the ellipsis).
  */
-export function displayCell(v: Cell, kind: ColumnKind, maxChars = MAX_DISPLAY): CellDisplay {
-  if (v === null || v === undefined) return { text: "<null>", cls: " nul" };
+export function displayCell(v: Cell, kind: ColumnKind, maxChars = MAX_DISPLAY, nullText = "<null>"): CellDisplay {
+  if (v === null || v === undefined) return { text: nullText, cls: " nul" };
   if (typeof v === "string") {
     const s = v.length > maxChars ? v.slice(0, maxChars) : v;
     return { text: WS_TEST.test(s) ? s.replace(WS_RE, " ") : s, cls: "" };
@@ -152,7 +152,7 @@ export function compareKeys(a: number | string | null, b: number | string | null
 }
 
 /** Number of characters a cell occupies when drawn (for auto-fit). */
-export function displayLength(v: Cell, kind: ColumnKind): number {
+export function displayLength(v: Cell, kind: ColumnKind, nullText = "<null>"): number {
   if (typeof v === "string") return Math.min(v.length, MAX_DISPLAY);
-  return displayCell(v, kind).text.length;
+  return displayCell(v, kind, MAX_DISPLAY, nullText).text.length;
 }

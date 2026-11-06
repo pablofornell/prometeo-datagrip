@@ -6,3 +6,5 @@ import "./table";
 import "./ddl";
 import "./console";
 import "./output";
+import "./navigate";
+import "./settings";

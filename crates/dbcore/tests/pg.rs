@@ -983,6 +983,42 @@ async fn nopk_rows_are_addressed_by_ctid_locator() {
     mgr.close_session(&s).await;
 }
 
+/// Session-scoped editing: uncommitted inside `begin`, invisible to the pool until `commit`, a failing batch
+/// leaves the (otherwise aborted) PostgreSQL transaction usable.
+#[tokio::test]
+async fn session_scoped_edit_stays_in_the_transaction() {
+    let (_cfg, mgr) = setup!();
+    let s = mgr.open_session("pg").await.unwrap();
+    scratch_schema(&mgr, &s, "scratch_sess", "create table t (id int primary key, v varchar(3)); insert into t values (1,'a'),(2,'b')").await;
+    let t = ObjectRef::table(Some("scratch_sess"), "t");
+    let req = TableDataRequest { order_by: Some("id".into()), ..Default::default() };
+    let vs = |rs: &ResultSet| rs.rows.iter().map(|r| r[1].clone()).collect::<Vec<_>>();
+
+    assert_ok(&run(&mgr, &s, "begin").await);
+    let r = mgr.apply_changes_in_session(&s, &t, &[change(ChangeKind::Update, json!({"id": 1}), json!({"v": "one"}))]).await.unwrap();
+    assert!(r.committed, "{r:?}");
+    assert_eq!(vs(&mgr.table_data_in_session(&s, &t, &req).await.unwrap()), vec![json!("one"), json!("b")]);
+    assert_eq!(vs(&mgr.table_data("pg", &t, &req).await.unwrap()), vec![json!("a"), json!("b")], "not visible to other connections");
+
+    // too long value: the change fails, the transaction is not aborted
+    let r = mgr.apply_changes_in_session(&s, &t, &[change(ChangeKind::Update, json!({"id": 2}), json!({"v": "toolong"}))]).await.unwrap();
+    assert!(!r.committed && r.results[0].error.as_deref().unwrap().contains("too long"), "{r:?}");
+    assert_eq!(vs(&mgr.table_data_in_session(&s, &t, &req).await.unwrap()), vec![json!("one"), json!("b")]);
+
+    assert_ok(&run(&mgr, &s, "commit").await);
+    assert_eq!(vs(&mgr.table_data("pg", &t, &req).await.unwrap()), vec![json!("one"), json!("b")]);
+
+    // rollback path
+    assert_ok(&run(&mgr, &s, "begin").await);
+    let del = change(ChangeKind::Delete, json!({"id": 2}), json!({}));
+    assert!(mgr.apply_changes_in_session(&s, &t, &[del]).await.unwrap().committed);
+    assert_ok(&run(&mgr, &s, "rollback").await);
+    assert_eq!(mgr.table_data("pg", &t, &req).await.unwrap().rows.len(), 2);
+
+    assert_ok(&run(&mgr, &s, "drop schema scratch_sess cascade").await);
+    mgr.close_session(&s).await;
+}
+
 /// Defect 2: a no-PK key that matches two rows through a locator-less change affects exactly one;
 /// a count other than 1 rolls everything back (here: a locator that matches nothing).
 #[tokio::test]

@@ -1,7 +1,8 @@
-/** One result tab: read-only data grid + the floating paging pill. */
-import { type JSX } from "solid-js";
+/** One result tab: data grid (editable when the result is one table with a usable key) + the floating paging pill. */
+import { Show, createMemo, type JSX } from "solid-js";
 import { DataGrid, GridPagingPill } from "../../components/grid";
-import type { PageSize } from "../../components/grid";
+import type { GridColumn, PageSize } from "../../components/grid";
+import { SqlPopup } from "../table/Popups";
 import { copyText } from "./export";
 import type { ConsoleOutput, ResultTab } from "./model";
 
@@ -11,6 +12,19 @@ export function ResultView(props: { tab: ResultTab; out: ConsoleOutput; selected
   const chunk = () => {
     const s = tab().pageSize();
     return typeof s === "number" ? Math.max(s, 500) : 5000;
+  };
+  // read-only columns of an editable result (expressions, aliases, generated columns)
+  const columns = createMemo<GridColumn[]>(() => {
+    const e = tab().edit();
+    return e ? tab().columns.map((c, i) => (e.editable[i] ? c : { ...c, readOnly: true })) : tab().columns;
+  });
+  const host = () => props.out.host;
+  const previewSql = () => {
+    try {
+      return host()?.previewEdits(tab(), tab().gridApi?.getChanges() ?? []) ?? "";
+    } catch (e) {
+      return `-- ${String((e as Error)?.message ?? e)}`;
+    }
   };
   const changePageSize = (size: PageSize) => {
     if (size === tab().pageSize()) return;
@@ -26,7 +40,7 @@ export function ResultView(props: { tab: ResultTab; out: ConsoleOutput; selected
       onFocus={(e) => e.target === root && root.querySelector<HTMLElement>(".dgg")?.focus()}
     >
       <DataGrid
-        columns={tab().columns}
+        columns={columns()}
         rowCount={tab().rowCount()}
         getRow={(i) => tab().rows[i]}
         version={tab().version()}
@@ -37,6 +51,10 @@ export function ResultView(props: { tab: ResultTab; out: ConsoleOutput; selected
         onCopy={(text) => void copyText(text)}
         onReload={() => props.out.host?.rerun(tab())}
         tableName={tab().meta.find((c) => c.tableRef)?.tableRef ?? undefined}
+        editable={!!tab().edit()}
+        onSubmit={(changes) => host()?.applyEdits(tab(), changes) ?? false}
+        onChangesChange={tab().setPending}
+        apiRef={(a) => (tab().gridApi = a)}
       >
         <GridPagingPill
           rowCount={tab().rowCount()}
@@ -45,6 +63,15 @@ export function ResultView(props: { tab: ResultTab; out: ConsoleOutput; selected
           onCountRows={tab().hasMore() ? () => void tab().loadAll() : undefined}
         />
       </DataGrid>
+      <Show when={tab().preview()}>
+        <SqlPopup
+          sql={previewSql()}
+          dialect={props.out.dialect}
+          primary={{ label: "Submit", run: () => (tab().setPreview(false), tab().gridApi?.submit()) }}
+          secondaryLabel="Cancel"
+          onClose={() => (tab().setPreview(false), tab().gridApi?.focus())}
+        />
+      </Show>
     </div>
   );
 }

@@ -10,7 +10,7 @@ import {
   isTauri,
 } from "../../api/db";
 import { notify } from "../../components/ui";
-import type { OutputHost, ResultTab } from "./model";
+import { type OutputHost, type ResultTab, currentOutput } from "./model";
 
 export const FORMATS: { id: ExportFormat; label: string; ext: string }[] = [
   { id: "csv", label: "CSV", ext: "csv" },
@@ -93,4 +93,13 @@ export async function exportResultToFile(tab: ResultTab, host: OutputHost, forma
   } catch (e) {
     notify({ kind: "error", title: "Export failed", body: errText(e) });
   }
+}
+
+/** `grid.export` without a target: Export Data to File of the selected result of the output. False when none. */
+export function exportCurrentResult(): boolean {
+  const out = currentOutput();
+  const tab = out?.current();
+  if (!out?.host || !tab) return false;
+  void exportResultToFile(tab, out.host, tab.extractor());
+  return true;
 }

@@ -21,7 +21,16 @@ import {
   untrack,
   type JSX,
 } from "solid-js";
+import { settings } from "../../state/settings";
+import { computeAggregates, type Aggregates } from "./aggregates";
 import { COPY_FORMAT_LABELS, formatRows, type CopyColumn } from "./copy";
+import { DEFAULT_FIND_OPTIONS, compileQuery, findNextMatch, type FindOptions } from "./find";
+import { FindBar } from "./FindBar";
+import { LocalFilterPopup } from "./LocalFilterPopup";
+import { NULL_KEY, countMatches, countValues, type ValueCount } from "./localFilter";
+import { ManageColumns } from "./ManageColumns";
+import { SidePanel, type SideDock } from "./SidePanel";
+import { cellRect, indexAt, prefixSums, recordWidth, toLogical, toScreen, windowOf } from "./transpose";
 import {
   DEFAULT_VALUE,
   classifyType,
@@ -46,7 +55,9 @@ import type {
   DataGridApi,
   GridChange,
   GridColumn,
+  GridViewState,
   SelRange,
+  SideTab,
   SortSpec,
   ViewMode,
 } from "./types";
@@ -59,6 +70,13 @@ const OVERSCAN_ROWS = 4;
 const OVERSCAN_PX = 280;
 const MIN_COL_W = 28;
 const CHAR_W = 8;
+/** Transposed layout: record columns are fitted to the first rows only (the rest get a default width). */
+const REC_FIT_ROWS = 3000;
+const REC_DEFAULT_W = recordWidth(17);
+const REC_MIN_W = 40;
+const REC_MAX_W = 460;
+/** Width of the column-name gutter of the transposed layout: icon + name (measured: 11 chars -> 132px with its border). */
+const nameGutterW = (maxChars: number) => Math.max(60, Math.round(maxChars * CHAR_W + 44));
 
 export interface SelectionInfo {
   /** 1-based position of the active cell (status bar `row:col`), null when nothing is selected. */
@@ -107,10 +125,14 @@ export interface DataGridProps {
   /** Clipboard hook (Tauri clipboard plugin); default uses the browser clipboard. */
   onCopy?: (text: string, format: CopyFormat) => void;
   onReload?: () => void;
-  /** Funnel button of a column header. */
+  /** Funnel button of a column header. Omit it to get the built-in local filter popup. */
   onColumnFilter?: (column: number, anchor: DOMRect) => void;
   onSelectionChange?: (info: SelectionInfo) => void;
   onColumnsChange?: (state: ColumnsState) => void;
+  /** Gutter / header numbers start after this many rows (paged table editor: `offset + index + 1`). */
+  rowNumberOffset?: number;
+  /** Reports transpose / find / record view / local filter / hidden columns, to keep toolbar toggles in sync. */
+  onViewChange?: (state: GridViewState) => void;
   apiRef?: (api: DataGridApi) => void;
   /** Overlay slot (e.g. the floating paging pill), positioned over the scroller. */
   children?: JSX.Element;
@@ -127,7 +149,8 @@ const esc = (s: string) => (/[&<>]/.test(s) ? s.replace(/&/g, "&amp;").replace(/
  */
 const charWidth = () => CHAR_W;
 
-function iconClass(c: GridColumn): string {
+function iconClass(c: GridColumn | undefined): string {
+  if (!c) return "k-col";
   if (c.isPk && c.isFk) return "k-pkfk";
   if (c.isPk) return "k-pk";
   if (c.isFk) return "k-fk";
@@ -162,6 +185,33 @@ export function DataGrid(props: DataGridProps): JSX.Element {
   const [viewW, setViewW] = createSignal(800);
   const [viewH, setViewH] = createSignal(600);
   const [ls, setLs] = createSignal(0);
+
+  // ---- view state ----
+  const [transposed, setTransposed] = createSignal(false);
+  const T = transposed;
+  const [findOpen, setFindOpen] = createSignal(false);
+  const [findQuery, setFindQuery] = createSignal("");
+  const [findOpts, setFindOpts] = createSignal<FindOptions>(DEFAULT_FIND_OPTIONS);
+  const [findFilterRows, setFindFilterRows] = createSignal(false);
+  const [sideTab, setSideTab] = createSignal<SideTab | null>(null);
+  const [sideDock, setSideDock] = createSignal<SideDock>("right");
+  const [sideTwoCol, setSideTwoCol] = createSignal(false);
+  const [sideSize, setSideSize] = createSignal(0);
+  const [colFilters, setColFilters] = createSignal<Map<number, Set<string>>>(new Map());
+  const [lfEnabled, setLfEnabled] = createSignal(true);
+  const [lfPopup, setLfPopup] = createSignal<{ ci: number; anchor: DOMRect; values: ValueCount[]; truncated: boolean } | null>(null);
+  const [manage, setManage] = createSignal<{ anchor?: DOMRect; bounds: DOMRect } | null>(null);
+
+  const findRe = createMemo(() => compileQuery(findQuery(), findOpts()));
+  const findError = () => {
+    const c = findRe();
+    return typeof c === "string" ? c : null;
+  };
+  /** Cell text predicate of the open Find bar (null when closed, empty or invalid). */
+  const matcher = createMemo<((t: string) => boolean) | null>(() => {
+    const c = findRe();
+    return findOpen() && c && typeof c !== "string" ? (t) => c.test(t) : null;
+  });
 
   // ---- columns ----
   const kinds = createMemo<ColumnKind[]>(() => props.columns.map((c) => classifyType(c.typeName)));
@@ -211,45 +261,88 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     vis().forEach((ci, i) => m.set(ci, i));
     return m;
   });
-  const totalW = () => colX()[colX().length - 1];
+  const totalW = () => hX()[hX().length - 1];
 
   // ---- rows ----
-  const insCount = () => pending.insertedCount;
-  const total = createMemo(() => insCount() + props.rowCount);
-  const gutterW = createMemo(() => Math.max(32, String(Math.max(total(), 1)).length * 8 + 16));
-  const bodyH = () => total() * ROW_H;
+  const insCount = createMemo(() => pending.insertedCount);
+  const rowOff = () => props.rowNumberOffset ?? 0;
+  const nameW = createMemo(() => nameGutterW(props.columns.reduce((m, c) => Math.max(m, c.name.length), 0)));
 
-  /** Local sort permutation: sorted position -> source row (null = natural order). */
-  const sortOrder = createMemo<Int32Array | null>(() => {
+  /** Value key of a cell for the local filter (what the popup lists and compares). */
+  const keyOf = (v: Cell, kind: ColumnKind) => (v === null || v === undefined ? NULL_KEY : displayCell(v, kind, 100000, "").text);
+
+  /** Row predicate of the active local filters and of the Find bar's "Filter rows" (null = every row passes). */
+  const rowFilter = createMemo<((row: Cell[]) => boolean) | null>(() => {
+    const preds: ((row: Cell[]) => boolean)[] = [];
+    if (lfEnabled()) {
+      for (const [ci, allowed] of colFilters()) {
+        const kind = kinds()[ci];
+        preds.push((row) => allowed.has(keyOf(row[ci] ?? null, kind)));
+      }
+    }
+    const m = findFilterRows() ? matcher() : null;
+    if (m) {
+      const v = vis();
+      const k = kinds();
+      const nt = settings.gridNullText;
+      preds.push((row) => v.some((ci) => m(displayCell(row[ci] ?? null, k[ci], 400, nt).text)));
+    }
+    return preds.length ? (row) => preds.every((f) => f(row)) : null;
+  });
+
+  /** Display order of the source rows after the local filter and the local sort (null = natural order, every row). */
+  const rowOrder = createMemo<Int32Array | null>(() => {
     const s = sortState();
     touch(props.version);
     const n = props.rowCount;
-    if ((props.sortMode ?? "local") !== "local" || s.length === 0 || n === 0) return null;
-    const keyCols = s.map((sp) => {
-      const keys: (number | string | null)[] = new Array(n);
-      const kind = kinds()[sp.col];
+    const local = (props.sortMode ?? "local") === "local" && s.length > 0;
+    const filt = rowFilter();
+    if ((!local && !filt) || n === 0) return null;
+    let idx: Int32Array;
+    if (filt) {
+      const keep: number[] = [];
       for (let i = 0; i < n; i++) {
         const row = props.getRow(i);
-        keys[i] = row ? sortKey(row[sp.col], kind) : null;
+        if (row && filt(row)) keep.push(i);
       }
-      return { keys, sign: sp.dir === "asc" ? 1 : -1 };
-    });
-    const idx = new Int32Array(n);
-    for (let i = 0; i < n; i++) idx[i] = i;
-    idx.sort((a, b) => {
-      for (const kc of keyCols) {
-        const d = compareKeys(kc.keys[a], kc.keys[b]);
-        if (d !== 0) return d * kc.sign;
-      }
-      return a - b;
-    });
+      idx = Int32Array.from(keep);
+    } else {
+      idx = new Int32Array(n);
+      for (let i = 0; i < n; i++) idx[i] = i;
+    }
+    if (local) {
+      const keyCols = s.map((sp) => {
+        const keys: (number | string | null)[] = new Array(n);
+        const kind = kinds()[sp.col];
+        for (let i = 0; i < n; i++) {
+          const row = props.getRow(i);
+          keys[i] = row ? sortKey(row[sp.col], kind) : null;
+        }
+        return { keys, sign: sp.dir === "asc" ? 1 : -1 };
+      });
+      idx.sort((a, b) => {
+        for (const kc of keyCols) {
+          const d = compareKeys(kc.keys[a], kc.keys[b]);
+          if (d !== 0) return d * kc.sign;
+        }
+        return a - b;
+      });
+    }
     return idx;
   });
+  const viewCount = () => rowOrder()?.length ?? props.rowCount;
+  const total = createMemo(() => insCount() + viewCount());
+  const gutterW = createMemo(() => (T() ? nameW() : Math.max(32, String(Math.max(rowOff() + total(), 1)).length * 8 + 16)));
+  /** Number of screen rows (vertical axis): records normally, visible columns when transposed. */
+  const vCount = () => (T() ? vis().length : total());
+  const bodyH = () => vCount() * ROW_H;
+
   const invCache = new WeakMap<Int32Array, Int32Array>();
+  /** Source row -> display position (-1 when filtered out). */
   const invOf = (o: Int32Array) => {
     let inv = invCache.get(o);
     if (!inv) {
-      inv = new Int32Array(o.length);
+      inv = new Int32Array(props.rowCount).fill(-1);
       for (let i = 0; i < o.length; i++) inv[o[i]] = i;
       invCache.set(o, inv);
     }
@@ -257,15 +350,47 @@ export function DataGrid(props: DataGridProps): JSX.Element {
   };
   /** Source row of display row `r` (-1 for inserted rows). */
   const srcOf = (r: number) => {
-    const k = r - pending.insertedCount;
+    const k = r - insCount();
     if (k < 0) return -1;
-    const o = sortOrder();
+    const o = rowOrder();
     return o ? o[k] : k;
   };
 
+  /** Transposed layout: widths of the record columns, fitted to the first rows (see `recordWidth`). */
+  const recX = createMemo<Float64Array>(() => {
+    if (!T()) return new Float64Array(1);
+    touch(props.version);
+    const n = total();
+    const ni = insCount();
+    const o = rowOrder();
+    const v = vis();
+    const k = kinds();
+    const nt = settings.gridNullText;
+    const off = rowOff();
+    const w = new Float64Array(n);
+    const scan = Math.min(n, ni + REC_FIT_ROWS);
+    for (let r = 0; r < n; r++) {
+      if (r < ni || r >= scan) {
+        w[r] = REC_DEFAULT_W;
+        continue;
+      }
+      const row = props.getRow(o ? o[r - ni] : r - ni);
+      if (!row) {
+        w[r] = REC_DEFAULT_W;
+        continue;
+      }
+      let chars = String(off + r + 1).length;
+      for (let i = 0; i < v.length; i++) chars = Math.max(chars, displayLength(row[v[i]] ?? null, k[v[i]], nt));
+      w[r] = Math.min(REC_MAX_W, Math.max(REC_MIN_W, recordWidth(chars)));
+    }
+    return prefixSums(w);
+  });
+  /** Prefix sums of the horizontal screen axis: visible columns normally, records when transposed. */
+  const hX = createMemo<Float64Array>(() => (T() ? recX() : colX()));
+
   const rowWin = createMemo<[number, number]>(
     () => {
-      const t = total();
+      const t = vCount();
       const r0 = Math.max(0, Math.floor(scrollTop() / ROW_H) - OVERSCAN_ROWS);
       const r1 = Math.min(t - 1, Math.ceil((scrollTop() + viewH() - HEADER_H) / ROW_H) + OVERSCAN_ROWS);
       return [r0, r1];
@@ -280,23 +405,17 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     return out;
   });
   const colWin = createMemo<[number, number]>(
-    () => {
-      const X = colX();
-      const n = X.length - 1;
-      if (n <= 0) return [0, -1];
-      const x0 = scrollLeft() - OVERSCAN_PX;
-      const x1 = scrollLeft() + viewW() - gutterW() + OVERSCAN_PX;
-      let lo = 0;
-      while (lo < n - 1 && X[lo + 1] <= x0) lo++;
-      let hi = lo;
-      while (hi < n - 1 && X[hi + 1] < x1) hi++;
-      return [lo, hi];
-    },
+    () => windowOf(hX(), scrollLeft() - OVERSCAN_PX, scrollLeft() + viewW() - gutterW() + OVERSCAN_PX),
     [0, -1],
     { equals: (a, b) => a[0] === b[0] && a[1] === b[1] },
   );
   const hdrCols = createMemo(() => {
     const [a, b] = colWin();
+    if (T()) {
+      const out: number[] = [];
+      for (let r = a; r <= b; r++) out.push(r);
+      return out;
+    }
     return vis().slice(a, b + 1);
   });
 
@@ -309,25 +428,36 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     if (e) return e.value;
     return props.getRow(src)?.[ci] ?? null;
   }
+  /** HTML of one cell; `fm` = Find matcher (marks matching cells that are not selected). */
+  function cellHtml(r: number, vi: number, ci: number, val: Cell, x: number, w: number, right: boolean, dimUnset: boolean, nt: string, fm: ((t: string) => boolean) | null): string {
+    const maxc = ((w / charWidth()) | 0) + 3;
+    const d = displayCell(val, kinds()[ci], fm ? 400 : maxc, nt);
+    // unset cells of a new row: dim only for NOT NULL columns without default (measured on DataGrip)
+    let cls = dimUnset && val === null && (props.columns[ci].nullable !== false || props.columns[ci].isPk) ? "" : d.cls;
+    let text = d.text;
+    if (fm) {
+      if (fm(text) && !inSel(r, vi)) cls += " fm";
+      if (text.length > maxc) text = text.slice(0, maxc);
+    }
+    return `<div class="c${right ? " r" : ""}${cls}" style="left:${x}px;width:${w}px">${esc(text)}</div>`;
+  }
   function rowHtml(r: number): string {
     pending.version();
     touch(props.version);
+    const nt = settings.gridNullText;
+    const fm = matcher();
     const X = colX();
     const v = vis();
     const [c0, c1] = colWin();
     const k = kinds();
     const ni = pending.insertedCount;
     let html = "";
-    const cw = charWidth();
     if (r < ni) {
       const ins = pending.inserted(r);
       for (let vi = c0; vi <= c1; vi++) {
         const ci = v[vi];
         const val = ins?.values.get(ci) ?? null;
-        const d = displayCell(val, k[ci], (((X[vi + 1] - X[vi]) / cw) | 0) + 3);
-        // unset cells of a new row: dim only for NOT NULL columns without default (measured on DataGrip)
-        if (val === null && (props.columns[ci].nullable !== false || props.columns[ci].isPk)) d.cls = "";
-        html += `<div class="c${isRightAligned(k[ci], val) ? " r" : ""}${d.cls}" style="left:${X[vi]}px;width:${X[vi + 1] - X[vi]}px">${esc(d.text)}</div>`;
+        html += cellHtml(r, vi, ci, val, X[vi], X[vi + 1] - X[vi], isRightAligned(k[ci], val), true, nt, fm);
       }
       return html;
     }
@@ -341,8 +471,38 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     for (let vi = c0; vi <= c1; vi++) {
       const ci = v[vi];
       const val = edits && edits.has(ci) ? edits.get(ci) : (row[ci] ?? null);
-      const d = displayCell(val, k[ci], (((X[vi + 1] - X[vi]) / cw) | 0) + 3);
-      html += `<div class="c${isRightAligned(k[ci], val) ? " r" : ""}${d.cls}" style="left:${X[vi]}px;width:${X[vi + 1] - X[vi]}px">${esc(d.text)}</div>`;
+      html += cellHtml(r, vi, ci, val, X[vi], X[vi + 1] - X[vi], isRightAligned(k[ci], val), false, nt, fm);
+    }
+    return html;
+  }
+  /** Transposed layout: HTML of screen row `vi` (one column of the result) across the visible records. */
+  function rowHtmlT(vi: number): string {
+    pending.version();
+    touch(props.version);
+    const ci = vis()[vi];
+    if (ci === undefined) return "";
+    const nt = settings.gridNullText;
+    const fm = matcher();
+    const X = recX();
+    const [h0, h1] = colWin();
+    const ni = pending.insertedCount;
+    const o = rowOrder();
+    let html = "";
+    for (let r = h0; r <= h1; r++) {
+      const x = X[r];
+      const w = X[r + 1] - x;
+      if (r < ni) {
+        html += cellHtml(r, vi, ci, pending.inserted(r)?.values.get(ci) ?? null, x, w, false, true, nt, fm);
+        continue;
+      }
+      const src = o ? o[r - ni] : r - ni;
+      const row = props.getRow(src);
+      if (!row) {
+        html += `<div class="c sk" style="left:${x}px;width:${w}px"></div>`;
+        continue;
+      }
+      const edits = pending.rowEdits(src);
+      html += cellHtml(r, vi, ci, edits && edits.has(ci) ? edits.get(ci) : (row[ci] ?? null), x, w, false, false, nt, fm);
     }
     return html;
   }
@@ -386,6 +546,9 @@ export function DataGrid(props: DataGridProps): JSX.Element {
           setOrder(props.columns.map((_, i) => i));
           setHidden(new Set<number>());
           setInternalSort([]);
+          setColFilters(new Map());
+          setLfPopup(null);
+          setManage(null);
           setSelection([], null);
           setEdit(null);
           setValueEd(null);
@@ -447,57 +610,66 @@ export function DataGrid(props: DataGridProps): JSX.Element {
 
   function ensureVisible(r: number, c: number) {
     if (!scroller) return;
-    const X = colX();
+    const X = hX();
+    const sp = toScreen(T(), r, c);
     const dataH = scroller.clientHeight - HEADER_H;
-    const top = r * ROW_H;
+    const top = sp.v * ROW_H;
     if (top < scroller.scrollTop) scroller.scrollTop = top;
     else if (top + ROW_H > scroller.scrollTop + dataH) scroller.scrollTop = top + ROW_H - dataH;
     const dataW = scroller.clientWidth - gutterW();
-    const left = X[c] ?? 0;
-    const right = X[c + 1] ?? left;
+    const left = X[sp.h] ?? 0;
+    const right = X[sp.h + 1] ?? left;
     if (left < scroller.scrollLeft) scroller.scrollLeft = left;
     else if (right > scroller.scrollLeft + dataW) scroller.scrollLeft = Math.min(left, right - dataW);
   }
 
-  // underlay rectangles
+  // underlay rectangles (logical blocks mapped through the active layout)
+  const rectOf = (r0: number, r1: number, c0: number, c1: number) => cellRect(T(), hX(), ROW_H, r0, r1, c0, c1);
   const selRects = createMemo<Rect[]>(() => {
-    const X = colX();
     const out: Rect[] = [];
+    const n = nCols();
+    const tot = total();
     for (const g of ranges()) {
-      if (g.c0 >= X.length - 1) continue;
-      const x = X[g.c0];
-      out.push({ k: "sel", x, y: g.r0 * ROW_H, w: X[Math.min(g.c1 + 1, X.length - 1)] - x, h: (g.r1 - g.r0 + 1) * ROW_H });
+      if (g.c0 >= n || g.r0 >= tot) continue;
+      out.push({ k: "sel", ...rectOf(g.r0, g.r1, g.c0, Math.min(g.c1, n - 1)) });
     }
     return out;
+  });
+  const curRect = createMemo<Rect | null>(() => {
+    const a = active();
+    if (!a || a.r >= total()) return null;
+    return { k: "cur", ...rectOf(a.r, a.r, 0, Math.max(0, nCols() - 1)) };
   });
   const changeRects = createMemo<Rect[]>(() => {
     pending.version();
     const out: Rect[] = [];
     if (pending.isEmpty()) return out;
-    const [r0, r1] = rowWin();
+    const [w0, w1] = T() ? colWin() : rowWin(); // window over display rows
     const ni = pending.insertedCount;
-    const W = totalW();
-    const X = colX();
+    const last = Math.max(0, nCols() - 1);
     const pos = visPos();
-    for (let r = r0; r <= Math.min(ni - 1, r1); r++) out.push({ k: "ins", x: 0, y: r * ROW_H, w: W, h: ROW_H });
-    const o = sortOrder();
+    for (let r = w0; r <= Math.min(ni - 1, w1); r++) out.push({ k: "ins", ...rectOf(r, r, 0, last) });
+    const o = rowOrder();
     const inv = o ? invOf(o) : null;
-    const disp = (src: number) => (inv ? inv[src] : src) + ni;
+    const disp = (src: number) => (inv ? inv[src] : src);
     for (const src of pending.deletedRows()) {
       const d = disp(src);
-      if (d >= r0 && d <= r1) out.push({ k: "del", x: 0, y: d * ROW_H, w: W, h: ROW_H });
+      if (d < 0) continue;
+      if (d + ni >= w0 && d + ni <= w1) out.push({ k: "del", ...rectOf(d + ni, d + ni, 0, last) });
     }
     for (const [src, m] of pending.editedRows()) {
       const d = disp(src);
-      if (d < r0 || d > r1 || pending.isDeleted(src)) continue;
+      if (d < 0) continue;
+      const r = d + ni;
+      if (r < w0 || r > w1 || pending.isDeleted(src)) continue;
       for (const ci of m.keys()) {
         const vi = pos.get(ci);
         if (vi === undefined) continue;
-        out.push({ k: "mod", x: X[vi], y: d * ROW_H, w: X[vi + 1] - X[vi], h: ROW_H });
+        out.push({ k: "mod", ...rectOf(r, r, vi, vi) });
       }
     }
     const a = active();
-    if (a && a.r < ni) out.push({ k: "tint", x: 0, y: a.r * ROW_H, w: W, h: ROW_H });
+    if (a && a.r < ni) out.push({ k: "tint", ...rectOf(a.r, a.r, 0, last) });
     return out;
   });
 
@@ -552,9 +724,9 @@ export function DataGrid(props: DataGridProps): JSX.Element {
   let lastNeedMoreFor = -1;
   createEffect(() => {
     const n = props.rowCount;
-    const r1 = rowWin()[1];
+    const r1 = T() ? colWin()[1] : rowWin()[1];
     if (!props.hasMore || props.loadingMore || !props.onNeedMore) return;
-    const pageRows = Math.ceil(viewH() / ROW_H);
+    const pageRows = T() ? 30 : Math.ceil(viewH() / ROW_H);
     if (r1 >= total() - Math.max(60, pageRows * 2) && lastNeedMoreFor !== n) {
       lastNeedMoreFor = n;
       props.onNeedMore();
@@ -562,20 +734,9 @@ export function DataGrid(props: DataGridProps): JSX.Element {
   });
 
   // ---- hit testing ----
-  function colAt(x: number): number {
-    const X = colX();
-    const n = X.length - 1;
-    if (n <= 0 || x < 0) return -1;
-    if (x >= X[n]) return -1;
-    let lo = 0;
-    let hi = n - 1;
-    while (lo < hi) {
-      const mid = (lo + hi + 1) >> 1;
-      if (X[mid] <= x) lo = mid;
-      else hi = mid - 1;
-    }
-    return lo;
-  }
+  /** Index of the horizontal axis entry (column normally, record when transposed) under data x; -1 outside. */
+  const colAt = (x: number) => indexAt(hX(), x);
+
   function toData(e: { clientX: number; clientY: number }) {
     const rect = scroller.getBoundingClientRect();
     return {
@@ -628,11 +789,21 @@ export function DataGrid(props: DataGridProps): JSX.Element {
   }
   onCleanup(() => dragCleanup?.());
 
-  const clampRow = (y: number) => Math.max(0, Math.min(total() - 1, Math.floor(y / ROW_H)));
-  const clampCol = (x: number) => {
+  /** Screen row (vertical axis) under data y, clamped. */
+  const clampV = (y: number) => Math.max(0, Math.min(vCount() - 1, Math.floor(y / ROW_H)));
+  /** Horizontal axis entry under data x, clamped. */
+  const clampH = (x: number) => {
     const c = colAt(x);
-    return c >= 0 ? c : x < 0 ? 0 : nCols() - 1;
+    return c >= 0 ? c : x < 0 ? 0 : Math.max(0, hX().length - 2);
   };
+  const clampCell = (p: { x: number; y: number }): CellPos => toLogical(T(), clampV(p.y), clampH(p.x));
+  /** Logical cell under a data point, null outside the cells. */
+  function cellAtPoint(p: { x: number; y: number }): CellPos | null {
+    if (p.y < 0 || p.y >= bodyH()) return null;
+    const h = colAt(p.x);
+    if (h < 0) return null;
+    return toLogical(T(), Math.floor(p.y / ROW_H), h);
+  }
 
   function onBodyMouseDown(e: MouseEvent) {
     if (e.button !== 0 && e.button !== 2) return;
@@ -640,29 +811,38 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     if (isScrollbar(e) || total() === 0 || nCols() === 0) return;
     const p = toData(e);
     if (p.inHeader) return;
-    const r = clampRow(p.y);
     if (p.y < 0 || p.y >= bodyH()) return;
     const mod = e.ctrlKey || e.metaKey;
     root.focus({ preventScroll: true });
 
     if (p.inGutter) {
-      if (e.button === 2 && rowFullySel(r)) return;
+      // row numbers (normal) select a row; column names (transposed) select a column
+      const t = T();
+      const idx = clampV(p.y);
       const act = active();
-      if (e.shiftKey && act) selectRows(act.r, r, false, { r, c: act.c });
-      else if (mod) selectRows(r, r, true, { r, c: act?.c ?? 0 });
-      else selectRows(r, r, false, { r, c: act?.c ?? 0 });
+      const at = (i: number): CellPos => (t ? { r: act?.r ?? 0, c: i } : { r: i, c: act?.c ?? 0 });
+      const pick = t ? selectCols : selectRows;
+      const full = t ? colSelectedFully : rowFullySel;
+      if (e.button === 2 && full(idx)) return;
+      if (e.shiftKey && act) pick(t ? act.c : act.r, idx, false, at(idx));
+      else if (mod) pick(idx, idx, true, at(idx));
+      else pick(idx, idx, false, at(idx));
       if (e.button === 2) return;
-      const start = r;
+      const start = idx;
       startDrag((ev) => {
         const q = toData(ev);
-        const rr = clampRow(q.y);
-        setRanges((prev) => [...prev.slice(0, -1), { r0: Math.min(start, rr), r1: Math.max(start, rr), c0: 0, c1: nCols() - 1 }]);
-        setActive({ r: rr, c: active()?.c ?? 0 });
+        const ii = clampV(q.y);
+        const g: SelRange = t
+          ? { r0: 0, r1: Math.max(0, total() - 1), c0: Math.min(start, ii), c1: Math.max(start, ii) }
+          : { r0: Math.min(start, ii), r1: Math.max(start, ii), c0: 0, c1: nCols() - 1 };
+        setRanges((prev) => [...prev.slice(0, -1), g]);
+        setActive(at(ii));
       });
       return;
     }
-    const c = colAt(p.x);
-    if (c < 0) return;
+    const cell = cellAtPoint(p);
+    if (!cell) return;
+    const { r, c } = cell;
     if (e.button === 2) {
       if (!inSel(r, c)) selectCell(r, c);
       return;
@@ -671,8 +851,8 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     else if (mod) addCell(r, c);
     else selectCell(r, c);
     startDrag((ev) => {
-      const q = toData(ev);
-      extendTo(clampRow(q.y), clampCol(q.x));
+      const q = clampCell(toData(ev));
+      extendTo(q.r, q.c);
     });
   }
 
@@ -680,10 +860,9 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     if ((e.target as Element).closest(".dgg-header, .dgg-editor") || isScrollbar(e)) return;
     const p = toData(e);
     if (p.inHeader || p.inGutter) return;
-    const r = clampRow(p.y);
-    const c = colAt(p.x);
-    if (c < 0 || p.y < 0 || p.y >= bodyH()) return;
-    selectCell(r, c);
+    const cell = cellAtPoint(p);
+    if (!cell) return;
+    selectCell(cell.r, cell.c);
     startEdit();
   }
 
@@ -730,6 +909,28 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     );
   }
   const colSelectedFully = (vi: number) => ranges().some((g) => g.c0 <= vi && g.c1 >= vi && g.r0 === 0 && g.r1 >= total() - 1);
+  const rowHasSel = (r: number) => ranges().some((g) => r >= g.r0 && r <= g.r1);
+
+  /** Transposed layout: the numbered header cell of a record selects that row. */
+  function onRecHeaderDown(e: MouseEvent, r: number) {
+    if (e.button !== 0 && e.button !== 2) return;
+    root.focus({ preventScroll: true });
+    const act = active();
+    const at: CellPos = { r, c: act?.c ?? 0 };
+    if (e.button === 2) {
+      if (!rowFullySel(r)) selectRows(r, r, false, at);
+      return;
+    }
+    if (e.shiftKey && act) selectRows(act.r, r, false, { r, c: act.c });
+    else if (e.ctrlKey || e.metaKey) selectRows(r, r, true, at);
+    else selectRows(r, r, false, at);
+    const start = r;
+    startDrag((ev) => {
+      const rr = clampH(toData(ev).x);
+      setRanges((prev) => [...prev.slice(0, -1), { r0: Math.min(start, rr), r1: Math.max(start, rr), c0: 0, c1: nCols() - 1 }]);
+      setActive({ r: rr, c: active()?.c ?? 0 });
+    });
+  }
 
   function emitColumns() {
     props.onColumnsChange?.({ order: order(), hidden: [...hidden()], widths: widths() });
@@ -990,6 +1191,11 @@ export function DataGrid(props: DataGridProps): JSX.Element {
   function selectionText(format: CopyFormat): string {
     const b = selectionBlock();
     if (!b) return "";
+    if (T() && format === "tsv") {
+      // the transposed grid copies what is on screen: one line per column of the result
+      const flipped = b.cols.map((_, j) => b.rows.map((row) => row[j]));
+      return formatRows(format, b.rows.map((_, i) => ({ name: String(i + 1), typeName: "" })), flipped, { tableName: props.tableName, header: false });
+    }
     return formatRows(format, b.cols, b.rows, { tableName: props.tableName, header: format === "csv" || format === "markdown" ? true : false });
   }
   function writeClipboard(text: string, format: CopyFormat) {
@@ -1073,31 +1279,45 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     else selectCell(r, c);
   }
   const pageRows = () => Math.max(1, Math.floor((scroller.clientHeight - HEADER_H) / ROW_H) - 1);
+  /** Move by screen deltas: `dv` down the vertical axis, `dh` along the horizontal one (swapped when transposed). */
+  const moveScreen = (dv: number, dh: number, shift: boolean, ctrl: boolean) => (T() ? move(dh, dv, shift, ctrl) : move(dv, dh, shift, ctrl));
+  /** Next cell of Tab / Shift+Tab in reading order of the active layout (null at the ends). */
+  function tabTarget(r: number, c: number, back: boolean): CellPos | null {
+    if (T()) {
+      if (!back) return r < total() - 1 ? { r: r + 1, c } : c < nCols() - 1 ? { r: 0, c: c + 1 } : null;
+      return r > 0 ? { r: r - 1, c } : c > 0 ? { r: total() - 1, c: c - 1 } : null;
+    }
+    if (!back) return c < nCols() - 1 ? { r, c: c + 1 } : r < total() - 1 ? { r: r + 1, c: 0 } : null;
+    return c > 0 ? { r, c: c - 1 } : r > 0 ? { r: r - 1, c: nCols() - 1 } : null;
+  }
 
   function onKeyDown(e: KeyboardEvent) {
-    if ((e.target as HTMLElement).closest?.(".dgg-editor, .dgg-ve, .dgg-menu")) return;
+    if ((e.target as HTMLElement).closest?.(".dgg-editor, .dgg-ve, .dgg-menu, .dgg-find, .dgg-side")) return;
     const mod = e.ctrlKey || e.metaKey;
     const k = e.key;
     const alt = e.altKey;
     const shift = e.shiftKey;
     let handled = true;
-    if (k === "ArrowDown" && !alt && true) move(1, 0, shift, mod);
-    else if (k === "ArrowUp" && !alt) move(-1, 0, shift, mod);
-    else if (k === "ArrowRight" && !alt) move(0, 1, shift, mod);
-    else if (k === "ArrowLeft" && !alt) move(0, -1, shift, mod);
-    else if (k === "Home") move(mod ? -total() : 0, -nCols(), shift, false) /* ctrl: first row too */;
-    else if (k === "End") move(mod ? total() : 0, nCols(), shift, false);
-    else if (k === "PageDown") move(pageRows(), 0, shift, false);
-    else if (k === "PageUp") move(-pageRows(), 0, shift, false);
+    const big = Math.max(total(), nCols()) + 1;
+    if (k === "ArrowDown" && !alt) moveScreen(1, 0, shift, mod);
+    else if (k === "ArrowUp" && !alt) moveScreen(-1, 0, shift, mod);
+    else if (k === "ArrowRight" && !alt) moveScreen(0, 1, shift, mod);
+    else if (k === "ArrowLeft" && !alt) moveScreen(0, -1, shift, mod);
+    else if (k === "Home") moveScreen(mod ? -big : 0, -big, shift, false) /* ctrl: first row too */;
+    else if (k === "End") moveScreen(mod ? big : 0, big, shift, false);
+    else if (k === "PageDown") moveScreen(pageRows(), 0, shift, false);
+    else if (k === "PageUp") moveScreen(-pageRows(), 0, shift, false);
     else if (k === "Tab") {
       const a = active();
       if (!a) selectCell(0, 0);
-      else if (shift) {
-        if (a.c > 0) selectCell(a.r, a.c - 1);
-        else if (a.r > 0) selectCell(a.r - 1, nCols() - 1);
-      } else if (a.c < nCols() - 1) selectCell(a.r, a.c + 1);
-      else if (a.r < total() - 1) selectCell(a.r + 1, 0);
-    } else if (k === "Enter" && mod && !alt) submit();
+      else {
+        const t = tabTarget(a.r, a.c, shift);
+        if (t) selectCell(t.r, t.c);
+      }
+    } else if (k === "Enter" && mod && shift && !alt) toggleRecordView();
+    else if (k === "F12" && mod) openManageColumns();
+    else if (k.toLowerCase() === "f" && mod && !alt && !shift) openFind();
+    else if (k === "Enter" && mod && !alt) submit();
     else if (k === "Enter" && shift && !mod) openValueEditor();
     else if (k === "Enter" || k === "F2") startEdit();
     else if (k === "Escape") {
@@ -1162,6 +1382,10 @@ export function DataGrid(props: DataGridProps): JSX.Element {
       { label: "Paste", shortcut: "Ctrl+V", disabled: !ed || !has, onSelect: pasteFromClipboard },
       { separator: true },
       { label: "Select All", shortcut: "Ctrl+A", onSelect: selectAll },
+      { separator: true },
+      { label: "Transpose", checked: T(), onSelect: () => toggleTranspose() },
+      { label: "Show Record View", shortcut: "Ctrl+Shift+Enter", checked: sideTab() !== null, onSelect: toggleRecordView },
+      { label: "Manage Columns…", shortcut: "Ctrl+F12", onSelect: () => openManageColumns() },
       { label: "Reload Page", shortcut: "Ctrl+F5", disabled: !props.onReload, onSelect: () => props.onReload?.() },
     ];
   }
@@ -1206,13 +1430,13 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     if ((e.target as Element).closest(".dgg-editor, .dgg-ve, .dgg-overlay")) return;
     const p = toData(e);
     if (isScrollbar(e)) return;
-    if (p.inHeader) {
+    if (p.inHeader && !T()) {
       const vi = colAt(p.x);
       if (vi < 0) return;
       setMenu({ x: e.clientX, y: e.clientY, items: headerMenu(vis()[vi]) });
       return;
     }
-    if (p.inGutter || (p.y >= 0 && p.y < bodyH() && colAt(p.x) >= 0)) {
+    if (p.inHeader || p.inGutter || (p.y >= 0 && p.y < bodyH() && colAt(p.x) >= 0)) {
       setMenu({ x: e.clientX, y: e.clientY, items: bodyMenu() });
     }
   }
@@ -1245,6 +1469,210 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     props.onSelectionChange({ row: a ? a.r + 1 : null, col: a ? a.c + 1 : null, cells, numeric });
   });
 
+  // ---- transpose ----
+  function toggleTranspose() {
+    setTransposedView(!T());
+  }
+  function setTransposedView(on: boolean) {
+    if (on === T()) return;
+    batch(() => {
+      setEdit(null);
+      setDropAt(null);
+      setDragCol(null);
+      setTransposed(on);
+    });
+    if (scroller) {
+      scroller.scrollTop = 0;
+      scroller.scrollLeft = 0;
+    }
+    queueMicrotask(() => {
+      const a = active();
+      if (a) ensureVisible(a.r, a.c);
+    });
+  }
+
+  // ---- find ----
+  let focusFind: (() => void) | null = null;
+  const cellText = (r: number, c: number): string => {
+    const ci = vis()[c];
+    if (r >= insCount() && !props.getRow(srcOf(r))) return "";
+    return displayCell(cellValue(r, ci), kinds()[ci], 400, settings.gridNullText).text;
+  };
+  function findFrom(dir: 1 | -1, includeStart: boolean) {
+    const m = matcher();
+    if (!m || total() === 0 || nCols() === 0) return;
+    const hit = findNextMatch({ nRows: total(), nCols: nCols(), start: active(), dir, transposed: T(), textAt: cellText, match: m, includeStart });
+    if (hit) selectCell(hit.r, hit.c);
+  }
+  const findNext = () => findFrom(1, false);
+  const findPrevious = () => findFrom(-1, false);
+  let findTimer = 0;
+  function onFindQuery(q: string) {
+    setFindQuery(q);
+    clearTimeout(findTimer);
+    findTimer = window.setTimeout(() => findFrom(1, true), 60);
+  }
+  onCleanup(() => clearTimeout(findTimer));
+  function openFind() {
+    if (findOpen()) {
+      focusFind?.();
+      return;
+    }
+    const a = active();
+    if (a && a.r < total()) {
+      const v = cellValue(a.r, vis()[a.c]);
+      // DataGrip prefills (and selects) the text of the active cell
+      if (v !== null && v !== undefined && typeof v !== "object") setFindQuery(String(v).split("\n")[0].slice(0, 200));
+    }
+    setFindOpen(true);
+  }
+  function closeFind() {
+    if (!findOpen()) return;
+    clearTimeout(findTimer);
+    setFindOpen(false);
+    root.focus({ preventScroll: true });
+  }
+  // a changed row filter re-numbers the rows: drop the selection and go back to the top
+  createEffect(
+    on(
+      rowFilter,
+      () =>
+        batch(() => {
+          setSelection([], null);
+          if (scroller) scroller.scrollTop = 0;
+        }),
+      { defer: true },
+    ),
+  );
+
+  // ---- local filter (header funnel) ----
+  const sourceKey = (i: number, ci: number) => {
+    const row = props.getRow(i);
+    return row ? keyOf(row[ci] ?? null, kinds()[ci]) : undefined;
+  };
+  function openLocalFilter(ci: number, anchor: DOMRect) {
+    const { values, truncated } = countValues(props.rowCount, (i) => sourceKey(i, ci));
+    setLfPopup({ ci, anchor, values, truncated });
+  }
+  function toggleFilterValue(ci: number, key: string) {
+    const m = new Map(colFilters());
+    const set = new Set(m.get(ci) ?? []);
+    if (!set.delete(key)) set.add(key);
+    if (set.size) m.set(ci, set);
+    else m.delete(ci);
+    batch(() => {
+      setLfEnabled(true);
+      setColFilters(m);
+    });
+  }
+  function toggleAllFilterValues(ci: number) {
+    const m = new Map(colFilters());
+    if (m.get(ci)?.size) m.delete(ci);
+    else m.set(ci, new Set(lfPopup()?.values.map((v) => v.key) ?? []));
+    batch(() => {
+      setLfEnabled(true);
+      setColFilters(m);
+    });
+  }
+  const filterMatchCount = () => countMatches(props.rowCount, colFilters(), sourceKey);
+  const clearLocalFilter = () => setColFilters(new Map());
+
+  // ---- manage columns ----
+  function openManageColumns(anchor?: DOMRect) {
+    setManage({ anchor, bounds: root.getBoundingClientRect() });
+  }
+  function setHiddenSet(next: Set<number>) {
+    batch(() => {
+      setHidden(next);
+      setSelection([], null);
+    });
+    emitColumns();
+  }
+  function moveColumnTo(ci: number, toIndex: number) {
+    const o = order().filter((c) => c !== ci);
+    o.splice(Math.max(0, Math.min(o.length, toIndex)), 0, ci);
+    batch(() => {
+      setOrder(o);
+      setSelection([], null);
+    });
+    emitColumns();
+  }
+
+  // ---- side panel (record view) ----
+  function showSidePanel(tab: SideTab | null = "record") {
+    if (tab === null) {
+      setSideTab(null);
+      root.focus({ preventScroll: true });
+      return;
+    }
+    if (!sideSize()) setSideSize(sideDock() === "right" ? Math.max(240, Math.min(520, Math.round(root.clientWidth * 0.3) + 1)) : 260);
+    if (!sideTab() && !active() && total() > 0 && nCols() > 0) selectCell(0, 0);
+    setSideTab(tab);
+  }
+  function toggleRecordView() {
+    showSidePanel(sideTab() ? null : "record");
+  }
+  const activeCi = () => {
+    const a = active();
+    return a ? (vis()[a.c] ?? null) : null;
+  };
+  const recordValue = (ci: number): Cell => {
+    pending.version();
+    touch(props.version);
+    const a = active();
+    return a && a.r < total() ? cellValue(a.r, ci) : null;
+  };
+  function focusField(ci: number) {
+    const a = active();
+    const vi = visPos().get(ci);
+    if (!a || vi === undefined || (a.c === vi && ranges().length === 1)) return;
+    setSelection([{ r0: a.r, r1: a.r, c0: vi, c1: vi }], { r: a.r, c: vi });
+    ensureVisible(a.r, vi);
+  }
+  function commitField(ci: number, text: string) {
+    const a = active();
+    if (!a) return;
+    const kind = kinds()[ci];
+    if (!canEditCell(a.r, ci) || text === editText(cellValue(a.r, ci))) return;
+    applyValue(a.r, ci, parseEdit(text, kind));
+  }
+  function aggregates(): Aggregates {
+    pending.version();
+    touch(props.version);
+    const nums: number[] = [];
+    const rowSet = new Set<number>();
+    const colSet = new Set<number>();
+    let count = 0;
+    let seen = 0;
+    const v = vis();
+    outer: for (const g of ranges()) {
+      for (let r = g.r0; r <= g.r1; r++) {
+        for (let c = g.c0; c <= g.c1; c++) {
+          if (seen++ > 200000) break outer;
+          rowSet.add(r);
+          colSet.add(c);
+          const val = cellValue(r, v[c]);
+          if (val === null || val === undefined) continue;
+          count++;
+          const n = typeof val === "number" ? val : typeof val === "string" && kinds()[v[c]] === "number" ? Number(val) : NaN;
+          if (!Number.isNaN(n)) nums.push(n);
+        }
+      }
+    }
+    return computeAggregates(nums, count, rowSet.size, colSet.size);
+  }
+
+  // ---- view state ----
+  const viewState = createMemo<GridViewState>(() => ({
+    transposed: T(),
+    findOpen: findOpen(),
+    sidePanel: sideTab(),
+    localFilterActive: lfEnabled() && colFilters().size > 0,
+    localFilterEnabled: lfEnabled(),
+    hiddenColumns: hidden().size,
+  }));
+  createEffect(() => props.onViewChange?.(viewState()));
+
   // ---- public api ----
   const api: DataGridApi = {
     getChanges: () => pending.toChanges(props.columns, (src) => props.getRow(src)),
@@ -1262,12 +1690,25 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     copy,
     selectAll,
     scrollToRow: (row) => {
-      scroller.scrollTop = Math.max(0, row * ROW_H);
+      if (T()) scroller.scrollLeft = hX()[Math.min(Math.max(0, row), hX().length - 1)] ?? 0;
+      else scroller.scrollTop = Math.max(0, row * ROW_H);
     },
     focus: () => root.focus({ preventScroll: true }),
     openValueEditor,
     showAllColumns,
     clearSort,
+    setTransposed: setTransposedView,
+    toggleTranspose,
+    showSidePanel,
+    toggleRecordView,
+    openFind,
+    closeFind,
+    findNext,
+    findPrevious,
+    openManageColumns,
+    setLocalFilterEnabled: setLfEnabled,
+    clearLocalFilter,
+    getViewState: viewState,
   };
   props.apiRef?.(api);
 
@@ -1278,11 +1719,12 @@ export function DataGrid(props: DataGridProps): JSX.Element {
 
   // ---- value editor placement ----
   const editorStyle = (ed: EditState): JSX.CSSProperties => {
-    const X = colX();
+    const X = hX();
+    const { v, h } = toScreen(T(), ed.r, ed.vi);
     return {
-      left: X[ed.vi] + "px",
-      top: ed.r * ROW_H + "px",
-      width: X[ed.vi + 1] - X[ed.vi] + "px",
+      left: X[h] + "px",
+      top: v * ROW_H + "px",
+      width: X[h + 1] - X[h] + "px",
       height: ROW_H + "px",
     };
   };
@@ -1298,7 +1740,21 @@ export function DataGrid(props: DataGridProps): JSX.Element {
       <div class="dgg-sizer" style={{ width: gutterW() + totalW() + "px", height: HEADER_H + bodyH() + "px" }}>
         <div class="dgg-header">
           <div class="dgg-corner" style={{ width: gutterW() + "px" }} />
-          <For each={hdrCols()}>
+          <Show when={T()}>
+            <For each={hdrCols()}>
+              {(r) => (
+                <div
+                  class="dgg-hc rec"
+                  classList={{ sel: rowHasSel(r) }}
+                  style={{ left: gutterW() + (hX()[r] ?? 0) + "px", width: (hX()[r + 1] ?? 0) - (hX()[r] ?? 0) + "px" }}
+                  onMouseDown={(e) => onRecHeaderDown(e, r)}
+                >
+                  {rowOff() + r + 1}
+                </div>
+              )}
+            </For>
+          </Show>
+          <For each={T() ? [] : hdrCols()}>
             {(ci) => {
               const vi = () => visPos().get(ci) ?? 0;
               const sortIdx = () => sortState().findIndex((s) => s.col === ci);
@@ -1316,9 +1772,14 @@ export function DataGrid(props: DataGridProps): JSX.Element {
                   </span>
                   <button
                     class="dgg-hbtn funnel"
+                    classList={{ on: lfEnabled() && colFilters().has(ci) }}
                     title="Column filter"
                     tabIndex={-1}
-                    onClick={(e) => props.onColumnFilter?.(ci, (e.currentTarget as HTMLElement).getBoundingClientRect())}
+                    onClick={(e) => {
+                      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                      if (props.onColumnFilter) props.onColumnFilter(ci, rect);
+                      else openLocalFilter(ci, rect);
+                    }}
                   />
                   <button
                     class="dgg-hbtn sort"
@@ -1348,7 +1809,7 @@ export function DataGrid(props: DataGridProps): JSX.Element {
               );
             }}
           </For>
-          <Show when={dropAt() !== null}>
+          <Show when={!T() && dropAt() !== null}>
             <div class="dgg-drop" style={{ left: gutterW() + (colX()[dropAt()!] ?? 0) + "px" }} />
           </Show>
         </div>
@@ -1357,26 +1818,36 @@ export function DataGrid(props: DataGridProps): JSX.Element {
           <div class="dgg-gutter" style={{ width: gutterW() + "px", height: bodyH() + "px" }}>
             <For each={rowList()}>
               {(r) => (
-                <div
-                  class="dgg-gr"
-                  classList={{
-                    cur: hasSelectionAt(r),
-                    sel: rowFullySel(r),
-                    ins: rowState(r) === "ins",
-                    del: rowState(r) === "del",
-                    mod: rowState(r) === "mod",
-                  }}
-                  style={{ top: r * ROW_H + "px" }}
+                <Show
+                  when={T()}
+                  fallback={
+                    <div
+                      class="dgg-gr"
+                      classList={{
+                        cur: hasSelectionAt(r),
+                        sel: rowFullySel(r),
+                        ins: rowState(r) === "ins",
+                        del: rowState(r) === "del",
+                        mod: rowState(r) === "mod",
+                      }}
+                      style={{ top: r * ROW_H + "px" }}
+                    >
+                      {rowOff() + r + 1}
+                    </div>
+                  }
                 >
-                  {r + 1}
-                </div>
+                  <div class="dgg-gr nm" classList={{ sel: colSelectedFully(r) }} style={{ top: r * ROW_H + "px" }}>
+                    <i class={"dgg-ico " + iconClass(props.columns[vis()[r]])} />
+                    <span>{props.columns[vis()[r]]?.name}</span>
+                  </div>
+                </Show>
               )}
             </For>
           </div>
           <div class="dgg-data" style={{ left: gutterW() + "px", width: totalW() + "px", height: bodyH() + "px" }}>
             <div class="dgg-underlay">
-              <Show when={active()}>
-                <div class="dgg-u cur" style={{ top: active()!.r * ROW_H + "px", width: totalW() + "px", height: ROW_H + "px" }} />
+              <Show when={curRect()}>
+                {(q) => <div class="dgg-u cur" style={{ left: q().x + "px", top: q().y + "px", width: q().w + "px", height: q().h + "px" }} />}
               </Show>
               <For each={changeRects()}>
                 {(q) => <div class={"dgg-u " + q.k} style={{ left: q.x + "px", top: q.y + "px", width: q.w + "px", height: q.h + "px" }} />}
@@ -1386,10 +1857,10 @@ export function DataGrid(props: DataGridProps): JSX.Element {
               </For>
             </div>
             <For each={rowList()}>
-              {(r) => <div class="dgg-row" style={{ top: r * ROW_H + "px", width: totalW() + "px" }} innerHTML={rowHtml(r)} />}
+              {(r) => <div class="dgg-row" style={{ top: r * ROW_H + "px", width: totalW() + "px" }} innerHTML={T() ? rowHtmlT(r) : rowHtml(r)} />}
             </For>
             <Show when={edit()}>
-              {(ed) => <CellEditor state={ed()} style={editorStyle(ed())} right={isRightAligned(kinds()[ed().ci], cellValue(ed().r, ed().ci))} onCommit={commitEdit} onCancel={cancelEdit} onValueEditor={(t) => {
+              {(ed) => <CellEditor state={ed()} style={editorStyle(ed())} right={!T() && isRightAligned(kinds()[ed().ci], cellValue(ed().r, ed().ci))} onCommit={commitEdit} onCancel={cancelEdit} onValueEditor={(t) => {
                 const s = edit();
                 if (!s) return;
                 setEdit(null);
@@ -1398,8 +1869,8 @@ export function DataGrid(props: DataGridProps): JSX.Element {
                 const s = edit();
                 if (!s) return;
                 commitEdit(t, true);
-                const nc = s.vi + (back ? -1 : 1);
-                if (nc >= 0 && nc < nCols()) selectCell(s.r, nc);
+                const nx = tabTarget(s.r, s.vi, back);
+                if (nx) selectCell(nx.r, nx.c);
                 root.focus({ preventScroll: true });
               }} />}
             </Show>
@@ -1410,33 +1881,138 @@ export function DataGrid(props: DataGridProps): JSX.Element {
   );
 
   const empty = () => props.rowCount === 0 && pending.insertedCount === 0;
+  const textMode = () => (props.viewMode ?? "table") === "text";
+  const sideStyleSize = () => sideSize() || 476;
 
   return (
     <div
       ref={root}
       class="dgg"
+      classList={{ pop: !!(manage() || lfPopup()) }}
       style={{ "letter-spacing": ls() ? ls() + "px" : undefined }}
       tabIndex={0}
       onKeyDown={onKeyDown}
       onContextMenu={onContextMenu}
       onPaste={onPaste}
       onCopy={(e) => {
-        if (edit() || (e.target as HTMLElement).closest?.(".dgg-ve")) return;
+        if (edit() || (e.target as HTMLElement).closest?.(".dgg-ve, .dgg-find, .dgg-side")) return;
         e.preventDefault();
         const t = selectionText("tsv");
         if (t) e.clipboardData?.setData("text/plain", t);
       }}
     >
-      <Show when={(props.viewMode ?? "table") === "text"} fallback={tableView}>
-        <TextView columns={props.columns} rowCount={props.rowCount} getRow={props.getRow} version={props.version} />
-      </Show>
-      <Show when={empty() && (props.viewMode ?? "table") === "table"}>
-        <div class="dgg-empty" style={{ top: HEADER_H + 1 + "px" }}>
-          No rows
+      <div class="dgg-split" classList={{ bottom: sideDock() === "bottom" }}>
+        <div class="dgg-main">
+          <Show when={findOpen()}>
+            <FindBar
+              query={findQuery()}
+              options={findOpts()}
+              filterRows={findFilterRows()}
+              error={findError()}
+              focusRef={(f) => (focusFind = f)}
+              onQuery={onFindQuery}
+              onOptions={setFindOpts}
+              onFilterRows={setFindFilterRows}
+              onNext={findNext}
+              onPrevious={findPrevious}
+              onClose={closeFind}
+            />
+          </Show>
+          <div class="dgg-view">
+            <Show when={!textMode()} fallback={<TextView columns={props.columns} rowCount={props.rowCount} getRow={props.getRow} version={props.version} />}>
+              {tableView}
+            </Show>
+            <Show when={empty() && !textMode()}>
+              <div class="dgg-empty" style={{ top: HEADER_H + 1 + "px" }}>
+                No rows
+              </div>
+            </Show>
+            <div class="dgg-overlay">{props.children}</div>
+          </div>
         </div>
-      </Show>
-      <div class="dgg-overlay">{props.children}</div>
+        <Show when={sideTab()}>
+          {(tab) => (
+            <SidePanel
+              tab={tab()}
+              onTab={setSideTab}
+              dock={sideDock()}
+              onDock={(d) => (setSideDock(d), setSideSize(d === "right" ? Math.max(240, Math.min(520, Math.round(root.clientWidth * 0.3) + 1)) : 260))}
+              twoColumns={sideTwoCol()}
+              onTwoColumns={setSideTwoCol}
+              onClose={() => showSidePanel(null)}
+              size={sideStyleSize()}
+              onSize={setSideSize}
+              columns={props.columns}
+              fieldCols={vis()}
+              activeCol={activeCi}
+              hasRecord={() => !!active() && active()!.r < total()}
+              fieldText={(ci) => editText(recordValue(ci))}
+              fieldIsNull={(ci) => recordValue(ci) === null || recordValue(ci) === undefined}
+              fieldEditable={(ci) => {
+                const a = active();
+                return !!a && canEditCell(a.r, ci);
+              }}
+              nullText={settings.gridNullText}
+              iconClass={iconClass}
+              onFocusField={focusField}
+              onCommitField={commitField}
+              onExpandField={(ci) => {
+                focusField(ci);
+                openValueEditor();
+              }}
+              valueTitle={() => (activeCi() === null ? "" : props.columns[activeCi()!].name)}
+              valueText={() => (activeCi() === null ? "" : editText(recordValue(activeCi()!)))}
+              valueEditable={() => {
+                const a = active();
+                return !!a && canEditCell(a.r, vis()[a.c]);
+              }}
+              onCommitValue={(t) => {
+                const ci = activeCi();
+                if (ci !== null) commitField(ci, t);
+              }}
+              aggregates={aggregates}
+              onFocusGrid={() => root.focus({ preventScroll: true })}
+            />
+          )}
+        </Show>
+      </div>
       <Show when={menu()}>{(m) => <GridMenu x={m().x} y={m().y} items={m().items} onClose={() => (setMenu(null), root.focus({ preventScroll: true }))} />}</Show>
+      <Show when={manage()}>
+        {(m) => (
+          <ManageColumns
+            columns={props.columns}
+            order={order().length === props.columns.length ? order() : props.columns.map((_, i) => i)}
+            hidden={hidden()}
+            anchor={m().anchor}
+            bounds={m().bounds}
+            onToggle={(ci, visible) => {
+              const n = new Set(hidden());
+              if (visible) n.delete(ci);
+              else n.add(ci);
+              setHiddenSet(n);
+            }}
+            onShowAll={() => setHiddenSet(new Set())}
+            onHideAll={() => setHiddenSet(new Set(props.columns.map((_, i) => i)))}
+            onMove={moveColumnTo}
+            onClose={() => (setManage(null), root.focus({ preventScroll: true }))}
+          />
+        )}
+      </Show>
+      <Show when={lfPopup()}>
+        {(m) => (
+          <LocalFilterPopup
+            column={props.columns[m().ci].name}
+            anchor={m().anchor}
+            values={m().values}
+            truncated={m().truncated}
+            selected={colFilters().get(m().ci) ?? new Set<string>()}
+            matchCount={filterMatchCount()}
+            onToggle={(k) => toggleFilterValue(m().ci, k)}
+            onToggleAll={() => toggleAllFilterValues(m().ci)}
+            onClose={() => (setLfPopup(null), root.focus({ preventScroll: true }))}
+          />
+        )}
+      </Show>
       <Show when={valueEd()}>
         {(v) => (
           <div class="dgg-ve-wrap" onMouseDown={() => (setValueEd(null), root.focus({ preventScroll: true }))}>

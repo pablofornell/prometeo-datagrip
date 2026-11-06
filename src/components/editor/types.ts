@@ -120,6 +120,11 @@ export interface SqlEditorProps {
   statementFrame?: boolean;
   /** Show the gutter (line numbers). Default true. */
   gutter?: boolean;
+  /** Line numbers in the gutter. Default: the `editorLineNumbers` setting (Settings > Editor > General > Appearance). */
+  lineNumbers?: boolean;
+  /** Font size / line height override of this editor (the Settings preview); default: the `editorFontSize` / `editorLineHeight` settings. */
+  fontSize?: number;
+  lineHeight?: number;
   /**
    * Single-line mode for the table editor's WHERE / ORDER BY fields: no gutter, stripe or frame,
    * newlines are stripped and Enter calls `onSubmit`.

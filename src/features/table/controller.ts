@@ -15,6 +15,13 @@ export interface TableController {
   nextPage: () => void;
   prevPage: () => void;
   openDdl: () => void;
+  txMode: () => "auto" | "manual";
+  /** A manual-mode transaction is open (uncommitted submitted changes). */
+  inTx: () => boolean;
+  commit: () => void;
+  rollback: () => void;
+  /** Opens the Export Data dialog of the table. */
+  exportData: () => void;
   /** Resolves true when the tab may close (nothing pending, or the user chose Submit / Discard). */
   confirmClose: () => Promise<boolean>;
 }

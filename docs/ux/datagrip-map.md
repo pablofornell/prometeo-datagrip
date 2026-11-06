@@ -1598,3 +1598,70 @@ The jars also hold `lib/intellij.platform.resources.jar!fonts/Roboto-Light.ttf`.
 | Editor line spacing | 1.2 | **inferred**; the float constant was not extracted |
 | Console font | Same as the editor font (JetBrains Mono 13) by default | **inferred**: `ConsoleFontOptions` / `AppConsoleFontConfigurable` exist and no bundled scheme has a `console-font` element |
 | Font size offsets | `ToolWindow.Header.font.size.offset` 0; `Popup.Advertiser.fontSizeOffset` -1; `*.fontSizeOffset.compact` -1 | theme json |
+
+---
+
+## Settings dialog
+
+Captured from DataGrip 2026.3 on a private Xvfb with a copy of the config (Islands Dark), no window manager, dialog at its default size **900x700** (no title bar is drawn without a WM). Shots: `screens/97-settings-*.png`. In `97-settings-appearance-dark.png` the "Editor color scheme" shows `Light` only because the copied config was Islands Light before the theme id was switched; the real Dark default is `Islands Dark`.
+
+**Frame (dialog 900x700, content area):**
+
+| Part | Value |
+|---|---|
+| Left pane | 233px wide (grows to 257px when deep nodes are expanded), 1px divider `#26282C`. Search field at x 8..225, y 10..38 (28px). Magnifier with a small dropdown glyph; filled with a clear `x` when it has text. |
+| Tree | Rows **25px**, indent **16px**, chevron box 16px centred at x=20+16*depth, label at x=34+16*depth. Top-level nodes (Database, Appearance & Behavior, Keymap, Editor...) are semi-bold. Selection spans the full pane width: `#2A4371` when the tree has focus, `#33353B` otherwise. Small "settings stored per project" glyphs at the right of some rows (not copied). |
+| Search | Filters the tree to the matching pages plus their ancestors (all expanded) and selects the first match. The matches are highlighted in the **page content** (orange `#BA9752`), not in the tree rows. |
+| Header | Breadcrumb `Group > Page` at x=250 (semi-bold, 13px, centre y=16), right side: back, forward arrows and a pin toggle. |
+| Page | Text starts at x=17 after the pane edge. Section title (`Limitations`) = label + 1px rule to the right edge, items indented **24px** more (checkbox at +41). Pitch: checkbox rows 29px, rows with a 28px field 40px. Page scrolls with a thin overlay scrollbar. |
+| Footer | 50px, 1px top border. `(?)` help button at the left; buttons `OK` (default, blue) / `Cancel` / `Apply` (disabled until something changes), 72x28, gap 12, right margin 15. There is **no Reset** button; keymap has its own reset in the context menu. |
+
+**Tree (top level order):** `Database`, `Appearance & Behavior`, `Keymap`, `Editor`, `Plugins`, `Version Control`, `Languages`, `AI`, `Tools`, `Backup and Sync`, `Advanced Settings`.
+
+**Pages relevant to the clone:**
+
+- `Appearance & Behavior > Appearance` (`97-settings-appearance-dark.png`): `Theme:` combo (Islands Dark / Light / Sync with OS...), `Editor color scheme:`, `Use custom font: Inter, Size 13` (the UI font), UI Options and Tree Views checkboxes. `Appearance & Behavior > Data Editor and Viewer` only has the grid font / alternate row colors / boolean display (no NULL text; NULL colours live in the colour scheme).
+- `Editor > Font` (`97-settings-editor-font-dark.png`): `Font:` combo (JetBrains Mono), `Size: 13.0`, `Line height: 1.2`, `Enable ligatures`, a link to Reader mode, `Typography Settings`. A **live preview** fills the right pane (x 615..900, bold/regular samples and ligatures).
+- `Editor > General > Appearance` (`97-settings-editor-general-appearance-dark.png`): caret options, `Code Structure` with `Show line numbers: Absolute` (checkbox + combo), indent guides, `Presentation`. `Editor > General` itself has mouse control, soft wraps, virtual space, scroll offset.
+- `Database > Data Editor and Viewer` (`97-settings-database-data-editor-dark.png`): `Limitations`: `Limit page size to: 500` (checkbox + 66px field), `Result set prefetch size`, `Filter history size`, `Maximum number of bytes loaded per value`, `Show first 10 data rows in preview`; `Controls Customization` (paging control position); `Data Presentation` (custom font, alternate rows, boolean as, transpose, number/date formats).
+- `Database > Query Execution` (`97-settings-database-query-execution-dark.png`): a list `Execute`, `Execute (2)`, `Execute (3)` with `Shortcut`, `When caret inside statement execute`, `When caret outside...`, `For selection execute`, `Open results in new tab`, script splitting, `Review parameters before execution`. Sub-pages `Output and Results` (where results show) and `User Parameters`. The default transaction mode is **not** a global setting in DataGrip (it is per data source, `Options` tab).
+- `Keymap` (`97-settings-keymap-dark.png`, also `94-`, `95-`): keymap combo `XWin` + gear, link to plugins, toolbar (expand all, collapse all, edit, **search field** with a "find by shortcut" button), a bordered tree: folders `Editor Actions`, `Main Menu`, `Tool Windows`, `External Tools`, `Version Control Systems`, `Database`... Action rows: icon, name, `inherited from ...` hint and the shortcut as **key caps** (rounded 1px boxes per key, `or` between alternatives) right-aligned. Footer checkbox `Use national layouts for shortcuts`.
+- Search example (`97-settings-search-font-dark.png`, query `font`): the tree shows `Database > Data Editor and Viewer`, `Appearance & Behavior > Appearance / Data Editor and Viewer`, `Keymap`, `Editor > General > Appearance / Editor Tabs`, `Font`, `Color Scheme > ...`, with the term highlighted in the page content.
+
+**What the clone builds (`src/features/settings`):** the same frame, a tree reduced to `Database > Query Execution / Data Editor and Viewer`, `Appearance & Behavior > Appearance`, `Keymap`, `Editor > General > Appearance / Font`. Deviations, all because DataGrip has no equivalent operative control: `Display NULL as:` sits under `Data Editor and Viewer > Data Presentation`, `Default transaction mode:` under `Query Execution > Transactions`, the Font page has no family combo / ligatures (single bundled font), and the UI font size (`Use custom font`) is not offered (the chrome metrics are fixed px). No Reset, no help button, no pin.
+
+---
+
+## Grid views
+
+Captured from DataGrip 2026.3 on a private Xvfb (`:64`) with a copy of the config (Islands Dark), a SQLite sample DB and `select * from customers`; window 1600x1000, 1 screenshot px = 1 CSS px. Screens: `98-grid-transpose-dark.png`, `98-grid-find-dark.png`, `98-grid-record-view-dark.png`, `98-grid-value-tab-dark.png`, `98-grid-aggregates-tab-dark.png`, `98-grid-manage-columns-dark.png`, `98-grid-local-filter-menu-dark.png`, `98-grid-local-filter-popup-dark.png`. The clone lives in `src/components/grid` (`DataGrid`, `FindBar`, `SidePanel`, `ManageColumns`, `LocalFilterPopup`, `SqlPreview`).
+
+**Transpose** (`View as` eye menu: `Transpose` is a check item next to `Table / Tree / Text`).
+- Rows become columns. Top header row (27px, `#292A2C`) holds the row numbers left-aligned (`1`, `2`, `3`...; the active record's header is `#1F2024`). The left column (132px with its border for `signup_date`, i.e. name chars x 8 + 44) holds `[icon] name` on the grid background with a 1px `#323438` right border. It is not highlighted when its cells are selected.
+- Record columns are **fitted to their content**: width = chars x 8 + 14 (17 chars -> 150px, 10 -> 94px, 18 -> 158px). Cells are left-aligned (numbers too), row height 27px.
+- The selected cell keeps `#214283`; the active record is a full-height `#1F2024` band (the transposed "current row").
+- The local filter survives the toggle; the paging pill stays centred.
+
+**Find on Current Page** (`Ctrl+F`, toolbar magnifier, shown pressed while open).
+- A **38px bar** (`#212326`, 1px `#26282C` bottom border) between the toolbar and the header: search icon with a history caret (x 22), query field (text at x 52), `x` clear, [New Line `Ctrl+Shift+Enter`, not built], toggles `Cc` (Match Case, `Alt+C`) `.*` (Regex) `W` (Words, `Alt+W`) 22x22, 1px separator, up/down arrows (previous / next), checkbox `Filter rows`, close `x` at the right edge. A pressed toggle is `#2E4D89`.
+- It opens **prefilled and selected with the text of the active cell**. Typing selects the first match at or after the active cell; `Enter` next, `Shift+Enter` previous, `Esc` closes (selection stays).
+- Every cell that contains a match gets the fill `#114957` (the whole cell, not the substring); the selected cell keeps `#214283`.
+- `Filter rows` hides the rows without a match (row numbers restart at 1).
+
+**Local filter** (the header funnel, and the toolbar filter-grid button `Table Result Local Filter`).
+- Toolbar button menu: `Enable Local Filter` (check) and `Clear Local Filter For All Columns`.
+- Funnel popup `Local Filter For 'country'`: 210x502, title strip `#26282C` (39px), search field (28px), a `Value | Count` header with a check-all box, one 25px row per distinct value (`null` first, then sorted) with a checkbox and the row count, footer `Select a checkbox to filter rows`, or `Number of matches N` once something is ticked. Counts are always over all rows.
+- Ticking values filters **live**: rows not ticked disappear, row numbers restart at 1, the funnel gets a **green dot** (`#5FAD65`, 6px, top right). The pill still says `40 rows`.
+
+**Record View** (`Ctrl+Shift+Enter`, toolbar `Record View`, `Show Record View` in the context menu).
+- A **side panel docked at the right** of the grid (476px = 30% of the island, 1px `#26282C` divider), the grid narrows. Header 36px with pill tabs `Record | Value | Aggregates` (selected `#233558` / `#2E4D89`, 26px high), then a gear (menu: `Move to Bottom`, `Change to Two Column Layout`) and `x`.
+- `Record`: one field per column of the **active row**: label `[column icon] name` (20px) over a 28px input (1px `#40434A`, radius 4, Inter 13), pitch 61px, 12px side padding. The field of the active cell has the 2px blue focus border and an expand icon (opens the value editor). Fields are editable (commit on Enter / blur). There is **no next/previous button**: navigation is the grid selection (arrow keys, click), the fields follow it.
+- `Value`: the text of the active cell in JetBrains Mono 13 with a 22px gutter and a current-line band; header has `fx` and soft-wrap icons.
+- `Aggregates`: bordered box, rows of 31px: `AVG`, `COEFFICIENT_OF_VARIATION` (cut with an ellipsis), `COLS`, `COUNT`, `COUNT_NUMS`, `MAX`, `MEDIAN`, `MIN`, `ROWS`, `SUM` for the selected cells; missing statistics read `Not enough values`; the status bar shows `SUM: ...`.
+
+**Manage Columns** (toolbar columns icon, `Ctrl+F12`; the icon gets a blue dot while columns are hidden).
+- Popup 421x521 (title strip `#26282C` 39px, body `#191A1C`, border `#33353B`): search field `Search columns` (30px), 26px rows `[checkbox] [icon] name TYPE` (type in small gray caps), selected row `#2A4371`, hidden rows dimmed. Hovering a row shows a pin icon and a **drag handle** (reorder). Footer `N of M visible` at the left, links `Show all` (only when something is hidden) and `Hide all` at the right. All columns can be hidden (the row-number gutter stays).
+
+**Preview Pending Changes** (`60-grid-preview-pending-changes-popup-dark.png`): the popup is a 735px wide editor box (310px high, 1px `#26282C` border, 9px left gutter rule, JetBrains Mono 13 / 22px, SQL colors) over a right-aligned `Submit` (primary) / `Cancel` row. The clone's `PendingSqlPreview` takes the SQL text; the table feature builds it.
+
+**Not captured / assumptions:** Light-theme colors of the find bar and the match fill, the `Tree` view, `fx` in the Value tab and the pin column action are not built; the wide-record cap (460px) of the transposed layout is an assumption.

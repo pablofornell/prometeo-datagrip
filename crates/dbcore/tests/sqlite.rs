@@ -265,6 +265,55 @@ async fn paging_and_cancellation() {
     mgr.close_session(&s).await;
 }
 
+/// Editing on a session: own transaction outside `BEGIN`, a savepoint inside it (the transaction survives a failed
+/// batch and the rows are visible to `table_data_in_session`).
+#[tokio::test]
+async fn session_scoped_edit_and_read() {
+    let (_d, _cfg, mgr) = setup().await;
+    let s = mgr.open_session("lite").await.unwrap();
+    let products = ObjectRef::table(Some("main"), "products");
+    let req = TableDataRequest { order_by: Some("id".into()), limit: 10, ..Default::default() };
+    let name_of = |rs: &ResultSet| rs.rows.iter().map(|r| r[2].clone()).collect::<Vec<_>>();
+
+    // auto: committed at once (the pool sees it)
+    let r = mgr.apply_changes_in_session(&s, &products, &[change(ChangeKind::Update, json!({"id": 1}), json!({"name": "Auto"}))]).await.unwrap();
+    assert!(r.committed && r.applied == 1, "{r:?}");
+    assert_eq!(name_of(&mgr.table_data("lite", &products, &req).await.unwrap())[0], json!("Auto"));
+
+    // manual: applied inside the open transaction
+    assert_ok(&run(&mgr, &s, "begin").await);
+    assert!(mgr.session_in_transaction(&s).unwrap());
+    let r = mgr.apply_changes_in_session(&s, &products, &[change(ChangeKind::Update, json!({"id": 1}), json!({"name": "Manual"}))]).await.unwrap();
+    assert!(r.committed, "{r:?}");
+    assert!(mgr.session_in_transaction(&s).unwrap(), "still in the transaction");
+    assert_eq!(name_of(&mgr.table_data_in_session(&s, &products, &req).await.unwrap())[0], json!("Manual"));
+
+    // a failing batch rolls back to the savepoint only: "Manual" survives, the second row stays untouched
+    let r = mgr
+        .apply_changes_in_session(
+            &s,
+            &products,
+            &[change(ChangeKind::Update, json!({"id": 2}), json!({"name": "Lost"})), change(ChangeKind::Update, json!({"id": 999}), json!({"name": "x"}))],
+        )
+        .await
+        .unwrap();
+    assert!(!r.committed && r.applied == 0 && r.results[1].error.is_some(), "{r:?}");
+    let rs = mgr.table_data_in_session(&s, &products, &req).await.unwrap();
+    assert_eq!((name_of(&rs)[0].clone(), name_of(&rs)[1].clone()), (json!("Manual"), json!("Beta")));
+
+    // rollback undoes the batch of the transaction
+    assert_ok(&run(&mgr, &s, "rollback").await);
+    assert_eq!(name_of(&mgr.table_data_in_session(&s, &products, &req).await.unwrap())[0], json!("Auto"));
+
+    // an open paging result of the session is released first
+    let mut h = mgr.execute(&s, "select n from nums", ExecOptions { max_rows: 10, ..Default::default() }).await.unwrap();
+    let ev = wait_done(&mut h).await;
+    assert!(matches!(ev.iter().find(|e| matches!(e, ExecEvent::ResultSet { .. })), Some(ExecEvent::ResultSet { has_more: true, .. })));
+    let rs = mgr.table_data_in_session(&s, &products, &req).await.unwrap();
+    assert_eq!(rs.rows.len(), 2);
+    mgr.close_session(&s).await;
+}
+
 #[tokio::test]
 async fn table_data_edit_export() {
     let (_d, _cfg, mgr) = setup().await;

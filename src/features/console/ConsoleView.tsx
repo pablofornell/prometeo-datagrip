@@ -94,7 +94,7 @@ function ConsoleInner(props: { tab: EditorTab; active: boolean; dsId: string; co
     ),
   );
   createEffect(() => {
-    if (props.active) setStatus("txMode", `Tx: ${session.txMode() === "manual" ? "Manual" : "Auto"}`);
+    if (props.active) setStatus("txMode", session.txMode() === "manual" ? (session.inTx() ? "Tx: Manual (active)" : "Tx: Manual") : "Tx: Auto");
   });
   // open the DB session as soon as the data source is connected, so the schema switcher shows the real schema
   createEffect(() => {

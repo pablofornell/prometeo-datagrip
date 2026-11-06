@@ -8,6 +8,7 @@ import {
   type DataSource,
   type ExecHandle,
   type ExecHandlers,
+  applyChanges,
   closeSession,
   execute,
   executeCollect,
@@ -17,9 +18,10 @@ import {
 } from "../../api/db";
 import { type EditorError, type ExecMark, type ExecuteRequest, type SqlEditorHandle, splitStatements } from "../../components/editor";
 import { errorsField, execMarksField } from "../../components/editor/state";
-import type { PageSize } from "../../components/grid";
+import type { GridChange, PageSize } from "../../components/grid";
 import { type MenuItem, notify, openMenu } from "../../components/ui";
 import { showToolWindow } from "../../state/layout";
+import { settings } from "../../state/settings";
 import { activateTab } from "../../state/tabs";
 import { ensureConnected } from "../explorer";
 import {
@@ -33,7 +35,12 @@ import {
 } from "../output/format";
 import { saveSchema, savedSchema } from "./schemaPref";
 import { qualifiedTitle, resultTable } from "./title";
-import { ConsoleOutput, DEFAULT_PAGE_SIZE, type OutputHost, ResultTab, createOutput, removeOutput } from "../output/model";
+import { resolveEdit } from "./editable";
+import { keyedChanges } from "../output/edit";
+import { ALL_FIRST_CHUNK, ConsoleOutput, type OutputHost, ResultTab, createOutput, defaultPageSize, removeOutput } from "../output/model";
+import { askChoice } from "../table/dialogs";
+import { applyChangesInSession, ensureTransaction } from "../table/session";
+import { previewSql, toRowChanges } from "../table/sql";
 
 export type TxMode = "auto" | "manual";
 export type Isolation = "read uncommitted" | "read committed" | "repeatable read" | "serializable";
@@ -65,6 +72,8 @@ export class ConsoleSession implements OutputHost {
   private disposed = false;
   private connectedLogged = false;
   private curHandle?: Promise<ExecHandle>;
+  /** A result was edited inside the open manual transaction (the editable result is reloaded after a Roll Back). */
+  private editedInTx = false;
 
   readonly txMode: Accessor<TxMode>;
   private readonly setTx: (m: TxMode) => void;
@@ -79,6 +88,7 @@ export class ConsoleSession implements OutputHost {
   private readonly setMarks: (m: ExecMark[]) => void;
   readonly errors: Accessor<EditorError[]>;
   private readonly setErrors: (e: EditorError[]) => void;
+  /** The page size of this console: the pill's choice, else the Settings page size (reactive). */
   readonly pageSize: Accessor<PageSize>;
   private readonly setPageSize: (p: PageSize) => void;
 
@@ -95,7 +105,7 @@ export class ConsoleSession implements OutputHost {
       const [g, s] = createSignal<T>(v);
       return [g, (x: T) => void s(() => x)];
     };
-    [this.txMode, this.setTx] = sig<TxMode>("auto");
+    [this.txMode, this.setTx] = sig<TxMode>(settings.defaultTxMode);
     [this.isolation, this.setIso] = sig<Isolation>(ds.driver === "mysql" ? "repeatable read" : "read committed");
     [this.inTx, this.setInTx] = sig(false);
     // the schema chosen last time shows at once; it is applied to the session when that opens (`ensureSession`)
@@ -104,7 +114,9 @@ export class ConsoleSession implements OutputHost {
     );
     [this.marks, this.setMarks] = sig<ExecMark[]>([]);
     [this.errors, this.setErrors] = sig<EditorError[]>([]);
-    [this.pageSize, this.setPageSize] = sig<PageSize>(DEFAULT_PAGE_SIZE);
+    const [sizeOverride, setSizeOverride] = createSignal<PageSize | null>(null);
+    this.pageSize = () => sizeOverride() ?? defaultPageSize();
+    this.setPageSize = (p) => void setSizeOverride(() => p);
   }
 
   get dsId(): string {
@@ -267,7 +279,7 @@ export class ConsoleSession implements OutputHost {
 
   private async startExecute(sid: string, sql: string, o: RunOptions, handlers: ExecHandlers) {
     const size = o.pageSize ?? this.pageSize();
-    const options = { maxRows: size === "all" ? DEFAULT_PAGE_SIZE : size, keepOpenSecs: 600 };
+    const options = { maxRows: size === "all" ? ALL_FIRST_CHUNK : size, keepOpenSecs: 600 };
     return execute(sid, sql, handlers, options);
   }
 
@@ -276,6 +288,21 @@ export class ConsoleSession implements OutputHost {
     if (out.running()) {
       notify({ kind: "info", title: "The console is busy", body: "Wait for the running statement or cancel it (Ctrl+F2)." });
       return;
+    }
+    const dirty = out.results().filter((r) => r.pending() > 0 && (r.id === o.replace?.id || (!o.replace && !r.pinned())));
+    if (dirty.length) {
+      const n = dirty.reduce((a, r) => a + r.pending(), 0);
+      const a = await askChoice({
+        title: "Uncommitted Changes",
+        message: `The result has ${n} pending change${n === 1 ? "" : "s"} that were not submitted. Running the statement discards them.`,
+        choices: [
+          { label: "Discard and Run", value: "run", primary: true },
+          { label: "Cancel", value: "cancel" },
+        ],
+        cancel: "cancel",
+      });
+      if (a !== "run") return;
+      if (out.running()) return;
     }
     out.setRunning(true);
     showToolWindow("output", false);
@@ -328,6 +355,8 @@ export class ConsoleSession implements OutputHost {
           leadingComment(sql) ?? (req.ranges.length && cur ? this.attachedComment(cur.from) : null) ?? (parts ? qualifiedTitle(parts, this.driver, this.ds.database, this.schema()) : `Result ${ordinal}`);
         const tab = new ResultTab(meta, e.rows, e.hasMore, title, sql, e.index, () => handleP, pageSize);
         tab.ms = ms;
+        // editable when it is one table with a usable key (resolved with the table's metadata, so a moment later)
+        if (meta.length) void resolveEdit(this.ds, meta, sql, this.schema()).then((t) => !tab.closed && tab.setEdit(t));
         out.addResult(tab, { first, replace: first ? o.replace : undefined });
         first = false;
         const id = out.log("text", rowsRetrieved(e.rows.length, ms));
@@ -436,6 +465,54 @@ export class ConsoleSession implements OutputHost {
     out.setRunning(false);
   }
 
+  // ------------------------------------------------------------ editing results
+
+  /**
+   * Submit of an editable result. Tx: Auto applies the changes in their own transaction; Tx: Manual applies them
+   * inside the console's transaction (a savepoint on its session), which stays open until Commit / Roll Back. The
+   * result is executed again afterwards, so it shows what the database now has.
+   */
+  async applyEdits(tab: ResultTab, changes: GridChange[]): Promise<boolean> {
+    const edit = tab.edit();
+    if (!edit || tab.applying()) return false;
+    const fail = (body: string) => {
+      notify({ kind: "error", title: "Cannot submit the changes", body });
+      return false;
+    };
+    tab.setApplying(true);
+    try {
+      const rowChanges = toRowChanges(keyedChanges(edit, tab.meta, tab.rows, changes), []);
+      let res;
+      if (this.txMode() === "manual") {
+        const sid = await this.ensureSession();
+        tab.detach(); // the paging stream of the result is released by the session operation
+        await ensureTransaction(sid, this.driver);
+        this.setInTx(true);
+        res = await applyChangesInSession(this.ds.id, sid, edit.table, rowChanges);
+        this.editedInTx = true;
+      } else {
+        res = await applyChanges(this.ds.id, edit.table, rowChanges);
+      }
+      if (!res.committed) return fail(res.results.find((r) => r.error)?.error ?? "The transaction was rolled back.");
+    } catch (e) {
+      return fail(errText(e));
+    } finally {
+      tab.setApplying(false);
+    }
+    this.out.log("text", this.txMode() === "manual" ? `${changes.length} change${changes.length === 1 ? "" : "s"} applied in the open transaction` : `${changes.length} change${changes.length === 1 ? "" : "s"} committed`);
+    tab.gridApi?.clearChanges();
+    tab.setPending(0);
+    this.rerun(tab);
+    return true;
+  }
+
+  /** The statements Submit would run (Preview Pending Changes). */
+  previewEdits(tab: ResultTab, changes: GridChange[]): string {
+    const edit = tab.edit();
+    if (!edit) return "";
+    return previewSql(this.driver, edit.table, tab.meta, keyedChanges(edit, tab.meta, tab.rows, changes));
+  }
+
   // ------------------------------------------------------------ transactions
 
   async setTxMode(m: TxMode): Promise<void> {
@@ -465,6 +542,12 @@ export class ConsoleSession implements OutputHost {
       await this.silent(sid, kind === "commit" ? "COMMIT" : "ROLLBACK");
       this.out.log("text", kind === "commit" ? "transaction committed" : "transaction rolled back");
       this.setInTx(false);
+      // the edited result still shows the rolled back values: execute it again
+      const edited = this.editedInTx;
+      this.editedInTx = false;
+      const cur = this.out.current();
+      const target = cur?.edit() ? cur : this.out.results().find((r) => r.edit());
+      if (kind === "rollback" && edited && target) this.rerun(target);
     } catch (e) {
       this.out.log("error", errText(e));
     }

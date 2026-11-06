@@ -10,6 +10,7 @@ import { OutputToolbar } from "./OutputToolbar";
 import "./output.css";
 
 export { currentOutput, outputOf } from "./model";
+export { exportCurrentResult } from "./export";
 export type { ConsoleOutput, ResultTab } from "./model";
 
 registerSlot("output.header", OutputHeader);
