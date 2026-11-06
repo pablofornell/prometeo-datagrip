@@ -134,17 +134,31 @@ const isGenerated = (n: TreeNode): boolean => {
   return typeof x.extra === "string" && /generated/i.test(x.extra);
 };
 
+/** What `schemaChange` reads out of a statement. */
+export interface SchemaChange {
+  /** The schema the statement selects when the text says it unambiguously (`USE x`, `SET search_path TO x`), else null. */
+  schema: string | null;
+  /**
+   * PostgreSQL: the value list of `SET search_path` / `SET SCHEMA` exactly as written (`"$user", public`), which is
+   * what a reopened session must run again (`SET search_path TO <searchPath>`); null when the statement resets it
+   * (`DEFAULT`, `RESET`, `DISCARD ALL`). Absent for MySQL `USE`.
+   */
+  searchPath?: string | null;
+}
+
 /**
- * Whether a statement switches the session's schema, and to which one: `{ schema }` (null when it cannot be read from
- * the text), or null when the statement does not touch it. Only the START of the statement counts: `update t set ...`
- * and `select 'use x'` do not (a regex over the whole script took them for `SET` / `USE`).
+ * Whether a statement switches the session's schema: `{ schema, searchPath? }` (`schema` is null when it cannot be
+ * read from the text: `"$user", public` and `pg_temp, public` do not select a schema called `$user` / `pg_temp`, the
+ * server knows which one `current_schema()` is), or null when the statement does not touch it. Only the START of the
+ * statement counts: `update t set ...` and `select 'use x'` do not (a regex over the whole script took them for `SET`
+ * / `USE`).
  */
-export function schemaChange(stmt: string, dialect: DataSource["driver"]): { schema: string | null } | null {
+export function schemaChange(stmt: string, dialect: DataSource["driver"]): SchemaChange | null {
   if (dialect === "sqlite") return null;
-  const toks = lex(stmt, dialect)
+  const all = lex(stmt, dialect)
     .filter((t) => t.kind !== "comment")
-    .slice(0, 8)
-    .map((t) => ({ kind: t.kind, text: stmt.slice(t.from, t.to) }));
+    .map((t) => ({ kind: t.kind, from: t.from, to: t.to, text: stmt.slice(t.from, t.to) }));
+  const toks = all.slice(0, 8);
   const w = (i: number) => (toks[i]?.kind === "word" ? lower(toks[i].text) : "");
   const name = (i: number): string | null => {
     const t = toks[i];
@@ -154,14 +168,29 @@ export function schemaChange(stmt: string, dialect: DataSource["driver"]): { sch
     return null;
   };
   if (dialect === "mysql") return w(0) === "use" ? { schema: name(1) } : null;
-  if (w(0) === "discard" && w(1) === "all") return { schema: null };
-  if (w(0) === "reset" && (w(1) === "search_path" || w(1) === "all")) return { schema: null };
+  if (w(0) === "discard" && w(1) === "all") return { schema: null, searchPath: null };
+  if (w(0) === "reset" && (w(1) === "search_path" || w(1) === "all")) return { schema: null, searchPath: null };
   if (w(0) !== "set") return null;
   let i = 1;
   if (w(i) === "local") return null; // reverts when the transaction ends
   if (w(i) === "session") i++;
-  if (w(i) === "schema") return { schema: name(i + 1) };
-  if (w(i) === "search_path" && (w(i + 1) === "to" || toks[i + 1]?.text === "=")) return { schema: name(i + 2) };
+  // the values after `TO` / `=` / `SCHEMA`, up to the closing `;`
+  const values = (from: number) => {
+    let rest = all.slice(from);
+    while (rest.length && rest[rest.length - 1].text === ";") rest = rest.slice(0, -1);
+    return rest;
+  };
+  const change = (from: number): SchemaChange => {
+    const v = values(from);
+    if (v.length === 0) return { schema: null };
+    if (v.length === 1 && v[0].kind === "word" && lower(v[0].text) === "default") return { schema: null, searchPath: null };
+    const text = stmt.slice(v[0].from, v[v.length - 1].to);
+    const one = v.length === 1 ? name(from) : null; // a list picks its schema on the server
+    const special = one !== null && /^(\$user|pg_temp(_\d+)?|pg_catalog)$/i.test(one);
+    return { schema: special ? null : one, searchPath: text };
+  };
+  if (w(i) === "schema") return change(i + 1);
+  if (w(i) === "search_path" && (w(i + 1) === "to" || toks[i + 1]?.text === "=")) return change(i + 2);
   return null;
 }
 

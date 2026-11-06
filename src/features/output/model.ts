@@ -8,6 +8,7 @@ import { createStore, produce } from "solid-js/store";
 import type { Cell, ColumnMeta, Driver, ExecHandle, ExportFormat, TxStatus } from "../../api/db";
 import type { DataGridApi, GridChange, GridColumn, GridViewState, ViewMode } from "../../components/grid";
 import type { PageSize } from "../../components/grid";
+import { isConnectionLost } from "../../state/connection-errors";
 import { settings } from "../../state/settings";
 import { activeTab } from "../../state/tabs";
 import type { EditTarget } from "./edit";
@@ -37,6 +38,8 @@ export interface OutputHost {
   txStatus(): TxStatus;
   /** Resolves true when the transaction ended (or there was none). */
   endTx(kind: "commit" | "rollback"): Promise<boolean>;
+  /** A paging fetch failed because the connection is gone (`isConnectionLost`): the host drops its dead session. */
+  connectionLost?(): void;
   openTxMenu(anchor: HTMLElement | DOMRect): void;
   /**
    * Submits the pending changes of an editable result (inside the console's transaction when Tx is Manual) and
@@ -109,6 +112,8 @@ export class ResultTab {
   fetchError?: string;
   /** Where the problem notes go (the Output log of the console that owns the tab). */
   log?: (kind: "text" | "error", text: string) => void;
+  /** Set by the console: its session died under a paging fetch. */
+  onConnectionLost?: () => void;
 
   constructor(
     readonly meta: ColumnMeta[],
@@ -161,6 +166,7 @@ export class ResultTab {
       this.fetchError = String((e as Error)?.message ?? e).replace(/^Error:\s*/, "");
       this.setHasMore(false);
       this.markPartial(partialMessage(this.fetchError, this.rows.length));
+      if (isConnectionLost(e)) this.onConnectionLost?.();
     } finally {
       this.setLoadingMore(false);
     }
@@ -309,6 +315,7 @@ export class ConsoleOutput {
   /** New result tabs of an execution: replaces `replace` in place (Reload) or every unpinned tab. */
   addResult(tab: ResultTab, opts: { first: boolean; replace?: ResultTab }): void {
     tab.log = (kind, text) => void this.log(kind, text);
+    tab.onConnectionLost = () => this.host?.connectionLost?.();
     let list = this.results();
     if (opts.first) {
       if (opts.replace) {

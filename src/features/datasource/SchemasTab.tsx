@@ -2,7 +2,7 @@ import { For, Show, createEffect, createMemo, createSignal, on, untrack } from "
 import { introspect, type TreeNode } from "../../api/db";
 import { Checkbox, Icon, TextField, tip } from "../../components/ui";
 import { withConnection } from "./remote";
-import { pathKey, visibleSchemas } from "./schemas";
+import { parseVisibleSchemas, pathKey } from "./schemas";
 import type { Session } from "./session";
 
 interface Node {
@@ -73,7 +73,7 @@ export function SchemasTab(props: { s: Session }) {
     return out;
   });
   const sel = createMemo(() => {
-    const v = visibleSchemas(d().form);
+    const v = parseVisibleSchemas(d().form.options.visibleSchemas); // the draft; Apply stores it in the UI state
     return v ? new Set(v.map(pathKey)) : null; // null = all
   });
   const isOn = (path: string[]) => sel() === null || sel()!.has(pathKey(path));

@@ -10,7 +10,7 @@ persistence (`explorer.state`), status-bar crumbs. `model.ts` node kinds, icons,
 `ExplorerBody.tsx` / `ExplorerToolbar.tsx` / `dialogs.tsx` UI. `schema.ts` reactive `schemaSnapshotFor` and the
 sequences / routines that the SQL editor's completion gets through `setCompletionExtrasProvider` (components/editor/extras.ts).
 `rename.ts` Shift+F6 (`ALTER ... RENAME` per DBMS, identifier quoting), `QuickDoc.tsx` Ctrl+Q popup,
-`SchemaSelector.tsx` popup of the schema badge (saves `options.visibleSchemas`, then reloads the tree).
+`SchemaSelector.tsx` popup of the schema badge (saves the schema filter in the UI state, then reloads the tree; no reconnect).
 `icons/` explorer-local icons (see icons/README.md).
 
 ## Module API (`src/features/explorer/index.ts`)

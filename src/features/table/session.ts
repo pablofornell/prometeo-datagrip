@@ -22,6 +22,7 @@ import {
   tableData,
 } from "../../api/db";
 import { invoke } from "../../api/tauri";
+import { isConnectionLost } from "../../state/connection-errors";
 import { INTERNAL_MARK } from "../output/format";
 
 export function tableDataInSession(dsId: string, sessionId: string, table: ObjectRef, request: TableDataRequest = {}): Promise<ResultSet> {
@@ -36,9 +37,11 @@ export function applyChangesInSession(dsId: string, sessionId: string, table: Ob
   return isTauri() ? invoke("apply_changes_in_session", { sessionId, table, changes }) : applyChanges(dsId, table, changes);
 }
 
-/** The server says the session is gone (data source disconnected / deactivated, console closed). */
-const LOST = /Session '[^']*' does not exist|Session is closed/i;
-export const isSessionLost = (e: unknown): boolean => LOST.test(String((e as Error)?.message ?? e));
+/**
+ * The session is gone: the data source was disconnected / deactivated, the console closed, or the server killed the
+ * connection (`connectionLost`, `[08006]` / `[08S01]` messages). See `isConnectionLost`.
+ */
+export const isSessionLost = isConnectionLost;
 
 export type TxEndedEvent = Extract<ExecEvent, { kind: "txEnded" }>;
 
@@ -58,7 +61,7 @@ export function txReport(events: ExecEvent[]): TxReport {
   return r;
 }
 
-export type TxEndKind = "commit" | "rollback" | "implicit" | "serverRollback";
+export type TxEndKind = "commit" | "rollback" | "implicit" | "serverRollback" | "connectionLost";
 
 /**
  * What a `txEnded` event means, given the statement that produced it (`COMMIT` / `END` that ends with
@@ -66,6 +69,7 @@ export type TxEndKind = "commit" | "rollback" | "implicit" | "serverRollback";
  */
 export function classifyTxEnd(sql: string | null, e: Pick<TxEndedEvent, "committed" | "tag">): TxEndKind {
   if (e.tag === "IMPLICIT COMMIT") return "implicit";
+  if (e.tag === "CONNECTION LOST") return "connectionLost"; // the connection took the transaction with it
   if (e.committed) return "commit";
   const kw = (/^\s*(?:\/\*[\s\S]*?\*\/\s*)*([A-Za-z]+)/.exec(sql ?? "")?.[1] ?? "").toUpperCase();
   return kw === "COMMIT" || kw === "END" || sql === null ? "serverRollback" : "rollback";
@@ -75,11 +79,16 @@ export const SERVER_ROLLBACK_LOG = "transaction rolled back by the server: the t
 export const SERVER_ROLLBACK_TITLE = "The transaction was rolled back";
 export const SERVER_ROLLBACK_BODY = "The transaction had failed, so the server rolled it back instead of committing it. Nothing was saved.";
 
+/** The failure of a statement of ours as an Error that keeps the backend's `connectionLost` flag (`isConnectionLost`). */
+export function controlError(err: { message: string; connectionLost?: boolean }): Error {
+  return Object.assign(new Error(err.message), err.connectionLost ? { connectionLost: true } : {});
+}
+
 /** Runs a statement the user did not type (hidden from the history popup) and reports the transaction events. */
 export async function control(sessionId: string, sql: string): Promise<TxReport> {
   const ev = await executeCollect(sessionId, `${sql} ${INTERNAL_MARK}`, { maxRows: 10, stopOnError: true });
   const err = ev.find((e) => e.kind === "error");
-  if (err && err.kind === "error") throw new Error(err.message);
+  if (err && err.kind === "error") throw controlError(err);
   return txReport(ev);
 }
 

@@ -14,6 +14,7 @@ import { setStatus } from "../../state/status";
 import { activeTab, registerBeforeClose } from "../../state/tabs";
 import { registerConsoleActions } from "./actions";
 import { ConsoleView } from "./ConsoleView";
+import { createQuitHandler } from "./quit";
 import { confirmEndTransactions, openTransactions } from "./txguard";
 import "./console.css";
 
@@ -44,13 +45,16 @@ function guardQuit(): void {
     try {
       const { getCurrentWindow } = await import("@tauri-apps/api/window");
       const win = getCurrentWindow();
-      const un = await win.onCloseRequested(async (e) => {
-        e.preventDefault();
-        if (!(await confirmEndTransactions({ reason: "quitting the application" }))) return;
-        un();
-        unlisten = undefined;
-        await win.close();
-      });
+      const un: () => void = await win.onCloseRequested(
+        createQuitHandler({
+          confirm: () => confirmEndTransactions({ reason: "quitting the application" }),
+          quit: async () => {
+            un();
+            unlisten = undefined;
+            await win.close();
+          },
+        }),
+      );
       unlisten = un;
       if (openTransactions({}).length === 0) (un(), (unlisten = undefined)); // ended while the handler was being installed
     } catch {

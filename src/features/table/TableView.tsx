@@ -35,6 +35,7 @@ import { registerController } from "./controller";
 import { confirmEndTransactions } from "../console/txguard";
 import { connectedDataSourceIds, ensureConnected } from "../explorer";
 import { rowsRetrieved } from "../output/format";
+import { CONNECTION_LOST_LOG, CONNECTION_LOST_TX_LOG } from "../../state/connection-errors";
 import { type ConsoleOutput, createOutput, removeOutput } from "../output/model";
 import { dsInfo, errText, loadDataSources, writeClipboard } from "./ds";
 import { exportTableQuery } from "./exportData";
@@ -309,15 +310,25 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
     }
   }
 
-  /** The session is gone (data source disconnected / deactivated): the server rolled the transaction back with it. */
-  function sessionLost(): void {
+  /**
+   * The session is gone (connection lost, data source disconnected / deactivated): the server rolled the transaction
+   * back with it. The next read / submit opens a new session (Manual mode).
+   */
+  function sessionLost(o: { closed?: boolean } = {}): void {
     const had = inTx();
+    const old = sid();
     setSid(undefined);
     setTxStatus("idle");
-    if (had) {
-      out?.log("error", "the transaction was rolled back: connection closed");
-      notify({ kind: "warning", title: "The transaction was rolled back", body: `The connection of '${props.tab.title}' was closed, so its open transaction was rolled back. Reload the page to see the data as the database holds it.` });
-    } else out?.log("text", "connection closed");
+    if (old) void closeSession(old).catch(() => {}); // releases a dead session (the backend accepts that)
+    if (o.closed) {
+      if (had) {
+        out?.log("error", "the transaction was rolled back: connection closed");
+        notify({ kind: "warning", title: "The transaction was rolled back", body: `The connection of '${props.tab.title}' was closed, so its open transaction was rolled back. Reload the page to see the data as the database holds it.` });
+      } else out?.log("text", "connection closed");
+    } else if (had) {
+      out?.log("error", CONNECTION_LOST_TX_LOG);
+      notify({ kind: "warning", title: "The transaction was rolled back", body: `The connection of '${props.tab.title}' was lost, so its open transaction was rolled back. Reload the page to see the data as the database holds it.` });
+    } else out?.log("text", CONNECTION_LOST_LOG);
   }
 
   /** After `sessionLost`: a new session for the next operation (Manual mode), `undefined` in Auto mode / on failure. */
@@ -334,7 +345,7 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
 
   // the data source was disconnected while this editor holds a transaction session
   createEffect(() => {
-    if (!connectedDataSourceIds().has(dsId) && untrack(sid)) sessionLost(); // reopened on the next read / submit
+    if (!connectedDataSourceIds().has(dsId) && untrack(sid)) sessionLost({ closed: true }); // reopened on the next read / submit
   });
 
   /** Tx: Manual opens a session for this tab; back to Auto asks about an open transaction and drops the session. */
@@ -350,7 +361,7 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
       return;
     }
     const had = inTx();
-    if (had && !(await confirmEndTransactions({ tabId: props.tab.id, reason: "switching to the Auto transaction mode" }))) return;
+    if (had && !(await confirmEndTransactions({ tabId: props.tab.id, reason: "switching to the Auto transaction mode", keepsSession: true }))) return;
     const id = sid();
     setSid(undefined);
     setTxStatus("idle");
@@ -363,7 +374,9 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
    * Commit / Roll Back of the open transaction. Returns whether it ended. `reload`: reload the page when the data on
    * screen may not be the database's (rolled back by us or by the server).
    */
+  let txError: string | null = null;
   async function endTx(kind: "commit" | "rollback", reload = true): Promise<boolean> {
+    txError = null;
     const id = sid();
     if (!id || !inTx()) return true;
     try {
@@ -371,6 +384,10 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
       if (r.status) setTxStatus(r.status);
       else await syncTxStatus(id);
       const how = r.ended[0] ? classifyTxEnd(kind === "commit" ? "COMMIT" : "ROLLBACK", r.ended[0]) : kind;
+      if (how === "connectionLost") {
+        sessionLost();
+        return true; // the connection took the transaction with it
+      }
       if (how === "serverRollback") {
         out?.log("error", SERVER_ROLLBACK_LOG);
         notify({ kind: "error", title: SERVER_ROLLBACK_TITLE, body: SERVER_ROLLBACK_BODY });
@@ -383,6 +400,7 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
         sessionLost();
         return true; // the connection took the transaction with it
       }
+      txError = errText(e);
       fail(kind === "commit" ? "Cannot commit the transaction" : "Cannot roll back the transaction", e);
       await syncTxStatus(id);
       return false;
@@ -437,6 +455,7 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
       inTx,
       txStatus,
       endTx: (kind) => endTx(kind, false),
+      txError: () => txError,
       commit,
       rollback,
       exportData: () => setExportDlg(true),

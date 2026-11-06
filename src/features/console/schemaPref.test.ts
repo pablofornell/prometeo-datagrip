@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { savedSchema, saveSchema } from "./schemaPref";
+import { savedSchema, saveSchema, saveSearchPath, savedSearchPath } from "./schemaPref";
 
 describe("console schema preference", () => {
   it("is kept per data source and console, and can be forgotten", () => {
@@ -14,5 +14,12 @@ describe("console schema preference", () => {
     saveSchema("pg", "console", null);
     expect(savedSchema("pg", "console")).toBeNull();
     expect(savedSchema("pg", "console_1")).toBe("inventory");
+  });
+  it("keeps the search_path text verbatim, per console", () => {
+    saveSearchPath("pg", "console", '"$user", public');
+    expect(savedSearchPath("pg", "console")).toBe('"$user", public');
+    expect(savedSearchPath("pg", "console_1")).toBeNull();
+    saveSearchPath("pg", "console", null);
+    expect(savedSearchPath("pg", "console")).toBeNull();
   });
 });

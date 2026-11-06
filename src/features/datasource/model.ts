@@ -17,11 +17,14 @@
  *   autoDisconnectSec  absent = off, otherwise seconds of inactivity before the connection is closed
  *   startupScript      SQL run when a session opens
  *   showSystemSchemas  "true": the explorer also lists system schemas
- *   visibleSchemas     JSON array of introspection paths of the schemas to show, e.g. [["postgres","public"]]
- *                      (PG: [db, schema], MySQL: [schema], SQLite: ["main"]). Absent = all (non-system).
+ *   visibleSchemas     NOT a backend option any more: the form carries it (JSON array of introspection paths of the
+ *                      schemas to show, e.g. [["postgres","public"]]; absent = all non-system) but Apply stores it in the
+ *                      UI state (state/schema-filter), because options are part of the connection fingerprint and a
+ *                      view filter must not reconnect. Old configs that still have it are read as the fallback.
  * Any other key is a free driver property edited in the Advanced tab.
  */
 import type { DataSource, DataSourceConfig } from "../../api/db";
+import { visibleSchemasRaw } from "./schemas";
 import { DBMS, type Dbms, buildUrl, dbmsOf, fromSqlxUrl, isMemoryUrl, parseUrl, sqliteFileOfUrl, toSqlxUrl } from "./drivers";
 
 export type ConnType = "default" | "memory" | "url";
@@ -123,6 +126,9 @@ export function formFromDataSource(ds: DataSource): Form {
     readOnly: ds.readOnly,
     options: { ...ds.options },
   };
+  const filter = visibleSchemasRaw(ds);
+  if (filter) f.options.visibleSchemas = filter;
+  else delete f.options.visibleSchemas;
   if (connType === "url") {
     f.url = fromSqlxUrl(dbms, ds.urlOverride!);
     const p = parseUrl(dbms, f.url);
@@ -145,10 +151,47 @@ export const normalizedForm = (f: Form): Form => ({
   options: Object.fromEntries(Object.entries(f.options).sort(([a], [b]) => (a < b ? -1 : 1))),
 });
 
+/**
+ * The part of a form snapshot that is saved to the backend: everything but the schema filter (a view setting that goes
+ * to the UI state). A change here needs a `save_data_source`.
+ */
+export function savedPart(snapshot: string): string {
+  const f = JSON.parse(snapshot) as Form;
+  delete f.options?.visibleSchemas;
+  return JSON.stringify(f);
+}
+
+/**
+ * The part that makes the backend reconnect when it changes (its connection fingerprint leaves out the name and the
+ * color; the schema filter is not saved there at all). Only these changes can end open transactions.
+ */
+export function reconnectPart(snapshot: string): string {
+  const f = JSON.parse(snapshot) as Partial<Form>;
+  delete f.options?.visibleSchemas;
+  delete f.name;
+  delete f.color;
+  return JSON.stringify(f);
+}
+
+/**
+ * Whether saving `after` over `before` makes the backend reconnect the data source: its connection fingerprint is the
+ * whole config except the name, the color and the password (src-tauri `connection_fingerprint`). So an options key
+ * does reconnect, and that is why view settings do not live there.
+ */
+export function reconnectsOnSave(before: Partial<DataSourceConfig>, after: Partial<DataSourceConfig>): boolean {
+  const stable = (c: Partial<DataSourceConfig>): string => {
+    const { name: _n, color: _c, password: _p, hasPassword: _h, passwordStorage: _s, options, ...rest } = c as Record<string, unknown> & { options?: Record<string, string> };
+    const opts = Object.fromEntries(Object.entries(options ?? {}).sort(([x], [y]) => (x < y ? -1 : 1)));
+    return JSON.stringify(Object.entries({ ...rest, options: opts }).sort(([x], [y]) => (x < y ? -1 : 1)));
+  };
+  return stable(before) !== stable(after);
+}
+
 /** Form -> backend config (without `password`, which the caller adds). */
 export function configFromForm(f: Form, id: string | null): Partial<DataSourceConfig> & { name: string } {
   const info = DBMS[f.dbms];
   const options = { ...f.options };
+  delete options.visibleSchemas; // a view filter (UI state), not part of the connection
   if (f.dbms === "mariadb") options.dbms = "mariadb";
   else delete options.dbms;
   if (f.auth === "none") options.auth = "none";

@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { friendlyConnectionError } from "./connection-errors";
+import { friendlyConnectionError, isConnectionLost } from "./connection-errors";
 
 const RAW = "error communicating with database: Connection refused (os error 111)";
 
@@ -30,5 +30,28 @@ describe("friendlyConnectionError", () => {
       friendlyConnectionError('error returned from database: password authentication failed for user "postgres"', { driver: "postgres", host: "h", port: 1 }),
     ).toBe('error returned from database: password authentication failed for user "postgres"');
     expect(friendlyConnectionError("error communicating with database: broken pipe", { driver: "postgres" })).toBe("broken pipe");
+  });
+});
+
+describe("isConnectionLost", () => {
+  it("the backend's connectionLost flag", () => {
+    expect(isConnectionLost({ connectionLost: true, message: "whatever" })).toBe(true);
+    expect(isConnectionLost({ connectionLost: false, message: "syntax error" })).toBe(false);
+  });
+  it("the SQLSTATE prefix of PG / SQLite (08006) and MySQL (08S01), with or without `Error:`", () => {
+    expect(isConnectionLost(new Error("[08006] connection lost: the server closed the connection"))).toBe(true);
+    expect(isConnectionLost("Error: [08S01] connection lost")).toBe(true);
+    expect(isConnectionLost(new Error("[08003] no connection"))).toBe(true);
+    expect(isConnectionLost(new Error("[08001] cannot connect"))).toBe(true);
+  });
+  it("the old `Session ... does not exist` text", () => {
+    expect(isConnectionLost(new Error("Session 's3' does not exist"))).toBe(true);
+    expect(isConnectionLost("Session is closed")).toBe(true);
+  });
+  it("is not fooled by other errors", () => {
+    expect(isConnectionLost(new Error('relation "t" does not exist'))).toBe(false);
+    expect(isConnectionLost(new Error("syntax error near [08006]"))).toBe(false);
+    expect(isConnectionLost(undefined)).toBe(false);
+    expect(isConnectionLost(null)).toBe(false);
   });
 });

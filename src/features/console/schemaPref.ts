@@ -20,3 +20,25 @@ export function saveSchema(dsId: string, consoleName: string, schema: string | n
   cache = m;
   saveUiState(KEY, m);
 }
+
+const PATH_KEY = "console.searchPath";
+let pathCache: Record<string, string> | undefined;
+const paths = () => (pathCache ??= loadLocal<Record<string, string>>(PATH_KEY, {}));
+
+/**
+ * The value list of the `SET search_path` the user ran in a console, verbatim (`"$user", public`): a reopened session
+ * runs it again, which one schema name could not express.
+ */
+export function savedSearchPath(dsId: string, consoleName: string): string | null {
+  return paths()[keyOf(dsId, consoleName)] ?? null;
+}
+
+/** `null` forgets it (RESET / DEFAULT, or the schema was switched some other way). */
+export function saveSearchPath(dsId: string, consoleName: string, path: string | null): void {
+  const m = { ...paths() };
+  if (path) m[keyOf(dsId, consoleName)] = path;
+  else delete m[keyOf(dsId, consoleName)];
+  if (JSON.stringify(m) === JSON.stringify(paths())) return;
+  pathCache = m;
+  saveUiState(PATH_KEY, m);
+}

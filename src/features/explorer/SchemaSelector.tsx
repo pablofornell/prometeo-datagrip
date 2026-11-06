@@ -1,62 +1,16 @@
 /**
  * Schema selector popup (click on the `1` / `2 of 4` badge of a data source or database node): a checklist of the
- * schemas that saves `options.visibleSchemas` (the key of Data Sources > Schemas) and refreshes the tree.
- * Enter or a click outside applies, Escape cancels.
+ * schemas. The choice is a view filter kept in the UI state (the same store as Data Sources > Schemas), so applying it
+ * refreshes the tree and does NOT reconnect: sessions and their open transactions stay. Enter or a click outside
+ * applies, Escape cancels.
  */
 import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
 import { render } from "solid-js/web";
-import type { DataSource, TreeNode } from "../../api/db";
+import type { DataSource } from "../../api/db";
 import { Checkbox, notify } from "../../components/ui";
-import { pathKey, visibleSchemas } from "../datasource/schemas";
-import { updateDataSource } from "./commands";
-import { dsOf, rawIntrospect } from "./core";
-
-export interface SchemaItem {
-  path: string[];
-  name: string;
-  system: boolean;
-}
-export interface SchemaGroup {
-  /** PostgreSQL database; null for MySQL / SQLite (the schemas hang off the data source). */
-  name: string | null;
-  items: SchemaItem[];
-}
-
-/** Every schema the server lists (system ones included), grouped by database for PostgreSQL. */
-export async function loadSchemaGroups(ds: DataSource): Promise<SchemaGroup[]> {
-  const toItems = (nodes: TreeNode[]): SchemaItem[] =>
-    nodes.filter((n) => n.kind === "schema").map((n) => ({ path: n.path, name: n.name, system: !!n.extra.system }));
-  const top = await rawIntrospect(ds.id, [], true);
-  if (ds.driver !== "postgres") return [{ name: null, items: toItems(top) }];
-  const dbs = top.filter((n) => n.kind === "database" && (n.hasChildren || n.extra.current));
-  return Promise.all(dbs.map(async (d) => ({ name: d.name, items: toItems(await rawIntrospect(ds.id, d.path, true)) })));
-}
-
-/**
- * `options.visibleSchemas` for a set of checked schemas: undefined (key removed) when it is the default view
- * (every non-system schema), else the JSON list of the checked introspection paths.
- */
-export function visibleSchemasOption(groups: SchemaGroup[], checked: ReadonlySet<string>): string | undefined {
-  const all = groups.flatMap((g) => g.items);
-  const isDefault = all.every((i) => checked.has(pathKey(i.path)) === !i.system);
-  return isDefault ? undefined : JSON.stringify(all.filter((i) => checked.has(pathKey(i.path))).map((i) => i.path));
-}
-
-/** The checked set a data source starts with: its `visibleSchemas`, else the non-system schemas. */
-export function initialChecked(ds: DataSource, groups: SchemaGroup[]): Set<string> {
-  const v = visibleSchemas(ds);
-  if (v) return new Set(v.map(pathKey));
-  return new Set(groups.flatMap((g) => g.items).filter((i) => !i.system).map((i) => pathKey(i.path)));
-}
-
-async function save(ds: DataSource, value: string | undefined): Promise<void> {
-  await updateDataSource(ds.id, (cfg) => {
-    const options = { ...cfg.options };
-    if (value === undefined) delete options.visibleSchemas;
-    else options.visibleSchemas = value;
-    return { ...cfg, options };
-  });
-}
+import { pathKey, visibleSchemas, visibleSchemasRaw } from "../datasource/schemas";
+import { dsOf } from "./core";
+import { type SchemaGroup, type SchemaItem, initialChecked, loadSchemaGroups, save, visibleSchemasOption } from "./schemaFilter";
 
 function Selector(props: { ds: DataSource; groups: SchemaGroup[]; anchor: DOMRect; close: (apply: boolean, checked: ReadonlySet<string>) => void }) {
   const [checked, setChecked] = createSignal<ReadonlySet<string>>(initialChecked(props.ds, props.groups));
@@ -166,7 +120,7 @@ export async function openSchemaSelector(dsId: string, anchor: HTMLElement): Pro
     closed = true;
     openPop = undefined;
     const value = visibleSchemasOption(groups, checked);
-    const before = visibleSchemas(ds) ? ds.options.visibleSchemas : undefined;
+    const before = visibleSchemas(ds) ? visibleSchemasRaw(ds) : undefined;
     queueMicrotask(() => {
       dispose?.();
       host.remove();

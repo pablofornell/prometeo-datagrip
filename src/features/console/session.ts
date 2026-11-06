@@ -35,9 +35,10 @@ import {
   summary,
   underlinePosition,
 } from "../output/format";
-import { saveSchema, savedSchema } from "./schemaPref";
+import { CONNECTION_LOST_LOG, CONNECTION_LOST_TX_LOG, isConnectionLost } from "../../state/connection-errors";
+import { saveSchema, saveSearchPath, savedSchema, savedSearchPath } from "./schemaPref";
 import { qualifiedTitle, resultTable } from "./title";
-import { resolveEdit, schemaChange } from "./editable";
+import { type SchemaChange, resolveEdit, schemaChange } from "./editable";
 import { keyedChanges } from "../output/edit";
 import { ALL_FIRST_CHUNK, ConsoleOutput, type OutputHost, ResultTab, createOutput, defaultPageSize, removeOutput } from "../output/model";
 import { askChoice } from "../table/dialogs";
@@ -48,6 +49,7 @@ import {
   applyChangesInSession,
   classifyTxEnd,
   control,
+  controlError,
   ensureTransaction,
   isSessionLost,
   txReport,
@@ -87,8 +89,15 @@ export class ConsoleSession implements OutputHost {
   private curHandle?: Promise<ExecHandle>;
   /** A result was edited inside the open transaction (the editable result is reloaded when it is rolled back). */
   private editedInTx = false;
-  /** The session's schema changed in a way that could not be read from the text; detect it when nothing is paging. */
-  private schemaDirty = false;
+  /** The session's schema changed and the server has to say which one; read it as soon as nothing is paging. */
+  private readonly schemaDirtySig = createSignal(false);
+  private get schemaDirty(): boolean {
+    return this.schemaDirtySig[0]();
+  }
+  private set schemaDirty(v: boolean) {
+    this.schemaDirtySig[1](v);
+  }
+
 
   readonly txMode: Accessor<TxMode>;
   private readonly setTx: (m: TxMode) => void;
@@ -99,6 +108,8 @@ export class ConsoleSession implements OutputHost {
   private readonly setTxStatus: (s: TxStatus) => void;
   /** A transaction is open (`active` or `failed`). */
   readonly inTx: Accessor<boolean>;
+  /** Why the last `endTx` failed (null when it did not): the close / quit guard shows it. */
+  txError: string | null = null;
   /** Current schema (PG `public`, MySQL database, SQLite `main`), null until known. */
   readonly schema: Accessor<string | null>;
   private readonly setSchema: (s: string | null) => void;
@@ -138,6 +149,12 @@ export class ConsoleSession implements OutputHost {
     this.setPageSize = (p) => void setSizeOverride(() => p);
   }
 
+  /**
+   * A schema change is waiting for the server to say which schema it is, and nothing blocks the query any more (no
+   * result is paging, nothing runs). Reactive: the view calls `settleSchema` when this turns true.
+   */
+  readonly schemaReadable = (): boolean => this.schemaDirty && !this.out.running() && !!this.sessionId && !this.out.results().some((r) => r.hasMore());
+
   get dsId(): string {
     return this.ds.id;
   }
@@ -164,7 +181,10 @@ export class ConsoleSession implements OutputHost {
     if (this.driver === "sqlite") return [];
     const sql: string[] = [];
     const want = withSchema ? savedSchema(this.ds.id, this.consoleName) : null;
-    if (want) sql.push(this.useSchemaSql(want));
+    // the user's own `SET search_path` is replayed as written (`"$user", public`); a schema picked in the switcher is one name
+    const path = withSchema && this.driver === "postgres" ? savedSearchPath(this.ds.id, this.consoleName) : null;
+    if (path) sql.push(`SET search_path TO ${path}`);
+    else if (want) sql.push(this.useSchemaSql(want));
     if (this.isolation() !== DEFAULT_ISOLATION(this.driver)) sql.push(this.isolationSql(this.isolation()));
     return sql;
   }
@@ -183,9 +203,10 @@ export class ConsoleSession implements OutputHost {
       try {
         sid = await openSession(this.ds.id, this.initSql());
       } catch (e) {
-        if (isSessionLost(e) || !savedSchema(this.ds.id, this.consoleName)) throw e;
+        if (isSessionLost(e) || !(savedSchema(this.ds.id, this.consoleName) || savedSearchPath(this.ds.id, this.consoleName))) throw e;
         // the saved schema is gone (dropped / renamed): forget it, open with the session default
         saveSchema(this.ds.id, this.consoleName, null);
+        saveSearchPath(this.ds.id, this.consoleName, null);
         sid = await openSession(this.ds.id, this.initSql(false));
       }
       if (this.disposed) {
@@ -208,7 +229,7 @@ export class ConsoleSession implements OutputHost {
   private async silent(sid: string, sql: string) {
     const ev = await executeCollect(sid, `${sql} ${INTERNAL_MARK}`, { maxRows: 10, stopOnError: true });
     const err = ev.find((e) => e.kind === "error");
-    if (err && err.kind === "error") throw new Error(err.message);
+    if (err && err.kind === "error") throw controlError(err);
     const r = txReport(ev);
     if (r.status) this.setTxStatus(r.status);
     return ev;
@@ -246,9 +267,20 @@ export class ConsoleSession implements OutputHost {
 
   /** Re-detect after the user ran `SET search_path` / `USE` themselves; the new schema is the console's from now on. */
   private async refreshSchema(sid: string): Promise<void> {
-    await this.detectSchema(sid);
-    const now = this.schema();
+    this.schemaDirty = false;
+    const now = await this.detectSchema(sid);
     if (this.driver !== "sqlite" && now) saveSchema(this.ds.id, this.consoleName, now);
+  }
+
+  /** The deferred read of `afterSchemaChange` (see `schemaReadable`). */
+  async settleSchema(): Promise<void> {
+    const sid = this.sessionId;
+    if (!sid || !this.schemaReadable()) return;
+    try {
+      await this.refreshSchema(sid);
+    } catch (e) {
+      if (isSessionLost(e)) this.sessionLost();
+    }
   }
 
   // ------------------------------------------------------------ lost session
@@ -257,24 +289,36 @@ export class ConsoleSession implements OutputHost {
    * The session is gone (the data source was disconnected / deactivated): drop it, forget the transaction (the server
    * rolled it back with the connection) and reopen on the next run with the console's settings (`initSql`).
    */
-  private sessionLost(): void {
-    const had = this.txStatus() !== "idle";
+  private sessionLost(o: { tx?: boolean; closed?: boolean } = {}): void {
+    // `tx`: the caller knows a transaction was open (the backend's `txStatus: idle` may have been applied already)
+    const had = o.tx ?? this.txStatus() !== "idle";
+    const old = this.sessionId;
     this.sessionId = undefined;
     this.opening = undefined;
     this.setTxStatus("idle");
     this.editedInTx = false;
     this.connectedLogged = false;
-    if (had) {
-      this.out.log("error", "the transaction was rolled back: connection closed");
-      notify({ kind: "warning", title: "The transaction was rolled back", body: `The connection of '${this.title()}' was closed, so its open transaction was rolled back.` });
-    } else {
-      this.out.log("text", "connection closed");
-    }
+    this.schemaDirty = false;
+    if (old) void closeSession(old).catch(() => {}); // releases a dead session (the backend accepts that)
+    if (o.closed) {
+      if (had) {
+        this.out.log("error", "the transaction was rolled back: connection closed");
+        notify({ kind: "warning", title: "The transaction was rolled back", body: `The connection of '${this.title()}' was closed, so its open transaction was rolled back.` });
+      } else this.out.log("text", "connection closed");
+    } else if (had) {
+      this.out.log("error", CONNECTION_LOST_TX_LOG);
+      notify({ kind: "warning", title: "The transaction was rolled back", body: `The connection of '${this.title()}' was lost, so its open transaction was rolled back. The next run opens a new connection.` });
+    } else this.out.log("text", CONNECTION_LOST_LOG);
+  }
+
+  /** A paging fetch of a result found the connection dead (the backend marked the session lost; its transaction is gone). */
+  connectionLost(): void {
+    if (this.sessionId && !this.out.running()) this.sessionLost({ tx: this.inTx() });
   }
 
   /** The data source was disconnected while this console was open (called by the view). */
   connectionClosed(): void {
-    if (this.sessionId && !this.out.running()) this.sessionLost();
+    if (this.sessionId && !this.out.running()) this.sessionLost({ closed: true });
   }
 
   // ------------------------------------------------------------ execution
@@ -381,13 +425,16 @@ export class ConsoleSession implements OutputHost {
     let ordinal = 0;
     let failed = 0;
     let executed = 0;
-    let cur: { sql: string; t0: number; from: number; to: number; errored: boolean; schema?: { schema: string | null } } | null = null;
+    let cur: { sql: string; t0: number; from: number; to: number; errored: boolean; schema?: SchemaChange } | null = null;
     // schema of the session while the script runs: a `USE x;` / `SET search_path` earlier in the script decides which
     // schema the edit-target lookup and the tab title of the next statements use
     let scriptSchema = this.schema();
     let schemaTouched = false;
     let schemaUnknown = false;
+    let searchPath: string | null | undefined; // the last `SET search_path` value list of the script (null: reset)
     let sessionClosed = false;
+    let txLost = false; // the backend ended the transaction because the connection died
+    const txAtStart = this.inTx();
     let reloadEdited = false;
     const nowMs = () => performance.now();
     const t00 = nowMs();
@@ -447,6 +494,7 @@ export class ConsoleSession implements OutputHost {
           schemaTouched = true;
           if (cur.schema.schema) scriptSchema = cur.schema.schema;
           else schemaUnknown = true;
+          searchPath = cur.schema.searchPath === undefined ? null : cur.schema.searchPath; // `USE x` drops an earlier path
         }
         const ms = nowMs() - (cur?.t0 ?? t00);
         const sql = cur?.sql ?? req.sql;
@@ -458,7 +506,7 @@ export class ConsoleSession implements OutputHost {
       onError: (e) => {
         failed++;
         out.log("error", e.message);
-        if (/^Session is closed$/i.test(e.message.trim())) sessionClosed = true;
+        if (isConnectionLost(e)) sessionClosed = true; // `connectionLost`, `[08006]` / `[08S01]`, or the session is gone
         const ms = nowMs() - (cur?.t0 ?? t00);
         if (cur && req.ranges.length) {
           cur.errored = true;
@@ -473,7 +521,10 @@ export class ConsoleSession implements OutputHost {
       onTxStatus: (e) => this.setTxStatus(e.status),
       onTxEnded: (e) => {
         const kind = classifyTxEnd(cur?.sql ?? null, e);
-        if (kind === "serverRollback") {
+        if (kind === "connectionLost") {
+          txLost = true; // reported once, with the dead session dropped, when the run ends
+          sessionClosed = true;
+        } else if (kind === "serverRollback") {
           out.log("error", SERVER_ROLLBACK_LOG);
           notify({ kind: "error", title: SERVER_ROLLBACK_TITLE, body: SERVER_ROLLBACK_BODY });
         } // "implicit": the backend's own message line already says that the statement committed the transaction
@@ -512,8 +563,8 @@ export class ConsoleSession implements OutputHost {
         sid = await prepare();
       } catch (e) {
         if (!isSessionLost(e)) throw e;
-        // the session died (data source deactivated / disconnected): reopen it once
-        this.sessionLost();
+        // the session died (connection lost, data source deactivated / disconnected): reopen it once
+        this.sessionLost({ tx: txAtStart || this.inTx() });
         sid = await prepare();
       }
       let handle: ExecHandle;
@@ -521,7 +572,7 @@ export class ConsoleSession implements OutputHost {
         handle = await this.startExecute(sid, req.sql, o, handlers);
       } catch (e) {
         if (!isSessionLost(e)) throw e;
-        this.sessionLost();
+        this.sessionLost({ tx: txAtStart || this.inTx() });
         sid = await prepare();
         handle = await this.startExecute(sid, req.sql, o, handlers);
       }
@@ -566,32 +617,36 @@ export class ConsoleSession implements OutputHost {
     }
     for (const r of staleTabs) r.announce();
     if (first) out.select("output"); // nothing returned rows: show the log
-    if (sessionClosed) this.sessionLost();
-    if (this.sessionId && schemaTouched) await this.afterSchemaChange(this.sessionId, scriptSchema, schemaUnknown);
+    if (sessionClosed) this.sessionLost({ tx: txLost || txAtStart || this.inTx() });
+    if (this.sessionId && schemaTouched) await this.afterSchemaChange(this.sessionId, scriptSchema, schemaUnknown, searchPath ?? null);
     out.setRunning(false);
     if (reloadEdited) this.reloadEdited();
   }
 
   /**
-   * The script switched the schema. The new one comes from the statement text; when that cannot be read it is
-   * detected with a query on the session, which is only done while no result of this console is paging (a query on the
-   * session closes the open result set, and the rows beyond the first page would be lost).
+   * The script switched the schema. A textual name (`USE x`, `SET search_path TO x`) shows at once. For PostgreSQL the
+   * real current schema is read from the server (`current_schema()`: `"$user", public` is `public` when there is no
+   * such user schema, `pg_temp` is never it), and so is every change whose target the text does not give. That query
+   * is only run while no result of this console is paging (a query on the session closes the open result set, and the
+   * rows beyond the first page would be lost); otherwise it waits until the results are complete or closed.
+   * The text of `SET search_path` is kept as written for the next session (`initSql`).
    */
-  private async afterSchemaChange(sid: string, textual: string | null, unknown: boolean): Promise<void> {
-    const paging = this.out.results().some((r) => r.hasMore());
-    if (unknown && !paging) {
-      try {
-        await this.refreshSchema(sid);
-      } catch (e) {
-        if (isSessionLost(e)) this.sessionLost();
-      }
-      return;
-    }
+  private async afterSchemaChange(sid: string, textual: string | null, unknown: boolean, path: string | null): Promise<void> {
+    if (this.driver !== "sqlite") saveSearchPath(this.ds.id, this.consoleName, path);
     if (textual) {
       this.setSchema(textual);
       if (this.driver !== "sqlite") saveSchema(this.ds.id, this.consoleName, textual);
     }
-    if (unknown) this.schemaDirty = true; // detect it before the next statement
+    if (!unknown && this.driver !== "postgres") return;
+    if (this.out.results().some((r) => r.hasMore())) {
+      this.schemaDirty = true;
+      return;
+    }
+    try {
+      await this.refreshSchema(sid);
+    } catch (e) {
+      if (isSessionLost(e)) this.sessionLost();
+    }
   }
 
   /** Executes the edited result again, so the grid shows what the database holds (after a roll back). */
@@ -668,7 +723,7 @@ export class ConsoleSession implements OutputHost {
 
   async setTxMode(m: TxMode): Promise<void> {
     if (m === this.txMode()) return;
-    if (m === "auto" && this.inTx() && !(await confirmEndTransactions({ tabId: this.tabId, reason: "switching to the Auto transaction mode" }))) return;
+    if (m === "auto" && this.inTx() && !(await confirmEndTransactions({ tabId: this.tabId, reason: "switching to the Auto transaction mode", keepsSession: true }))) return;
     this.setTx(m);
     this.out.log("text", `${m === "manual" ? "Manual" : "Auto"} transaction mode ON`);
   }
@@ -691,7 +746,11 @@ export class ConsoleSession implements OutputHost {
    * (error shown). The server decides what happened: a COMMIT of a failed PostgreSQL transaction rolls back.
    */
   async endTx(kind: "commit" | "rollback"): Promise<boolean> {
-    if (this.out.running()) return false;
+    this.txError = null;
+    if (this.out.running()) {
+      this.txError = "A statement is still running on the connection.";
+      return false;
+    }
     let sid: string | undefined;
     try {
       sid = await this.ensureSession();
@@ -705,6 +764,10 @@ export class ConsoleSession implements OutputHost {
       else await this.syncTxStatus(sid);
       const ended = r.ended[0];
       const how = ended ? classifyTxEnd(kind === "commit" ? "COMMIT" : "ROLLBACK", ended) : kind;
+      if (how === "connectionLost") {
+        this.sessionLost({ tx: true });
+        return true; // the connection took the transaction with it
+      }
       if (how === "serverRollback") {
         this.out.log("error", SERVER_ROLLBACK_LOG);
         notify({ kind: "error", title: SERVER_ROLLBACK_TITLE, body: SERVER_ROLLBACK_BODY });
@@ -716,10 +779,11 @@ export class ConsoleSession implements OutputHost {
       return true;
     } catch (e) {
       if (isSessionLost(e)) {
-        this.sessionLost();
-        return true; // the connection took the transaction with it
+        this.sessionLost({ tx: true });
+        return true; // the connection took the transaction with it: it is rolled back, the user was told
       }
-      this.out.log("error", errText(e));
+      this.txError = errText(e);
+      this.out.log("error", this.txError);
       if (sid) await this.syncTxStatus(sid);
       return false;
     }
@@ -783,6 +847,7 @@ export class ConsoleSession implements OutputHost {
       await this.silent(sid, this.useSchemaSql(name));
       this.setSchema(name);
       saveSchema(this.ds.id, this.consoleName, name);
+      if (this.driver === "postgres") saveSearchPath(this.ds.id, this.consoleName, null);
     } catch (e) {
       if (isSessionLost(e)) this.sessionLost();
       notify({ kind: "error", title: "Cannot switch the schema", body: errText(e) });

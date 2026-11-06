@@ -4,7 +4,7 @@
  *   openDataSourceDialog({ selectId?, newDriver? })   open (or re-focus) the dialog
  *   onDataSourcesChanged(cb)                          called after Apply / OK saved or deleted data sources
  *                                                     (also the window event "prometeo:datasources-changed")
- *   visibleSchemas(ds) / isSchemaVisible(ds, path)    read `options.visibleSchemas` (see ./model.ts for all keys)
+ *   visibleSchemas(ds) / isSchemaVisible(ds, path)    read the schema filter (UI state; legacy `options.visibleSchemas` as fallback)
  *
  * Actions: `db.dataSources`, `db.properties` (ctx = data source id or `{ id }`),
  *          `db.newDataSource.postgres | .mysql | .mariadb | .sqlite`.

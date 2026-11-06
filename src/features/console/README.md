@@ -34,10 +34,18 @@
   error balloon and reloads the edited result / table page.
 * A result column is editable (or part of the key) only when it is a plain reference to that table column
   (`editable.ts: selectItems / plainSources`): `select customer_id as id` and `id + 1 as id` are read-only.
-* A session lost to a disconnect (`Session '..' does not exist`) is dropped, the transaction is reported rolled back and the
-  next run reopens it with `initSql` (saved schema / `USE` + non-default isolation level).
+* A lost connection (`isConnectionLost` in `state/connection-errors.ts`: the `error` event's `connectionLost`, a `[08006]` /
+  `[08S01]` message prefix, or the old `Session '..' does not exist`) drops the session, resets the tx state, logs
+  `The connection was lost. The transaction was rolled back.` plus a balloon, and the next run reopens it with `initSql`
+  (the user's `SET search_path` text as written, else the saved schema / `USE`, + non-default isolation level).
+* After `SET search_path` / `SET SCHEMA` the real schema is read with `select current_schema()` (`"$user", public` is not a
+  schema called `$user`), never while a result is paging: `schemaReadable()` / `settleSchema()` defer it.
 * Nothing runs on the session while a paged result is open, except what the user asks for; when `fetch_more` fails the
   result shows a banner and an Output line that the rows shown are NOT the whole result.
 * `txguard.ts`: `confirmEndTransactions({ dsId?, tabId?, reason })` asks Commit / Roll Back / Cancel for the consoles and table
   editors in scope. Used by the console tab's `beforeClose`, the table tab close, Tx: Auto switch and the app quit; the
-  explorer (deactivate) and the data source dialog (settings changed) call it too.
+  explorer (deactivate) and the data source dialog (settings changed) call it too. A transaction that cannot be ended is
+  never a dead end: a lost connection counts as ended (rolled back, the user is told); a failed COMMIT offers Roll Back /
+  Close Anyway / Cancel. `quit.ts`: a second quit request while the prompt is open quits.
+* The schema filter of the explorer is UI state (`state/schema-filter.ts`), not `options.visibleSchemas`: options are part of
+  the backend's connection fingerprint, so saving them reconnects and drops every session and open transaction.

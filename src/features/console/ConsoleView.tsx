@@ -118,6 +118,10 @@ function ConsoleInner(props: { tab: EditorTab; active: boolean; dsId: string; co
   createEffect(() => {
     if (!connectedDataSourceIds().has(props.dsId) && session.sessionId) session.connectionClosed();
   });
+  // a SET search_path that ran while a result was paging: the server is asked which schema it is once nothing pages
+  createEffect(() => {
+    if (session.schemaReadable()) void session.settleSchema();
+  });
   // open the DB session as soon as the data source is connected, so the schema switcher shows the real schema
   createEffect(() => {
     if (props.active && connectedDataSourceIds().has(props.dsId) && !session.sessionId) void session.ensureSession().catch(() => {});

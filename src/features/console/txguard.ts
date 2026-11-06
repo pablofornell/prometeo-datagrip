@@ -17,14 +17,21 @@ export interface TxScope {
   tabId?: string;
   /** What is about to happen, as the end of "Commit or roll back before ...": `closing the console`. */
   reason: string;
+  /** The session stays alive afterwards (switching to Auto): a transaction that cannot be ended must not be abandoned. */
+  keepsSession?: boolean;
 }
 
 interface OpenTx {
   tabId: string;
   title: string;
   status: TxStatus;
-  /** Cancels what runs (consoles) and resolves when the transaction ended. */
+  /**
+   * Cancels what runs (consoles) and resolves when the transaction ended. A connection that was lost counts as
+   * ended (the server rolled the transaction back; the tab told the user). False: it could not be ended.
+   */
   end(kind: "commit" | "rollback"): Promise<boolean>;
+  /** Why the last `end` failed. */
+  error(): string | null;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -46,11 +53,12 @@ export function openTransactions(scope: Pick<TxScope, "dsId" | "tabId">): OpenTx
         }
         return s.endTx(kind);
       },
+      error: () => s.txError ?? null,
     });
   }
   for (const c of allControllers()) {
     if (!c.inTx() || !inScope(c.dsId, c.tabId)) continue;
-    list.push({ tabId: c.tabId, title: c.title(), status: c.txStatus(), end: (kind) => c.endTx(kind) });
+    list.push({ tabId: c.tabId, title: c.title(), status: c.txStatus(), end: (kind) => c.endTx(kind), error: () => c.txError?.() ?? null });
   }
   return list;
 }
@@ -94,6 +102,40 @@ export async function confirmEndTransactions(scope: TxScope): Promise<boolean> {
     cancel: "cancel",
   });
   if (answer !== "commit" && answer !== "rollback") return false;
-  for (const o of open) if (!(await o.end(answer))) return false;
+  for (const o of open) if (!(await endOne(o, answer, scope))) return false;
   return true;
+}
+
+/**
+ * Ends one transaction. When that fails (not a lost connection: `end` resolves true for those), the user always gets a
+ * way out: after a failed COMMIT Roll Back / Close anyway / Cancel, after a failed ROLLBACK Close anyway / Cancel.
+ * Closing the connection makes the server roll back what is not committed, so Close anyway loses nothing the
+ * failed COMMIT had not already lost. (A session that stays alive has no Close anyway.)
+ */
+async function endOne(o: OpenTx, first: "commit" | "rollback", scope: TxScope): Promise<boolean> {
+  let kind = first;
+  for (;;) {
+    if (await o.end(kind)) return true;
+    const why = o.error() ?? "the server did not answer";
+    const verb = kind === "commit" ? "commit" : "roll back";
+    const choices = [
+      ...(kind === "commit" ? [{ label: "Roll Back", value: "rollback", primary: true }] : []),
+      ...(scope.keepsSession ? [] : [{ label: "Close Anyway", value: "force", primary: kind !== "commit" }]),
+      { label: "Cancel", value: "cancel" },
+    ];
+    const answer = await askChoice({
+      title: `Cannot ${verb} the transaction`,
+      message:
+        `The transaction of '${o.title}' could not be ${kind === "commit" ? "committed" : "rolled back"}: ${why}` +
+        (scope.keepsSession ? "" : `\n\nClose Anyway goes on with ${scope.reason}: the connection closes and the server rolls back whatever was not committed.`),
+      choices,
+      cancel: "cancel",
+    });
+    if (answer === "force" && !scope.keepsSession) return true;
+    if (answer === "rollback") {
+      kind = "rollback";
+      continue;
+    }
+    return false;
+  }
 }

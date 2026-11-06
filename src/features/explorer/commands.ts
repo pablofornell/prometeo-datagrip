@@ -34,6 +34,8 @@ import {
 import { type ENode, type NodeData, TABLE_CHILD, TABLE_LIKE, ddlRefOf, referenceOf, tabIconOf, tableRefOf } from "./model";
 import { canRenameNode, renameSqlOf } from "./rename";
 import { confirmEndTransactions } from "../console/txguard";
+import { reconnectsOnSave } from "../datasource/model";
+import { forgetVisibleSchemas } from "../../state/schema-filter";
 
 const errText = (e: unknown) => String((e as Error)?.message ?? e).replace(/^Error:\s*/, "");
 const fail = (title: string, e: unknown): void => {
@@ -416,15 +418,22 @@ export async function confirmRename(s: Extract<DialogState, { kind: "rename" }>)
   controller()?.select(target?.id ?? null);
 }
 
-/** Saves a change to the stored configuration of a data source, then reloads the explorer. The password is kept. */
-export async function updateDataSource(dsId: string, change: (cfg: Omit<DataSource, "hasPassword" | "passwordStorage">) => Omit<DataSource, "hasPassword" | "passwordStorage">): Promise<void> {
+/**
+ * Saves a change to the stored configuration of a data source, then reloads the explorer. The password is kept.
+ * A change the backend answers with a reconnect (anything but the name / color) first asks about open transactions;
+ * resolves false when the user cancelled. View settings (the schema filter) do not belong here: `saveVisibleSchemas`.
+ */
+export async function updateDataSource(dsId: string, change: (cfg: Omit<DataSource, "hasPassword" | "passwordStorage">) => Omit<DataSource, "hasPassword" | "passwordStorage">): Promise<boolean> {
   // the saved copy: another window or the dialog may have changed it meanwhile
   const cur = (await listDataSources()).find((x) => x.id === dsId) ?? dsOf(dsId);
-  if (!cur) return;
+  if (!cur) return true;
   const { hasPassword: _h, passwordStorage: _p, ...cfg } = cur;
-  await saveDataSource(change(cfg));
+  const next = change(cfg);
+  if (reconnectsOnSave(cfg, next) && !(await confirmEndTransactions({ dsId, reason: "reconnecting with the new settings" }))) return false;
+  await saveDataSource(next);
   window.dispatchEvent(new CustomEvent("prometeo:datasources-changed"));
   await reloadDataSources();
+  return true;
 }
 
 export async function confirmRemoveDs(ds: DataSource): Promise<void> {
@@ -432,6 +441,7 @@ export async function confirmRemoveDs(ds: DataSource): Promise<void> {
   if (!(await confirmEndTransactions({ dsId: ds.id, reason: "removing the data source" }))) return;
   try {
     await deleteDataSource(ds.id);
+    forgetVisibleSchemas(ds.id);
   } catch (e) {
     return fail("Cannot remove the data source", e);
   }

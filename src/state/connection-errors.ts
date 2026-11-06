@@ -40,3 +40,25 @@ export function friendlyConnectionError(raw: string, t: ConnectionTarget): strin
   }
   return msg.replace(/^error communicating with database:\s*/i, "");
 }
+
+// ---------------------------------------------------------------- lost connections
+
+/** SQLSTATE class 08 as the backend prefixes it: 08006 (PG / SQLite), 08S01 (MySQL), 08003 / 08001. */
+const LOST_PREFIX = /^\s*(?:Error:\s*)?\[(?:08006|08S01|08003|08001)\]/;
+/** The older wording for a session the backend no longer has (data source disconnected / deactivated). */
+const SESSION_GONE = /Session '[^']*' does not exist|Session is closed/i;
+
+/**
+ * The connection of a session is gone (the server killed it, the network dropped, the data source was disconnected).
+ * `err` is an Error / message string, or an `error` ExecEvent (`connectionLost: true`). One definition for the
+ * consoles, the table editors and the transaction guard.
+ */
+export function isConnectionLost(err: unknown): boolean {
+  if (err && typeof err === "object" && (err as { connectionLost?: unknown }).connectionLost === true) return true;
+  const msg = typeof err === "string" ? err : String((err as { message?: unknown } | null | undefined)?.message ?? err ?? "");
+  return LOST_PREFIX.test(msg) || SESSION_GONE.test(msg);
+}
+
+/** The line a console / table editor logs when the connection died under its session. */
+export const CONNECTION_LOST_LOG = "The connection was lost.";
+export const CONNECTION_LOST_TX_LOG = "The connection was lost. The transaction was rolled back.";

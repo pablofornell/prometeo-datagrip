@@ -24,6 +24,8 @@ export interface TableController {
   txStatus: () => TxStatus;
   /** Commit / Roll Back; resolves true when the transaction ended (or there was none), false when it did not. */
   endTx: (kind: "commit" | "rollback") => Promise<boolean>;
+  /** Why the last `endTx` failed (null when it did not). */
+  txError?: () => string | null;
   commit: () => void;
   rollback: () => void;
   /** Opens the Export Data dialog of the table. */

@@ -10,6 +10,8 @@ const be = {
   opened: [] as { sid: string; initSql: string[] }[],
   ran: [] as string[],
   txCalls: [] as string[],
+  /** What `current_schema()` / `database()` answer. */
+  schema: "public",
 };
 const range = (n: number) => ({ start: 0, end: n, startChar: 0, endChar: n, startUtf16: 0, endUtf16: n });
 
@@ -33,12 +35,12 @@ function answer(sid: string, sql: string): ExecEvent[] {
       set("idle");
       ev.push({ kind: "update", index: i, rowsAffected: 0 });
     } else if (w === "BOOM") {
-      ev.push({ kind: "error", index: i, message: "boom", position: null, positionUtf16: null });
+      ev.push({ kind: "error", index: i, message: "boom", position: null, positionUtf16: null, connectionLost: false });
       if (cur === "active") set("failed");
       break;
     } else if (w === "SELECT") {
       const cs = /current_schema|database\(\)/.test(st);
-      ev.push({ kind: "resultset", index: i, columns: [{ name: "c", typeName: "int4", nullable: true, isPk: false, tableRef: null }], rows: cs ? [["public"]] : [[1]], hasMore: false });
+      ev.push({ kind: "resultset", index: i, columns: [{ name: "c", typeName: "int4", nullable: true, isPk: false, tableRef: null }], rows: cs ? [[be.schema]] : [[1]], hasMore: /\bbig_table\b/.test(st) });
     } else ev.push({ kind: "update", index: i, rowsAffected: 1 });
     i++;
   }
@@ -97,9 +99,16 @@ const resolveEdit = vi.fn(async () => null);
 vi.mock("./editable", async (orig) => ({ ...(await orig<typeof import("./editable")>()), resolveEdit: (...a: unknown[]) => (resolveEdit as (...x: unknown[]) => unknown)(...a) }));
 vi.mock("./schemaPref", () => {
   const m = new Map<string, string>();
-  return { savedSchema: (d: string, c: string) => m.get(d + c) ?? null, saveSchema: (d: string, c: string, s: string | null) => (s ? m.set(d + c, s) : m.delete(d + c)) };
+  const p = new Map<string, string>();
+  return {
+    savedSchema: (d: string, c: string) => m.get(d + c) ?? null,
+    saveSchema: (d: string, c: string, s: string | null) => (s ? m.set(d + c, s) : m.delete(d + c)),
+    savedSearchPath: (d: string, c: string) => p.get(d + c) ?? null,
+    saveSearchPath: (d: string, c: string, s: string | null) => (s ? p.set(d + c, s) : p.delete(d + c)),
+  };
 });
 
+import { savedSchema, savedSearchPath } from "./schemaPref";
 import { ConsoleSession } from "./session";
 
 const ds = (driver: "postgres" | "mysql" = "postgres") => ({ id: "d1", name: "pg", driver, database: "shop", readOnly: false }) as never;
@@ -112,6 +121,7 @@ beforeEach(() => {
   be.tx.clear();
   be.opened.length = be.ran.length = 0;
   be.next = 1;
+  be.schema = "public";
   notify.mockClear();
   resolveEdit.mockClear();
 });
@@ -127,7 +137,7 @@ describe("Manual-mode console after a disconnect", () => {
     be.tx.clear();
 
     await s.run(req("update t set a = 2")); // used to throw outside the reconnect try and stay stuck
-    expect(lines(s)).toContain("the transaction was rolled back: connection closed");
+    expect(lines(s)).toContain("The connection was lost. The transaction was rolled back.");
     expect(s.sessionId).toBeDefined();
     expect(s.sessionId).not.toBe(firstSid);
     // the isolation level the console had is part of the new session (initSql), not forgotten
@@ -142,6 +152,7 @@ describe("Manual-mode console after a disconnect", () => {
     await s.run(req("update t set a = 1"));
     expect(s.inTx()).toBe(true);
     s.connectionClosed();
+    expect(lines(s)).toContain("the transaction was rolled back: connection closed");
     expect(s.inTx()).toBe(false);
     expect(s.sessionId).toBeUndefined();
   });
@@ -181,11 +192,57 @@ describe("the schema re-check after a run", () => {
     expect(internal).toHaveLength(1); // only the one at session open, none after the run
     expect(be.ran.at(-1)).toContain("select * from big_table");
   });
-  it("a real SET search_path updates the label from the statement text, without querying the session", async () => {
+  it("a SET search_path shows the schema the SERVER reports, not the first word of the text", async () => {
     const s = mk();
-    await s.run(req("set search_path to shop; select 1"));
-    expect(s.schema()).toBe("shop");
-    expect(be.ran.filter((x) => /current_schema/.test(x))).toHaveLength(1);
+    be.schema = "alice"; // there is a schema named like the user, so "$user" resolves to it
+    await s.run(req('SET search_path TO "$user", public'));
+    expect(s.schema()).toBe("alice");
+    expect(s.label()).toBe("shop.alice");
+    expect(be.ran.filter((x) => /current_schema/.test(x))).toHaveLength(2); // at open + after the SET
+  });
+  it("`$user` without such a schema: the label is public, never `$user`", async () => {
+    const s = mk();
+    await s.run(req('SET search_path TO "$user", public'));
+    expect(s.schema()).toBe("public");
+    expect(savedSchema("d1", "console")).toBe("public");
+  });
+  it("pg_temp first in the path is not the current schema", async () => {
+    const s = mk();
+    await s.run(req("set search_path to pg_temp, public"));
+    expect(s.schema()).toBe("public");
+    expect(savedSchema("d1", "console")).not.toBe("pg_temp");
+  });
+  it("keeps the whole search_path text and replays it verbatim when the session reopens", async () => {
+    const s = mk();
+    await s.run(req('SET search_path TO "$user", public'));
+    const first = s.sessionId!;
+    be.sessions.delete(first); // gone
+    await s.run(req("select 1"));
+    expect(be.opened.at(-1)!.initSql).toEqual(['SET search_path TO "$user", public']);
+    expect(be.opened.at(-1)!.sid).not.toBe(first);
+  });
+  it("RESET search_path forgets the saved path", async () => {
+    const s = mk();
+    await s.run(req("set search_path to a, b"));
+    await s.run(req("reset search_path"));
+    expect(savedSearchPath("d1", "console")).toBeNull();
+  });
+  it("never queries the session while a result of the console is still paging; reads when it closes", async () => {
+    const s = mk();
+    be.schema = "alice";
+    await s.run(req('set search_path to "$user", public; select * from big_table'));
+    const tab = s.out.results()[0];
+    expect(tab.hasMore()).toBe(true);
+    expect(be.ran.filter((x) => /current_schema/.test(x))).toHaveLength(1); // only the one at session open
+    expect(be.ran.at(-1)).toContain("big_table");
+    expect(savedSearchPath("d1", "console")).toBe('"$user", public'); // the text is kept at once
+    expect(s.schemaReadable()).toBe(false);
+    tab.close();
+    expect(s.schemaReadable()).toBe(true); // the view's effect then calls settleSchema
+    await s.settleSchema();
+    expect(s.schema()).toBe("alice");
+    expect(s.schemaReadable()).toBe(false);
+    expect(be.ran.filter((x) => /current_schema/.test(x))).toHaveLength(2);
   });
 });
 

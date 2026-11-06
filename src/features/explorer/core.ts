@@ -35,7 +35,7 @@ import {
   tabIconOf,
 } from "./model";
 import { theme } from "../../state/theme";
-import { isSchemaVisible, visibleSchemas } from "../datasource/schemas";
+import { isSchemaVisible, visibleSchemas, visibleSchemasRaw } from "../datasource/schemas";
 
 // ---------------------------------------------------------------- signals
 
@@ -137,7 +137,8 @@ export function setShowSystemObjects(v: boolean): void {
 
 // ---------------------------------------------------------------- data sources
 
-const dsSignature = (ds: DataSource) => JSON.stringify(ds);
+/** What makes a data source node stale: its saved config, and the schema filter (UI state, not part of the config). */
+const dsSignature = (ds: DataSource) => JSON.stringify(ds) + "\u0000" + (visibleSchemasRaw(ds) ?? "");
 
 function dsNode(ds: DataSource): ENode {
   const n: ENode = {
@@ -303,7 +304,7 @@ async function fetchChildren(node: ENode): Promise<ENode[]> {
   const tns = await rawIntrospect(d.dsId, d.path, schemaLevel || showSystemObjects());
   let list = tns;
   if (schemaLevel) {
-    // `options.visibleSchemas` (Data Sources > Schemas, or the badge popup) lists the schemas to show; without it
+    // the schema filter (Data Sources > Schemas, or the badge popup) lists the schemas to show; without it
     // every non-system schema is shown.
     const explicit = ds ? visibleSchemas(ds) : null;
     const all = explicit

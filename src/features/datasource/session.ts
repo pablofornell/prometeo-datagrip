@@ -8,6 +8,8 @@ import { createStore, produce, unwrap } from "solid-js/store";
 import { friendlyConnectionError } from "../../state/connection-errors";
 import { deleteDataSource, listDataSources, saveDataSource, testConnection } from "../../api/db";
 import type { DataSource, DataSourceConfig } from "../../api/db";
+import { forgetVisibleSchemas } from "../../state/schema-filter";
+import { saveVisibleSchemas } from "./schemas";
 import { DBMS, type Dbms, buildUrl, parseUrl, sqliteFileOfUrl } from "./drivers";
 import {
   type Draft,
@@ -16,6 +18,8 @@ import {
   type Problem,
   autoName,
   configFromForm,
+  reconnectPart,
+  savedPart,
   defaultForm,
   formFromDataSource,
   normalizedForm,
@@ -104,6 +108,10 @@ export function createSession() {
   // ---- derived state
   const isNew = (d: Draft) => d.id == null;
   const isModified = (d: Draft) => d.id != null && (snapshot(d.form) !== d.base || d.password.touched);
+  /** Saving reaches the backend (the schema filter alone is a UI-state setting and does not). */
+  const needsSave = (d: Draft) => d.id != null && (savedPart(snapshot(d.form)) !== savedPart(d.base) || d.password.touched);
+  /** Saving reconnects the data source (name / color / schema filter do not): open transactions would be lost. */
+  const reconnects = (d: Draft) => d.id != null && (reconnectPart(snapshot(d.form)) !== reconnectPart(d.base) || d.password.touched);
   const hasChanges = () => deletedIds().length > 0 || drafts.some((d) => isNew(d) || isModified(d));
 
   const problems = createMemo<SessionProblem[]>(() => {
@@ -359,24 +367,35 @@ export function createSession() {
       });
       return false;
     }
-    // Saving reconnects an existing data source, and removing closes it: ask before open transactions are lost.
+    // Saving a changed connection reconnects an existing data source, and removing closes it: ask before open
+    // transactions are lost. A changed schema filter is not a connection change: nothing to ask.
     const affected = [
       ...deletedIds(),
-      ...drafts.filter((d) => !isNew(d) && isModified(d) && d.id).map((d) => d.id as string),
+      ...drafts.filter((d) => reconnects(d) && d.id).map((d) => d.id as string),
     ];
     for (const dsId of affected) {
       if (!(await confirmEndTransactions({ dsId, reason: "reconnecting with the new settings" }))) return false;
     }
     setApplying(true);
     try {
-      for (const id of deletedIds()) await deleteDataSource(id);
+      for (const id of deletedIds()) {
+        await deleteDataSource(id);
+        forgetVisibleSchemas(id);
+      }
       setDeletedIds([]);
       const keys = drafts.filter((d) => isNew(d) || isModified(d)).map((d) => d.key);
       for (const key of keys) {
         const i = indexOf(key);
         const d = drafts[i];
-        const cfg = { ...configFromForm(d.form, d.id), password: passwordToSend(d) } as Partial<DataSourceConfig> & { name: string };
-        const saved = await saveDataSource(cfg);
+        let saved: DataSource;
+        if (d.id != null && d.saved && !needsSave(d)) {
+          // only the schema filter changed: a UI-state write, the backend (and its connection) is left alone
+          saved = d.saved;
+        } else {
+          const cfg = { ...configFromForm(d.form, d.id), password: passwordToSend(d) } as Partial<DataSourceConfig> & { name: string };
+          saved = await saveDataSource(cfg);
+        }
+        saveVisibleSchemas(saved.id, d.form.options.visibleSchemas);
         const j = indexOf(key);
         if (j < 0) continue;
         batch(() => {
