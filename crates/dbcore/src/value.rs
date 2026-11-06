@@ -249,6 +249,52 @@ async fn pg_ensure_types(live: &Live, oids: &[u32]) -> Result<()> {
     Ok(())
 }
 
+/// `schema.table` of every column that is a plain reference to a table column (`None` for expressions).
+async fn pg_table_refs(live: &Live, cols: &[sqlx::postgres::PgColumn]) -> Vec<Option<String>> {
+    let rels: Vec<u32> = cols
+        .iter()
+        .map(|c| if c.relation_attribute_no().is_some_and(|n| n > 0) { c.relation_id().map(|o| o.0).unwrap_or(0) } else { 0 })
+        .collect();
+    pg_ensure_rels(live, &rels).await;
+    let cache = live.pg_rels.lock().unwrap_or_else(|e| e.into_inner());
+    rels.iter().map(|o| cache.get(o).cloned()).collect()
+}
+
+/// Resolve the table OIDs a result set reports (`RowDescription`) to `schema.table`, once per OID.
+/// Best effort: a failed lookup (or a table the catalog cannot see yet) just leaves `table_ref` empty.
+async fn pg_ensure_rels(live: &Live, rels: &[u32]) {
+    let missing: Vec<u32> = {
+        let cache = live.pg_rels.lock().unwrap_or_else(|e| e.into_inner());
+        let mut m: Vec<u32> = rels.iter().copied().filter(|o| *o != 0 && !cache.contains_key(o)).collect();
+        m.sort_unstable();
+        m.dedup();
+        m
+    };
+    if missing.is_empty() {
+        return;
+    }
+    let list = missing.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let Ok(rows) = live
+        .pool
+        .query_strings(&format!(
+            "select c.oid::int8, n.nspname::text, c.relname::text from pg_class c \
+             join pg_namespace n on n.oid = c.relnamespace where c.oid in ({list})"
+        ))
+        .await
+    else {
+        return;
+    };
+    let mut cache = live.pg_rels.lock().unwrap_or_else(|e| e.into_inner());
+    for r in rows {
+        let g = |i: usize| r.get(i).cloned().flatten().unwrap_or_default();
+        let oid: u32 = g(0).parse().unwrap_or(0);
+        // temp tables live in a per-session schema: not a name the user can open
+        if oid != 0 && !g(1).starts_with("pg_temp") && !g(1).starts_with("pg_toast") {
+            cache.insert(oid, format!("{}.{}", g(1), g(2)));
+        }
+    }
+}
+
 pub(crate) fn pg_text_cell(kind: &PgKind, s: &str, opts: DecodeOpts) -> Cell {
     match kind {
         PgKind::Bool => match s {
@@ -436,14 +482,15 @@ impl RowDecoder {
             RawRow::Pg(r) => {
                 let oids: Vec<u32> = r.columns().iter().map(|c| c.type_info().oid().map(|o| o.0).unwrap_or(0)).collect();
                 pg_ensure_types(live, &oids).await?;
+                let rels = pg_table_refs(live, r.columns()).await;
                 let cache = live.pg_types.lock().unwrap_or_else(|e| e.into_inner());
                 let mut kinds = Vec::new();
                 let mut metas = Vec::new();
                 let mut sig = Vec::new();
-                for (c, oid) in r.columns().iter().zip(oids) {
+                for ((c, oid), rel) in r.columns().iter().zip(oids).zip(rels) {
                     let (name, kind) = pg_resolve(&cache, oid, 0);
                     kinds.push(kind);
-                    metas.push(meta(c.name(), name));
+                    metas.push(ColumnMeta { table_ref: rel, ..meta(c.name(), name) });
                     sig.push((c.name().to_string(), oid));
                 }
                 Ok((RowDecoder::Pg(Arc::new(kinds), opts, sig), metas))
@@ -526,13 +573,19 @@ fn meta(name: &str, type_name: String) -> ColumnMeta {
 
 /// Column metadata of a statement without running it (`describe`). Used to show the
 /// columns of a query that returned zero rows.
-pub(crate) async fn describe_columns(conn: &mut Conn, sql: &str) -> Vec<ColumnMeta> {
+pub(crate) async fn describe_columns(live: &Live, conn: &mut Conn, sql: &str) -> Vec<ColumnMeta> {
     use sqlx::Executor;
     fn conv<C: Column>(cols: &[C]) -> Vec<ColumnMeta> {
         cols.iter().map(|c| meta(c.name(), c.type_info().name().to_lowercase())).collect()
     }
     match conn {
-        Conn::Pg(c) => c.describe(sql).await.map(|d| conv(d.columns())).unwrap_or_default(),
+        Conn::Pg(c) => match c.describe(sql).await {
+            Ok(d) => {
+                let refs = pg_table_refs(live, d.columns()).await;
+                conv(d.columns()).into_iter().zip(refs).map(|(m, table_ref)| ColumnMeta { table_ref, ..m }).collect()
+            }
+            Err(_) => Vec::new(),
+        },
         Conn::My(c) => c.describe(sql).await.map(|d| conv(d.columns())).unwrap_or_default(),
         Conn::Lite(c) => c.describe(sql).await.map(|d| conv(d.columns())).unwrap_or_default(),
     }

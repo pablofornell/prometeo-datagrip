@@ -1,9 +1,12 @@
 //! DDL reconstruction for the "DDL" tab / "Go to DDL".
 //!
 //! * PostgreSQL: rebuilt from the catalogs (`pg_get_constraintdef`, `pg_get_indexdef`,
-//!   `pg_get_viewdef`, `pg_get_functiondef`, `pg_get_triggerdef`).
-//! * MySQL: `SHOW CREATE ...`.
-//! * SQLite: `sqlite_master.sql`.
+//!   `pg_get_viewdef`, `pg_get_functiondef`, `pg_get_triggerdef`) in DataGrip's style: lower-case keywords,
+//!   `-- auto-generated definition`, aligned column names, single-column constraints under their column,
+//!   one statement per paragraph (`alter table .. owner to`, `create index .. on ..`). Text the server writes
+//!   itself (view bodies, function bodies) is passed through unchanged.
+//! * MySQL: `SHOW CREATE ...` (server text, unchanged; our own `create index` is lower-case).
+//! * SQLite: `sqlite_master.sql` (stored text, unchanged).
 
 use crate::conn::{Live, Pool};
 use crate::error::{DbError, Result};
@@ -73,22 +76,24 @@ async fn pg_ddl(live: &Live, o: &ObjectRef) -> Result<String> {
             let def = first_cell(pool, &format!("select pg_get_viewdef({}, true)", pg_rel_expr(&sc, &o.name)))
                 .await?
                 .ok_or_else(|| DbError::NotFound(format!("View {sc}.{} not found", o.name)))?;
-            let mut out = format!("CREATE OR REPLACE VIEW {} AS\n{}", pg_qname(pool, &sc, &o.name).await?, end_stmt(def));
-            out.push_str(&pg_extras(pool, &sc, &o.name, false, true).await?);
-            Ok(out)
+            let mut stmts = vec![
+                AUTO_GENERATED.to_string(),
+                format!("create or replace view {} as\n{}", pg_qname(pool, &sc, &o.name).await?, end_stmt(def)),
+            ];
+            stmts.extend(pg_extras(pool, &sc, &o.name, false, true).await?);
+            Ok(join_stmts(stmts))
         }
         NodeKind::MaterializedView => {
             let def = first_cell(pool, &format!("select pg_get_viewdef({}, true)", pg_rel_expr(&sc, &o.name)))
                 .await?
                 .ok_or_else(|| DbError::NotFound(format!("Materialized view {sc}.{} not found", o.name)))?;
             let def = def.trim_end().trim_end_matches(';').to_string();
-            let mut out = format!(
-                "CREATE MATERIALIZED VIEW {} AS\n{}\nWITH DATA;",
-                pg_qname(pool, &sc, &o.name).await?,
-                def
-            );
-            out.push_str(&pg_extras(pool, &sc, &o.name, true, false).await?);
-            Ok(out)
+            let mut stmts = vec![
+                AUTO_GENERATED.to_string(),
+                format!("create materialized view {} as\n{}\nwith data;", pg_qname(pool, &sc, &o.name).await?, def),
+            ];
+            stmts.extend(pg_extras(pool, &sc, &o.name, true, false).await?);
+            Ok(join_stmts(stmts))
         }
         NodeKind::Function | NodeKind::Procedure | NodeKind::Routine => {
             let sig = match &o.signature {
@@ -108,19 +113,38 @@ async fn pg_ddl(live: &Live, o: &ObjectRef) -> Result<String> {
             .ok_or_else(|| DbError::NotFound(format!("Routine {sc}.{} not found", o.name)))?;
             Ok(end_stmt(def))
         }
-        NodeKind::Sequence => first_cell(
-            pool,
-            &format!(
-                "select format('CREATE SEQUENCE %I.%I AS %s START WITH %s INCREMENT BY %s MINVALUE %s MAXVALUE %s CACHE %s%s;', \
-                        schemaname, sequencename, data_type::text, start_value, increment_by, min_value, max_value, cache_size, \
-                        case when cycle then ' CYCLE' else '' end) \
-                 from pg_sequences where schemaname = {} and sequencename = {}",
-                pl(&sc),
-                pl(&o.name)
-            ),
-        )
-        .await?
-        .ok_or_else(|| DbError::NotFound(format!("Sequence {sc}.{} not found", o.name))),
+        NodeKind::Sequence => {
+            let row = pool
+                .query_strings(&format!(
+                    "select quote_ident(schemaname) || '.' || quote_ident(sequencename), data_type::text, start_value::text, \
+                            increment_by::text, min_value::text, max_value::text, cache_size::text, cycle::text, \
+                            quote_ident(sequenceowner) \
+                     from pg_sequences where schemaname = {} and sequencename = {}",
+                    pl(&sc),
+                    pl(&o.name)
+                ))
+                .await?;
+            let r = row.first().ok_or_else(|| DbError::NotFound(format!("Sequence {sc}.{} not found", o.name)))?;
+            let mut create = format!(
+                "create sequence {}\n    as {}\n    start with {}\n    increment by {}\n    minvalue {}\n    maxvalue {}\n    cache {}",
+                g(r, 0),
+                g(r, 1),
+                g(r, 2),
+                g(r, 3),
+                g(r, 4),
+                g(r, 5),
+                g(r, 6)
+            );
+            if g(r, 7) == "true" {
+                create.push_str("\n    cycle");
+            }
+            create.push(';');
+            Ok(join_stmts(vec![
+                AUTO_GENERATED.to_string(),
+                create,
+                format!("alter sequence {} owner to {};", g(r, 0), g(r, 8)),
+            ]))
+        }
         NodeKind::Index => first_cell(
             pool,
             &format!(
@@ -131,7 +155,7 @@ async fn pg_ddl(live: &Live, o: &ObjectRef) -> Result<String> {
             ),
         )
         .await?
-        .map(end_stmt)
+        .map(|d| format!("{};", index_def(&d)))
         .ok_or_else(|| DbError::NotFound(format!("Index {sc}.{} not found", o.name))),
         NodeKind::Trigger => {
             let t = o.table.clone().ok_or_else(|| DbError::InvalidArgument("trigger needs a table".into()))?;
@@ -144,7 +168,7 @@ async fn pg_ddl(live: &Live, o: &ObjectRef) -> Result<String> {
                 ),
             )
             .await?
-            .map(end_stmt)
+            .map(|d| format!("{};", trigger_def(&d)))
             .ok_or_else(|| DbError::NotFound(format!("Trigger {} not found", o.name)))
         }
         NodeKind::PrimaryKey | NodeKind::ForeignKey | NodeKind::UniqueKey | NodeKind::Check => {
@@ -160,10 +184,10 @@ async fn pg_ddl(live: &Live, o: &ObjectRef) -> Result<String> {
             .await?
             .ok_or_else(|| DbError::NotFound(format!("Constraint {} not found", o.name)))?;
             Ok(format!(
-                "ALTER TABLE {}\n    ADD CONSTRAINT {} {};",
+                "alter table {}\n    add constraint {} {};",
                 pg_qname(pool, &sc, &t).await?,
                 pgq(pool, &o.name).await?,
-                def
+                lower_keywords(&def)
             ))
         }
         NodeKind::Column => {
@@ -173,7 +197,7 @@ async fn pg_ddl(live: &Live, o: &ObjectRef) -> Result<String> {
                 .iter()
                 .find(|r| g(r, 8) == o.name)
                 .ok_or_else(|| DbError::NotFound(format!("Column {} not found", o.name)))?;
-            Ok(format!("ALTER TABLE {}\n    ADD {};", pg_qname(pool, &sc, &t).await?, pg_column_line(r)))
+            Ok(format!("alter table {}\n    add {};", pg_qname(pool, &sc, &t).await?, pg_column_line(r)))
         }
         NodeKind::Schema => {
             let owner = first_cell(
@@ -182,11 +206,11 @@ async fn pg_ddl(live: &Live, o: &ObjectRef) -> Result<String> {
             )
             .await?;
             Ok(match owner {
-                Some(ow) => format!("CREATE SCHEMA {} AUTHORIZATION {};", pgq(pool, &o.name).await?, pgq(pool, &ow).await?),
-                None => format!("CREATE SCHEMA {};", pgq(pool, &o.name).await?),
+                Some(ow) => format!("create schema {} authorization {};", pgq(pool, &o.name).await?, pgq(pool, &ow).await?),
+                None => format!("create schema {};", pgq(pool, &o.name).await?),
             })
         }
-        NodeKind::Database => Ok(format!("CREATE DATABASE {};", pgq(pool, &o.name).await?)),
+        NodeKind::Database => Ok(format!("create database {};", pgq(pool, &o.name).await?)),
         k => Err(DbError::Unsupported(format!("No DDL for {k:?}"))),
     }
 }
@@ -205,32 +229,160 @@ fn pg_column_lines_sql(schema: &str, table: &str) -> String {
     )
 }
 
-fn pg_column_line(r: &[Option<String>]) -> String {
+/// Column name (as quoted by the server) and the rest of its definition.
+fn pg_column_parts(r: &[Option<String>]) -> (String, String) {
     let serial = !g(r, 9).is_empty() && g(r, 3).starts_with("nextval(");
     let ty = match (serial, g(r, 1).as_str()) {
         (true, "integer") => "serial".to_string(),
         (true, "bigint") => "bigserial".to_string(),
         (true, "smallint") => "smallserial".to_string(),
-        _ => g(r, 1),
+        _ => spaced_type(&g(r, 1)),
     };
-    let mut l = format!("{} {}", g(r, 0), ty);
+    let serial_type = serial && matches!(g(r, 1).as_str(), "integer" | "bigint" | "smallint");
+    let mut l = ty;
     if !g(r, 7).is_empty() {
-        l.push_str(&format!(" COLLATE {}", g(r, 7)));
+        l.push_str(&format!(" collate {}", g(r, 7)));
     }
     match g(r, 4).as_str() {
-        "a" => l.push_str(" GENERATED ALWAYS AS IDENTITY"),
-        "d" => l.push_str(" GENERATED BY DEFAULT AS IDENTITY"),
+        "a" => l.push_str(" generated always as identity"),
+        "d" => l.push_str(" generated by default as identity"),
         _ => {}
     }
+    let default = lower_keywords(&g(r, 3));
     if g(r, 5) == "s" {
-        l.push_str(&format!(" GENERATED ALWAYS AS ({}) STORED", g(r, 3)));
-    } else if !g(r, 3).is_empty() && g(r, 4).is_empty() && !(serial && ty != g(r, 1)) {
-        l.push_str(&format!(" DEFAULT {}", g(r, 3)));
+        l.push_str(&format!(" generated always as ({default}) stored"));
+    } else if !default.is_empty() && g(r, 4).is_empty() && !serial_type {
+        l.push_str(&format!(" default {default}"));
     }
-    if g(r, 2) == "true" {
-        l.push_str(" NOT NULL");
+    // `serial` already means not null
+    if g(r, 2) == "true" && !serial_type {
+        l.push_str(" not null");
     }
-    l
+    (g(r, 0), l)
+}
+
+fn pg_column_line(r: &[Option<String>]) -> String {
+    let (name, rest) = pg_column_parts(r);
+    format!("{name} {rest}")
+}
+
+/// `numeric(12,2)` -> `numeric(12, 2)` (DataGrip's spelling).
+fn spaced_type(t: &str) -> String {
+    if t.contains('(') && !t.contains(", ") {
+        t.replace(',', ", ")
+    } else {
+        t.to_string()
+    }
+}
+
+/// One `pg_constraint` row of a table.
+struct PgCon {
+    name: String,
+    kind: char,
+    /// `pg_get_constraintdef`, keywords lower-cased
+    def: String,
+    /// column names (unquoted); one entry for a column constraint
+    cols: Vec<String>,
+    /// foreign key whose referenced columns are the primary key of the target (DataGrip omits them)
+    ref_is_pk: bool,
+}
+
+impl PgCon {
+    fn from_row(r: &[Option<String>]) -> PgCon {
+        PgCon {
+            name: g(r, 0),
+            kind: g(r, 1).chars().next().unwrap_or('c'),
+            def: lower_keywords(&g(r, 2)),
+            cols: g(r, 3).split(',').filter(|c| !c.is_empty()).map(str::to_string).collect(),
+            ref_is_pk: g(r, 4) == "true",
+        }
+    }
+
+    /// The name PostgreSQL generates when none is given; such names are not written out.
+    fn is_default_name(&self, table: &str) -> bool {
+        let want = match self.kind {
+            'p' => format!("{table}_pkey"),
+            'u' => format!("{table}_{}_key", self.cols.join("_")),
+            'f' => format!("{table}_{}_fkey", self.cols.join("_")),
+            'c' if self.cols.len() == 1 => format!("{table}_{}_check", self.cols[0]),
+            'c' => format!("{table}_check"),
+            _ => return false,
+        };
+        self.name == want
+    }
+
+    /// Whether the constraint is written under its column (`primary key`, `unique`, `references t`, `check (..)`).
+    fn inline_clause(&self) -> Option<String> {
+        if self.cols.len() != 1 {
+            return None;
+        }
+        match self.kind {
+            'p' if strip_parens(&self.def) == "primary key" => Some("primary key".into()),
+            'u' if strip_parens(&self.def) == "unique" => Some("unique".into()),
+            'f' => {
+                let rest = self.def.split_once(") references ").map(|(_, r)| r)?;
+                Some(references(rest, self.ref_is_pk))
+            }
+            'c' => Some(self.def.clone()),
+            _ => None,
+        }
+    }
+
+    fn table_clause(&self) -> String {
+        if self.kind == 'f' {
+            if let Some((cols, rest)) = self.def.split_once(") references ") {
+                return format!("{}) {}", cols, references(rest, self.ref_is_pk));
+            }
+        }
+        self.def.clone()
+    }
+
+    /// Lines of the constraint at `indent` spaces: `clause`, or `constraint name` + the clause one level deeper.
+    fn lines(&self, table: &str, clause: &str, indent: usize) -> String {
+        let pad = " ".repeat(indent);
+        if self.is_default_name(table) {
+            format!("{pad}{clause}")
+        } else {
+            format!("{pad}constraint {}\n{pad}    {clause}", self.name)
+        }
+    }
+}
+
+/// `primary key (id)` -> `primary key` (the text with every parenthesised group removed, trimmed).
+fn strip_parens(s: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0;
+    for c in s.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `clients(id) on delete cascade` -> `clients on delete cascade` when the referenced column is the target's
+/// primary key, else `clients (id) on delete cascade`.
+fn references(rest: &str, ref_is_pk: bool) -> String {
+    let (target, after) = match rest.find('(') {
+        Some(open) => (rest[..open].trim_end(), &rest[open..]),
+        None => return format!("references {rest}"),
+    };
+    let (cols, tail) = match after.find(')') {
+        Some(close) => (&after[..=close], after[close + 1..].trim_start()),
+        None => return format!("references {rest}"),
+    };
+    let mut out = format!("references {target}");
+    if !ref_is_pk {
+        out.push_str(&format!(" {cols}"));
+    }
+    if !tail.is_empty() {
+        out.push(' ');
+        out.push_str(tail);
+    }
+    out
 }
 
 async fn pg_table_ddl(pool: &Pool, sc: &str, name: &str) -> Result<String> {
@@ -242,53 +394,94 @@ async fn pg_table_ddl(pool: &Pool, sc: &str, name: &str) -> Result<String> {
                     coalesce((select quote_ident(pn.nspname) || '.' || quote_ident(pc.relname) from pg_inherits i \
                               join pg_class pc on pc.oid = i.inhparent join pg_namespace pn on pn.oid = pc.relnamespace \
                               where i.inhrelid = c.oid limit 1), ''), \
-                    coalesce(obj_description(c.oid, 'pg_class'), '') \
+                    coalesce(obj_description(c.oid, 'pg_class'), ''), \
+                    quote_ident(pg_get_userbyid(c.relowner)) \
              from pg_class c where c.oid = {rel}"
         ))
         .await?;
     let h = head.first().ok_or_else(|| DbError::NotFound(format!("Table {sc}.{name} not found")))?;
     let qname = pg_qname(pool, sc, name).await?;
-    let unlogged = if g(h, 1) == "u" { "UNLOGGED " } else { "" };
+    let unlogged = if g(h, 1) == "u" { "unlogged " } else { "" };
 
-    let mut out;
+    let mut stmts = vec![AUTO_GENERATED.to_string()];
+    let mut comments = Vec::new();
     if g(h, 3) == "true" {
-        out = format!("CREATE {unlogged}TABLE {qname}\n    PARTITION OF {} {};", g(h, 5), g(h, 4));
+        stmts.push(format!(
+            "create {unlogged}table {qname}\n    partition of {} {};",
+            g(h, 5),
+            lower_keywords(&g(h, 4))
+        ));
     } else {
         let cols = pool.query_strings(&pg_column_lines_sql(sc, name)).await?;
-        let cons = pool
+        let cons: Vec<PgCon> = pool
             .query_strings(&format!(
-                "select quote_ident(conname), pg_get_constraintdef(oid) from pg_constraint \
-                 where conrelid = {rel} and contype in ('p','u','c','f','x') and conparentid = 0 \
-                 order by (contype = 'p') desc, (contype = 'u') desc, (contype = 'c') desc, (contype = 'f') desc, conname"
+                "select quote_ident(c.conname), c.contype::text, pg_get_constraintdef(c.oid), \
+                        coalesce((select string_agg(a.attname, ',' order by k.o) \
+                                  from unnest(c.conkey) with ordinality as k(n, o) \
+                                  join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k.n), ''), \
+                        (c.contype = 'f' and exists (select 1 from pg_constraint p where p.conrelid = c.confrelid \
+                                                       and p.contype = 'p' and p.conkey = c.confkey))::text \
+                 from pg_constraint c \
+                 where c.conrelid = {rel} and c.contype in ('p','u','c','f','x') and c.conparentid = 0 \
+                 order by (c.contype = 'p') desc, (c.contype = 'u') desc, (c.contype = 'c') desc, (c.contype = 'f') desc, c.conname"
             ))
-            .await?;
-        let mut lines: Vec<String> = cols.iter().map(|r| format!("    {}", pg_column_line(r))).collect();
-        lines.extend(cons.iter().map(|r| format!("    CONSTRAINT {} {}", g(r, 0), g(r, 1))));
-        out = format!("CREATE {unlogged}TABLE {qname}\n(\n{}\n)", lines.join(",\n"));
-        if !g(h, 2).is_empty() {
-            out.push_str(&format!("\nPARTITION BY {}", g(h, 2)));
+            .await?
+            .iter()
+            .map(|r| PgCon::from_row(r))
+            .collect();
+
+        let mut table_level: Vec<&PgCon> = Vec::new();
+        let mut inline: Vec<Vec<(&PgCon, String)>> = vec![Vec::new(); cols.len()];
+        for c in &cons {
+            let target = c
+                .inline_clause()
+                .and_then(|cl| cols.iter().position(|r| g(r, 8) == c.cols[0]).map(|i| (i, cl)));
+            match target {
+                Some((i, cl)) => inline[i].push((c, cl)),
+                None => table_level.push(c),
+            }
         }
-        out.push(';');
-        // comments
-        let mut comments = String::new();
+
+        let parts: Vec<(String, String)> = cols.iter().map(|r| pg_column_parts(r)).collect();
+        let width = parts.iter().map(|(n, _)| n.chars().count()).max().unwrap_or(0);
+        let mut items: Vec<String> = Vec::new();
+        for (i, (n, rest)) in parts.iter().enumerate() {
+            let mut item = format!("    {n:<width$} {rest}");
+            for (c, clause) in &inline[i] {
+                item.push('\n');
+                item.push_str(&c.lines(name, clause, 8));
+            }
+            items.push(item);
+        }
+        for c in table_level {
+            items.push(c.lines(name, &c.table_clause(), 4));
+        }
+        let mut create = format!("create {unlogged}table {qname}\n(\n{}\n)", items.join(",\n"));
+        if !g(h, 2).is_empty() {
+            create.push_str(&format!("\npartition by {}", lower_keywords(&g(h, 2))));
+        }
+        create.push(';');
+        stmts.push(create);
+
         if !g(h, 6).is_empty() {
-            comments.push_str(&format!("\n\nCOMMENT ON TABLE {qname} IS {};", pl(&g(h, 6))));
+            comments.push(format!("comment on table {qname} is {};", pl(&g(h, 6))));
         }
         for r in &cols {
             if !g(r, 6).is_empty() {
-                comments.push_str(&format!("\nCOMMENT ON COLUMN {qname}.{} IS {};", g(r, 0), pl(&g(r, 6))));
+                comments.push(format!("comment on column {qname}.{} is {};", g(r, 0), pl(&g(r, 6))));
             }
         }
-        out.push_str(&comments);
     }
-    out.push_str(&pg_extras(pool, sc, name, true, true).await?);
-    Ok(out)
+    stmts.extend(comments);
+    stmts.push(format!("alter table {qname}\n    owner to {};", g(h, 7)));
+    stmts.extend(pg_extras(pool, sc, name, true, true).await?);
+    Ok(join_stmts(stmts))
 }
 
-/// Indexes (not backing a constraint) and triggers appended to table / view DDL.
-async fn pg_extras(pool: &Pool, sc: &str, name: &str, indexes: bool, triggers: bool) -> Result<String> {
+/// Indexes (not backing a constraint) and triggers appended to table / view DDL, one statement each.
+async fn pg_extras(pool: &Pool, sc: &str, name: &str, indexes: bool, triggers: bool) -> Result<Vec<String>> {
     let rel = pg_rel_expr(sc, name);
-    let mut out = String::new();
+    let mut out = Vec::new();
     if indexes {
         let rows = pool
             .query_strings(&format!(
@@ -298,12 +491,7 @@ async fn pg_extras(pool: &Pool, sc: &str, name: &str, indexes: bool, triggers: b
                  order by ic.relname"
             ))
             .await?;
-        if !rows.is_empty() {
-            out.push('\n');
-        }
-        for r in rows {
-            out.push_str(&format!("\n{};", g(&r, 0)));
-        }
+        out.extend(rows.iter().map(|r| format!("{};", index_def(&g(r, 0)))));
     }
     if triggers {
         let rows = pool
@@ -311,14 +499,130 @@ async fn pg_extras(pool: &Pool, sc: &str, name: &str, indexes: bool, triggers: b
                 "select pg_get_triggerdef(oid) from pg_trigger where tgrelid = {rel} and not tgisinternal order by tgname"
             ))
             .await?;
-        if !rows.is_empty() {
-            out.push('\n');
-        }
-        for r in rows {
-            out.push_str(&format!("\n{};", g(&r, 0)));
-        }
+        out.extend(rows.iter().map(|r| format!("{};", trigger_def(&g(r, 0)))));
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------- text helpers
+
+const AUTO_GENERATED: &str = "-- auto-generated definition";
+
+/// Statements are separated by an empty line, except the leading comment which sticks to the first statement.
+fn join_stmts(stmts: Vec<String>) -> String {
+    let mut out = String::new();
+    for (i, s) in stmts.iter().enumerate() {
+        if i == 1 && stmts[0].starts_with("--") {
+            out.push('\n');
+        } else if i > 0 {
+            out.push_str("\n\n");
+        }
+        out.push_str(s);
+    }
+    out
+}
+
+/// Lower-cases the keywords of SQL the server wrote (`pg_get_constraintdef`, `pg_get_indexdef`, ...).
+/// The server spells keywords in upper case and double-quotes every identifier that has an upper-case letter,
+/// so a bare word without lower-case letters is a keyword. Quoted identifiers and string literals are kept.
+fn lower_keywords(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\'' || c == '"' {
+            out.push(c);
+            while let Some(d) = it.next() {
+                out.push(d);
+                if d == c {
+                    if it.peek() == Some(&c) {
+                        out.push(it.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else if c.is_alphabetic() || c == '_' {
+            let mut w = String::from(c);
+            while let Some(&d) = it.peek() {
+                if d.is_alphanumeric() || d == '_' || d == '$' {
+                    w.push(d);
+                    it.next();
+                } else {
+                    break;
+                }
+            }
+            let letters = w.chars().filter(|x| x.is_alphabetic()).count();
+            if letters >= 2 && !w.chars().any(|x| x.is_lowercase()) {
+                out.push_str(&w.to_lowercase());
+            } else {
+                out.push_str(&w);
+            }
+        } else if c.is_ascii_digit() {
+            // numbers and identifier tails such as `t1`: copy the whole word
+            out.push(c);
+            while let Some(&d) = it.peek() {
+                if d.is_alphanumeric() || d == '_' || d == '.' {
+                    out.push(d);
+                    it.next();
+                } else {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `CREATE INDEX i ON s.t USING btree (c)` -> `create index i\n    on s.t (c)` (`btree` is the default method).
+fn index_def(def: &str) -> String {
+    let d = lower_keywords(def.trim_end().trim_end_matches(';'));
+    match d.split_once(" on ") {
+        Some((head, rest)) => format!("{head}\n    on {}", rest.replacen(" using btree (", " (", 1)),
+        None => d,
+    }
+}
+
+/// `CREATE TRIGGER t BEFORE UPDATE ON s.x FOR EACH ROW EXECUTE FUNCTION f()` in DataGrip's layout:
+/// `create trigger t`, the timing, `on` table and `for each` clauses indented, `execute ..` last.
+fn trigger_def(def: &str) -> String {
+    let d = lower_keywords(def.trim_end().trim_end_matches(';'));
+    let (pre, exec) = match d.split_once(" execute ") {
+        Some((a, b)) => (a.to_string(), Some(b.to_string())),
+        None => (d.clone(), None),
+    };
+    let Some(after_create) = pre.strip_prefix("create constraint trigger ").map(|r| ("create constraint trigger", r)).or_else(|| pre.strip_prefix("create trigger ").map(|r| ("create trigger", r))) else {
+        return d;
+    };
+    let (kw, rest) = after_create;
+    // trigger name (possibly double-quoted)
+    let name_end = if let Some(quoted) = rest.strip_prefix('"') {
+        quoted.find('"').map(|i| i + 2).unwrap_or(rest.len())
+    } else {
+        rest.find(' ').unwrap_or(rest.len())
+    };
+    let (name, rest) = rest.split_at(name_end);
+    let Some((timing, rest)) = rest.trim_start().split_once(" on ") else {
+        return d;
+    };
+    let (table, tail) = rest.split_once(' ').unwrap_or((rest, ""));
+    let mut lines = vec![format!("{kw} {name}"), format!("    {timing}"), format!("    on {table}")];
+    let tail = tail.trim();
+    if let Some((before, when)) = tail.split_once(" when ") {
+        if !before.is_empty() {
+            lines.push(format!("    {before}"));
+        }
+        lines.push(format!("    when {when}"));
+    } else if let Some(rest) = tail.strip_prefix("when ") {
+        lines.push(format!("    when {rest}"));
+    } else if !tail.is_empty() {
+        lines.push(format!("    {tail}"));
+    }
+    if let Some(e) = exec {
+        lines.push(format!("execute {e}"));
+    }
+    lines.join("\n")
 }
 
 // ================================================================= MySQL
@@ -407,5 +711,56 @@ async fn lite_ddl(live: &Live, o: &ObjectRef) -> Result<String> {
         Some(s) => Ok(end_stmt(s)),
         None if ty == "index" => Ok(format!("-- {} is created automatically by a UNIQUE / PRIMARY KEY constraint", o.name)),
         None => Err(DbError::NotFound(format!("{} {} not found", ty, name))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keywords_go_lower_case_but_quoted_text_does_not() {
+        assert_eq!(lower_keywords("FOREIGN KEY (a) REFERENCES shop.categories(id) ON DELETE CASCADE"), "foreign key (a) references shop.categories(id) on delete cascade");
+        assert_eq!(lower_keywords(r#"CHECK (("Name" <> 'NOT NULL'::text))"#), r#"check (("Name" <> 'NOT NULL'::text))"#);
+        assert_eq!(lower_keywords("CURRENT_TIMESTAMP"), "current_timestamp");
+        assert_eq!(lower_keywords("t1 = 10 AND x IS NOT NULL"), "t1 = 10 and x is not null");
+        assert_eq!(lower_keywords("'it''s OK' AS x"), "'it''s OK' as x");
+    }
+
+    #[test]
+    fn index_and_trigger_layout() {
+        assert_eq!(index_def("CREATE INDEX idx_a ON shop.t USING btree (a)"), "create index idx_a\n    on shop.t (a)");
+        assert_eq!(
+            index_def("CREATE UNIQUE INDEX u ON shop.t USING gin (a) WHERE (b < 5)"),
+            "create unique index u\n    on shop.t using gin (a) where (b < 5)"
+        );
+        assert_eq!(
+            trigger_def("CREATE TRIGGER trg BEFORE UPDATE ON shop.t FOR EACH ROW EXECUTE FUNCTION shop.f()"),
+            "create trigger trg\n    before update\n    on shop.t\n    for each row\nexecute function shop.f()"
+        );
+        assert_eq!(
+            trigger_def("CREATE TRIGGER trg AFTER INSERT OR UPDATE ON t FOR EACH ROW WHEN ((new.a > 1)) EXECUTE FUNCTION f()"),
+            "create trigger trg\n    after insert or update\n    on t\n    for each row\n    when ((new.a > 1))\nexecute function f()"
+        );
+    }
+
+    #[test]
+    fn constraints_sit_under_their_column() {
+        let pk = PgCon { name: "invoices_pkey".into(), kind: 'p', def: "primary key (id)".into(), cols: vec!["id".into()], ref_is_pk: false };
+        assert_eq!(pk.inline_clause().as_deref(), Some("primary key"));
+        assert_eq!(pk.lines("invoices", "primary key", 8), "        primary key");
+        let fk = PgCon { name: "fk_client".into(), kind: 'f', def: "foreign key (client_id) references clients(id) on delete cascade".into(), cols: vec!["client_id".into()], ref_is_pk: true };
+        assert_eq!(fk.inline_clause().as_deref(), Some("references clients on delete cascade"));
+        assert_eq!(fk.lines("invoices", "references clients", 8), "        constraint fk_client\n            references clients");
+        let fk2 = PgCon { name: "x".into(), kind: 'f', def: "foreign key (a) references t(b)".into(), cols: vec!["a".into()], ref_is_pk: false };
+        assert_eq!(fk2.inline_clause().as_deref(), Some("references t (b)"));
+        let comp = PgCon { name: "t_pkey".into(), kind: 'p', def: "primary key (a, b)".into(), cols: vec!["a".into(), "b".into()], ref_is_pk: false };
+        assert_eq!(comp.inline_clause(), None);
+        assert_eq!(comp.table_clause(), "primary key (a, b)");
+    }
+
+    #[test]
+    fn statements_are_paragraphs_under_the_header() {
+        assert_eq!(join_stmts(vec![AUTO_GENERATED.into(), "create a;".into(), "alter b;".into()]), "-- auto-generated definition\ncreate a;\n\nalter b;");
     }
 }

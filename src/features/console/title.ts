@@ -1,10 +1,12 @@
 /**
- * Name of a result tab. The backend does not report the source table of ad-hoc queries, so (like DataGrip's
- * "main.customers" / "postgres.sales.invoices") the table is read from the statement itself when it is a plain
- * `SELECT ... FROM table [alias] [WHERE|ORDER BY|LIMIT ...]` without joins, subqueries or set operations.
+ * Name of a result tab (DataGrip's "main.customers" / "postgres.sales.invoices"). The table comes from the column
+ * metadata when the backend reports it (`ColumnMeta.tableRef`, PostgreSQL); otherwise (MySQL, SQLite) it is read
+ * from the statement itself when that is a plain `SELECT ... FROM table [alias] [WHERE|ORDER BY|LIMIT ...]`
+ * without joins, subqueries or set operations.
  */
 import type { Dialect } from "../../components/editor";
 import { lex } from "../../components/editor/lexer";
+import type { ColumnMeta } from "../../api/types";
 
 const END = new Set(["where", "order", "limit", "offset", "fetch", "for", "window"]);
 const SET_OPS = new Set(["union", "intersect", "except", "with"]);
@@ -58,6 +60,22 @@ export function singleTable(sql: string, dialect: Dialect): string[] | null {
   const rest = toks[i];
   if (!rest || rest.text === ";") return parts;
   return rest.kind === "word" && END.has(rest.text.toLowerCase()) ? parts : null;
+}
+
+/**
+ * Parts (`[schema, table]`) of the single table a result comes from: the one table the columns report
+ * (expression columns, which report none, are ignored), or null when they report several (a join).
+ * Falls back to parsing the statement when no column reports a table.
+ */
+export function resultTable(meta: Pick<ColumnMeta, "tableRef">[], sql: string, dialect: Dialect): string[] | null {
+  const refs = new Set(meta.map((c) => c.tableRef).filter((r): r is string => !!r));
+  if (refs.size > 1) return null;
+  if (refs.size === 1) {
+    const ref = [...refs][0];
+    const dot = ref.indexOf(".");
+    return dot < 0 ? [ref] : [ref.slice(0, dot), ref.slice(dot + 1)];
+  }
+  return singleTable(sql, dialect);
 }
 
 /** DataGrip's tab name: `postgres.sales.invoices` (PG), `demo.orders` (MySQL), `main.customers` (SQLite). */

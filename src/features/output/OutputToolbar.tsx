@@ -6,14 +6,13 @@ import { FORMATS, copyResult, exportResultToFile, formatLabel } from "./export";
 import { currentOutput, type ConsoleOutput, type ResultTab } from "./model";
 
 function ResultToolbar(props: { out: ConsoleOutput; tab: ResultTab }): JSX.Element {
-  let pt = { x: 0, y: 0 };
   const host = () => props.out.host;
   const tab = () => props.tab;
-  const at = (items: MenuItem[], anchor?: DOMRect) =>
-    openMenu(items, anchor ? { x: anchor.left, y: anchor.bottom + 2 } : { x: pt.x, y: pt.y + 8 });
+  const at = (items: MenuItem[], anchor: DOMRect | HTMLElement) =>
+    openMenu(items, anchor instanceof HTMLElement ? { anchor } : { x: anchor.left, y: anchor.bottom + 2 });
 
   return (
-    <div onMouseDown={(e: MouseEvent) => (pt = { x: e.clientX, y: e.clientY })}>
+    <div>
       <GridToolbar
         running={props.out.running()}
         viewMode={tab().viewMode()}
@@ -27,11 +26,16 @@ function ResultToolbar(props: { out: ConsoleOutput; tab: ResultTab }): JSX.Eleme
             r,
           )
         }
-        onExport={() =>
-          at([
-            { label: "Export to File...", icon: "export", run: () => host() && void exportResultToFile(tab(), host()!, tab().extractor()) },
-            { label: "Copy to Clipboard", icon: "copy", run: () => host() && void copyResult(tab(), host()!, tab().extractor()) },
-          ])
+        pinned={tab().pinned()}
+        onPin={() => tab().setPinned(!tab().pinned())}
+        onExport={(anchor) =>
+          at(
+            [
+              { label: "Export to File...", icon: "export", run: () => host() && void exportResultToFile(tab(), host()!, tab().extractor()) },
+              { label: "Copy to Clipboard", icon: "copy", run: () => host() && void copyResult(tab(), host()!, tab().extractor()) },
+            ],
+            anchor,
+          )
         }
         onOptions={(r) =>
           at(

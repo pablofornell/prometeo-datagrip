@@ -16,6 +16,7 @@ persistence (`explorer.state`), status-bar crumbs. `model.ts` node kinds, icons,
 * `revealObject(dsId, objectRef): Promise<boolean>` expands + selects the object (columns, keys, indexes too)
 * `schemaSnapshotFor(dsId, schema?)` reactive; loads once, reloads after a refresh of that data source;
   `loadSchemaSnapshot(dsId, schema?)` promise variant
+* `ensureConnected(dsId)` connects a data source if needed (spinner on its tree node, connection state); idempotent
 * `reloadDataSources()` (also on window focus and on the `prometeo:datasources-changed` window event),
   `refreshConnectionState()`, `openTableTab(node.data)` / `openDdlTab` / `newConsole(dsId?)` / `jumpToConsole(dsId?)`
 

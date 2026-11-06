@@ -32,6 +32,8 @@
   --dgg-i-chevron: url("../../assets/icons/chevron-down.svg");
   --dgg-i-sortBy: url("../../assets/icons/sort-by.svg");
   --dgg-i-table: url("../../assets/icons/dg/table.svg");
+  --dgg-i-pin: url("../../assets/icons/pin.svg");
+  --dgg-i-pinOn: url("../../assets/icons/pin-selected.svg");
 }
 :root[data-theme="dark"] {
   --dgg-i-column: url("../../assets/icons/dg/column_dark.svg");
@@ -60,6 +62,8 @@
   --dgg-i-chevron: url("../../assets/icons/chevron-down_dark.svg");
   --dgg-i-sortBy: url("../../assets/icons/sort-by_dark.svg");
   --dgg-i-table: url("../../assets/icons/dg/table_dark.svg");
+  --dgg-i-pin: url("../../assets/icons/pin_dark.svg");
+  --dgg-i-pinOn: url("../../assets/icons/pin-selected_dark.svg");
 }
 
 .dgg-i,
@@ -89,6 +93,8 @@
 .dgg-i.i-chevron { background-image: var(--dgg-i-chevron); }
 .dgg-i.i-sortBy { background-image: var(--dgg-i-sortBy); }
 .dgg-i.i-table { background-image: var(--dgg-i-table); }
+.dgg-i.i-pin { background-image: var(--dgg-i-pin); }
+.dgg-i.i-pinOn { background-image: var(--dgg-i-pinOn); }
 .dgg-ico.k-col { background-image: var(--dgg-i-column); }
 .dgg-ico.k-pk { background-image: var(--dgg-i-pk); }
 .dgg-ico.k-fk { background-image: var(--dgg-i-fk); }

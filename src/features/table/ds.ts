@@ -1,6 +1,6 @@
 /** Small cache of the data sources (name, driver, read-only flag) for the table / DDL views. */
 import { createSignal } from "solid-js";
-import { type DataSource, connect, listDataSources } from "../../api/db";
+import { type DataSource, listDataSources } from "../../api/db";
 
 const [list, setList] = createSignal<DataSource[]>([]);
 let loading: Promise<void> | undefined;
@@ -28,11 +28,6 @@ export function dsInfo(dsId: string): DataSource | undefined {
 }
 
 export const errText = (e: unknown): string => String((e as Error)?.message ?? e).replace(/^Error:\s*/, "");
-
-/** `connect` is idempotent in the backend; restored tabs call it before their first request. */
-export async function ensureConnected(dsId: string): Promise<void> {
-  await connect(dsId);
-}
 
 /** Clipboard write: Tauri plugin when available, else the browser API / a textarea fallback. */
 export async function writeClipboard(text: string): Promise<void> {

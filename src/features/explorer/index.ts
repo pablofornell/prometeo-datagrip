@@ -7,8 +7,10 @@
  *   refreshNode(idOrPath)        reload a node: id string, or [dsId, ...backend path]
  *   revealObject(dsId, ref)      expand + select an object (async)
  *   schemaSnapshotFor(dsId, s?)  reactive cached schemaSnapshot (tables + columns) for completion
+ *   ensureConnected(dsId)        connects a data source if needed (tree spinner, connection state); idempotent
  */
-import { onRefreshed, reloadDataSources, loadSaved, refreshConnectionState, setLoaded, selectedNode, nodeInfo } from "./core";
+import { onRefreshed, reloadDataSources, loadSaved, refreshConnectionState, setLoaded, selectedNode, nodeInfo, dataSources } from "./core";
+import { closeStaleTabs } from "./restore";
 import { registerSlot } from "../../state/slots";
 import { activeTabId } from "../../state/tabs";
 import { createRoot, createEffect, on } from "solid-js";
@@ -26,6 +28,7 @@ export {
   refreshConnectionState,
   dataSources as explorerDataSources,
   connected as connectedDataSourceIds,
+  ensureConnected,
 } from "./core";
 export { schemaSnapshotFor, loadSchemaSnapshot } from "./schema";
 export { openTable as openTableTab, openDdl as openDdlTab, newConsole, jumpToConsole } from "./commands";
@@ -47,6 +50,8 @@ function start(): void {
     await loadSaved();
     try {
       await reloadDataSources();
+      // restored tabs of deleted data sources close silently (only with a list we actually got)
+      closeStaleTabs(new Set(dataSources().map((d) => d.id)));
     } catch {
       /* backend not ready: the list stays empty */
     }

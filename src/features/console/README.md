@@ -8,4 +8,4 @@
   per console tab; `format.ts` is the DataGrip log wording (unit tested).
 * Statements the console sends itself (BEGIN, COMMIT, `SET search_path`, `select current_schema()`) end with
   `/*prometeo:internal*/` so the history popup hides them.
-* Needs `ensureConnected` from `../explorer/core` (not exported by the explorer index).
+* Uses `ensureConnected` from the explorer module (`../explorer`).

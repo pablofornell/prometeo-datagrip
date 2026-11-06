@@ -30,7 +30,9 @@ type Icon =
   | "chevron"
   | "sortBy"
   | "table"
-  | "text";
+  | "text"
+  | "pin"
+  | "pinOn";
 
 function Btn(props: {
   icon: Icon;
@@ -83,12 +85,16 @@ export interface GridToolbarProps {
   onPreview?: () => void;
   onSubmit?: () => void;
   onDDL?: () => void;
+  /** `Pin Tab`: keeps the result tab when the next execution would replace it. The button is hidden without a handler. */
+  pinned?: boolean;
+  onPin?: () => void;
   onFind?: () => void;
   onLocalFilter?: () => void;
   onRecordView?: () => void;
   onSql?: () => void;
   onOpenInEditor?: () => void;
-  onExport?: () => void;
+  /** Gets the export button, so the menu / dialog can open under it. */
+  onExport?: (anchor: HTMLElement) => void;
   onManageColumns?: () => void;
   onOptions?: (anchor: DOMRect) => void;
 }
@@ -141,6 +147,9 @@ export function GridToolbar(props: GridToolbarProps): JSX.Element {
       <button class="dgg-tbtn text" title="Go to DDL" tabIndex={-1} onClick={() => props.onDDL?.()} disabled={!props.onDDL}>
         DDL
       </button>
+      <Show when={props.onPin}>
+        <Btn icon={props.pinned ? "pinOn" : "pin"} title={props.pinned ? "Unpin Tab" : "Pin Tab"} selected={props.pinned} onClick={() => props.onPin?.()} />
+      </Show>
       <Sep />
       <Btn icon="find" title="Find on Current Page" shortcut="Ctrl+F" disabled={!props.onFind} onClick={props.onFind} />
       <Btn icon="filter" title="Table Result Local Filter" disabled={!props.onLocalFilter} onClick={props.onLocalFilter} />
@@ -163,7 +172,7 @@ export function GridToolbar(props: GridToolbarProps): JSX.Element {
         <i class="dgg-i i-chevron" />
       </button>
       <Sep />
-      <Btn icon="export" title="Export Data" disabled={!props.onExport} onClick={props.onExport} />
+      <Btn icon="export" title="Export Data" disabled={!props.onExport} onClick={(e) => props.onExport?.(e.currentTarget as HTMLElement)} />
       <Sep />
       <Btn icon="columns" title="Manage Columns" shortcut="Ctrl+F12" disabled={!props.onManageColumns} onClick={props.onManageColumns} />
       <Btn icon="viewAs" title="View as" onClick={openViewAs} />

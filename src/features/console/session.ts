@@ -21,7 +21,7 @@ import type { PageSize } from "../../components/grid";
 import { type MenuItem, notify, openMenu } from "../../components/ui";
 import { showToolWindow } from "../../state/layout";
 import { activateTab } from "../../state/tabs";
-import { ensureConnected } from "../explorer/core";
+import { ensureConnected } from "../explorer";
 import {
   INTERNAL_MARK,
   completedIn,
@@ -31,7 +31,8 @@ import {
   rowsRetrieved,
   summary,
 } from "../output/format";
-import { qualifiedTitle, singleTable } from "./title";
+import { saveSchema, savedSchema } from "./schemaPref";
+import { qualifiedTitle, resultTable } from "./title";
 import { ConsoleOutput, DEFAULT_PAGE_SIZE, type OutputHost, ResultTab, createOutput, removeOutput } from "../output/model";
 
 export type TxMode = "auto" | "manual";
@@ -97,7 +98,10 @@ export class ConsoleSession implements OutputHost {
     [this.txMode, this.setTx] = sig<TxMode>("auto");
     [this.isolation, this.setIso] = sig<Isolation>(ds.driver === "mysql" ? "repeatable read" : "read committed");
     [this.inTx, this.setInTx] = sig(false);
-    [this.schema, this.setSchema] = sig<string | null>(ds.driver === "sqlite" ? "main" : ds.driver === "mysql" ? ds.database || null : null);
+    // the schema chosen last time shows at once; it is applied to the session when that opens (`ensureSession`)
+    [this.schema, this.setSchema] = sig<string | null>(
+      ds.driver === "sqlite" ? "main" : (savedSchema(ds.id, consoleName) ?? (ds.driver === "mysql" ? ds.database || null : null)),
+    );
     [this.marks, this.setMarks] = sig<ExecMark[]>([]);
     [this.errors, this.setErrors] = sig<EditorError[]>([]);
     [this.pageSize, this.setPageSize] = sig<PageSize>(DEFAULT_PAGE_SIZE);
@@ -133,7 +137,7 @@ export class ConsoleSession implements OutputHost {
       }
       this.sessionId = sid;
       this.connectedLogged = false;
-      await this.detectSchema(sid);
+      await this.applySavedSchema(sid, await this.detectSchema(sid));
       return sid;
     })().finally(() => (this.opening = undefined));
     return this.opening;
@@ -146,21 +150,51 @@ export class ConsoleSession implements OutputHost {
     return ev;
   }
 
-  private async detectSchema(sid: string): Promise<void> {
-    if (this.driver === "sqlite") return this.setSchema("main");
+  /** Reads the session's current schema into the signal; resolves to it (null when it could not be read). */
+  private async detectSchema(sid: string): Promise<string | null> {
+    if (this.driver === "sqlite") {
+      this.setSchema("main");
+      return "main";
+    }
     try {
       const ev = await this.silent(sid, this.driver === "postgres" ? "select current_schema()" : "select database()");
       const rs = ev.find((e) => e.kind === "resultset");
       const v = rs && rs.kind === "resultset" ? rs.rows[0]?.[0] : null;
-      if (typeof v === "string") this.setSchema(v);
+      if (typeof v === "string") {
+        this.setSchema(v);
+        return v;
+      }
     } catch {
       /* the label stays "<schema>" */
     }
+    return null;
   }
 
-  /** Re-detect after the user ran `SET search_path` / `USE` themselves. */
+  /** Puts the session into the schema the user chose in this console earlier (before a restart / reconnect). */
+  private async applySavedSchema(sid: string, actual: string | null): Promise<void> {
+    const want = this.driver === "sqlite" ? null : savedSchema(this.ds.id, this.consoleName);
+    if (!want) return;
+    if (actual === want) return;
+    try {
+      await this.silent(sid, this.useSchemaSql(want));
+      this.setSchema(want);
+    } catch {
+      // the schema is gone (dropped / renamed): forget it, the session default stays
+      saveSchema(this.ds.id, this.consoleName, null);
+      this.setSchema(actual);
+    }
+  }
+
+  private useSchemaSql(name: string): string {
+    const q = this.driver === "postgres" ? `"${name.replace(/"/g, '""')}"` : `\`${name.replace(/`/g, "``")}\``;
+    return this.driver === "postgres" ? `SET search_path TO ${q}` : `USE ${q}`;
+  }
+
+  /** Re-detect after the user ran `SET search_path` / `USE` themselves; the new schema is the console's from now on. */
   private async refreshSchema(sid: string): Promise<void> {
     await this.detectSchema(sid);
+    const now = this.schema();
+    if (this.driver !== "sqlite" && now) saveSchema(this.ds.id, this.consoleName, now);
   }
 
   // ------------------------------------------------------------ execution
@@ -289,9 +323,7 @@ export class ConsoleSession implements OutputHost {
         ordinal++;
         const sql = cur?.sql ?? req.sql;
         const meta = e.columns;
-        const refs = new Set(meta.map((c) => c.tableRef));
-        const ref = refs.size === 1 ? meta[0]?.tableRef : null;
-        const parts = ref ? ref.split(".") : singleTable(sql, this.driver);
+        const parts = resultTable(meta, sql, this.driver);
         const title =
           leadingComment(sql) ?? (req.ranges.length && cur ? this.attachedComment(cur.from) : null) ?? (parts ? qualifiedTitle(parts, this.driver, this.ds.database, this.schema()) : `Result ${ordinal}`);
         const tab = new ResultTab(meta, e.rows, e.hasMore, title, sql, e.index, () => handleP, pageSize);
@@ -492,9 +524,9 @@ export class ConsoleSession implements OutputHost {
     if (this.out.running()) return;
     try {
       const sid = await this.ensureSession();
-      const q = this.driver === "postgres" ? `"${name.replace(/"/g, '""')}"` : `\`${name.replace(/`/g, "``")}\``;
-      await this.silent(sid, this.driver === "postgres" ? `SET search_path TO ${q}` : `USE ${q}`);
+      await this.silent(sid, this.useSchemaSql(name));
       this.setSchema(name);
+      saveSchema(this.ds.id, this.consoleName, name);
     } catch (e) {
       notify({ kind: "error", title: "Cannot switch the schema", body: errText(e) });
     }

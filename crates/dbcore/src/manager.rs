@@ -162,6 +162,7 @@ impl ConnectionManager {
             opts,
             server_version: version.clone(),
             pg_types: Mutex::new(HashMap::new()),
+            pg_rels: Mutex::new(HashMap::new()),
             keepalive: Mutex::new(keepalive),
         });
         self.inner.sources.write().unwrap().insert(cfg.id.clone(), live);

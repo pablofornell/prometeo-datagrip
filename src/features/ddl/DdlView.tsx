@@ -5,8 +5,9 @@ import { SqlEditor } from "../../components/editor";
 import { ActionButton, notify } from "../../components/ui";
 import { setStatus } from "../../state/status";
 import type { EditorTab } from "../../state/tabs";
+import { ensureConnected } from "../explorer";
 import { type ObjectTabData, openTableTab } from "../table/commands";
-import { dsInfo, ensureConnected, errText, loadDataSources } from "../table/ds";
+import { dsInfo, errText, loadDataSources } from "../table/ds";
 import "./ddl.css";
 
 export function DdlView(props: { tab: EditorTab; active: boolean }): JSX.Element {
@@ -31,8 +32,10 @@ function Ddl(props: { tab: EditorTab; active: boolean; dsId: string; objectRef: 
       setError(null);
       setLoaded(true);
     } catch (e) {
+      // the first load shows the error inside the tab (restored tabs must not raise a balloon each);
+      // a failed Reload of a DDL that is already shown has no other place to report
       setError(errText(e));
-      notify({ kind: "error", title: "Cannot generate the DDL", body: errText(e) });
+      if (loaded()) notify({ kind: "error", title: "Cannot generate the DDL", body: errText(e) });
     }
   }
   onMount(() => void load());

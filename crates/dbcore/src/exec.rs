@@ -340,7 +340,7 @@ async fn run_statement(
     let Some((decoder, cols)) = dec else {
         drop(stream);
         if might_return_rows(sql) {
-            let cols = describe_columns(conn, sql).await;
+            let cols = describe_columns(&live, conn, sql).await;
             if !cols.is_empty() {
                 task.sh.send(ExecEvent::ResultSet { index: idx, columns: cols, rows: Vec::new(), has_more: false });
                 return Ok(Flow::Next);

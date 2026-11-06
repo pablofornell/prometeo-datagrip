@@ -28,7 +28,8 @@ import { setStatus } from "../../state/status";
 import { type EditorTab, activateTab, updateTab } from "../../state/tabs";
 import { type ObjectTabData, openDdlTab } from "./commands";
 import { registerController } from "./controller";
-import { dsInfo, ensureConnected, errText, loadDataSources, writeClipboard } from "./ds";
+import { ensureConnected } from "../explorer";
+import { dsInfo, errText, loadDataSources, writeClipboard } from "./ds";
 import { FilterBar } from "./FilterBar";
 import { ChoiceDialog, ColumnFilterPopup, EXPORT_FORMATS, ExportDialog, SqlPopup, type ExportTarget } from "./Popups";
 import { type PageSize, type Query, createTableSource } from "./source";
@@ -153,8 +154,9 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
         await ensureConnected(dsId);
         await src.load();
       } catch (e) {
+        // shown inside the tab: restoring many tabs must not raise a balloon each (the explorer closes tabs of
+        // deleted data sources at startup, see features/explorer/restore.ts)
         setError(errText(e));
-        fail("Cannot open the table", e);
       }
     })();
   });

@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { qualifiedTitle, singleTable } from "./title";
+import { qualifiedTitle, resultTable, singleTable } from "./title";
 
 describe("result tab names", () => {
   it("finds the single table of a plain select", () => {
@@ -23,5 +23,19 @@ describe("result tab names", () => {
     expect(qualifiedTitle(["customers"], "sqlite", "", "main")).toBe("main.customers");
     expect(qualifiedTitle(["orders"], "mysql", "demo", "demo")).toBe("demo.orders");
     expect(qualifiedTitle(["t"], "postgres", "postgres", null)).toBe("postgres.public.t");
+  });
+});
+
+describe("result table from column metadata", () => {
+  const col = (tableRef: string | null) => ({ tableRef });
+  it("uses the reported table, ignoring expression columns", () => {
+    expect(resultTable([col("sales.invoices"), col(null)], "select id, count(*) over () from sales.other", "postgres")).toEqual(["sales", "invoices"]);
+  });
+  it("reports no single table for a join, whatever the statement says", () => {
+    expect(resultTable([col("sales.invoices"), col("sales.clients")], "select * from invoices", "postgres")).toBeNull();
+  });
+  it("falls back to parsing the statement when nothing is reported", () => {
+    expect(resultTable([col(null)], "select count(*) from sales.invoices", "mysql")).toEqual(["sales", "invoices"]);
+    expect(resultTable([col(null)], "select 1", "sqlite")).toBeNull();
   });
 });

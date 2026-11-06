@@ -44,6 +44,8 @@ pub(crate) struct Live {
     pub server_version: String,
     /// Cache of PG type OIDs resolved from the catalog.
     pub pg_types: Mutex<HashMap<u32, PgTypeRow>>,
+    /// Cache of PG table OIDs (`RowDescription.relation_id`) -> `schema.table`, for `ColumnMeta::table_ref`.
+    pub pg_rels: Mutex<HashMap<u32, String>>,
     /// SQLite `:memory:` data sources: one connection kept open for the lifetime of the data
     /// source, because a shared in-memory database vanishes when its last connection closes.
     pub keepalive: Mutex<Option<Conn>>,
