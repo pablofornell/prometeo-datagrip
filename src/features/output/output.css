@@ -56,8 +56,43 @@
   min-width: 0;
   outline: none;
 }
+.dgo-result {
+  flex-direction: column;
+}
 .dgo-result > .dgg {
   flex: 1;
+  min-height: 0;
+}
+/* the result is not complete: its paging stream was closed */
+.dgo-partial {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--dg-warning);
+  background: var(--dg-editor-bg);
+  color: var(--dg-text);
+  font-size: 12px;
+}
+.dgo-partial span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dgo-partial-link {
+  flex: none;
+  color: var(--dg-link, #548AF7);
+  cursor: pointer;
+}
+/* idle "Cancel Running Statements": a gray square (red only while a statement runs) */
+.dg-stop-idle rect {
+  fill: #595959;
+}
+[data-theme="light"] .dg-stop-idle rect {
+  fill: var(--dg-icon-disabled);
 }
 
 /* log toolbar */

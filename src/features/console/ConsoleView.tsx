@@ -1,11 +1,13 @@
 /** Content of a `console` editor tab (slot `editor.view.console`): toolbar + SQL editor bound to the console file. */
 import { Show, createEffect, createMemo, createSignal, on, onCleanup, onMount, type JSX } from "solid-js";
-import { readConsole, writeConsole } from "../../api/db";
+import { listDataSources, readConsole, writeConsole } from "../../api/db";
 import { SqlEditor, type SqlEditorHandle } from "../../components/editor";
 import { setStatus } from "../../state/status";
-import type { EditorTab } from "../../state/tabs";
+import { type EditorTab, updateTab } from "../../state/tabs";
 import { connectedDataSourceIds, explorerDataSources, schemaSnapshotFor } from "../explorer";
+import { dsIconUrl } from "../output/dsicon";
 import { markConsoleActive } from "../output/model";
+import { txLabel } from "../table/session";
 import { ConsoleToolbar } from "./ConsoleToolbar";
 import { dsOf, toEditorSchema } from "./ds";
 import { registerSession, unregisterSession } from "./registry";
@@ -48,22 +50,33 @@ function ConsoleInner(props: { tab: EditorTab; active: boolean; dsId: string; co
   // ---- autosave (like DataGrip: no explicit save)
   let timer: ReturnType<typeof setTimeout> | undefined;
   let dirty = false;
-  const flush = () => {
+  const write = () => void writeConsole(props.dsId, props.consoleName, text()).catch(() => {});
+  /**
+   * Saves the script. A console of a data source that was deleted meanwhile is NOT written back (that would resurrect
+   * its folder): the backend's list decides, since the explorer's own list is refreshed after the tabs are closed.
+   */
+  const flush = (checkDataSource = true) => {
     clearTimeout(timer);
     if (!dirty) return;
     dirty = false;
-    void writeConsole(props.dsId, props.consoleName, text()).catch(() => {});
+    if (!checkDataSource) return write();
+    const body = text();
+    void listDataSources().then(
+      (l) => l.some((d) => d.id === props.dsId) && void writeConsole(props.dsId, props.consoleName, body).catch(() => {}),
+      write,
+    );
   };
+  const flushNow = () => flush(false); // the page is going away: no time for a round trip
   onMount(() => {
     readConsole(props.dsId, props.consoleName)
       .then(setText, () => setText(""))
       .finally(() => setLoaded(true));
-    window.addEventListener("beforeunload", flush);
-    window.addEventListener("blur", flush);
+    window.addEventListener("beforeunload", flushNow);
+    window.addEventListener("blur", flushNow);
   });
   onCleanup(() => {
-    window.removeEventListener("beforeunload", flush);
-    window.removeEventListener("blur", flush);
+    window.removeEventListener("beforeunload", flushNow);
+    window.removeEventListener("blur", flushNow);
     flush();
     session.dispose();
     unregisterSession(props.tab.id);
@@ -94,7 +107,16 @@ function ConsoleInner(props: { tab: EditorTab; active: boolean; dsId: string; co
     ),
   );
   createEffect(() => {
-    if (props.active) setStatus("txMode", session.txMode() === "manual" ? (session.inTx() ? "Tx: Manual (active)" : "Tx: Manual") : "Tx: Auto");
+    if (props.active) setStatus("txMode", txLabel(session.txMode(), session.txStatus()));
+  });
+  // the console's tab shows the DBMS icon of its data source, like DataGrip
+  createEffect(() => {
+    const icon = dsIconUrl(ds.driver);
+    if (icon && props.tab.icon !== icon) updateTab(props.tab.id, { icon });
+  });
+  // the data source was disconnected / deactivated: the server rolled the open transaction back with the connection
+  createEffect(() => {
+    if (!connectedDataSourceIds().has(props.dsId) && session.sessionId) session.connectionClosed();
   });
   // open the DB session as soon as the data source is connected, so the schema switcher shows the real schema
   createEffect(() => {

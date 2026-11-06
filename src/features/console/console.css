@@ -38,6 +38,10 @@
 .dgc-text-btn:active {
   background: var(--dg-action-button-pressed-bg);
 }
+.dgc-tx-failed {
+  margin-left: 4px;
+  color: var(--dg-editor-wrong-ref);
+}
 .dgc-schema {
   font-size: 12px;
   gap: 4px;

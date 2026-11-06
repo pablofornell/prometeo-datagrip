@@ -14,9 +14,11 @@ import {
   type RowChange,
   type TableDataRequest,
   applyChanges,
+  type ExecEvent,
+  type TxStatus,
   executeCollect,
   isTauri,
-  sessionInTransaction,
+  sessionTxStatus,
   tableData,
 } from "../../api/db";
 import { invoke } from "../../api/tauri";
@@ -34,18 +36,68 @@ export function applyChangesInSession(dsId: string, sessionId: string, table: Ob
   return isTauri() ? invoke("apply_changes_in_session", { sessionId, table, changes }) : applyChanges(dsId, table, changes);
 }
 
-/** Runs a transaction-control statement the user did not type (hidden from the history popup). */
-async function control(sessionId: string, sql: string): Promise<void> {
+/** The server says the session is gone (data source disconnected / deactivated, console closed). */
+const LOST = /Session '[^']*' does not exist|Session is closed/i;
+export const isSessionLost = (e: unknown): boolean => LOST.test(String((e as Error)?.message ?? e));
+
+export type TxEndedEvent = Extract<ExecEvent, { kind: "txEnded" }>;
+
+/** What the backend reported about the transaction while a statement ran: the last `txStatus` and any `txEnded`. */
+export interface TxReport {
+  status: TxStatus | null;
+  ended: TxEndedEvent[];
+}
+
+/** Reads `txStatus` / `txEnded` out of collected events (the backend is the source of truth, no keyword tracking). */
+export function txReport(events: ExecEvent[]): TxReport {
+  const r: TxReport = { status: null, ended: [] };
+  for (const e of events) {
+    if (e.kind === "txStatus") r.status = e.status;
+    else if (e.kind === "txEnded") r.ended.push(e);
+  }
+  return r;
+}
+
+export type TxEndKind = "commit" | "rollback" | "implicit" | "serverRollback";
+
+/**
+ * What a `txEnded` event means, given the statement that produced it (`COMMIT` / `END` that ends with
+ * `committed: false` = PostgreSQL rolled back a failed transaction instead of committing it).
+ */
+export function classifyTxEnd(sql: string | null, e: Pick<TxEndedEvent, "committed" | "tag">): TxEndKind {
+  if (e.tag === "IMPLICIT COMMIT") return "implicit";
+  if (e.committed) return "commit";
+  const kw = (/^\s*(?:\/\*[\s\S]*?\*\/\s*)*([A-Za-z]+)/.exec(sql ?? "")?.[1] ?? "").toUpperCase();
+  return kw === "COMMIT" || kw === "END" || sql === null ? "serverRollback" : "rollback";
+}
+
+export const SERVER_ROLLBACK_LOG = "transaction rolled back by the server: the transaction had failed, so COMMIT did not save the changes";
+export const SERVER_ROLLBACK_TITLE = "The transaction was rolled back";
+export const SERVER_ROLLBACK_BODY = "The transaction had failed, so the server rolled it back instead of committing it. Nothing was saved.";
+
+/** Runs a statement the user did not type (hidden from the history popup) and reports the transaction events. */
+export async function control(sessionId: string, sql: string): Promise<TxReport> {
   const ev = await executeCollect(sessionId, `${sql} ${INTERNAL_MARK}`, { maxRows: 10, stopOnError: true });
   const err = ev.find((e) => e.kind === "error");
   if (err && err.kind === "error") throw new Error(err.message);
+  return txReport(ev);
 }
 
-/** Opens the transaction of a manual-mode session unless one is already open. Resolves whether it was open. */
-export async function ensureTransaction(sessionId: string, driver: Driver): Promise<boolean> {
-  if (await sessionInTransaction(sessionId)) return true;
-  await control(sessionId, driver === "mysql" ? "START TRANSACTION" : "BEGIN");
-  return false;
+/**
+ * Opens the transaction of a manual-mode session unless one is already open. Resolves the status of the session
+ * afterwards (`failed` when an earlier error aborted it: the caller must roll back first).
+ */
+export async function ensureTransaction(sessionId: string, driver: Driver): Promise<TxStatus> {
+  const st = await sessionTxStatus(sessionId);
+  if (st !== "idle") return st;
+  const r = await control(sessionId, driver === "mysql" ? "START TRANSACTION" : "BEGIN");
+  return r.status ?? "active";
 }
 
-export const endTransaction = (sessionId: string, kind: "commit" | "rollback"): Promise<void> => control(sessionId, kind === "commit" ? "COMMIT" : "ROLLBACK");
+export const endTransaction = (sessionId: string, kind: "commit" | "rollback"): Promise<TxReport> => control(sessionId, kind === "commit" ? "COMMIT" : "ROLLBACK");
+
+/** Status bar text of the transaction of a console / table editor: `Tx: Manual (failed)`. */
+export function txLabel(mode: "auto" | "manual", status: TxStatus): string {
+  const m = mode === "manual" ? "Manual" : "Auto";
+  return status === "idle" ? `Tx: ${m}` : `Tx: ${m} (${status})`;
+}

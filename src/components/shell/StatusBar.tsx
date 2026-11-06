@@ -44,7 +44,7 @@ export function StatusBar(): JSX.Element {
           <span class="dg-status-widget">{status.aggregator}</span>
         </Show>
         {/* DataGrip's status bar has no transaction widget in Auto mode; Manual is worth a reminder. */}
-        <Show when={status.txMode?.includes("Manual")}>
+        <Show when={!!status.txMode && status.txMode !== "Tx: Auto"}>
           <span class="dg-status-widget">{status.txMode}</span>
         </Show>
         <Show when={status.caret}>

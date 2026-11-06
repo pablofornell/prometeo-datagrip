@@ -2,6 +2,7 @@
  * State of one open "Data Sources and Drivers" dialog: the drafts of every data source, selection,
  * pending deletes and the Apply logic. Everything stays in memory until Apply / OK.
  */
+import { confirmEndTransactions } from "../console/txguard";
 import { batch, createMemo, createSignal } from "solid-js";
 import { createStore, produce, unwrap } from "solid-js/store";
 import { friendlyConnectionError } from "../../state/connection-errors";
@@ -357,6 +358,14 @@ export function createSession() {
         setError(first.message);
       });
       return false;
+    }
+    // Saving reconnects an existing data source, and removing closes it: ask before open transactions are lost.
+    const affected = [
+      ...deletedIds(),
+      ...drafts.filter((d) => !isNew(d) && isModified(d) && d.id).map((d) => d.id as string),
+    ];
+    for (const dsId of affected) {
+      if (!(await confirmEndTransactions({ dsId, reason: "reconnecting with the new settings" }))) return false;
     }
     setApplying(true);
     try {

@@ -43,6 +43,16 @@ export function ResultView(props: { tab: ResultTab; out: ConsoleOutput; selected
       data-focus-target={props.selected ? "" : undefined}
       onFocus={(e) => e.target === root && root.querySelector<HTMLElement>(".dgg")?.focus()}
     >
+      <Show when={tab().partial()}>
+        {(m) => (
+          <div class="dgo-partial" role="alert">
+            <span>{m().charAt(0).toUpperCase() + m().slice(1)}</span>
+            <a class="dgo-partial-link" onClick={() => props.out.host?.rerun(tab())}>
+              Reload
+            </a>
+          </div>
+        )}
+      </Show>
       <DataGrid
         columns={columns()}
         rowCount={tab().rowCount()}
@@ -58,6 +68,7 @@ export function ResultView(props: { tab: ResultTab; out: ConsoleOutput; selected
         editable={!!tab().edit()}
         onSubmit={(changes) => host()?.applyEdits(tab(), changes) ?? false}
         onChangesChange={tab().setPending}
+        onViewChange={tab().setView}
         apiRef={(a) => (tab().gridApi = a)}
       >
         <GridPagingPill

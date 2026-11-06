@@ -503,6 +503,7 @@
 .dgg-tbtn.text { width: auto; padding: 0 6px; }
 .dgg-tbtn.tx { color: var(--dg-text-secondary, #73767c); }
 .dgg-tbtn.tx .dgg-i { opacity: 0.6; }
+.dgg-tbtn.tx.failed { color: var(--dg-console-error, #f75464); }
 .dgg-tbtn.green .dgg-i.i-submit { filter: saturate(1.25) brightness(1.1); }
 .dgg-tsep {
   flex: none;

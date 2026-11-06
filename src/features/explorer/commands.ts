@@ -33,6 +33,7 @@ import {
 } from "./core";
 import { type ENode, type NodeData, TABLE_CHILD, TABLE_LIKE, ddlRefOf, referenceOf, tabIconOf, tableRefOf } from "./model";
 import { canRenameNode, renameSqlOf } from "./rename";
+import { confirmEndTransactions } from "../console/txguard";
 
 const errText = (e: unknown) => String((e as Error)?.message ?? e).replace(/^Error:\s*/, "");
 const fail = (title: string, e: unknown): void => {
@@ -221,6 +222,7 @@ export const dataSourceDialogAvailable = (): boolean => isActionEnabled(getActio
 
 export async function deactivate(dsId: string | undefined): Promise<void> {
   if (!dsId) return;
+  if (!(await confirmEndTransactions({ dsId, reason: "deactivating the data source" }))) return;
   try {
     await disconnect(dsId);
   } catch (e) {
@@ -427,6 +429,7 @@ export async function updateDataSource(dsId: string, change: (cfg: Omit<DataSour
 
 export async function confirmRemoveDs(ds: DataSource): Promise<void> {
   setDialog(null);
+  if (!(await confirmEndTransactions({ dsId: ds.id, reason: "removing the data source" }))) return;
   try {
     await deleteDataSource(ds.id);
   } catch (e) {

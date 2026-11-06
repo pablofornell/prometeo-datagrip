@@ -1,6 +1,8 @@
 /** The 34px toolbar of a query console (operative items of DataGrip's: run, history, Tx, commit / rollback, stop, schema). */
 import { Show, type JSX } from "solid-js";
 import { ActionButton, Icon, ToolbarSeparator, openMenu } from "../../components/ui";
+import { StopButton } from "../output/OutputToolbar";
+import { openSettings } from "../settings";
 import type { ConsoleSession } from "./session";
 
 export function ConsoleToolbar(props: { session: ConsoleSession }): JSX.Element {
@@ -20,16 +22,28 @@ export function ConsoleToolbar(props: { session: ConsoleSession }): JSX.Element 
       </span>
       <ToolbarSeparator />
       <ActionButton action="sql.history" icon="history" title="Browse Query History" />
+      <ActionButton icon="settings" title="Open Query Execution Settings…" onClick={() => openSettings("database.query-execution")} />
       <ToolbarSeparator />
-      <button ref={txBtn} type="button" class="dgc-text-btn" tabindex={-1} onMouseDown={(e) => e.preventDefault()} onClick={() => s().openTxMenu(txBtn)}>
+      <button
+        ref={txBtn}
+        type="button"
+        class="dgc-text-btn"
+        title={s().txStatus() === "failed" ? "The transaction has failed: an earlier statement raised an error. Roll it back to continue." : undefined}
+        tabindex={-1}
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={() => s().openTxMenu(txBtn)}
+      >
         <span>Tx: {s().txMode() === "manual" ? "Manual" : "Auto"}</span>
+        <Show when={s().txStatus() === "failed"}>
+          <span class="dgc-tx-failed">(failed)</span>
+        </Show>
         <Icon name="chevron-down" size={16} />
       </button>
-      <Show when={s().txMode() === "manual"}>
+      <Show when={s().txMode() === "manual" || s().inTx()}>
         <ActionButton action="sql.commit" icon="dg/commit" />
         <ActionButton action="sql.rollback" icon="dg/rollback" title="Roll Back" />
       </Show>
-      <ActionButton action="sql.cancel" icon="stop" class="dgc-stop" />
+      <StopButton running={s().out.running()} class="dgc-stop" />
       <span class="dgc-spacer" />
       <button
         ref={schemaBtn}

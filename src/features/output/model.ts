@@ -5,8 +5,8 @@
  */
 import { type Accessor, createMemo, createSignal } from "solid-js";
 import { createStore, produce } from "solid-js/store";
-import type { Cell, ColumnMeta, Driver, ExecHandle, ExportFormat } from "../../api/db";
-import type { DataGridApi, GridChange, GridColumn, ViewMode } from "../../components/grid";
+import type { Cell, ColumnMeta, Driver, ExecHandle, ExportFormat, TxStatus } from "../../api/db";
+import type { DataGridApi, GridChange, GridColumn, GridViewState, ViewMode } from "../../components/grid";
 import type { PageSize } from "../../components/grid";
 import { settings } from "../../state/settings";
 import { activeTab } from "../../state/tabs";
@@ -31,9 +31,12 @@ export interface OutputHost {
   /** Execute the statement of a result again (Reload Page); `pageSize` overrides the page size. */
   rerun(tab: ResultTab, pageSize?: PageSize): void;
   txMode(): "auto" | "manual";
-  /** A manual-mode transaction is open on the console's session. */
+  /** A transaction is open on the console's session (`active` or `failed`). */
   inTx(): boolean;
-  endTx(kind: "commit" | "rollback"): Promise<void>;
+  /** `idle` / `active` / `failed`, as the server reports it. */
+  txStatus(): TxStatus;
+  /** Resolves true when the transaction ended (or there was none). */
+  endTx(kind: "commit" | "rollback"): Promise<boolean>;
   openTxMenu(anchor: HTMLElement | DOMRect): void;
   /**
    * Submits the pending changes of an editable result (inside the console's transaction when Tx is Manual) and
@@ -91,13 +94,21 @@ export class ResultTab {
   /** The "Preview Pending Changes" popup is open. */
   readonly preview: Accessor<boolean>;
   readonly setPreview: (b: boolean) => void;
+  /** Transpose / record view / find state of the mounted grid (for the toolbar toggles). */
+  readonly view: Accessor<GridViewState | null>;
+  readonly setView: (v: GridViewState) => void;
   /** Handle of the mounted grid (set by the result view). */
   gridApi?: DataGridApi;
   /** Duration of the execution that produced it (header `648 ms`). */
   ms = 0;
   closed = false;
-  /** Fetch error shown once (result closed by the server / idle timeout). */
+  /** Why the rows beyond the loaded ones are not available (result closed by the server / idle timeout / newer statement). */
+  readonly partial: Accessor<string | null>;
+  private readonly setPartial: (m: string | null) => void;
+  /** Fetch error of the last `loadMore`. */
   fetchError?: string;
+  /** Where the problem notes go (the Output log of the console that owns the tab). */
+  log?: (kind: "text" | "error", text: string) => void;
 
   constructor(
     readonly meta: ColumnMeta[],
@@ -129,6 +140,8 @@ export class ResultTab {
     [this.pending, this.setPending] = sig(0);
     [this.applying, this.setApplying] = sig(false);
     [this.preview, this.setPreview] = sig(false);
+    [this.partial, this.setPartial] = sig<string | null>(null);
+    [this.view, this.setView] = sig<GridViewState | null>(null);
   }
 
   /** `fetch_more` of the next rows (scroll). No-op while loading or when everything is loaded. */
@@ -143,9 +156,11 @@ export class ResultTab {
       this.setHasMore(r.hasMore);
       this.setVersion(this.version() + 1);
     } catch (e) {
-      // closed by the server (idle timeout, newer execution): keep what is loaded
-      this.fetchError = String((e as Error)?.message ?? e);
+      // the paging stream is gone (idle timeout, newer statement on the session, data source disconnected): what is
+      // loaded is NOT the whole result, and the user has to be told
+      this.fetchError = String((e as Error)?.message ?? e).replace(/^Error:\s*/, "");
       this.setHasMore(false);
+      this.markPartial(partialMessage(this.fetchError, this.rows.length));
     } finally {
       this.setLoadingMore(false);
     }
@@ -160,9 +175,36 @@ export class ResultTab {
     }
   }
 
-  /** The server side of the paging stream is gone (newer execution): stop offering more rows. */
-  detach(): void {
+  /** Records that the result is incomplete (banner above the grid + a line in the Output log). */
+  private markPartial(message: string): void {
+    if (this.partial() === message) return;
+    this.setPartial(message);
+    this.log?.("error", `${this.title()}: ${message}`);
+  }
+
+  /**
+   * The server side of the paging stream is gone (a newer execution on the session): stop offering more rows. When
+   * rows were still to come, say that the grid shows only part of the result (`silent`: not yet, `announce` later;
+   * a tab that the new execution replaces anyway needs no note).
+   */
+  detach(reason = "a newer statement ran on the same connection", silent = false): void {
+    if (this.closed) return;
+    if (this.hasMore()) {
+      this.cutShort = true;
+      this.cutReason = reason;
+    }
     this.setHasMore(false);
+    if (!silent) this.announce();
+  }
+
+  private cutShort = false;
+  private cutReason = "";
+
+  /** Shows the "not the complete result" note of a stream that was cut short (once). */
+  announce(): void {
+    if (this.cutShort && !this.partial() && !this.closed) {
+      this.markPartial(`only the first ${this.rows.length.toLocaleString("en-US")} rows are shown: the result set was closed because ${this.cutReason}. Reload the result to see all rows.`);
+    }
   }
 
   /** Release the open result set on the server. */
@@ -171,7 +213,30 @@ export class ResultTab {
     this.closed = true;
     if (this.hasMore()) void this.handle().then((h) => h.close()).catch(() => {});
     this.setHasMore(false);
+    this.release();
   }
+
+  /**
+   * Drops what keeps the rows reachable once the tab is closed or replaced: the row storage itself, the grid handle
+   * (it closes over the grid's row accessor) and the log hook. Measured (FinalizationRegistry on the tabs): a closed
+   * result IS collected, but WebKit collects lazily, so its memory (+25 MB for 100k rows) only drops a few cycles
+   * later; nothing of ours keeps it alive.
+   */
+  private release(): void {
+    this.rows = [];
+    this.gridApi = undefined;
+    this.log = undefined;
+    this.fetchError = undefined;
+  }
+}
+
+/** The note for a failed `fetch_more`; "result set is closed" is the backend's wording for a stream that was released. */
+export function partialMessage(error: string, loaded: number): string {
+  const n = loaded.toLocaleString("en-US");
+  if (/result set is closed/i.test(error)) {
+    return `only the first ${n} rows are shown: the result set was closed (idle timeout, or another statement ran on the same connection), so it is not the complete result. Reload the result to see all rows.`;
+  }
+  return `could not load more rows (${error}). Only the first ${n} rows are shown, not the complete result.`;
 }
 
 const MAX_LINES = 3000;
@@ -243,6 +308,7 @@ export class ConsoleOutput {
 
   /** New result tabs of an execution: replaces `replace` in place (Reload) or every unpinned tab. */
   addResult(tab: ResultTab, opts: { first: boolean; replace?: ResultTab }): void {
+    tab.log = (kind, text) => void this.log(kind, text);
     let list = this.results();
     if (opts.first) {
       if (opts.replace) {
@@ -306,10 +372,14 @@ export function removeOutput(tabId: string): void {
 export const allOutputs = (): ConsoleOutput[] => [...outputs().values()];
 export const outputOf = (tabId: string): ConsoleOutput | undefined => outputs().get(tabId);
 
-/** The output shown by the tool window: the active console's, or the last active console's (table / DDL tabs). */
+/**
+ * The output shown by the tool window: the active console's, the active table editor's (its own queries), or the
+ * last active console's (DDL tabs).
+ */
 export function currentOutput(): ConsoleOutput | undefined {
   const t = activeTab();
   if (t?.kind === "console") return outputs().get(t.id);
+  if (t?.kind === "table" && outputs().has(t.id)) return outputs().get(t.id);
   const last = lastConsoleId();
   return last ? outputs().get(last) : undefined;
 }

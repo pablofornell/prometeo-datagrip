@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { completedIn, firstKeyword, formatDuration, leadingComment, logTimestamp, reportsCount, rowsAffected, rowsRetrieved, summary } from "./format";
+import { completedIn, firstKeyword, formatDuration, leadingComment, logTimestamp, reportsCount, rowsAffected, rowsRetrieved, summary, underlinePosition } from "./format";
 
 describe("output log wording", () => {
   it("formats the timestamp like DataGrip", () => {
@@ -31,5 +31,35 @@ describe("output log wording", () => {
   it("names results by the leading comment", () => {
     expect(leadingComment("-- Top customers by revenue\nSELECT 1")).toBe("Top customers by revenue");
     expect(leadingComment("SELECT 1")).toBeNull();
+  });
+});
+
+describe("rowsRetrieved from", () => {
+  it("starts at the page offset", () => {
+    expect(rowsRetrieved(500, 12, undefined, undefined, 501)).toBe("500 rows retrieved starting from 501 in 12 ms");
+  });
+});
+
+describe("underlinePosition", () => {
+  it("underlines the missing table, not the schema in front of it", () => {
+    const sql = "select * from shop.no_such_table";
+    const msg = 'relation "shop.no_such_table" does not exist';
+    // PostgreSQL reports position 15 (the `s` of `shop`)
+    expect(underlinePosition(sql, 15, msg)).toBe(20);
+    expect(sql.slice(20 - 1)).toBe("no_such_table");
+  });
+  it("works on the backend's real message (`[42P01] ERROR: relation ... does not exist\n  Position: 15`)", () => {
+    const sql = "select * from shop.no_such_table";
+    expect(underlinePosition(sql, 15, '[42P01] ERROR: relation "shop.no_such_table" does not exist\n  Position: 15')).toBe(20);
+    expect(underlinePosition('select * from "My Schema".t', 15, '[42P01] ERROR: relation "My Schema.t" does not exist')).toBe(27);
+  });
+  it("keeps every other position", () => {
+    expect(underlinePosition("select * from nope", 15, 'relation "nope" does not exist')).toBe(15);
+    expect(underlinePosition("selec 1", 1, 'syntax error at or near "selec"')).toBe(1);
+    expect(underlinePosition("select 1", null, "boom")).toBeUndefined();
+  });
+  it("works after an emoji (UTF-16 positions)", () => {
+    const sql = "select '😀' from s.t";
+    expect(underlinePosition(sql, sql.indexOf("s.t") + 1, 'relation "s.t" does not exist')).toBe(sql.indexOf("t", sql.indexOf("s.t") + 2) + 1);
   });
 });

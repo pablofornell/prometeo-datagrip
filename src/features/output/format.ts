@@ -32,10 +32,10 @@ export function formatDuration(ms: number): string {
 const rowsWord = (n: number): string => (n === 1 ? "1 row" : `${n} rows`);
 
 /** `18 rows retrieved starting from 1 in 902 ms (execution: 21 ms, fetching: 881 ms)`. */
-export function rowsRetrieved(rows: number, totalMs: number, execMs?: number, fetchMs?: number): string {
+export function rowsRetrieved(rows: number, totalMs: number, execMs?: number, fetchMs?: number, from = 1): string {
   const timing = execMs !== undefined && fetchMs !== undefined ? ` (execution: ${formatDuration(execMs)}, fetching: ${formatDuration(fetchMs)})` : "";
   if (rows === 0) return `0 rows retrieved in ${formatDuration(totalMs)}${timing}`;
-  return `${rowsWord(rows)} retrieved starting from 1 in ${formatDuration(totalMs)}${timing}`;
+  return `${rowsWord(rows)} retrieved starting from ${from} in ${formatDuration(totalMs)}${timing}`;
 }
 
 /** `2 rows affected in 4 ms`. */
@@ -97,3 +97,29 @@ export function leadingComment(sql: string): string | null {
 /** Marks SQL the console sends on its own (BEGIN, SET search_path, ...) so the history can hide it. */
 export const INTERNAL_MARK = "/*prometeo:internal*/";
 export const isInternalSql = (sql: string): boolean => sql.includes(INTERNAL_MARK);
+
+/**
+ * Where the editor underlines a server error: `positionUtf16` (1-based, inside the statement). PostgreSQL points a
+ * `relation "shop.no_such_table" does not exist` at the START of the qualified name, so the underline would cover
+ * `shop`, which exists; move it to the last part of the name, the one that is missing.
+ */
+export function underlinePosition(stmt: string, positionUtf16: number | null, message: string): number | undefined {
+  if (!positionUtf16 || positionUtf16 < 1) return undefined;
+  const m = /\b(?:relation|table|view|sequence|function|type|index) "([^"]+)" does not exist/i.exec(message);
+  if (!m?.[1].includes(".")) return positionUtf16;
+  const at = positionUtf16 - 1;
+  const span = /^(?:"(?:[^"]|"")*"|[\w$]+)(?:\.(?:"(?:[^"]|"")*"|[\w$]+))*/.exec(stmt.slice(at))?.[0];
+  if (!span) return positionUtf16;
+  const lastDot = (() => {
+    let q = false;
+    let d = -1;
+    for (let i = 0; i < span.length; i++) {
+      if (span[i] === '"') q = !q;
+      else if (span[i] === "." && !q) d = i;
+    }
+    return d;
+  })();
+  if (lastDot < 0) return positionUtf16;
+  const last = span.slice(lastDot + 1).replace(/^"|"$/g, "");
+  return m[1].endsWith("." + last) ? at + lastDot + 2 : positionUtf16;
+}

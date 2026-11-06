@@ -10,7 +10,7 @@
 import { batch, createSignal } from "solid-js";
 import { type Cell, type ColumnMeta, type ObjectRef, type ResultSet, tableData } from "../../api/db";
 import { settings } from "../../state/settings";
-import { tableDataInSession } from "./session";
+import { isSessionLost, tableDataInSession } from "./session";
 
 export type PageSize = number | "all";
 
@@ -31,11 +31,37 @@ interface Chunk {
   locators?: Cell[];
 }
 
+/** What the table editor reports to its Output after a page load (the query, how many rows, how long it took). */
+export interface QueryReport {
+  query: Query;
+  /** Rows of the page; for `all` the true row count of the table (the rows themselves arrive in chunks). */
+  rows: number;
+  ms: number;
+  error?: string;
+}
+
+export interface SourceHooks {
+  onQuery?: (r: QueryReport) => void;
+  /**
+   * A read on the manual-mode session failed because the session is gone (data source disconnected). The host drops
+   * it, tells the user the transaction was rolled back and resolves with a new session (undefined = use the pool).
+   */
+  onSessionLost?: () => Promise<string | undefined>;
+  /** The session to read through (opened on demand); replaces the plain `sessionId` accessor when given. */
+  ensureSession?: () => Promise<string | undefined>;
+}
+
 /**
  * `sessionId` (manual transaction mode) makes every read go through that session's connection, so the rows of its
  * open transaction are visible.
  */
-export function createTableSource(dsId: string, ref: ObjectRef, initial: Partial<Query> = {}, sessionId: () => string | undefined = () => undefined) {
+export function createTableSource(
+  dsId: string,
+  ref: ObjectRef,
+  initial: Partial<Query> = {},
+  sessionId: () => string | undefined = () => undefined,
+  hooks: SourceHooks = {},
+) {
   /** The page size the user picked in the pill; `null` follows the Settings page size. */
   let sizeOverride: PageSize | null = initial.pageSize ?? null;
   let query: Query = { where: "", orderBy: "", page: 0, ...initial, pageSize: sizeOverride ?? defaultPageSize() };
@@ -56,9 +82,16 @@ export function createTableSource(dsId: string, ref: ObjectRef, initial: Partial
   const chunkSizeOf = (q: Query) => (q.pageSize === "all" ? ALL_CHUNK : q.pageSize);
   const offsetOf = (q: Query) => (q.pageSize === "all" ? 0 : q.page * q.pageSize);
 
-  const read = (req: Parameters<typeof tableData>[2]): Promise<ResultSet> => {
-    const sid = sessionId();
-    return sid ? tableDataInSession(dsId, sid, ref, req) : tableData(dsId, ref, req);
+  const read = async (req: Parameters<typeof tableData>[2]): Promise<ResultSet> => {
+    const sid = hooks.ensureSession ? await hooks.ensureSession() : sessionId();
+    if (!sid) return tableData(dsId, ref, req);
+    try {
+      return await tableDataInSession(dsId, sid, ref, req);
+    } catch (e) {
+      if (!isSessionLost(e) || !hooks.onSessionLost) throw e;
+      const fresh = await hooks.onSessionLost();
+      return fresh ? tableDataInSession(dsId, fresh, ref, req) : tableData(dsId, ref, req);
+    }
   };
 
   const request = (q: Query, chunk: number, countTotal: boolean): Promise<ResultSet> =>
@@ -83,10 +116,18 @@ export function createTableSource(dsId: string, ref: ObjectRef, initial: Partial
     const q: Query = { ...query, ...next, pageSize: sizeOverride ?? defaultPageSize() };
     const my = ++gen;
     setLoading(true);
+    const t0 = performance.now();
     try {
       const all = q.pageSize === "all";
-      const rs = await request(q, 0, all);
+      let rs: ResultSet;
+      try {
+        rs = await request(q, 0, all);
+      } catch (e) {
+        hooks.onQuery?.({ query: q, rows: 0, ms: performance.now() - t0, error: String((e as Error)?.message ?? e).replace(/^Error:\s*/, "") });
+        throw e;
+      }
       if (my !== gen) return false;
+      hooks.onQuery?.({ query: q, rows: all ? (rs.totalHint ?? rs.rows.length) : rs.rows.length, ms: performance.now() - t0 });
       batch(() => {
         query = q;
         setApplied(q);

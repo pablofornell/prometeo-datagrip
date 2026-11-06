@@ -81,6 +81,8 @@ export interface GridToolbarProps {
   onRollback?: () => void;
   /** A manual transaction is open: enables commit / roll back. */
   txActive?: boolean;
+  /** The transaction failed (PG aborted state): shown in red, only Roll Back is useful. */
+  txFailed?: boolean;
 
   /** Extractor format shown in the `CSV ⌄` widget. */
   extractor?: string;
@@ -173,11 +175,12 @@ export function GridToolbar(props: GridToolbarProps): JSX.Element {
       <Show when={ed()}>
         <button
           class="dgg-tbtn text tx"
+          classList={{ failed: !!props.txFailed }}
           title="Transaction Mode"
           tabIndex={-1}
           onClick={(e) => props.onTxMenu?.((e.currentTarget as HTMLElement).getBoundingClientRect())}
         >
-          Tx: {props.txMode ?? "Auto"}
+          Tx: {props.txMode ?? "Auto"}{props.txFailed ? " (failed)" : ""}
           <i class="dgg-i i-chevron" />
         </button>
         <Show when={props.txMode === "Manual" && (props.onCommit || props.onRollback)}>

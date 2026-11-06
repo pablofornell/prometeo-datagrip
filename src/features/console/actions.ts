@@ -40,7 +40,7 @@ export function registerConsoleActions(): () => void {
       icon: "dg/commit",
       enabled: () => {
         const s = activeSession();
-        return !!s && s.txMode() === "manual" && s.inTx() && !s.out.running();
+        return !!s && s.inTx() && !s.out.running();
       },
       run: () => void activeSession()?.endTx("commit"),
     },
@@ -50,7 +50,7 @@ export function registerConsoleActions(): () => void {
       icon: "dg/rollback",
       enabled: () => {
         const s = activeSession();
-        return !!s && s.txMode() === "manual" && s.inTx() && !s.out.running();
+        return !!s && s.inTx() && !s.out.running();
       },
       run: () => void activeSession()?.endTx("rollback"),
     },

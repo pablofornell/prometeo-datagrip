@@ -1,5 +1,5 @@
 /** Export Data of a whole table (explorer context menu `grid.export`, the table editor's export button). */
-import { type Driver, type ExportOptions, type ObjectRef, defaultExportOptions, exportQuery, exportQueryToString, isTauri } from "../../api/db";
+import { type Driver, type ExportOptions, type ObjectRef, defaultExportOptions, exportQueryToFile, exportQueryToString } from "../../api/db";
 import { notify } from "../../components/ui";
 import { ensureConnected } from "../explorer";
 import { dsInfo, errText, loadDataSources, writeClipboard } from "./ds";
@@ -22,15 +22,10 @@ export async function exportTableQuery(
   const fmt = EXPORT_FORMATS.find((f) => f.value === options.format) ?? EXPORT_FORMATS[0];
   try {
     if (target === "file") {
-      const name = `${ref.name}.${fmt.ext}`;
-      let path: string | null = name;
-      if (isTauri()) {
-        const { save } = await import("@tauri-apps/plugin-dialog");
-        path = await save({ defaultPath: name, filters: [{ name: fmt.label, extensions: [fmt.ext] }] });
-      }
-      if (!path) return;
-      const n = await exportQuery(dsId, sql, options, path);
-      notify({ kind: "success", title: "Export finished", body: `${plural(n, "row")} exported to ${path}`, timeout: 6000 });
+      // the backend opens the Save dialog and refuses any other path (`exportQueryToFile`)
+      const done = await exportQueryToFile(dsId, sql, options, `${ref.name}.${fmt.ext}`);
+      if (!done) return; // cancelled
+      notify({ kind: "success", title: "Export finished", body: `${plural(done.rows, "row")} exported to ${done.path}`, timeout: 6000 });
     } else {
       const text = await exportQueryToString(dsId, sql, options);
       await writeClipboard(text);

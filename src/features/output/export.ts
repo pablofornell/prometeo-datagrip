@@ -3,9 +3,9 @@ import {
   type ExportFormat,
   type ExportOptions,
   defaultExportOptions,
-  exportQuery,
+  exportQueryToFile,
   exportQueryToString,
-  exportResult,
+  exportResultToFile as exportResultToFileDialog,
   exportToString,
   isTauri,
 } from "../../api/db";
@@ -84,12 +84,11 @@ export async function exportResultToFile(tab: ResultTab, host: OutputHost, forma
       URL.revokeObjectURL(a.href);
       return;
     }
-    const { save } = await import("@tauri-apps/plugin-dialog");
-    const path = await save({ defaultPath: name, filters: [{ name: fmt.label, extensions: [fmt.ext] }] });
-    if (!path) return;
+    // the backend opens the Save dialog and only writes to the path it returned
     const o = optionsFor(tab, host, format);
-    const n = tab.hasMore() ? await exportQuery(host.dsId, tab.sql, o, path) : await exportResult({ columns: tab.meta, rows: tab.rows }, o, path);
-    notify({ kind: "info", title: "Export finished", body: `${n.toLocaleString("en-US")} rows exported to ${path}` });
+    const done = tab.hasMore() ? await exportQueryToFile(host.dsId, tab.sql, o, name) : await exportResultToFileDialog({ columns: tab.meta, rows: tab.rows }, o, name);
+    if (!done) return; // the dialog was cancelled
+    notify({ kind: "info", title: "Export finished", body: `${done.rows.toLocaleString("en-US")} rows exported to ${done.path}` });
   } catch (e) {
     notify({ kind: "error", title: "Export failed", body: errText(e) });
   }

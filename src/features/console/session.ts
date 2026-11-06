@@ -10,11 +10,12 @@ import {
   type ExecHandlers,
   applyChanges,
   closeSession,
+  type TxStatus,
   execute,
   executeCollect,
   introspect,
   openSession,
-  sessionInTransaction,
+  sessionTxStatus,
 } from "../../api/db";
 import { type EditorError, type ExecMark, type ExecuteRequest, type SqlEditorHandle, splitStatements } from "../../components/editor";
 import { errorsField, execMarksField } from "../../components/editor/state";
@@ -32,15 +33,27 @@ import {
   rowsAffected,
   rowsRetrieved,
   summary,
+  underlinePosition,
 } from "../output/format";
 import { saveSchema, savedSchema } from "./schemaPref";
 import { qualifiedTitle, resultTable } from "./title";
-import { resolveEdit } from "./editable";
+import { resolveEdit, schemaChange } from "./editable";
 import { keyedChanges } from "../output/edit";
 import { ALL_FIRST_CHUNK, ConsoleOutput, type OutputHost, ResultTab, createOutput, defaultPageSize, removeOutput } from "../output/model";
 import { askChoice } from "../table/dialogs";
-import { applyChangesInSession, ensureTransaction } from "../table/session";
+import {
+  SERVER_ROLLBACK_BODY,
+  SERVER_ROLLBACK_LOG,
+  SERVER_ROLLBACK_TITLE,
+  applyChangesInSession,
+  classifyTxEnd,
+  control,
+  ensureTransaction,
+  isSessionLost,
+  txReport,
+} from "../table/session";
 import { previewSql, toRowChanges } from "../table/sql";
+import { confirmEndTransactions } from "./txguard";
 
 export type TxMode = "auto" | "manual";
 export type Isolation = "read uncommitted" | "read committed" | "repeatable read" | "serializable";
@@ -48,7 +61,7 @@ export type Isolation = "read uncommitted" | "read committed" | "repeatable read
 const ISOLATIONS: Isolation[] = ["read uncommitted", "read committed", "repeatable read", "serializable"];
 const cap = (s: string): string => s.replace(/\b\w/g, (c) => c.toUpperCase());
 const errText = (e: unknown): string => String((e as Error)?.message ?? e).replace(/^Error:\s*/, "");
-const LOST = /does not exist|is closed|not connected|Session is closed/i;
+const DEFAULT_ISOLATION = (driver: DataSource["driver"]): Isolation => (driver === "mysql" ? "repeatable read" : "read committed");
 
 export interface RunOptions {
   /** Result tab to replace in place (Reload Page). */
@@ -72,15 +85,20 @@ export class ConsoleSession implements OutputHost {
   private disposed = false;
   private connectedLogged = false;
   private curHandle?: Promise<ExecHandle>;
-  /** A result was edited inside the open manual transaction (the editable result is reloaded after a Roll Back). */
+  /** A result was edited inside the open transaction (the editable result is reloaded when it is rolled back). */
   private editedInTx = false;
+  /** The session's schema changed in a way that could not be read from the text; detect it when nothing is paging. */
+  private schemaDirty = false;
 
   readonly txMode: Accessor<TxMode>;
   private readonly setTx: (m: TxMode) => void;
   readonly isolation: Accessor<Isolation>;
   private readonly setIso: (i: Isolation) => void;
+  /** The server's transaction state of the session (events of `execute`, `sessionTxStatus`); never keyword tracking. */
+  readonly txStatus: Accessor<TxStatus>;
+  private readonly setTxStatus: (s: TxStatus) => void;
+  /** A transaction is open (`active` or `failed`). */
   readonly inTx: Accessor<boolean>;
-  private readonly setInTx: (b: boolean) => void;
   /** Current schema (PG `public`, MySQL database, SQLite `main`), null until known. */
   readonly schema: Accessor<string | null>;
   private readonly setSchema: (s: string | null) => void;
@@ -106,8 +124,9 @@ export class ConsoleSession implements OutputHost {
       return [g, (x: T) => void s(() => x)];
     };
     [this.txMode, this.setTx] = sig<TxMode>(settings.defaultTxMode);
-    [this.isolation, this.setIso] = sig<Isolation>(ds.driver === "mysql" ? "repeatable read" : "read committed");
-    [this.inTx, this.setInTx] = sig(false);
+    [this.isolation, this.setIso] = sig<Isolation>(DEFAULT_ISOLATION(ds.driver));
+    [this.txStatus, this.setTxStatus] = sig<TxStatus>("idle");
+    this.inTx = () => this.txStatus() !== "idle";
     // the schema chosen last time shows at once; it is applied to the session when that opens (`ensureSession`)
     [this.schema, this.setSchema] = sig<string | null>(
       ds.driver === "sqlite" ? "main" : (savedSchema(ds.id, consoleName) ?? (ds.driver === "mysql" ? ds.database || null : null)),
@@ -137,29 +156,67 @@ export class ConsoleSession implements OutputHost {
 
   // ------------------------------------------------------------ session
 
+  /**
+   * What a (re)opened session needs to look like the console: the schema the user chose and a non-default isolation
+   * level. The backend keeps no session settings, so they are re-applied as `initSql`.
+   */
+  private initSql(withSchema = true): string[] {
+    if (this.driver === "sqlite") return [];
+    const sql: string[] = [];
+    const want = withSchema ? savedSchema(this.ds.id, this.consoleName) : null;
+    if (want) sql.push(this.useSchemaSql(want));
+    if (this.isolation() !== DEFAULT_ISOLATION(this.driver)) sql.push(this.isolationSql(this.isolation()));
+    return sql;
+  }
+
+  private isolationSql(i: Isolation): string {
+    const lvl = i.toUpperCase();
+    return this.driver === "postgres" ? `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ${lvl}` : `SET SESSION TRANSACTION ISOLATION LEVEL ${lvl}`;
+  }
+
   /** Opens the DB session (once). Connects the data source first. */
   ensureSession(): Promise<string> {
     if (this.sessionId) return Promise.resolve(this.sessionId);
     this.opening ??= (async () => {
       await ensureConnected(this.ds.id);
-      const sid = await openSession(this.ds.id);
+      let sid: string;
+      try {
+        sid = await openSession(this.ds.id, this.initSql());
+      } catch (e) {
+        if (isSessionLost(e) || !savedSchema(this.ds.id, this.consoleName)) throw e;
+        // the saved schema is gone (dropped / renamed): forget it, open with the session default
+        saveSchema(this.ds.id, this.consoleName, null);
+        sid = await openSession(this.ds.id, this.initSql(false));
+      }
       if (this.disposed) {
         void closeSession(sid).catch(() => {});
         throw new Error("Console closed");
       }
       this.sessionId = sid;
       this.connectedLogged = false;
-      await this.applySavedSchema(sid, await this.detectSchema(sid));
+      this.setTxStatus("idle");
+      await this.detectSchema(sid);
       return sid;
     })().finally(() => (this.opening = undefined));
     return this.opening;
   }
 
+  /**
+   * A statement of ours (BEGIN, COMMIT, `select current_schema()`, ...). The transaction events it produces are
+   * applied here, like those of the user's statements.
+   */
   private async silent(sid: string, sql: string) {
     const ev = await executeCollect(sid, `${sql} ${INTERNAL_MARK}`, { maxRows: 10, stopOnError: true });
     const err = ev.find((e) => e.kind === "error");
     if (err && err.kind === "error") throw new Error(err.message);
+    const r = txReport(ev);
+    if (r.status) this.setTxStatus(r.status);
     return ev;
+  }
+
+  /** A paged result still holds the connection: running anything on the session closes its stream. Say so. */
+  private releaseResults(reason: string): void {
+    for (const r of this.out.results()) if (r.hasMore()) r.detach(reason);
   }
 
   /** Reads the session's current schema into the signal; resolves to it (null when it could not be read). */
@@ -182,21 +239,6 @@ export class ConsoleSession implements OutputHost {
     return null;
   }
 
-  /** Puts the session into the schema the user chose in this console earlier (before a restart / reconnect). */
-  private async applySavedSchema(sid: string, actual: string | null): Promise<void> {
-    const want = this.driver === "sqlite" ? null : savedSchema(this.ds.id, this.consoleName);
-    if (!want) return;
-    if (actual === want) return;
-    try {
-      await this.silent(sid, this.useSchemaSql(want));
-      this.setSchema(want);
-    } catch {
-      // the schema is gone (dropped / renamed): forget it, the session default stays
-      saveSchema(this.ds.id, this.consoleName, null);
-      this.setSchema(actual);
-    }
-  }
-
   private useSchemaSql(name: string): string {
     const q = this.driver === "postgres" ? `"${name.replace(/"/g, '""')}"` : `\`${name.replace(/`/g, "``")}\``;
     return this.driver === "postgres" ? `SET search_path TO ${q}` : `USE ${q}`;
@@ -207,6 +249,32 @@ export class ConsoleSession implements OutputHost {
     await this.detectSchema(sid);
     const now = this.schema();
     if (this.driver !== "sqlite" && now) saveSchema(this.ds.id, this.consoleName, now);
+  }
+
+  // ------------------------------------------------------------ lost session
+
+  /**
+   * The session is gone (the data source was disconnected / deactivated): drop it, forget the transaction (the server
+   * rolled it back with the connection) and reopen on the next run with the console's settings (`initSql`).
+   */
+  private sessionLost(): void {
+    const had = this.txStatus() !== "idle";
+    this.sessionId = undefined;
+    this.opening = undefined;
+    this.setTxStatus("idle");
+    this.editedInTx = false;
+    this.connectedLogged = false;
+    if (had) {
+      this.out.log("error", "the transaction was rolled back: connection closed");
+      notify({ kind: "warning", title: "The transaction was rolled back", body: `The connection of '${this.title()}' was closed, so its open transaction was rolled back.` });
+    } else {
+      this.out.log("text", "connection closed");
+    }
+  }
+
+  /** The data source was disconnected while this console was open (called by the view). */
+  connectionClosed(): void {
+    if (this.sessionId && !this.out.running()) this.sessionLost();
   }
 
   // ------------------------------------------------------------ execution
@@ -313,7 +381,14 @@ export class ConsoleSession implements OutputHost {
     let ordinal = 0;
     let failed = 0;
     let executed = 0;
-    let cur: { sql: string; t0: number; from: number; to: number; errored: boolean } | null = null;
+    let cur: { sql: string; t0: number; from: number; to: number; errored: boolean; schema?: { schema: string | null } } | null = null;
+    // schema of the session while the script runs: a `USE x;` / `SET search_path` earlier in the script decides which
+    // schema the edit-target lookup and the tab title of the next statements use
+    let scriptSchema = this.schema();
+    let schemaTouched = false;
+    let schemaUnknown = false;
+    let sessionClosed = false;
+    let reloadEdited = false;
     const nowMs = () => performance.now();
     const t00 = nowMs();
     let resolveHandle!: (h: ExecHandle) => void;
@@ -322,7 +397,10 @@ export class ConsoleSession implements OutputHost {
     handleP.catch(() => {});
     this.curHandle = handleP;
 
-    for (const r of out.results()) if (r.id !== o.replace?.id) r.detach();
+    // the new execution closes the paging streams of the earlier results: the tabs it replaces need no note, the ones
+    // that stay (pinned, or when this run returns no rows) say that they are cut short
+    const staleTabs = out.results().filter((r) => r.id !== o.replace?.id);
+    for (const r of staleTabs) r.detach(undefined, true);
 
     const mark = (status: "ok" | "error", ms: number) => {
       if (!cur || !req.ranges.length) return;
@@ -338,7 +416,7 @@ export class ConsoleSession implements OutputHost {
         executed++;
         const from = this.docOffset(req, e.range.startUtf16);
         const to = this.docOffset(req, e.range.endUtf16);
-        cur = { sql: e.sql, t0: nowMs(), from, to, errored: false };
+        cur = { sql: e.sql, t0: nowMs(), from, to, errored: false, schema: schemaChange(e.sql, this.driver) ?? undefined };
         out.log("sql", e.sql, this.prompt());
         if (req.ranges.length) {
           const r = this.editorStatement(from, to);
@@ -352,11 +430,11 @@ export class ConsoleSession implements OutputHost {
         const meta = e.columns;
         const parts = resultTable(meta, sql, this.driver);
         const title =
-          leadingComment(sql) ?? (req.ranges.length && cur ? this.attachedComment(cur.from) : null) ?? (parts ? qualifiedTitle(parts, this.driver, this.ds.database, this.schema()) : `Result ${ordinal}`);
+          leadingComment(sql) ?? (req.ranges.length && cur ? this.attachedComment(cur.from) : null) ?? (parts ? qualifiedTitle(parts, this.driver, this.ds.database, scriptSchema) : `Result ${ordinal}`);
         const tab = new ResultTab(meta, e.rows, e.hasMore, title, sql, e.index, () => handleP, pageSize);
         tab.ms = ms;
         // editable when it is one table with a usable key (resolved with the table's metadata, so a moment later)
-        if (meta.length) void resolveEdit(this.ds, meta, sql, this.schema()).then((t) => !tab.closed && tab.setEdit(t));
+        if (meta.length) void resolveEdit(this.ds, meta, sql, scriptSchema).then((t) => !tab.closed && tab.setEdit(t));
         out.addResult(tab, { first, replace: first ? o.replace : undefined });
         first = false;
         const id = out.log("text", rowsRetrieved(e.rows.length, ms));
@@ -365,6 +443,11 @@ export class ConsoleSession implements OutputHost {
         if (pageSize === "all" && e.hasMore) void tab.loadAll();
       },
       onUpdate: (e) => {
+        if (cur?.schema) {
+          schemaTouched = true;
+          if (cur.schema.schema) scriptSchema = cur.schema.schema;
+          else schemaUnknown = true;
+        }
         const ms = nowMs() - (cur?.t0 ?? t00);
         const sql = cur?.sql ?? req.sql;
         const count = reportsCount(sql);
@@ -375,42 +458,71 @@ export class ConsoleSession implements OutputHost {
       onError: (e) => {
         failed++;
         out.log("error", e.message);
+        if (/^Session is closed$/i.test(e.message.trim())) sessionClosed = true;
         const ms = nowMs() - (cur?.t0 ?? t00);
         if (cur && req.ranges.length) {
           cur.errored = true;
           mark("error", ms);
           this.setErrors([
             ...this.currentErrors(),
-            { statementFrom: cur.from, statementTo: cur.to, position: e.position ?? undefined, message: e.message.split("\n")[0] },
+            { statementFrom: cur.from, statementTo: cur.to, position: underlinePosition(cur.sql, e.positionUtf16, e.message), message: e.message.split("\n")[0] },
           ]);
         }
       },
       onMessage: (e) => void out.log("text", e.text),
+      onTxStatus: (e) => this.setTxStatus(e.status),
+      onTxEnded: (e) => {
+        const kind = classifyTxEnd(cur?.sql ?? null, e);
+        if (kind === "serverRollback") {
+          out.log("error", SERVER_ROLLBACK_LOG);
+          notify({ kind: "error", title: SERVER_ROLLBACK_TITLE, body: SERVER_ROLLBACK_BODY });
+        } // "implicit": the backend's own message line already says that the statement committed the transaction
+        // the grid must not keep values that are no longer in the database
+        if ((kind === "serverRollback" || kind === "rollback") && this.editedInTx) reloadEdited = true;
+        this.editedInTx = false;
+      },
       onDone: (e) => {
         doneEvent = e;
       },
     };
 
-    const launch = async (): Promise<void> => {
-      let sid = await this.ensureSession();
+    // the session ready for the statements: opened, connected, and in a transaction when the mode is Manual
+    const prepare = async (): Promise<string> => {
+      const sid = await this.ensureSession();
       if (!this.connectedLogged) {
         out.log("text", "Connected");
         this.connectedLogged = true;
       }
-      if (this.txMode() === "manual" && !(await sessionInTransaction(sid))) {
-        await this.silent(sid, this.driver === "mysql" ? "START TRANSACTION" : "BEGIN");
+      if (this.schemaDirty) {
+        this.schemaDirty = false;
+        await this.refreshSchema(sid);
+        scriptSchema = this.schema();
+      }
+      if (this.txMode() === "manual") {
+        const st = await sessionTxStatus(sid);
+        this.setTxStatus(st);
+        if (st === "idle") await this.silent(sid, this.driver === "mysql" ? "START TRANSACTION" : "BEGIN");
+      }
+      return sid;
+    };
+
+    const launch = async (): Promise<void> => {
+      let sid: string;
+      try {
+        sid = await prepare();
+      } catch (e) {
+        if (!isSessionLost(e)) throw e;
+        // the session died (data source deactivated / disconnected): reopen it once
+        this.sessionLost();
+        sid = await prepare();
       }
       let handle: ExecHandle;
       try {
         handle = await this.startExecute(sid, req.sql, o, handlers);
       } catch (e) {
-        if (!LOST.test(errText(e))) throw e;
-        // the session died (data source deactivated): reconnect once
-        this.sessionId = undefined;
-        this.setInTx(false);
-        sid = await this.ensureSession();
-        out.log("text", "Connected");
-        this.connectedLogged = true;
+        if (!isSessionLost(e)) throw e;
+        this.sessionLost();
+        sid = await prepare();
         handle = await this.startExecute(sid, req.sql, o, handlers);
       }
       resolveHandle(handle);
@@ -452,17 +564,41 @@ export class ConsoleSession implements OutputHost {
     } else {
       out.setLastMs(total);
     }
+    for (const r of staleTabs) r.announce();
     if (first) out.select("output"); // nothing returned rows: show the log
-    const sid = this.sessionId;
-    if (sid) {
-      try {
-        this.setInTx(await sessionInTransaction(sid));
-        if (/\b(set|use)\b/i.test(req.sql)) await this.refreshSchema(sid);
-      } catch {
-        /* session gone */
-      }
-    }
+    if (sessionClosed) this.sessionLost();
+    if (this.sessionId && schemaTouched) await this.afterSchemaChange(this.sessionId, scriptSchema, schemaUnknown);
     out.setRunning(false);
+    if (reloadEdited) this.reloadEdited();
+  }
+
+  /**
+   * The script switched the schema. The new one comes from the statement text; when that cannot be read it is
+   * detected with a query on the session, which is only done while no result of this console is paging (a query on the
+   * session closes the open result set, and the rows beyond the first page would be lost).
+   */
+  private async afterSchemaChange(sid: string, textual: string | null, unknown: boolean): Promise<void> {
+    const paging = this.out.results().some((r) => r.hasMore());
+    if (unknown && !paging) {
+      try {
+        await this.refreshSchema(sid);
+      } catch (e) {
+        if (isSessionLost(e)) this.sessionLost();
+      }
+      return;
+    }
+    if (textual) {
+      this.setSchema(textual);
+      if (this.driver !== "sqlite") saveSchema(this.ds.id, this.consoleName, textual);
+    }
+    if (unknown) this.schemaDirty = true; // detect it before the next statement
+  }
+
+  /** Executes the edited result again, so the grid shows what the database holds (after a roll back). */
+  private reloadEdited(): void {
+    const cur = this.out.current();
+    const target = cur?.edit() ? cur : this.out.results().find((r) => r.edit());
+    if (target) this.rerun(target);
   }
 
   // ------------------------------------------------------------ editing results
@@ -485,16 +621,22 @@ export class ConsoleSession implements OutputHost {
       let res;
       if (this.txMode() === "manual") {
         const sid = await this.ensureSession();
-        tab.detach(); // the paging stream of the result is released by the session operation
-        await ensureTransaction(sid, this.driver);
-        this.setInTx(true);
+        tab.detach("the changes are applied on the same connection"); // the paging stream is released by the session operation
+        const st = await ensureTransaction(sid, this.driver);
+        this.setTxStatus(st);
+        if (st === "failed") return fail("The transaction has failed (an earlier statement raised an error). Roll it back, then submit the changes again.");
         res = await applyChangesInSession(this.ds.id, sid, edit.table, rowChanges);
-        this.editedInTx = true;
+        await this.syncTxStatus(sid);
+        if (res.committed) this.editedInTx = true;
       } else {
         res = await applyChanges(this.ds.id, edit.table, rowChanges);
       }
       if (!res.committed) return fail(res.results.find((r) => r.error)?.error ?? "The transaction was rolled back.");
     } catch (e) {
+      if (isSessionLost(e)) {
+        this.sessionLost();
+        return fail("The connection was closed and its transaction rolled back, so nothing was applied. Submit the changes again.");
+      }
       return fail(errText(e));
     } finally {
       tab.setApplying(false);
@@ -515,9 +657,18 @@ export class ConsoleSession implements OutputHost {
 
   // ------------------------------------------------------------ transactions
 
+  /** Reads the server's state of the session into the signal (after an operation that gives no `txStatus` event). */
+  private async syncTxStatus(sid: string): Promise<void> {
+    try {
+      this.setTxStatus(await sessionTxStatus(sid));
+    } catch (e) {
+      if (isSessionLost(e)) this.sessionLost();
+    }
+  }
+
   async setTxMode(m: TxMode): Promise<void> {
     if (m === this.txMode()) return;
-    if (m === "auto" && this.inTx()) await this.endTx("commit");
+    if (m === "auto" && this.inTx() && !(await confirmEndTransactions({ tabId: this.tabId, reason: "switching to the Auto transaction mode" }))) return;
     this.setTx(m);
     this.out.log("text", `${m === "manual" ? "Manual" : "Auto"} transaction mode ON`);
   }
@@ -527,29 +678,50 @@ export class ConsoleSession implements OutputHost {
     if (this.driver === "sqlite") return;
     try {
       const sid = await this.ensureSession();
-      const lvl = i.toUpperCase();
-      await this.silent(sid, this.driver === "postgres" ? `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ${lvl}` : `SET SESSION TRANSACTION ISOLATION LEVEL ${lvl}`);
+      this.releaseResults("the isolation level was changed on the same connection");
+      await this.silent(sid, this.isolationSql(i));
     } catch (e) {
-      notify({ kind: "error", title: "Cannot change the transaction isolation", body: errText(e) });
+      if (isSessionLost(e)) this.sessionLost(); // the new level is applied when the session reopens (`initSql`)
+      else notify({ kind: "error", title: "Cannot change the transaction isolation", body: errText(e) });
     }
   }
 
-  async endTx(kind: "commit" | "rollback"): Promise<void> {
-    if (this.out.running()) return;
+  /**
+   * Commit / Roll Back of the open transaction. Resolves true when it ended (or there was none), false when it did not
+   * (error shown). The server decides what happened: a COMMIT of a failed PostgreSQL transaction rolls back.
+   */
+  async endTx(kind: "commit" | "rollback"): Promise<boolean> {
+    if (this.out.running()) return false;
+    let sid: string | undefined;
     try {
-      const sid = await this.ensureSession();
-      if (!(await sessionInTransaction(sid))) return this.setInTx(false);
-      await this.silent(sid, kind === "commit" ? "COMMIT" : "ROLLBACK");
-      this.out.log("text", kind === "commit" ? "transaction committed" : "transaction rolled back");
-      this.setInTx(false);
-      // the edited result still shows the rolled back values: execute it again
+      sid = await this.ensureSession();
+      if ((await sessionTxStatus(sid)) === "idle") {
+        this.setTxStatus("idle");
+        return true;
+      }
+      this.releaseResults(kind === "commit" ? "the transaction was committed" : "the transaction was rolled back");
+      const r = await control(sid, kind === "commit" ? "COMMIT" : "ROLLBACK");
+      if (r.status) this.setTxStatus(r.status);
+      else await this.syncTxStatus(sid);
+      const ended = r.ended[0];
+      const how = ended ? classifyTxEnd(kind === "commit" ? "COMMIT" : "ROLLBACK", ended) : kind;
+      if (how === "serverRollback") {
+        this.out.log("error", SERVER_ROLLBACK_LOG);
+        notify({ kind: "error", title: SERVER_ROLLBACK_TITLE, body: SERVER_ROLLBACK_BODY });
+      } else this.out.log("text", how === "commit" ? "transaction committed" : how === "implicit" ? "transaction committed" : "transaction rolled back");
+      // the edited result must show what the database holds now: after a roll back (by us or by the server)
       const edited = this.editedInTx;
       this.editedInTx = false;
-      const cur = this.out.current();
-      const target = cur?.edit() ? cur : this.out.results().find((r) => r.edit());
-      if (kind === "rollback" && edited && target) this.rerun(target);
+      if (edited && (how === "rollback" || how === "serverRollback")) this.reloadEdited();
+      return true;
     } catch (e) {
+      if (isSessionLost(e)) {
+        this.sessionLost();
+        return true; // the connection took the transaction with it
+      }
       this.out.log("error", errText(e));
+      if (sid) await this.syncTxStatus(sid);
+      return false;
     }
   }
 
@@ -607,10 +779,12 @@ export class ConsoleSession implements OutputHost {
     if (this.out.running()) return;
     try {
       const sid = await this.ensureSession();
+      this.releaseResults("the schema was switched on the same connection");
       await this.silent(sid, this.useSchemaSql(name));
       this.setSchema(name);
       saveSchema(this.ds.id, this.consoleName, name);
     } catch (e) {
+      if (isSessionLost(e)) this.sessionLost();
       notify({ kind: "error", title: "Cannot switch the schema", body: errText(e) });
     }
   }

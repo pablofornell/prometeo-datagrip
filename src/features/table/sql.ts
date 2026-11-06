@@ -28,6 +28,21 @@ export function selectSql(driver: Driver, ref: ObjectRef, where: string, orderBy
   return sql;
 }
 
+/**
+ * The query behind a table editor page as DataGrip logs it: `SELECT t.* FROM sales.clients t LIMIT 501` (one more
+ * row than the page, to know whether there is a next page). `all` has no LIMIT.
+ */
+export function tableQuerySql(driver: Driver, ref: ObjectRef, where: string, orderBy: string, pageSize: number | "all", page: number): string {
+  let sql = `SELECT t.* FROM ${qualifiedName(driver, ref)} t`;
+  if (where.trim()) sql += " WHERE " + where.trim();
+  if (orderBy.trim()) sql += " ORDER BY " + orderBy.trim();
+  if (pageSize !== "all") {
+    sql += ` LIMIT ${pageSize + 1}`;
+    if (page > 0) sql += ` OFFSET ${page * pageSize}`;
+  }
+  return sql;
+}
+
 // ---------------------------------------------------------------- ORDER BY <-> header sort
 
 /** `"name" desc, id` for the header sort state. */
@@ -84,8 +99,17 @@ function splitTop(s: string): string[] {
 
 // ---------------------------------------------------------------- literals and column filter
 
+/**
+ * `'...'` string literal. MySQL reads `\` inside it as an escape (`'C:\temp'` is a TAB), so it is doubled there;
+ * PostgreSQL (standard_conforming_strings) and SQLite take it literally.
+ */
+export function quoteString(driver: Driver | undefined, v: string): string {
+  const s = driver === "mysql" ? v.replace(/\\/g, "\\\\") : v;
+  return "'" + s.replace(/'/g, "''") + "'";
+}
+
 /** SQL literal of a cell (preview and filter conditions). */
-export function literal(v: Cell, typeName: string): string {
+export function literal(v: Cell, typeName: string, driver?: Driver): string {
   if (v === null || v === undefined) return "null";
   if (isDefaultCell(v)) return "DEFAULT";
   const kind = classifyType(typeName);
@@ -94,10 +118,10 @@ export function literal(v: Cell, typeName: string): string {
   if (typeof v === "string") {
     if (kind === "number" && /^-?\d+(\.\d+)?([eE][-+]?\d+)?$/.test(v.trim())) return v.trim();
     if (kind === "bool" && /^(true|false)$/i.test(v.trim())) return v.trim().toLowerCase();
-    return "'" + v.replace(/'/g, "''") + "'";
+    return quoteString(driver, v);
   }
   if (isBinaryCell(v)) return "'\\x" + v.$bin + "'";
-  return "'" + JSON.stringify(v).replace(/'/g, "''") + "'";
+  return quoteString(driver, JSON.stringify(v));
 }
 
 export type FilterOp = "=" | "<>" | "<" | ">" | "<=" | ">=" | "like" | "not like" | "is null" | "is not null";
@@ -121,9 +145,9 @@ export function buildCondition(driver: Driver, col: ColumnMeta, op: FilterOp, va
   if (op === "is null" || op === "is not null") return `${name} ${op}`;
   const kind = classifyType(col.typeName);
   let lit: string;
-  if (op === "like" || op === "not like") lit = "'" + value.replace(/'/g, "''") + "'";
+  if (op === "like" || op === "not like") lit = quoteString(driver, value);
   else if ((kind === "number" || kind === "bool") && value.trim() !== "" && literal(value, col.typeName)[0] !== "'") lit = literal(value, col.typeName);
-  else lit = "'" + value.replace(/'/g, "''") + "'";
+  else lit = quoteString(driver, value);
   return `${name} ${op} ${lit}`;
 }
 
@@ -177,16 +201,16 @@ export function previewSql(driver: Driver, ref: ObjectRef, columns: ColumnMeta[]
   const typeOf = (name: string) => columns.find((c) => c.name === name)?.typeName ?? "";
   const where = (key: Record<string, Cell>) =>
     Object.entries(key)
-      .map(([k, v]) => (v === null || v === undefined ? `${id(k)} is null` : `${id(k)} = ${literal(v, typeOf(k))}`))
+      .map(([k, v]) => (v === null || v === undefined ? `${id(k)} is null` : `${id(k)} = ${literal(v, typeOf(k), driver)}`))
       .join(" AND ");
   const out: string[] = [];
   for (const c of [...changes].sort((a, b) => ORDER[a.kind] - ORDER[b.kind])) {
     const entries = Object.entries(c.values);
     if (c.kind === "delete") out.push(`DELETE\nFROM ${table}\nWHERE ${where(c.key)};`);
     else if (c.kind === "update")
-      out.push(`UPDATE ${table}\nSET ${entries.map(([k, v]) => `${id(k)} = ${literal(v, typeOf(k))}`).join(",\n    ")}\nWHERE ${where(c.key)};`);
+      out.push(`UPDATE ${table}\nSET ${entries.map(([k, v]) => `${id(k)} = ${literal(v, typeOf(k), driver)}`).join(",\n    ")}\nWHERE ${where(c.key)};`);
     else if (entries.length === 0) out.push(`INSERT INTO ${table}\nDEFAULT VALUES;`);
-    else out.push(`INSERT INTO ${table} (${entries.map(([k]) => id(k)).join(", ")})\nVALUES (${entries.map(([k, v]) => literal(v, typeOf(k))).join(", ")});`);
+    else out.push(`INSERT INTO ${table} (${entries.map(([k]) => id(k)).join(", ")})\nVALUES (${entries.map(([k, v]) => literal(v, typeOf(k), driver)).join(", ")});`);
   }
   return out.join("\n\n");
 }

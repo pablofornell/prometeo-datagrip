@@ -1,9 +1,20 @@
 /** The 34px toolbar under the header: log mini toolbar on the Output tab, the grid toolbar on result tabs. */
 import { Show, type JSX } from "solid-js";
 import { GridToolbar } from "../../components/grid";
-import { ActionButton, type MenuItem, openMenu } from "../../components/ui";
+import { ActionButton, Icon, type MenuItem, openMenu } from "../../components/ui";
 import { FORMATS, copyResult, exportResultToFile, formatLabel } from "./export";
 import { currentOutput, type ConsoleOutput, type ResultTab } from "./model";
+
+/** Cancel Running Statements: gray square while idle, the red stop icon only while something runs. */
+export function StopButton(props: { running: boolean; class?: string }): JSX.Element {
+  return (
+    <ActionButton action="sql.cancel" class={props.class}>
+      <Show when={props.running} fallback={<svg class="dg-stop-idle" width="16" height="16" viewBox="0 0 16 16"><rect x="3.5" y="3.5" width="9" height="9" rx="1" /></svg>}>
+        <Icon name="stop" size={16} />
+      </Show>
+    </ActionButton>
+  );
+}
 
 function ResultToolbar(props: { out: ConsoleOutput; tab: ResultTab }): JSX.Element {
   const host = () => props.out.host;
@@ -24,6 +35,7 @@ function ResultToolbar(props: { out: ConsoleOutput; tab: ResultTab }): JSX.Eleme
         onCommit={() => void host()?.endTx("commit")}
         onRollback={() => void host()?.endTx("rollback")}
         txActive={!!host()?.inTx()}
+        txFailed={host()?.txStatus() === "failed"}
         onAddRow={() => api()?.addRow()}
         onDeleteRows={() => api()?.deleteRows()}
         onRevert={() => api()?.revertSelected()}
@@ -31,6 +43,18 @@ function ResultToolbar(props: { out: ConsoleOutput; tab: ResultTab }): JSX.Eleme
         onSubmit={() => api()?.submit()}
         viewMode={tab().viewMode()}
         onViewModeChange={tab().setViewMode}
+        transposed={!!tab().view()?.transposed}
+        onTransposeChange={() => api()?.toggleTranspose()}
+        onRecordView={() => api()?.toggleRecordView()}
+        recordViewOpen={!!tab().view()?.sidePanel}
+        onFind={() => api()?.openFind()}
+        findOpen={!!tab().view()?.findOpen}
+        localFilterEnabled={tab().view()?.localFilterEnabled ?? true}
+        localFilterActive={!!tab().view()?.localFilterActive}
+        onLocalFilterEnabledChange={(on) => api()?.setLocalFilterEnabled(on)}
+        onClearLocalFilter={() => api()?.clearLocalFilter()}
+        onManageColumns={(anchor) => api()?.openManageColumns(anchor)}
+        columnsHidden={(tab().view()?.hiddenColumns ?? 0) > 0}
         onReload={() => host()?.rerun(tab())}
         onCancel={() => host()?.cancel()}
         extractor={formatLabel(tab().extractor())}
@@ -75,7 +99,7 @@ function LogToolbar(props: { out: ConsoleOutput }): JSX.Element {
       <button ref={tx} type="button" class="dgo-tx" title="Transaction Mode" tabindex={-1} onMouseDown={(e) => e.preventDefault()} onClick={() => props.out.host?.openTxMenu(tx)}>
         Tx<i class="dgo-tx-mark" />
       </button>
-      <ActionButton action="sql.cancel" icon="stop" />
+      <StopButton running={props.out.running()} />
     </div>
   );
 }

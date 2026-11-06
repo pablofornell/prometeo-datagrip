@@ -2,16 +2,18 @@
  * Table data editor (`editor.view.table`): toolbar, WHERE | ORDER BY bar, the grid on a paged row source,
  * the rows pill, pending-changes preview, export, and the close guard hooks.
  */
-import { Show, createEffect, createMemo, createSignal, on, onCleanup, onMount, type JSX } from "solid-js";
+import { Show, createEffect, createMemo, createSignal, on, onCleanup, onMount, untrack, type JSX } from "solid-js";
 import {
   type ExportOptions,
   type ObjectRef,
+  type TxStatus,
   applyChanges,
   closeSession,
   defaultExportOptions,
   exportQueryToString,
   exportToString,
   openSession,
+  sessionTxStatus,
 } from "../../api/db";
 import {
   DataGrid,
@@ -20,6 +22,7 @@ import {
   type DataGridApi,
   type GridChange,
   type GridColumn,
+  type GridViewState,
   type SelectionInfo,
   type SortSpec,
 } from "../../components/grid";
@@ -29,14 +32,27 @@ import { setStatus } from "../../state/status";
 import { type EditorTab, activateTab, updateTab } from "../../state/tabs";
 import { type ObjectTabData, openDdlTab } from "./commands";
 import { registerController } from "./controller";
-import { ensureConnected } from "../explorer";
+import { confirmEndTransactions } from "../console/txguard";
+import { connectedDataSourceIds, ensureConnected } from "../explorer";
+import { rowsRetrieved } from "../output/format";
+import { type ConsoleOutput, createOutput, removeOutput } from "../output/model";
 import { dsInfo, errText, loadDataSources, writeClipboard } from "./ds";
 import { exportTableQuery } from "./exportData";
-import { applyChangesInSession, endTransaction, ensureTransaction } from "./session";
+import {
+  SERVER_ROLLBACK_BODY,
+  SERVER_ROLLBACK_LOG,
+  SERVER_ROLLBACK_TITLE,
+  applyChangesInSession,
+  classifyTxEnd,
+  endTransaction,
+  ensureTransaction,
+  isSessionLost,
+  txLabel,
+} from "./session";
 import { FilterBar } from "./FilterBar";
 import { ChoiceDialog, ColumnFilterPopup, EXPORT_FORMATS, ExportDialog, SqlPopup, type ExportTarget } from "./Popups";
-import { type PageSize, type Query, createTableSource } from "./source";
-import { appendCondition, buildCondition, orderByToSort, previewSql, qualifiedName, selectSql, sortToOrderBy, toRowChanges } from "./sql";
+import { type PageSize, type Query, type QueryReport, createTableSource } from "./source";
+import { appendCondition, buildCondition, orderByToSort, previewSql, qualifiedName, selectSql, sortToOrderBy, tableQuerySql, toRowChanges } from "./sql";
 import "./table.css";
 
 interface Choice {
@@ -61,11 +77,29 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
   // Tx: Manual works on a session of its own; its id makes the source read through it (it sees the open transaction)
   const [txMode, setTxModeSignal] = createSignal<"auto" | "manual">("auto");
   const [sid, setSid] = createSignal<string | undefined>();
-  const [inTx, setInTx] = createSignal(false);
+  // the server's state of that session (`idle` / `active` / `failed`), never guessed from what was typed
+  const [txStatus, setTxStatus] = createSignal<TxStatus>("idle");
+  const inTx = () => txStatus() !== "idle";
   const [applying, setApplying] = createSignal(false);
-  const src = createTableSource(dsId, ref, {}, sid);
   const ds = () => dsInfo(dsId);
   const driver = () => ds()?.driver ?? "postgres";
+
+  // ---- Output: the queries of this editor, like DataGrip logs them
+  let out: ConsoleOutput | undefined;
+  const prompt = () => (driver() === "postgres" ? `${ds()?.database ?? ""}.${ref.schema ?? "public"}` : (ref.schema ?? ds()?.database ?? ""));
+  const onQuery = (r: QueryReport) => {
+    const q = r.query;
+    out?.log("sql", tableQuerySql(driver(), ref, q.where, q.orderBy, q.pageSize, q.page), prompt());
+    if (r.error) out?.log("error", r.error);
+    else out?.log("text", rowsRetrieved(r.rows, r.ms, undefined, undefined, q.pageSize === "all" ? 1 : q.page * q.pageSize + 1));
+    out?.setLastMs(r.ms);
+  };
+  const src = createTableSource(dsId, ref, {}, sid, {
+    onQuery,
+    onSessionLost: () => recoverSession(),
+    // Tx: Manual reads go through the transaction session, reopened here when it was lost
+    ensureSession: async () => (txMode() === "manual" ? (sid() ?? (await openTxSession())) : undefined),
+  });
   let root!: HTMLDivElement;
   let api: DataGridApi | undefined;
 
@@ -78,6 +112,8 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
   const [exportDlg, setExportDlg] = createSignal(false);
   const [extractor, setExtractor] = createSignal<ExportOptions["format"]>("csv");
   const [colFilter, setColFilter] = createSignal<{ col: number; anchor: DOMRect } | null>(null);
+  // transpose / record view / find / local filter state of the grid, for the toolbar toggles
+  const [view, setView] = createSignal<GridViewState | null>(null);
 
   const cols = () => src.columns();
   const gridCols = createMemo<GridColumn[] | null>(() => cols()?.map((c) => ({ name: c.name, typeName: c.typeName, nullable: c.nullable, isPk: c.isPk })) ?? null);
@@ -159,7 +195,9 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
       try {
         await loadDataSources();
         if (!ds()) throw new Error("The data source of this tab no longer exists.");
+        out = createOutput(props.tab.id, driver());
         await ensureConnected(dsId);
+        out.log("text", "Connected");
         await src.load();
       } catch (e) {
         // shown inside the tab: restoring many tabs must not raise a balloon each (the explorer closes tabs of
@@ -168,7 +206,10 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
       }
     })();
   });
-  onCleanup(() => src.dispose());
+  onCleanup(() => {
+    src.dispose();
+    removeOutput(props.tab.id);
+  });
 
   // ---------------------------------------------------------------- editing
 
@@ -182,18 +223,28 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
     setApplying(true);
     try {
       const rowChanges = toRowChanges(changes, cs, src.locatorOf);
-      const id = txMode() === "manual" ? sid() : undefined;
+      const id = txMode() === "manual" ? (sid() ?? (await openTxSession())) : undefined;
       if (id) {
-        await ensureTransaction(id, driver());
-        setInTx(true);
+        const st = await ensureTransaction(id, driver());
+        setTxStatus(st);
+        if (st === "failed") {
+          notify({ kind: "error", title: "Cannot submit the changes", body: "The transaction has failed (an earlier statement raised an error). Roll it back, then submit the changes again." });
+          return false;
+        }
       }
       const res = id ? await applyChangesInSession(dsId, id, ref, rowChanges) : await applyChanges(dsId, ref, rowChanges);
+      if (id) await syncTxStatus(id);
       if (!res.committed) {
         const bad = res.results.find((r) => r.error);
         notify({ kind: "error", title: "Cannot submit the changes", body: bad?.error ?? "The transaction was rolled back." });
         return false;
       }
     } catch (e) {
+      if (isSessionLost(e)) {
+        sessionLost();
+        notify({ kind: "error", title: "Cannot submit the changes", body: "The connection was closed and its transaction rolled back, so nothing was applied. Submit the changes again." });
+        return false;
+      }
       fail("Cannot submit the changes", e);
       return false;
     } finally {
@@ -234,59 +285,108 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
       if (a === "cancel") return false;
       if (a === "submit" && !(await submitNow())) return false;
     }
-    if (inTx()) {
-      activateTab(props.tab.id);
-      const a = await ask({
-        title: "Active Transaction",
-        message: `'${props.tab.title}' has an open transaction with changes that are not committed yet.`,
-        choices: [
-          { label: "Commit", value: "commit", primary: true },
-          { label: "Roll Back", value: "rollback" },
-          { label: "Cancel", value: "cancel" },
-        ],
-        cancel: "cancel",
-      });
-      if (a === "cancel") return false;
-      return endTx(a === "commit" ? "commit" : "rollback", false);
-    }
-    return true;
+    // an open transaction: Commit / Roll Back / Cancel (the same dialog as for the consoles)
+    return confirmEndTransactions({ tabId: props.tab.id, reason: "closing the editor" });
   }
 
   // ---------------------------------------------------------------- transactions
 
-  /** Tx: Manual opens a session for this tab; back to Auto commits an open transaction and drops the session. */
+  /** Opens the transaction session of Tx: Manual (a connection of its own). */
+  async function openTxSession(): Promise<string> {
+    await ensureConnected(dsId);
+    const id = await openSession(dsId);
+    setSid(id);
+    setTxStatus("idle");
+    return id;
+  }
+
+  /** Reads the server's state of the session into the signal. */
+  async function syncTxStatus(id: string): Promise<void> {
+    try {
+      setTxStatus(await sessionTxStatus(id));
+    } catch (e) {
+      if (isSessionLost(e)) sessionLost();
+    }
+  }
+
+  /** The session is gone (data source disconnected / deactivated): the server rolled the transaction back with it. */
+  function sessionLost(): void {
+    const had = inTx();
+    setSid(undefined);
+    setTxStatus("idle");
+    if (had) {
+      out?.log("error", "the transaction was rolled back: connection closed");
+      notify({ kind: "warning", title: "The transaction was rolled back", body: `The connection of '${props.tab.title}' was closed, so its open transaction was rolled back. Reload the page to see the data as the database holds it.` });
+    } else out?.log("text", "connection closed");
+  }
+
+  /** After `sessionLost`: a new session for the next operation (Manual mode), `undefined` in Auto mode / on failure. */
+  async function recoverSession(): Promise<string | undefined> {
+    sessionLost();
+    if (txMode() !== "manual") return undefined;
+    try {
+      return await openTxSession();
+    } catch (e) {
+      fail("Cannot reopen the transaction session", e);
+      return undefined;
+    }
+  }
+
+  // the data source was disconnected while this editor holds a transaction session
+  createEffect(() => {
+    if (!connectedDataSourceIds().has(dsId) && untrack(sid)) sessionLost(); // reopened on the next read / submit
+  });
+
+  /** Tx: Manual opens a session for this tab; back to Auto asks about an open transaction and drops the session. */
   async function setTxMode(m: "auto" | "manual"): Promise<void> {
     if (m === txMode()) return;
     if (m === "manual") {
       try {
-        await ensureConnected(dsId);
-        setSid(await openSession(dsId));
+        await openTxSession();
         setTxModeSignal("manual");
       } catch (e) {
         fail("Cannot start the transaction session", e);
       }
       return;
     }
-    if (inTx() && !(await endTx("commit", false))) return;
+    const had = inTx();
+    if (had && !(await confirmEndTransactions({ tabId: props.tab.id, reason: "switching to the Auto transaction mode" }))) return;
     const id = sid();
     setSid(undefined);
+    setTxStatus("idle");
     setTxModeSignal("auto");
     if (id) void closeSession(id).catch(() => {});
+    if (had) void reloadPage({}, { keepTotal: true }); // show what the database holds now
   }
 
-  /** Commit / Roll Back of the open transaction. Returns whether it ended. `reload`: show the rolled back data. */
+  /**
+   * Commit / Roll Back of the open transaction. Returns whether it ended. `reload`: reload the page when the data on
+   * screen may not be the database's (rolled back by us or by the server).
+   */
   async function endTx(kind: "commit" | "rollback", reload = true): Promise<boolean> {
     const id = sid();
     if (!id || !inTx()) return true;
     try {
-      await endTransaction(id, kind);
+      const r = await endTransaction(id, kind);
+      if (r.status) setTxStatus(r.status);
+      else await syncTxStatus(id);
+      const how = r.ended[0] ? classifyTxEnd(kind === "commit" ? "COMMIT" : "ROLLBACK", r.ended[0]) : kind;
+      if (how === "serverRollback") {
+        out?.log("error", SERVER_ROLLBACK_LOG);
+        notify({ kind: "error", title: SERVER_ROLLBACK_TITLE, body: SERVER_ROLLBACK_BODY });
+      } else out?.log("text", how === "rollback" ? "transaction rolled back" : "transaction committed");
+      // the grid must not keep values that are no longer in the database
+      if (reload && (how === "rollback" || how === "serverRollback")) void reloadPage();
+      return true;
     } catch (e) {
+      if (isSessionLost(e)) {
+        sessionLost();
+        return true; // the connection took the transaction with it
+      }
       fail(kind === "commit" ? "Cannot commit the transaction" : "Cannot roll back the transaction", e);
+      await syncTxStatus(id);
       return false;
     }
-    setInTx(false);
-    if (kind === "rollback" && reload) void reloadPage();
-    return true;
   }
   const commit = () => void endTx("commit");
   const rollback = () => void endTx("rollback");
@@ -319,6 +419,7 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
   onCleanup(
     registerController({
       tabId: props.tab.id,
+      dsId,
       title: () => props.tab.title,
       root: () => root,
       editable,
@@ -334,6 +435,8 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
       confirmClose,
       txMode,
       inTx,
+      txStatus,
+      endTx: (kind) => endTx(kind, false),
       commit,
       rollback,
       exportData: () => setExportDlg(true),
@@ -363,7 +466,7 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
 
   // status bar: transaction mode (microtask: after the console's cleanup of the same tab switch)
   createEffect(() => {
-    const text = txMode() === "manual" ? (inTx() ? "Tx: Manual (active)" : "Tx: Manual") : "Tx: Auto";
+    const text = txLabel(txMode(), txStatus());
     if (props.active && editable()) queueMicrotask(() => setStatus("txMode", text));
   });
 
@@ -447,8 +550,7 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
   };
   const showQuery = () => {
     const q = src.applied();
-    const size = q.pageSize === "all" ? "" : ` limit ${q.pageSize + 1}${q.page ? ` offset ${q.page * q.pageSize}` : ""}`;
-    setSqlPopup({ sql: selectSql(driver(), ref, q.where, q.orderBy, false).replace("select *", "select t.*").replace(/ from (\S+)/, " from $1 t") + size, submit: false });
+    setSqlPopup({ sql: tableQuerySql(driver(), ref, q.where, q.orderBy, q.pageSize, q.page), submit: false });
   };
 
   const totalRows = () => {
@@ -468,6 +570,7 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
         onCommit={commit}
         onRollback={rollback}
         txActive={inTx()}
+        txFailed={txStatus() === "failed"}
         extractor={EXPORT_FORMATS.find((f) => f.value === extractor())?.label ?? "CSV"}
         onExtractorMenu={extractorMenu}
         onReload={reload}
@@ -479,6 +582,18 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
         onDDL={openDdl}
         onSql={showQuery}
         onExport={() => setExportDlg(true)}
+        transposed={!!view()?.transposed}
+        onTransposeChange={() => api?.toggleTranspose()}
+        onRecordView={() => api?.toggleRecordView()}
+        recordViewOpen={!!view()?.sidePanel}
+        onFind={() => api?.openFind()}
+        findOpen={!!view()?.findOpen}
+        localFilterEnabled={view()?.localFilterEnabled ?? true}
+        localFilterActive={!!view()?.localFilterActive}
+        onLocalFilterEnabledChange={(on) => api?.setLocalFilterEnabled(on)}
+        onClearLocalFilter={() => api?.clearLocalFilter()}
+        onManageColumns={(anchor) => api?.openManageColumns(anchor)}
+        columnsHidden={(view()?.hiddenColumns ?? 0) > 0}
       />
       <Show when={ds() && cols()}>
         <FilterBar
@@ -512,6 +627,7 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
               onReload={reload}
               onColumnFilter={(col, anchor) => setColFilter({ col, anchor })}
               onSelectionChange={onSelection}
+              onViewChange={setView}
               apiRef={(a) => (api = a)}
             >
               <GridPagingPill

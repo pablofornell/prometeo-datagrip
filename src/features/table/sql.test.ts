@@ -6,7 +6,9 @@ import {
   appendCondition,
   buildCondition,
   orderByToSort,
+  literal,
   previewSql,
+  tableQuerySql,
   qualifiedName,
   selectSql,
   sortToOrderBy,
@@ -46,6 +48,28 @@ describe("sql helpers", () => {
     expect(buildCondition("mysql", cols[0], "is null", "")).toBe("`id` is null");
     expect(appendCondition("a = 1", "b = 2")).toBe("a = 1 and b = 2");
     expect(appendCondition("a = 1 or c = 3", "b = 2")).toBe("(a = 1 or c = 3) and b = 2");
+  });
+
+  it("escapes backslashes in MySQL string literals (not in PostgreSQL / SQLite)", () => {
+    // MySQL reads `\t` / `\'` inside '...' as escapes: `C:\temp` must be sent as 'C:\\temp'
+    expect(buildCondition("mysql", cols[1], "=", "C:\\temp")).toBe("`Full Name` = 'C:\\\\temp'");
+    expect(buildCondition("mysql", cols[1], "=", "a\\'b")).toBe("`Full Name` = 'a\\\\''b'");
+    expect(buildCondition("mysql", cols[1], "like", "C:\\%")).toBe("`Full Name` like 'C:\\\\%'");
+    expect(buildCondition("postgres", cols[1], "=", "C:\\temp")).toBe(`"Full Name" = 'C:\\temp'`);
+    expect(buildCondition("sqlite", cols[1], "=", "C:\\temp")).toBe(`"Full Name" = 'C:\\temp'`);
+    expect(literal("C:\\temp", "varchar", "mysql")).toBe("'C:\\\\temp'");
+    expect(literal("C:\\temp", "varchar", "postgres")).toBe("'C:\\temp'");
+  });
+
+  it("previews MySQL values with the same escaping", () => {
+    const changes: GridChange[] = [{ kind: "update", row: 0, key: { id: 1 }, values: { "Full Name": "C:\\temp" } }];
+    expect(previewSql("mysql", ref, cols, changes)).toContain("= 'C:\\\\temp'");
+  });
+
+  it("writes the table editor query like DataGrip's Output (LIMIT page size + 1 to detect more rows)", () => {
+    expect(tableQuerySql("postgres", ref, "", "", 500, 0)).toBe("SELECT t.* FROM shop.clients t LIMIT 501");
+    expect(tableQuerySql("postgres", ref, " id > 5 ", "id desc", 100, 2)).toBe("SELECT t.* FROM shop.clients t WHERE id > 5 ORDER BY id desc LIMIT 101 OFFSET 200");
+    expect(tableQuerySql("mysql", { schema: "demo", name: "Order Items", kind: "table" }, "", "", "all", 0)).toBe("SELECT t.* FROM demo.`Order Items` t");
   });
 
   it("previews changes like DataGrip (DELETE, UPDATE, INSERT)", () => {
