@@ -20,6 +20,8 @@
   --dgg-i-revert: url("../../assets/icons/undo.svg");
   --dgg-i-preview: url("../../assets/icons/dg/preview-changes.svg");
   --dgg-i-submit: url("../../assets/icons/dg/submit.svg");
+  --dgg-i-commit: url("../../assets/icons/dg/commit.svg");
+  --dgg-i-rollback: url("../../assets/icons/dg/rollback.svg");
   --dgg-i-find: url("../../assets/icons/search.svg");
   --dgg-i-filter: url("../../assets/icons/filter.svg");
   --dgg-i-record: url("../../assets/icons/single-record-view.svg");
@@ -50,6 +52,8 @@
   --dgg-i-revert: url("../../assets/icons/undo_dark.svg");
   --dgg-i-preview: url("../../assets/icons/dg/preview-changes_dark.svg");
   --dgg-i-submit: url("../../assets/icons/dg/submit_dark.svg");
+  --dgg-i-commit: url("../../assets/icons/dg/commit_dark.svg");
+  --dgg-i-rollback: url("../../assets/icons/dg/rollback_dark.svg");
   --dgg-i-find: url("../../assets/icons/search_dark.svg");
   --dgg-i-filter: url("../../assets/icons/filter_dark.svg");
   --dgg-i-record: url("../../assets/icons/single-record-view_dark.svg");
@@ -81,6 +85,8 @@
 .dgg-i.i-revert { background-image: var(--dgg-i-revert); }
 .dgg-i.i-preview { background-image: var(--dgg-i-preview); }
 .dgg-i.i-submit { background-image: var(--dgg-i-submit); }
+.dgg-i.i-commit { background-image: var(--dgg-i-commit); }
+.dgg-i.i-rollback { background-image: var(--dgg-i-rollback); }
 .dgg-i.i-find { background-image: var(--dgg-i-find); }
 .dgg-i.i-filter { background-image: var(--dgg-i-filter); }
 .dgg-i.i-record { background-image: var(--dgg-i-record); }

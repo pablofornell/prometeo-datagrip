@@ -31,6 +31,8 @@ import { NULL_KEY, countMatches, countValues, type ValueCount } from "./localFil
 import { ManageColumns } from "./ManageColumns";
 import { SidePanel, type SideDock } from "./SidePanel";
 import { cellRect, indexAt, prefixSums, recordWidth, toLogical, toScreen, windowOf } from "./transpose";
+import { measuredViewport } from "./viewport";
+import { logicalPos, logicalShift, scrollExtent, scrollPos } from "./virtualScroll";
 import {
   DEFAULT_VALUE,
   classifyType,
@@ -387,12 +389,21 @@ export function DataGrid(props: DataGridProps): JSX.Element {
   });
   /** Prefix sums of the horizontal screen axis: visible columns normally, records when transposed. */
   const hX = createMemo<Float64Array>(() => (T() ? recX() : colX()));
+  // Axes longer than SCROLL_CAP are scrolled with a scaled scrollbar (virtualScroll.ts): the scroller is `extentH` / `extentW`
+  // long, `shiftV` / `shiftH` turn logical coordinates (row * ROW_H, prefix sums) into scroller coordinates.
+  const dataViewH = () => Math.max(0, viewH() - HEADER_H);
+  const dataViewW = () => Math.max(0, viewW() - gutterW());
+  const extentH = () => scrollExtent(bodyH());
+  const extentW = () => scrollExtent(totalW());
+  const shiftV = createMemo(() => (bodyH() > scrollExtent(bodyH()) ? logicalShift(scrollTop(), bodyH(), dataViewH()) : 0));
+  const shiftH = createMemo(() => (totalW() > scrollExtent(totalW()) ? logicalShift(scrollLeft(), totalW(), dataViewW()) : 0));
 
   const rowWin = createMemo<[number, number]>(
     () => {
       const t = vCount();
-      const r0 = Math.max(0, Math.floor(scrollTop() / ROW_H) - OVERSCAN_ROWS);
-      const r1 = Math.min(t - 1, Math.ceil((scrollTop() + viewH() - HEADER_H) / ROW_H) + OVERSCAN_ROWS);
+      const top = scrollTop() + shiftV();
+      const r0 = Math.max(0, Math.floor(top / ROW_H) - OVERSCAN_ROWS);
+      const r1 = Math.min(t - 1, Math.ceil((top + viewH() - HEADER_H) / ROW_H) + OVERSCAN_ROWS);
       return [r0, r1];
     },
     [0, -1],
@@ -405,7 +416,10 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     return out;
   });
   const colWin = createMemo<[number, number]>(
-    () => windowOf(hX(), scrollLeft() - OVERSCAN_PX, scrollLeft() + viewW() - gutterW() + OVERSCAN_PX),
+    () => {
+      const left = scrollLeft() + shiftH();
+      return windowOf(hX(), left - OVERSCAN_PX, left + viewW() - gutterW() + OVERSCAN_PX);
+    },
     [0, -1],
     { equals: (a, b) => a[0] === b[0] && a[1] === b[1] },
   );
@@ -485,12 +499,13 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     const fm = matcher();
     const X = recX();
     const [h0, h1] = colWin();
+    const shift = shiftH();
     const ni = pending.insertedCount;
     const o = rowOrder();
     let html = "";
     for (let r = h0; r <= h1; r++) {
-      const x = X[r];
-      const w = X[r + 1] - x;
+      const x = X[r] - shift;
+      const w = X[r + 1] - X[r];
       if (r < ni) {
         html += cellHtml(r, vi, ci, pending.inserted(r)?.values.get(ci) ?? null, x, w, false, true, nt, fm);
         continue;
@@ -608,23 +623,32 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     if (!active()) setActive({ r: 0, c: 0 });
   }
 
+  /** Logical data coordinate at the top / left of the visible data area, read from the scroller. */
+  const logicalTop = () => logicalPos(scroller.scrollTop, bodyH(), scroller.clientHeight - HEADER_H);
+  const logicalLeft = () => logicalPos(scroller.scrollLeft, totalW(), scroller.clientWidth - gutterW());
+
   function ensureVisible(r: number, c: number) {
     if (!scroller) return;
     const X = hX();
     const sp = toScreen(T(), r, c);
     const dataH = scroller.clientHeight - HEADER_H;
     const top = sp.v * ROW_H;
-    if (top < scroller.scrollTop) scroller.scrollTop = top;
-    else if (top + ROW_H > scroller.scrollTop + dataH) scroller.scrollTop = top + ROW_H - dataH;
+    const viewTop = logicalTop();
+    if (top < viewTop) scroller.scrollTop = scrollPos(top, bodyH(), dataH);
+    else if (top + ROW_H > viewTop + dataH) scroller.scrollTop = scrollPos(top + ROW_H - dataH, bodyH(), dataH);
     const dataW = scroller.clientWidth - gutterW();
     const left = X[sp.h] ?? 0;
     const right = X[sp.h + 1] ?? left;
-    if (left < scroller.scrollLeft) scroller.scrollLeft = left;
-    else if (right > scroller.scrollLeft + dataW) scroller.scrollLeft = Math.min(left, right - dataW);
+    const viewLeft = logicalLeft();
+    if (left < viewLeft) scroller.scrollLeft = scrollPos(left, totalW(), dataW);
+    else if (right > viewLeft + dataW) scroller.scrollLeft = scrollPos(Math.min(left, right - dataW), totalW(), dataW);
   }
 
   // underlay rectangles (logical blocks mapped through the active layout)
-  const rectOf = (r0: number, r1: number, c0: number, c1: number) => cellRect(T(), hX(), ROW_H, r0, r1, c0, c1);
+  const rectOf = (r0: number, r1: number, c0: number, c1: number) => {
+    const q = cellRect(T(), hX(), ROW_H, r0, r1, c0, c1);
+    return { ...q, x: q.x - shiftH(), y: q.y - shiftV() };
+  };
   const selRects = createMemo<Rect[]>(() => {
     const out: Rect[] = [];
     const n = nCols();
@@ -684,8 +708,12 @@ export function DataGrid(props: DataGridProps): JSX.Element {
 
   onMount(() => {
     const measure = () => {
-      setViewW(scroller.clientWidth);
-      setViewH(scroller.clientHeight);
+      // a hidden pane measures 0 x 0: keep the last size, or the rows built meanwhile lack every column from the third on
+      const v = measuredViewport(scroller.clientWidth, scroller.clientHeight, { w: viewW(), h: viewH() });
+      batch(() => {
+        setViewW(v.w);
+        setViewH(v.h);
+      });
     };
     measure();
     const ro = new ResizeObserver(measure);
@@ -740,8 +768,8 @@ export function DataGrid(props: DataGridProps): JSX.Element {
   function toData(e: { clientX: number; clientY: number }) {
     const rect = scroller.getBoundingClientRect();
     return {
-      x: e.clientX - rect.left + scroller.scrollLeft - gutterW(),
-      y: e.clientY - rect.top + scroller.scrollTop - HEADER_H,
+      x: e.clientX - rect.left + logicalLeft() - gutterW(),
+      y: e.clientY - rect.top + logicalTop() - HEADER_H,
       inGutter: e.clientX - rect.left < gutterW(),
       inHeader: e.clientY - rect.top < HEADER_H,
     };
@@ -1690,8 +1718,8 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     copy,
     selectAll,
     scrollToRow: (row) => {
-      if (T()) scroller.scrollLeft = hX()[Math.min(Math.max(0, row), hX().length - 1)] ?? 0;
-      else scroller.scrollTop = Math.max(0, row * ROW_H);
+      if (T()) scroller.scrollLeft = scrollPos(hX()[Math.min(Math.max(0, row), hX().length - 1)] ?? 0, totalW(), scroller.clientWidth - gutterW());
+      else scroller.scrollTop = scrollPos(Math.max(0, row * ROW_H), bodyH(), scroller.clientHeight - HEADER_H);
     },
     focus: () => root.focus({ preventScroll: true }),
     openValueEditor,
@@ -1722,8 +1750,8 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     const X = hX();
     const { v, h } = toScreen(T(), ed.r, ed.vi);
     return {
-      left: X[h] + "px",
-      top: v * ROW_H + "px",
+      left: X[h] - shiftH() + "px",
+      top: v * ROW_H - shiftV() + "px",
       width: X[h + 1] - X[h] + "px",
       height: ROW_H + "px",
     };
@@ -1737,7 +1765,7 @@ export function DataGrid(props: DataGridProps): JSX.Element {
       onMouseDown={onBodyMouseDown}
       onDblClick={onBodyDblClick}
     >
-      <div class="dgg-sizer" style={{ width: gutterW() + totalW() + "px", height: HEADER_H + bodyH() + "px" }}>
+      <div class="dgg-sizer" style={{ width: gutterW() + extentW() + "px", height: HEADER_H + extentH() + "px" }}>
         <div class="dgg-header">
           <div class="dgg-corner" style={{ width: gutterW() + "px" }} />
           <Show when={T()}>
@@ -1746,7 +1774,7 @@ export function DataGrid(props: DataGridProps): JSX.Element {
                 <div
                   class="dgg-hc rec"
                   classList={{ sel: rowHasSel(r) }}
-                  style={{ left: gutterW() + (hX()[r] ?? 0) + "px", width: (hX()[r + 1] ?? 0) - (hX()[r] ?? 0) + "px" }}
+                  style={{ left: gutterW() + (hX()[r] ?? 0) - shiftH() + "px", width: (hX()[r + 1] ?? 0) - (hX()[r] ?? 0) + "px" }}
                   onMouseDown={(e) => onRecHeaderDown(e, r)}
                 >
                   {rowOff() + r + 1}
@@ -1814,8 +1842,8 @@ export function DataGrid(props: DataGridProps): JSX.Element {
           </Show>
         </div>
 
-        <div class="dgg-body" style={{ height: bodyH() + "px" }}>
-          <div class="dgg-gutter" style={{ width: gutterW() + "px", height: bodyH() + "px" }}>
+        <div class="dgg-body" style={{ height: extentH() + "px" }}>
+          <div class="dgg-gutter" style={{ width: gutterW() + "px", height: extentH() + "px" }}>
             <For each={rowList()}>
               {(r) => (
                 <Show
@@ -1830,13 +1858,13 @@ export function DataGrid(props: DataGridProps): JSX.Element {
                         del: rowState(r) === "del",
                         mod: rowState(r) === "mod",
                       }}
-                      style={{ top: r * ROW_H + "px" }}
+                      style={{ top: r * ROW_H - shiftV() + "px" }}
                     >
                       {rowOff() + r + 1}
                     </div>
                   }
                 >
-                  <div class="dgg-gr nm" classList={{ sel: colSelectedFully(r) }} style={{ top: r * ROW_H + "px" }}>
+                  <div class="dgg-gr nm" classList={{ sel: colSelectedFully(r) }} style={{ top: r * ROW_H - shiftV() + "px" }}>
                     <i class={"dgg-ico " + iconClass(props.columns[vis()[r]])} />
                     <span>{props.columns[vis()[r]]?.name}</span>
                   </div>
@@ -1844,7 +1872,7 @@ export function DataGrid(props: DataGridProps): JSX.Element {
               )}
             </For>
           </div>
-          <div class="dgg-data" style={{ left: gutterW() + "px", width: totalW() + "px", height: bodyH() + "px" }}>
+          <div class="dgg-data" style={{ left: gutterW() + "px", width: extentW() + "px", height: extentH() + "px" }}>
             <div class="dgg-underlay">
               <Show when={curRect()}>
                 {(q) => <div class="dgg-u cur" style={{ left: q().x + "px", top: q().y + "px", width: q().w + "px", height: q().h + "px" }} />}
@@ -1857,7 +1885,7 @@ export function DataGrid(props: DataGridProps): JSX.Element {
               </For>
             </div>
             <For each={rowList()}>
-              {(r) => <div class="dgg-row" style={{ top: r * ROW_H + "px", width: totalW() + "px" }} innerHTML={T() ? rowHtmlT(r) : rowHtml(r)} />}
+              {(r) => <div class="dgg-row" style={{ top: r * ROW_H - shiftV() + "px", width: extentW() + "px" }} innerHTML={T() ? rowHtmlT(r) : rowHtml(r)} />}
             </For>
             <Show when={edit()}>
               {(ed) => <CellEditor state={ed()} style={editorStyle(ed())} right={!T() && isRightAligned(kinds()[ed().ci], cellValue(ed().r, ed().ci))} onCommit={commitEdit} onCancel={cancelEdit} onValueEditor={(t) => {

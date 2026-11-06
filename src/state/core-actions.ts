@@ -113,7 +113,7 @@ export function registerCoreActions(): () => void {
     stub(ACTION_IDS.cancel, "Cancel Running Statements", "Ctrl+F2", "stop"),
     stub(ACTION_IDS.history, "Browse Query History", "Ctrl+Alt+E", "history"),
     stub(ACTION_IDS.commit, "Commit", "Ctrl+Alt+Shift+Enter", "dg/commit"),
-    stub(ACTION_IDS.rollback, "Rollback", undefined, "dg/rollback"),
+    stub(ACTION_IDS.rollback, "Roll back", undefined, "dg/rollback"),
     stub(ACTION_IDS.refresh, "Refresh", "Ctrl+F5", "refresh"),
     stub(ACTION_IDS.exportData, "Export Data…", undefined, "export"),
   ];

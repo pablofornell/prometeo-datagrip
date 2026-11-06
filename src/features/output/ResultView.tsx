@@ -13,10 +13,14 @@ export function ResultView(props: { tab: ResultTab; out: ConsoleOutput; selected
     const s = tab().pageSize();
     return typeof s === "number" ? Math.max(s, 500) : 5000;
   };
-  // read-only columns of an editable result (expressions, aliases, generated columns)
+  // read-only columns of an editable result (expressions, aliases, generated columns); the key columns get the key icon
   const columns = createMemo<GridColumn[]>(() => {
     const e = tab().edit();
-    return e ? tab().columns.map((c, i) => (e.editable[i] ? c : { ...c, readOnly: true })) : tab().columns;
+    if (!e) return tab().columns;
+    return tab().columns.map((c, i) => {
+      if (!e.editable[i]) return { ...c, readOnly: true };
+      return e.key.includes(c.name) ? { ...c, isPk: true } : c;
+    });
   });
   const host = () => props.out.host;
   const previewSql = () => {

@@ -2,7 +2,6 @@
 import { Show, type JSX } from "solid-js";
 import { GridToolbar } from "../../components/grid";
 import { ActionButton, type MenuItem, openMenu } from "../../components/ui";
-import { TxBar } from "../table/TxBar";
 import { FORMATS, copyResult, exportResultToFile, formatLabel } from "./export";
 import { currentOutput, type ConsoleOutput, type ResultTab } from "./model";
 
@@ -22,6 +21,9 @@ function ResultToolbar(props: { out: ConsoleOutput; tab: ResultTab }): JSX.Eleme
         hasChanges={tab().pending() > 0}
         txMode={host()?.txMode() === "manual" ? "Manual" : "Auto"}
         onTxMenu={(r) => host()?.openTxMenu(r)}
+        onCommit={() => void host()?.endTx("commit")}
+        onRollback={() => void host()?.endTx("rollback")}
+        txActive={!!host()?.inTx()}
         onAddRow={() => api()?.addRow()}
         onDeleteRows={() => api()?.deleteRows()}
         onRevert={() => api()?.revertSelected()}
@@ -62,9 +64,6 @@ function ResultToolbar(props: { out: ConsoleOutput; tab: ResultTab }): JSX.Eleme
           )
         }
       />
-      <Show when={edit() && host()?.txMode() === "manual"}>
-        <TxBar inTx={!!host()?.inTx()} onCommit={() => void host()?.endTx("commit")} onRollback={() => void host()?.endTx("rollback")} shortcut="Ctrl+Alt+Shift+Enter" />
-      </Show>
     </div>
   );
 }

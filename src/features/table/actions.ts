@@ -77,7 +77,8 @@ export function tableActions(): Action[] {
     },
     {
       id: "table.commit",
-      title: "Commit",
+      // DataGrip: Console.TableResult.SubmitAndCommit (the console's Console.Transaction.Commit is "Commit")
+      title: "Submit and Commit",
       shortcut: "Ctrl+Alt+Shift+Enter",
       icon: "dg/commit",
       when: focused,

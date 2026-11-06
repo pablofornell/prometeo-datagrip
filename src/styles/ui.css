@@ -587,8 +587,8 @@
   display: flex;
   align-items: center;
   flex: none;
-  gap: 13px;
-  padding: 13px 15px;
+  gap: 12px;
+  padding: 11px 15px; /* measured on DataGrip: 1px border + 11 + 28px buttons + 11 = 51px (Settings and Data Sources) */
   border-top: 1px solid var(--dg-border);
 }
 .dg-dialog-footer-left {

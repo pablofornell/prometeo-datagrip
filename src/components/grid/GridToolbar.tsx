@@ -18,6 +18,8 @@ type Icon =
   | "revert"
   | "preview"
   | "submit"
+  | "commit"
+  | "rollback"
   | "find"
   | "filter"
   | "record"
@@ -74,6 +76,11 @@ export interface GridToolbarProps {
   /** Transaction mode label ("Auto" / "Manual"); the Tx widget is shown for editable results only. */
   txMode?: string;
   onTxMenu?: (anchor: DOMRect) => void;
+  /** Commit / Roll Back buttons after the Tx widget (shown while the mode is Manual and a handler is given). */
+  onCommit?: () => void;
+  onRollback?: () => void;
+  /** A manual transaction is open: enables commit / roll back. */
+  txActive?: boolean;
 
   /** Extractor format shown in the `CSV ⌄` widget. */
   extractor?: string;
@@ -173,6 +180,10 @@ export function GridToolbar(props: GridToolbarProps): JSX.Element {
           Tx: {props.txMode ?? "Auto"}
           <i class="dgg-i i-chevron" />
         </button>
+        <Show when={props.txMode === "Manual" && (props.onCommit || props.onRollback)}>
+          <Btn icon="commit" title="Commit" shortcut="Ctrl+Alt+Shift+Enter" disabled={!props.txActive || !props.onCommit} onClick={() => props.onCommit?.()} />
+          <Btn icon="rollback" title="Roll Back" disabled={!props.txActive || !props.onRollback} onClick={() => props.onRollback?.()} />
+        </Show>
       </Show>
       <Sep />
       <button class="dgg-tbtn text" title="Go to DDL" tabIndex={-1} onClick={() => props.onDDL?.()} disabled={!props.onDDL}>

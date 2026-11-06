@@ -46,7 +46,7 @@ export function registerConsoleActions(): () => void {
     },
     {
       id: "sql.rollback",
-      title: "Roll Back",
+      title: "Roll back",
       icon: "dg/rollback",
       enabled: () => {
         const s = activeSession();

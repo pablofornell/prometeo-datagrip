@@ -1,6 +1,9 @@
 /* Standalone demo of the data grid. Open http://localhost:1464/demo/grid.html (vite dev, see docs).
  * Query params: rows=100000  cols=30  theme=dark|light  editable=1|0  paged=0|1  ref=53|57  view=table|text
  *   offset=500  rowNumberOffset (paged table editor)   null=NULL  settings.gridNullText   transpose=1  record=1
+ *   tx=manual  txactive=1  Tx widget with the commit / roll back buttons
+ *   late=<ms>  rows arrive after the grid mounted
+ *   name=<text>  (ref demos) first name of row 1
  *   bench=<port>  run the scroll benchmark and POST the result to http://localhost:<port>/ (for engines without devtools) */
 import { Show, createSignal, onMount } from "solid-js";
 import { render } from "solid-js/web";
@@ -195,9 +198,13 @@ const NCOLS = Number(q.get("cols") ?? 30);
 function Demo() {
   const columns: GridColumn[] = ref ? REF_COLUMNS : BIG_COLUMNS.slice(0, NCOLS);
   const refRows = ref === "57" ? REF_57 : REF_53;
+  if (ref && q.get("name")) refRows[0] = [...refRows[0].slice(0, 1), q.get("name")!, ...refRows[0].slice(2)];
   const PAGE = 500;
 
-  const [loaded, setLoaded] = createSignal(ref ? refRows.length : PAGED ? Math.min(PAGE, ROWS) : ROWS);
+  // late=<ms>: the rows arrive that long after the grid mounted (a table editor / result tab loads asynchronously)
+  const LATE = Number(q.get("late") ?? 0);
+  const [loaded, setLoaded] = createSignal(LATE ? 0 : ref ? refRows.length : PAGED ? Math.min(PAGE, ROWS) : ROWS);
+  if (LATE) setTimeout(() => setLoaded(ref ? refRows.length : PAGED ? Math.min(PAGE, ROWS) : ROWS), LATE);
   const total = ref ? 40 : ROWS;
   const cache: Cell[][] = [];
   const getRow = (i: number): Cell[] | undefined => {
@@ -266,8 +273,11 @@ function Demo() {
       hasChanges={pending() > 0}
       viewMode={viewMode()}
       onViewModeChange={setViewMode}
-      txMode="Auto"
+      txMode={q.get("tx") === "manual" ? "Manual" : "Auto"}
       onTxMenu={() => setLog("tx menu")}
+      onCommit={() => setLog("commit")}
+      onRollback={() => setLog("rollback")}
+      txActive={q.get("txactive") === "1"}
       onReload={() => setLog("reload")}
       onAddRow={() => api.addRow()}
       onDeleteRows={() => api.deleteRows()}

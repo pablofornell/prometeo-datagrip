@@ -36,7 +36,6 @@ import { applyChangesInSession, endTransaction, ensureTransaction } from "./sess
 import { FilterBar } from "./FilterBar";
 import { ChoiceDialog, ColumnFilterPopup, EXPORT_FORMATS, ExportDialog, SqlPopup, type ExportTarget } from "./Popups";
 import { type PageSize, type Query, createTableSource } from "./source";
-import { TxBar } from "./TxBar";
 import { appendCondition, buildCondition, orderByToSort, previewSql, qualifiedName, selectSql, sortToOrderBy, toRowChanges } from "./sql";
 import "./table.css";
 
@@ -466,6 +465,9 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
         onCancel={cancelRunning}
         txMode={txMode() === "manual" ? "Manual" : "Auto"}
         onTxMenu={txMenu}
+        onCommit={commit}
+        onRollback={rollback}
+        txActive={inTx()}
         extractor={EXPORT_FORMATS.find((f) => f.value === extractor())?.label ?? "CSV"}
         onExtractorMenu={extractorMenu}
         onReload={reload}
@@ -478,9 +480,6 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
         onSql={showQuery}
         onExport={() => setExportDlg(true)}
       />
-      <Show when={editable() && txMode() === "manual"}>
-        <TxBar inTx={inTx()} onCommit={commit} onRollback={rollback} shortcut="Ctrl+Alt+Shift+Enter" />
-      </Show>
       <Show when={ds() && cols()}>
         <FilterBar
           driver={driver()}
