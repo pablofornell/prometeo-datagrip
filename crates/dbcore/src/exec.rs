@@ -21,8 +21,13 @@
 //! # Cancellation
 //! PG: `pg_cancel_backend(pid)` from a side connection. MySQL: `KILL QUERY id`.
 //! SQLite: `sqlite3_interrupt`. Closing a partially read result cancels the query,
-//! except inside an explicit transaction (heuristic: `BEGIN`/`START TRANSACTION` seen on
-//! the session) where the remaining rows are drained so the transaction is not aborted.
+//! except inside an open transaction (see [`crate::tx`]) where the remaining rows are drained so
+//! the transaction is not aborted.
+//!
+//! # Transaction events
+//! After every statement the session's [`TxStatus`] is updated from the server (see `tx.rs`);
+//! `TxStatus` is sent when it changed and `TxEnded` when a `COMMIT`/`ROLLBACK` (or a MySQL implicit
+//! commit) ended a transaction, both before `Done`.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -40,6 +45,7 @@ use crate::manager::*;
 use crate::model::*;
 use crate::quote::first_keyword;
 use crate::split::{split_statements, Statement};
+use crate::tx;
 use crate::value::{describe_columns, DecodeOpts, RawRow, RowDecoder};
 
 pub use crate::split::{statement_at, statement_at_utf16};
@@ -239,6 +245,24 @@ struct Task {
 }
 
 impl Task {
+    /// Update the session's transaction state after a statement and report what changed. `conn` is
+    /// `None` while a result stream still occupies the connection (state from the statement text only).
+    async fn tx_after(&mut self, conn: Option<&mut Conn>, idx: usize, sql: &str, outcome: tx::Outcome) {
+        let u = tx::after_statement(&self.sh.session, conn, sql, outcome).await;
+        if self.done_sent {
+            return;
+        }
+        if let Some((committed, tag)) = u.ended {
+            self.sh.send(ExecEvent::TxEnded { index: idx, committed, tag: tag.to_string() });
+        }
+        if let Some(text) = u.note {
+            self.sh.send(ExecEvent::Message { index: Some(idx), text });
+        }
+        if u.changed {
+            self.sh.send(ExecEvent::TxStatus { status: u.status });
+        }
+    }
+
     fn send_done(&mut self) {
         if !self.done_sent {
             self.done_sent = true;
@@ -285,7 +309,7 @@ async fn pull(stream: &mut ItemStream<'_>, sh: &Shared, st: &mut StreamState, t0
 /// Stop reading a stream that still has rows: cancel the query on the server (unless that
 /// would abort an open transaction) and consume what is left so the connection is reusable.
 async fn abort_stream(mut stream: ItemStream<'_>, sh: &Shared) {
-    let in_tx = sh.session.in_tx.load(Ordering::Relaxed);
+    let in_tx = sh.session.in_tx();
     let user = sh.token.is_cancelled();
     let cancel = !in_tx || user;
     if cancel {
@@ -298,6 +322,12 @@ async fn abort_stream(mut stream: ItemStream<'_>, sh: &Shared) {
     while stream.next().await.is_some() {}
 }
 
+/// Convert a 1-based position in Unicode code points (what PostgreSQL reports) into a 1-based offset in
+/// UTF-16 code units (what the editor counts) inside `text`.
+pub(crate) fn utf16_position(text: &str, position: usize) -> usize {
+    1 + text.chars().take(position.saturating_sub(1)).map(char::len_utf16).sum::<usize>()
+}
+
 fn might_return_rows(sql: &str) -> bool {
     matches!(
         first_keyword(sql).as_str(),
@@ -306,23 +336,10 @@ fn might_return_rows(sql: &str) -> bool {
     ) || sql.to_ascii_uppercase().contains("RETURNING")
 }
 
-fn track_tx(sess: &Session, sql: &str) {
-    let kw = first_keyword(sql);
-    match kw.as_str() {
-        "BEGIN" | "START" => sess.in_tx.store(true, Ordering::Relaxed),
-        "COMMIT" | "END" | "ABORT" => sess.in_tx.store(false, Ordering::Relaxed),
-        "ROLLBACK" => {
-            let up = sql.to_ascii_uppercase();
-            if !up.contains(" TO ") && !up.contains("SAVEPOINT") {
-                sess.in_tx.store(false, Ordering::Relaxed)
-            }
-        }
-        _ => {}
-    }
-}
-
 enum Flow {
     Next,
+    /// The result of the last statement is still open for paging (the connection is busy).
+    Paged,
 }
 
 async fn run_statement(
@@ -384,6 +401,8 @@ async fn run_statement(
         task.sh.send(ExecEvent::ResultSet { index: idx, columns: cols, rows, has_more: false });
     } else if is_last && !task.sh.token.is_cancelled() {
         task.sh.send(ExecEvent::ResultSet { index: idx, columns: cols, rows, has_more: true });
+        // the connection is busy: the state can only be derived from the statement text for now
+        task.tx_after(None, idx, sql, tx::Outcome::Ok).await;
         // idle first, then `Done`: a client that reacts to `Done` with a new execute must
         // never see the session as busy
         task.sh.ctl.running.store(false, Ordering::Relaxed);
@@ -391,7 +410,12 @@ async fn run_statement(
         let exhausted = page_loop(task, &mut stream, &decoder, &mut st, pending, idx, t0).await;
         if !exhausted {
             abort_stream(stream, &task.sh).await;
+        } else {
+            drop(stream);
         }
+        // the stream is gone: ask the server (silently, `Done` was sent long ago)
+        tx::refresh(&task.sh.session, conn).await;
+        return Ok(Flow::Paged);
     } else {
         task.sh.send(ExecEvent::ResultSet { index: idx, columns: cols, rows, has_more: false });
         task.sh.send(ExecEvent::Message {
@@ -464,6 +488,7 @@ async fn page_loop(
                             break;
                         }
                         Pull::Err(e) => {
+                            tx::note_stream_error(&task.sh.session, &e);
                             err = Some(e);
                             exhausted = true;
                             break;
@@ -475,6 +500,7 @@ async fn page_loop(
                         Pull::Row(r) => pending = Some(dec.decode(&r)),
                         Pull::End => exhausted = true,
                         Pull::Err(e) => {
+                            tx::note_stream_error(&task.sh.session, &e);
                             err = Some(e);
                             exhausted = true;
                         }
@@ -515,7 +541,7 @@ async fn exec_task(
     let mut guard = sess.conn.clone().lock_owned().await;
     match guard.as_mut() {
         None => {
-            task.sh.send(ExecEvent::Error { index: 0, message: "Session is closed".into(), position: None });
+            task.sh.send(ExecEvent::Error { index: 0, message: "Session is closed".into(), position: None, position_utf16: None });
         }
         Some(conn) => {
             let n = stmts.len();
@@ -526,10 +552,16 @@ async fn exec_task(
                 task.sh.send(ExecEvent::Statement { index: i, sql: st.text.clone(), range: st.range() });
                 ctl.running.store(true, Ordering::Relaxed);
                 match run_statement(&mut task, conn, i, &st.text, i + 1 == n).await {
-                    Ok(Flow::Next) => track_tx(&sess, &st.text),
+                    Ok(Flow::Next) => task.tx_after(Some(&mut *conn), i, &st.text, tx::Outcome::Ok).await,
+                    Ok(Flow::Paged) => {}
                     Err(e) => {
-                        task.sh.send(ExecEvent::Error { index: i, message: e.to_string(), position: e.position() });
-                        track_tx(&sess, &st.text);
+                        task.sh.send(ExecEvent::Error {
+                            index: i,
+                            message: e.to_string(),
+                            position: e.position(),
+                            position_utf16: e.position().map(|p| utf16_position(&st.text, p)),
+                        });
+                        task.tx_after(Some(&mut *conn), i, &st.text, tx::Outcome::from_error(&e)).await;
                         if task.opts.stop_on_error {
                             break;
                         }

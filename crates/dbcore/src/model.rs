@@ -36,7 +36,8 @@ pub struct DataSourceConfig {
     pub password: Option<String>,
     /// SQLite database file path.
     pub file: String,
-    /// Full connection URL; when set it replaces host/port/user/password/database.
+    /// Full connection URL; when set it replaces host/port/user/database. A non-null `password` still
+    /// overrides the password inside the URL (the app stores the password separately, never in the URL).
     pub url_override: Option<String>,
     /// Driver specific options: `sslmode`, `application_name`, `connectTimeout` (seconds), ...
     pub options: BTreeMap<String, String>,
@@ -263,6 +264,27 @@ pub struct StatementRange {
     pub end_utf16: usize,
 }
 
+/// Transaction state of a session, as the server sees it (see `tx.rs` for how it is determined).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TxStatus {
+    /// No open transaction (autocommit).
+    #[default]
+    Idle,
+    /// Inside a transaction.
+    Active,
+    /// Inside a transaction that the server aborted (PostgreSQL `25P02`): everything but
+    /// `ROLLBACK` / `ROLLBACK TO SAVEPOINT` is refused, and `COMMIT` rolls back.
+    Failed,
+}
+
+impl TxStatus {
+    /// Is there an open transaction (`Active` or `Failed`)?
+    pub fn is_open(self) -> bool {
+        self != TxStatus::Idle
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ExecEvent {
@@ -271,9 +293,20 @@ pub enum ExecEvent {
     #[serde(rename = "resultset")]
     ResultSet { index: usize, columns: Vec<ColumnMeta>, rows: Vec<Vec<Cell>>, has_more: bool },
     Update { index: usize, rows_affected: u64 },
-    /// `position` is the 1-based character offset inside the statement (PG).
-    Error { index: usize, message: String, position: Option<usize> },
+    /// `position` is the 1-based offset inside the statement **in Unicode code points** (PG reports
+    /// it that way); `position_utf16` is the same place as a 1-based offset in UTF-16 code units
+    /// (what JS strings / CodeMirror count), computed against the statement text that was sent.
+    /// They differ after any character outside the BMP (emoji). Use `position_utf16` in the editor.
+    Error { index: usize, message: String, position: Option<usize>, position_utf16: Option<usize> },
     Message { index: Option<usize>, text: String },
+    /// The transaction state of the session changed (sent right after the statement that changed
+    /// it, before `Done`). Also see `ConnectionManager::session_tx_status`.
+    TxStatus { status: TxStatus },
+    /// A `COMMIT` / `ROLLBACK` / `END` / `ABORT` statement finished, or MySQL committed implicitly.
+    /// `committed == false` for a `COMMIT` of a failed PostgreSQL transaction: the server rolled
+    /// it back (command tag `ROLLBACK`) without reporting an error. `tag` is the command tag:
+    /// `COMMIT`, `ROLLBACK` or `IMPLICIT COMMIT` (MySQL DDL & co. ended the transaction).
+    TxEnded { index: usize, committed: bool, tag: String },
     Done { elapsed_ms: u64, execution_ms: u64, fetching_ms: u64 },
 }
 

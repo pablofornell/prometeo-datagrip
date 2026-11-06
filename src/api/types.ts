@@ -43,7 +43,11 @@ export interface DataSourceConfig {
   password?: string | null;
   /** SQLite database file path. */
   file: string;
-  /** Full connection URL; when set it replaces host/port/user/password/database. */
+  /**
+   * Full connection URL; when set it replaces host/port/user/database. A password typed into it
+   * (`user:pass@` or `?password=`) is moved to the keyring on save: the backend returns the URL without
+   * it (`hasPassword: true`) and sends the password field when connecting.
+   */
   urlOverride: string | null;
   /** Driver specific options: `sslmode`, `application_name`, `connectTimeout` (seconds), ... */
   options: Record<string, string>;
@@ -240,12 +244,31 @@ export type ExecEvent =
   | { kind: "statement"; index: number; sql: string; range: StatementRange }
   | { kind: "resultset"; index: number; columns: ColumnMeta[]; rows: Cell[][]; hasMore: boolean }
   | { kind: "update"; index: number; rowsAffected: number }
-  /** `position` is the 1-based character offset inside the statement (PG). */
-  | { kind: "error"; index: number; message: string; position: number | null }
+  /**
+   * `position`: 1-based offset inside the statement in Unicode CODE POINTS (PG reports it that way).
+   * `positionUtf16`: the same place as a 1-based offset in UTF-16 code units (what JS strings and
+   * CodeMirror count; computed against the statement text that was sent). They differ after any emoji:
+   * use `positionUtf16` for the underline. Both `null` when the server gives no position (MySQL, SQLite).
+   */
+  | { kind: "error"; index: number; message: string; position: number | null; positionUtf16: number | null }
   | { kind: "message"; index: number | null; text: string }
+  /** The session's transaction state changed (sent right after the statement that changed it, before `done`). */
+  | { kind: "txStatus"; status: TxStatus }
+  /**
+   * A COMMIT / ROLLBACK (or a MySQL implicit commit) ended a transaction. `committed: false` with tag
+   * "ROLLBACK" after a COMMIT means PostgreSQL rolled back a failed transaction without an error:
+   * warn the user that nothing was saved. `tag` is "COMMIT", "ROLLBACK" or "IMPLICIT COMMIT".
+   */
+  | { kind: "txEnded"; index: number; committed: boolean; tag: string }
   | { kind: "done"; elapsedMs: number; executionMs: number; fetchingMs: number };
 
 export type ExecEventKind = ExecEvent["kind"];
+
+/**
+ * Transaction state of a session as the server sees it: `idle` (autocommit), `active`, or `failed`
+ * (PostgreSQL: aborted by an error; everything but ROLLBACK / ROLLBACK TO is refused and COMMIT rolls back).
+ */
+export type TxStatus = "idle" | "active" | "failed";
 
 // ---------------------------------------------------------------- export
 
@@ -293,4 +316,18 @@ export interface AppInfo {
   dataDir: string | null;
   /** Where new passwords are stored: the OS keyring when reachable, otherwise the JSON file. */
   passwordStorage: PasswordStorage;
+  /**
+   * Config files that were corrupt at startup: the backend set them aside and started with an empty
+   * one. Show each once (a notice). Absent / empty in the normal case.
+   */
+  startupWarnings?: StartupNotice[];
+}
+
+export interface StartupNotice {
+  /** `data-sources.json` or `ui-state.json`. */
+  file: string;
+  /** Ready to show; says where the damaged file went. */
+  message: string;
+  /** Full path of `<file>.corrupt-<unix seconds>`, when the backup could be made. */
+  backup: string | null;
 }

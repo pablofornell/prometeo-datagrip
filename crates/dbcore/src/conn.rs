@@ -120,7 +120,14 @@ pub(crate) fn build_opts(cfg: &DataSourceConfig) -> Result<ConnOpts> {
     match cfg.driver {
         Driver::Postgres => {
             let mut o = match url {
-                Some(u) => PgConnectOptions::from_str(u).map_err(bad)?,
+                Some(u) => {
+                    let mut o = PgConnectOptions::from_str(u).map_err(bad)?;
+                    // the password field wins over the URL: the app keeps passwords out of stored URLs
+                    if let Some(p) = &cfg.password {
+                        o = o.password(p);
+                    }
+                    o
+                }
                 None => {
                     let mut o = PgConnectOptions::new_without_pgpass()
                         .host(if cfg.host.is_empty() { "localhost" } else { &cfg.host })
@@ -148,7 +155,13 @@ pub(crate) fn build_opts(cfg: &DataSourceConfig) -> Result<ConnOpts> {
         }
         Driver::MySql => {
             let mut o = match url {
-                Some(u) => MySqlConnectOptions::from_str(u).map_err(bad)?,
+                Some(u) => {
+                    let mut o = MySqlConnectOptions::from_str(u).map_err(bad)?;
+                    if let Some(p) = &cfg.password {
+                        o = o.password(p);
+                    }
+                    o
+                }
                 None => {
                     let mut o = MySqlConnectOptions::new()
                         .host(if cfg.host.is_empty() { "localhost" } else { &cfg.host })

@@ -121,3 +121,13 @@ pub async fn wait_done(h: &mut ExecHandle) -> Vec<ExecEvent> {
     }
     out
 }
+
+/// The `TxStatus` events of a run, in order.
+pub fn tx_statuses(ev: &[ExecEvent]) -> Vec<TxStatus> {
+    ev.iter().filter_map(|e| if let ExecEvent::TxStatus { status } = e { Some(*status) } else { None }).collect()
+}
+
+/// The `TxEnded` events of a run: `(committed, tag)`.
+pub fn tx_ended(ev: &[ExecEvent]) -> Vec<(bool, String)> {
+    ev.iter().filter_map(|e| if let ExecEvent::TxEnded { committed, tag, .. } = e { Some((*committed, tag.clone())) } else { None }).collect()
+}

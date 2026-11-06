@@ -354,7 +354,7 @@ async fn execute_scripts_errors_and_session_state() {
 
     // server error: real message, SQLSTATE, position
     let ev = run(&mgr, &s, "select * from nonexistent_table_xyz").await;
-    let err = ev.iter().find_map(|e| if let ExecEvent::Error { message, position, index } = e { Some((message.clone(), *position, *index)) } else { None }).unwrap();
+    let err = ev.iter().find_map(|e| if let ExecEvent::Error { message, position, index, .. } = e { Some((message.clone(), *position, *index)) } else { None }).unwrap();
     assert_eq!(err.0, "[42P01] ERROR: relation \"nonexistent_table_xyz\" does not exist\n  Position: 15");
     assert_eq!(err.1, Some(15));
     assert_eq!(err.2, 0);
@@ -1168,4 +1168,119 @@ async fn open_results_are_closed_on_reexecute_and_idle_timeout() {
     assert_ok(&run(&mgr, &a, "rollback").await);
     mgr.close_session(&a).await;
     mgr.close_session(&b).await;
+}
+
+/// A failed transaction is reported as such, and `COMMIT` of it (which the server turns into a rollback with the
+/// command tag `ROLLBACK`, without an error) is reported as `TxEnded { committed: false }`.
+#[tokio::test]
+async fn failed_transaction_status_and_commit_that_rolls_back() {
+    let (_cfg, mgr) = setup!();
+    let s = mgr.open_session("pg").await.unwrap();
+    scratch_schema(&mgr, &s, "scratch_txs", "create table t (id int primary key, v text); insert into t values (1,'a')").await;
+    let t = ObjectRef::table(Some("scratch_txs"), "t");
+    let v = |mgr: &ConnectionManager| {
+        let mgr = mgr.clone();
+        let t = t.clone();
+        async move { mgr.table_data("pg", &t, &Default::default()).await.unwrap().rows[0][1].clone() }
+    };
+    assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Idle);
+
+    let ev = run(&mgr, &s, "begin").await;
+    assert_eq!(tx_statuses(&ev), vec![TxStatus::Active]);
+    assert_ok(&run(&mgr, &s, "update t set v = 'edited' where id = 1").await);
+    let ev = run(&mgr, &s, "select 1/0").await;
+    assert_eq!(errors(&ev).len(), 1);
+    assert_eq!(tx_statuses(&ev), vec![TxStatus::Failed]);
+    assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Failed);
+    assert!(mgr.session_in_transaction(&s).unwrap());
+    // a later statement is refused by the server and the state stays failed (no new event)
+    let ev = run(&mgr, &s, "select 1").await;
+    assert!(errors(&ev)[0].contains("25P02"));
+    assert!(tx_statuses(&ev).is_empty());
+    // editing in a failed transaction is refused with a clear message
+    let e = mgr.apply_changes_in_session(&s, &t, &[change(ChangeKind::Update, json!({"id": 1}), json!({"v": "x"}))]).await.unwrap_err();
+    assert!(e.to_string().contains("failed state"), "{e}");
+
+    // COMMIT: no error, but the work is gone
+    let ev = run(&mgr, &s, "commit").await;
+    assert_ok(&ev);
+    assert_eq!(tx_ended(&ev), vec![(false, "ROLLBACK".to_string())]);
+    assert!(ev.iter().any(|e| matches!(e, ExecEvent::Message { text, .. } if text.contains("ROLLBACK"))), "{ev:#?}");
+    assert_eq!(tx_statuses(&ev), vec![TxStatus::Idle]);
+    assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Idle);
+    assert_eq!(v(&mgr).await, json!("a"), "the edit did not survive the COMMIT");
+
+    // a healthy COMMIT is reported as committed
+    assert_ok(&run(&mgr, &s, "begin").await);
+    assert_ok(&run(&mgr, &s, "update t set v = 'kept' where id = 1").await);
+    let ev = run(&mgr, &s, "commit").await;
+    assert_eq!(tx_ended(&ev), vec![(true, "COMMIT".to_string())]);
+    assert_eq!(v(&mgr).await, json!("kept"));
+
+    // ROLLBACK TO SAVEPOINT revives a failed transaction
+    assert_ok(&run(&mgr, &s, "begin; savepoint sp; update t set v = 'x' where id = 1").await);
+    assert_eq!(tx_statuses(&run(&mgr, &s, "select 1/0").await), vec![TxStatus::Failed]);
+    let ev = run(&mgr, &s, "rollback to savepoint sp").await;
+    assert_ok(&ev);
+    assert_eq!(tx_statuses(&ev), vec![TxStatus::Active]);
+    assert!(tx_ended(&ev).is_empty());
+    let ev = run(&mgr, &s, "rollback").await;
+    assert_eq!(tx_ended(&ev), vec![(false, "ROLLBACK".to_string())]);
+    assert_eq!(tx_statuses(&ev), vec![TxStatus::Idle]);
+
+    // an error outside a transaction does not make it "failed"
+    let ev = run(&mgr, &s, "select 1/0").await;
+    assert!(tx_statuses(&ev).is_empty());
+    assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Idle);
+
+    assert_ok(&run(&mgr, &s, "drop schema scratch_txs cascade").await);
+    mgr.close_session(&s).await;
+}
+
+/// `position_utf16` counts UTF-16 code units: it is ahead of `position` (code points) after an emoji.
+#[tokio::test]
+async fn error_position_in_utf16_units() {
+    let (_cfg, mgr) = setup!();
+    let s = mgr.open_session("pg").await.unwrap();
+    let ev = run(&mgr, &s, "select '😀😀', nosuchcolumn").await;
+    let pos: Vec<_> = ev.iter().filter_map(|e| if let ExecEvent::Error { position, position_utf16, .. } = e { Some((*position, *position_utf16)) } else { None }).collect();
+    // `select ` + quote + 2 emoji + quote + comma + space = 13 code points before the identifier; the emoji take 2 units each
+    assert_eq!(pos, vec![(Some(14), Some(16))], "{ev:#?}");
+    let ev = run(&mgr, &s, "select nosuchcolumn").await;
+    let pos: Vec<_> = ev.iter().filter_map(|e| if let ExecEvent::Error { position, position_utf16, .. } = e { Some((*position, *position_utf16)) } else { None }).collect();
+    assert_eq!(pos, vec![(Some(8), Some(8))]);
+    mgr.close_session(&s).await;
+}
+
+/// `open_session_with` re-applies session settings on a fresh connection.
+#[tokio::test]
+async fn open_session_with_init_sql() {
+    let (_cfg, mgr) = setup!();
+    let init = vec!["set search_path to shop, public".to_string(), "set session characteristics as transaction isolation level serializable".to_string()];
+    let s = mgr.open_session_with("pg", &init).await.unwrap();
+    assert_eq!(scalar(&run(&mgr, &s, "select current_schema()").await), json!("shop"));
+    assert_eq!(scalar(&run(&mgr, &s, "show default_transaction_isolation").await), json!("serializable"));
+    mgr.close_session(&s).await;
+    // a failing statement fails the open and leaves no session behind
+    let e = mgr.open_session_with("pg", &["select * from definitely_not_a_table".to_string()]).await.unwrap_err();
+    assert!(e.to_string().contains("42P01"), "{e}");
+    // plain open_session is unchanged
+    let s = mgr.open_session("pg").await.unwrap();
+    assert_ne!(scalar(&run(&mgr, &s, "select current_schema()").await), json!("shop"));
+    mgr.close_session(&s).await;
+}
+
+/// A URL without a password plus the `password` field connects (the app keeps passwords out of stored URLs).
+#[tokio::test]
+async fn password_field_completes_a_url_without_password() {
+    let Some(mut cfg) = pg_cfg() else { return };
+    let (_, _, user, pass, _) = url_parts(cfg.url_override.as_deref().unwrap());
+    let url = cfg.url_override.clone().unwrap();
+    cfg.url_override = Some(url.replacen(&format!("{user}:{pass}@"), &format!("{user}@"), 1));
+    assert!(!cfg.url_override.as_deref().unwrap().contains(&pass));
+    let mgr = ConnectionManager::new();
+    assert!(!mgr.test_connection(&cfg).await.ok, "no password: must be refused");
+    cfg.password = Some(pass);
+    let r = mgr.test_connection(&cfg).await;
+    assert!(r.ok, "{r:?}");
 }

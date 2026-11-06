@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 
 use dbcore::{
-    ApplyResult, ConnectInfo, DataSourceConfig, Driver, ExecEvent, ExecOptions, ExportOptions, FetchedRows, HistoryEntry,
-    ObjectRef, ResultSet, RowChange, SnapshotObject, Statement, TableDataRequest, TestResult, TreeNode,
+    ApplyResult, ConnectInfo, DataSourceConfig, Driver, ExecEvent, ExecOptions, ExportFormat, ExportOptions, FetchedRows, HistoryEntry,
+    ObjectRef, ResultSet, RowChange, SnapshotObject, Statement, TableDataRequest, TestResult, TreeNode, TxStatus,
 };
 use serde_json::Value;
 use tauri::ipc::Channel;
@@ -67,9 +67,12 @@ pub async fn connected_data_sources(state: State<'_, AppState>) -> Res<Vec<Strin
 
 // ---------------------------------------------------------------- sessions
 
+/// `init_sql` (optional): statements run, in order, on the new connection before the session is returned, to
+/// re-apply per-session settings (`SET search_path`, `USE db`, isolation level) of a reopened console.
+/// The backend does not remember them. A failing statement fails the call and no session is left behind.
 #[tauri::command]
-pub async fn open_session(state: State<'_, AppState>, ds_id: String) -> Res<String> {
-    state.open_session(&ds_id).await
+pub async fn open_session(state: State<'_, AppState>, ds_id: String, init_sql: Option<Vec<String>>) -> Res<String> {
+    state.open_session_with(&ds_id, &init_sql.unwrap_or_default()).await
 }
 
 #[tauri::command]
@@ -77,9 +80,16 @@ pub async fn close_session(state: State<'_, AppState>, session_id: String) -> Re
     state.close_session(&session_id).await
 }
 
+/// True while a transaction is open (`active` or `failed` in [`session_tx_status`]).
 #[tauri::command]
 pub async fn session_in_transaction(state: State<'_, AppState>, session_id: String) -> Res<bool> {
     state.session_in_transaction(&session_id).await
+}
+
+/// `"idle"`, `"active"` or `"failed"` (PostgreSQL: the transaction was aborted; `COMMIT` would roll back).
+#[tauri::command]
+pub async fn session_tx_status(state: State<'_, AppState>, session_id: String) -> Res<TxStatus> {
+    state.session_tx_status(&session_id).await
 }
 
 // ---------------------------------------------------------------- introspection
@@ -163,6 +173,42 @@ pub async fn apply_changes_in_session(state: State<'_, AppState>, session_id: St
 
 // ---------------------------------------------------------------- export
 
+/// Open the native "Save" dialog from the backend and return the chosen path (`null` = cancelled). Only a path
+/// returned here is accepted by `export_query` / `export_result` (once, for five minutes): the webview cannot
+/// make the backend write to an arbitrary file.
+#[tauri::command]
+pub async fn choose_export_path(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    suggested_name: Option<String>,
+    format: Option<ExportFormat>,
+) -> Res<Option<String>> {
+    use tauri_plugin_dialog::DialogExt;
+    let (ext, label) = match format {
+        Some(ExportFormat::Tsv) => ("tsv", "TSV"),
+        Some(ExportFormat::Json) => ("json", "JSON"),
+        Some(ExportFormat::SqlInsert) => ("sql", "SQL"),
+        Some(ExportFormat::Markdown) => ("md", "Markdown"),
+        _ => ("csv", "CSV"),
+    };
+    let mut dlg = app.dialog().file().set_parent(&window).add_filter(label, &[ext]).add_filter("All files", &["*"]);
+    if let Some(name) = suggested_name.as_deref().filter(|n| !n.trim().is_empty()) {
+        // a file name only: the dialog decides the folder
+        let name = std::path::Path::new(name).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        dlg = dlg.set_file_name(name);
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    dlg.save_file(move |p| {
+        let _ = tx.send(p);
+    });
+    let Some(chosen) = rx.await.map_err(|_| "The save dialog was closed".to_string())? else { return Ok(None) };
+    let path = chosen.into_path().map_err(|e| e.to_string())?;
+    state.allow_export_path(path.clone());
+    Ok(Some(path.display().to_string()))
+}
+
+/// `path` must come from `choose_export_path`.
 #[tauri::command]
 pub async fn export_query(state: State<'_, AppState>, ds_id: String, sql: String, options: ExportOptions, path: String) -> Res<usize> {
     state.export_query(&ds_id, &sql, options, &PathBuf::from(path)).await
@@ -173,6 +219,7 @@ pub async fn export_query_to_string(state: State<'_, AppState>, ds_id: String, s
     state.export_query_to_string(&ds_id, &sql, options).await
 }
 
+/// `path` must come from `choose_export_path`.
 #[tauri::command]
 pub async fn export_result(state: State<'_, AppState>, result: ResultSet, options: ExportOptions, path: String) -> Res<usize> {
     state.export_result(result, options, PathBuf::from(path)).await

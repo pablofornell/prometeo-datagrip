@@ -1,6 +1,5 @@
 //! Table data browsing and editing.
 
-use std::sync::atomic::Ordering;
 
 use futures_util::StreamExt;
 use serde_json::Value;
@@ -197,7 +196,14 @@ impl ConnectionManager {
         let sess = self.session(session)?;
         let mut guard = self.lock_session_conn(&sess).await?;
         let conn = guard.as_mut().ok_or_else(|| DbError::NoSession(session.0.clone()))?;
-        let in_tx = sess.in_tx.load(Ordering::Relaxed);
+        // the user's statements may have ended the transaction behind our back (MySQL implicit commit)
+        crate::tx::refresh(&sess, conn).await;
+        if sess.tx_status() == TxStatus::Failed {
+            return Err(DbError::InvalidArgument(
+                "The transaction is in a failed state (current transaction is aborted): roll it back before editing".into(),
+            ));
+        }
+        let in_tx = sess.in_tx();
         let (results, failed) = run_on_conn(conn, d, in_tx, &stmts).await?;
         Ok(ApplyResult { applied: if failed { 0 } else { changes.len() }, committed: !failed, results })
     }

@@ -9,16 +9,20 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use dbcore::{
     export_result, export_to_string, ApplyResult, ConnectInfo, ConnectionManager, DataSourceConfig, Driver, ExecEvent,
     ExecOptions, ExecutionId, ExportOptions, FetchedRows, HistoryEntry, ObjectRef, QueryHistory, ResultSet, RowChange,
-    SessionId, SnapshotObject, Statement, TableDataRequest, TestResult, TreeNode,
+    SessionId, SnapshotObject, Statement, TableDataRequest, TestResult, TreeNode, TxStatus,
 };
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::store::{ConsoleStore, DataSourceStore, DataSourceView, NoKeyring, OsKeyring, PasswordStorage, SecretStore, UiStateStore};
+use crate::store::{
+    redact, strip_url_password, ConsoleStore, DataSourceStore, DataSourceView, NoKeyring, OsKeyring, PasswordStorage, SecretStore, StartupNotice,
+    UiStateStore,
+};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,7 +33,13 @@ pub struct AppInfo {
     pub data_dir: String,
     /// Where new passwords are stored: the OS keyring when reachable, otherwise the JSON file.
     pub password_storage: PasswordStorage,
+    /// Files that were corrupt at startup and set aside (`<file>.corrupt-<ts>`); the app started with an
+    /// empty one. Show them once. Empty in the normal case.
+    pub startup_warnings: Vec<StartupNotice>,
 }
+
+/// How long a path chosen in the save dialog stays valid for `export_query` / `export_result`.
+const EXPORT_PATH_TTL: Duration = Duration::from_secs(300);
 
 /// A running (or still pageable) execution.
 #[derive(Debug, Clone)]
@@ -51,6 +61,9 @@ pub struct AppState {
     sessions: Mutex<HashMap<String, String>>,
     /// execution id -> meta; an entry lives until the execution task ends.
     executions: Arc<Mutex<HashMap<String, ExecMeta>>>,
+    /// Export targets the user picked in a save dialog opened by the backend (`choose_export_path`), each
+    /// valid once and for [`EXPORT_PATH_TTL`]. `export_query` / `export_result` write nowhere else.
+    export_paths: Mutex<HashMap<PathBuf, Instant>>,
 }
 
 /// Run blocking work (file IO, keyring) off the async workers.
@@ -67,6 +80,13 @@ fn connection_fingerprint(c: &DataSourceConfig) -> Value {
         }
     }
     v
+}
+
+/// `msg` without the password of `cfg` (also when it sits in a URL): error texts reach the UI and logs.
+fn redact_for(cfg: &DataSourceConfig, msg: &str) -> String {
+    let url_pw = cfg.url_override.as_deref().and_then(|u| strip_url_password(u).1);
+    let known: Vec<&str> = cfg.password.as_deref().into_iter().chain(url_pw.as_deref()).collect();
+    redact(msg, &known)
 }
 
 impl AppState {
@@ -88,6 +108,7 @@ impl AppState {
             data_dir,
             sessions: Mutex::new(HashMap::new()),
             executions: Arc::new(Mutex::new(HashMap::new())),
+            export_paths: Mutex::new(HashMap::new()),
         })
     }
 
@@ -100,7 +121,15 @@ impl AppState {
             config_dir: self.config_dir.display().to_string(),
             data_dir: self.data_dir.display().to_string(),
             password_storage,
+            startup_warnings: self.startup_warnings(),
         })
+    }
+
+    /// Corrupt files set aside while the stores were loaded.
+    pub fn startup_warnings(&self) -> Vec<StartupNotice> {
+        let mut w = self.sources.notices();
+        w.extend(self.ui.notices());
+        w
     }
 
     // ------------------------------------------------------------ data sources
@@ -111,7 +140,7 @@ impl AppState {
 
     pub async fn save_data_source(&self, cfg: DataSourceConfig) -> Result<DataSourceView, String> {
         let prev = self.sources.view(&cfg.id).map(|v| connection_fingerprint(&v.cfg));
-        let password_given = cfg.password.is_some();
+        let password_given = cfg.password.is_some() || cfg.url_override.as_deref().is_some_and(crate::store::url_has_password);
         let sources = self.sources.clone();
         let view = blocking(move || sources.save(cfg)).await?;
         let changed = prev.map(|p| p != connection_fingerprint(&view.cfg)).unwrap_or(false);
@@ -140,7 +169,9 @@ impl AppState {
     pub async fn test_connection(&self, cfg: DataSourceConfig) -> Result<TestResult, String> {
         let sources = self.sources.clone();
         let cfg = blocking(move || sources.with_stored_password(cfg)).await?;
-        Ok(self.mgr.test_connection(&cfg).await)
+        let mut res = self.mgr.test_connection(&cfg).await;
+        res.message = redact_for(&cfg, &res.message);
+        Ok(res)
     }
 
     async fn config(&self, id: &str) -> Result<DataSourceConfig, String> {
@@ -150,7 +181,7 @@ impl AppState {
 
     pub async fn connect(&self, id: &str) -> Result<ConnectInfo, String> {
         let cfg = self.config(id).await?;
-        self.mgr.connect(&cfg).await.map_err(String::from)
+        self.mgr.connect(&cfg).await.map_err(|e| redact_for(&cfg, &e.to_string()))
     }
 
     pub async fn disconnect(&self, id: &str) -> Result<(), String> {
@@ -167,7 +198,13 @@ impl AppState {
     // ------------------------------------------------------------ sessions
 
     pub async fn open_session(&self, ds_id: &str) -> Result<String, String> {
-        let s = self.mgr.open_session(ds_id).await.map_err(String::from)?;
+        self.open_session_with(ds_id, &[]).await
+    }
+
+    /// `init_sql`: statements run on the new connection before it is handed out (re-applies `SET search_path`,
+    /// `USE db`, the isolation level, ... of a console that is reopened); if one fails, the session is not opened.
+    pub async fn open_session_with(&self, ds_id: &str, init_sql: &[String]) -> Result<String, String> {
+        let s = self.mgr.open_session_with(ds_id, init_sql).await.map_err(String::from)?;
         self.sessions.lock().unwrap().insert(s.0.clone(), ds_id.to_string());
         Ok(s.0)
     }
@@ -181,6 +218,11 @@ impl AppState {
 
     pub async fn session_in_transaction(&self, session_id: &str) -> Result<bool, String> {
         self.mgr.session_in_transaction(&SessionId(session_id.to_string())).map_err(String::from)
+    }
+
+    /// `idle` / `active` / `failed` (see `dbcore::TxStatus`).
+    pub async fn session_tx_status(&self, session_id: &str) -> Result<TxStatus, String> {
+        self.mgr.session_tx_status(&SessionId(session_id.to_string())).map_err(String::from)
     }
 
     // ------------------------------------------------------------ introspection
@@ -301,8 +343,32 @@ impl AppState {
 
     // ------------------------------------------------------------ export
 
-    /// Stream every row of `sql` to `path`. Returns the number of rows written.
+    /// Remember `path` as chosen by the user in a save dialog: the next `export_query` / `export_result` to
+    /// exactly this path is allowed (once, within five minutes).
+    pub fn allow_export_path(&self, path: PathBuf) {
+        let mut m = self.export_paths.lock().unwrap();
+        m.retain(|_, t| t.elapsed() < EXPORT_PATH_TTL);
+        m.insert(path, Instant::now());
+    }
+
+    /// Consume the permission for `path`; the frontend cannot make the backend write to a file the user did
+    /// not pick.
+    fn take_export_path(&self, path: &Path) -> Result<(), String> {
+        let mut m = self.export_paths.lock().unwrap();
+        m.retain(|_, t| t.elapsed() < EXPORT_PATH_TTL);
+        match m.remove(path) {
+            Some(_) => Ok(()),
+            None => Err(format!(
+                "Refusing to write {}: export targets must be chosen in the save dialog (choose_export_path)",
+                path.display()
+            )),
+        }
+    }
+
+    /// Stream every row of `sql` to `path` (a path from [`allow_export_path`](Self::allow_export_path)).
+    /// Returns the number of rows written.
     pub async fn export_query(&self, ds_id: &str, sql: &str, opts: ExportOptions, path: &Path) -> Result<usize, String> {
+        self.take_export_path(path)?;
         let file = File::create(path).map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
         let mut w = BufWriter::new(file);
         let res = self.mgr.export_query(ds_id, sql, &opts, &mut w).await;
@@ -321,6 +387,7 @@ impl AppState {
     }
 
     pub async fn export_result(&self, rs: ResultSet, opts: ExportOptions, path: PathBuf) -> Result<usize, String> {
+        self.take_export_path(&path)?;
         blocking(move || {
             let file = File::create(&path).map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
             let mut w = BufWriter::new(file);

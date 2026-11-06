@@ -13,6 +13,7 @@ fn all_futures_are_send(m: &ConnectionManager, cfg: &DataSourceConfig, sid: &Ses
     is_send(m.reconnect(cfg));
     is_send(m.disconnect("x"));
     is_send(m.open_session("x"));
+    is_send(m.open_session_with("x", &[]));
     is_send(m.close_session(sid));
     is_send(m.introspect("x", &[]));
     is_send(m.introspect_with("x", &[], &IntrospectOptions::default()));

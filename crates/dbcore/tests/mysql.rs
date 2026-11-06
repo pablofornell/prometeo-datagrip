@@ -663,3 +663,102 @@ async fn no_busy_after_done_and_idle_timeout() {
     assert_eq!(scalar(&run(&mgr, &s, "select 9").await), json!(9));
     mgr.close_session(&s).await;
 }
+
+/// DDL commits implicitly in MySQL: the session must notice that the transaction is gone (it used to keep
+/// `in_tx == true`, so a later ROLLBACK undid nothing and `apply_changes_in_session` edited with a savepoint
+/// in autocommit mode, i.e. never inside a transaction the user could roll back).
+#[tokio::test]
+async fn implicit_commit_ends_the_tracked_transaction() {
+    let (_cfg, mgr) = setup!();
+    let s = mgr.open_session("my").await.unwrap();
+    assert_ok(&run(&mgr, &s, "drop table if exists demo.scratch_ic2; drop table if exists demo.scratch_ic; create table demo.scratch_ic (id int primary key, v varchar(32)); insert into demo.scratch_ic values (1,'a')").await);
+    let t = ObjectRef::table(Some("demo"), "scratch_ic");
+    let req = TableDataRequest { order_by: Some("id".into()), ..Default::default() };
+    let vs = |rs: &ResultSet| rs.rows.iter().map(|r| r[1].clone()).collect::<Vec<_>>();
+
+    assert_ok(&run(&mgr, &s, "start transaction").await);
+    assert!(mgr.session_in_transaction(&s).unwrap());
+    // DDL: implicit commit
+    assert_ok(&run(&mgr, &s, "create table demo.scratch_ic2 (i int)").await);
+    assert!(!mgr.session_in_transaction(&s).unwrap(), "the server ended the transaction");
+    assert_ok(&run(&mgr, &s, "drop table demo.scratch_ic2").await);
+
+    // an edit now gets a transaction of its own and is committed (visible to another connection)
+    let r = mgr.apply_changes_in_session(&s, &t, &[change(ChangeKind::Update, json!({"id": 1}), json!({"v": "kept"}))]).await.unwrap();
+    assert!(r.committed, "{r:?}");
+    assert_eq!(vs(&mgr.table_data("my", &t, &req).await.unwrap()), vec![json!("kept")]);
+
+    // a new explicit transaction is tracked again; ROLLBACK undoes the work
+    assert_ok(&run(&mgr, &s, "begin").await);
+    assert!(mgr.session_in_transaction(&s).unwrap());
+    assert_ok(&run(&mgr, &s, "update demo.scratch_ic set v = 'gone'").await);
+    assert!(mgr.session_in_transaction(&s).unwrap());
+    assert_ok(&run(&mgr, &s, "rollback").await);
+    assert!(!mgr.session_in_transaction(&s).unwrap());
+    assert_eq!(vs(&mgr.table_data("my", &t, &req).await.unwrap()), vec![json!("kept")]);
+
+    // ROLLBACK after an implicit commit really has nothing to undo
+    assert_ok(&run(&mgr, &s, "begin; update demo.scratch_ic set v = 'ddl-commits-me'; alter table demo.scratch_ic add column x int").await);
+    assert!(!mgr.session_in_transaction(&s).unwrap());
+    assert_ok(&run(&mgr, &s, "rollback").await);
+    assert_eq!(vs(&mgr.table_data("my", &t, &req).await.unwrap()), vec![json!("ddl-commits-me")]);
+
+    // autocommit = 0 puts every statement into an open transaction
+    assert_ok(&run(&mgr, &s, "set autocommit = 0").await);
+    assert_ok(&run(&mgr, &s, "update demo.scratch_ic set v = 'ac0'").await);
+    assert!(mgr.session_in_transaction(&s).unwrap());
+    assert_ok(&run(&mgr, &s, "rollback").await);
+    assert_ok(&run(&mgr, &s, "set autocommit = 1").await);
+    assert!(!mgr.session_in_transaction(&s).unwrap());
+    assert_eq!(vs(&mgr.table_data("my", &t, &req).await.unwrap()), vec![json!("ddl-commits-me")]);
+
+    assert_ok(&run(&mgr, &s, "drop table demo.scratch_ic").await);
+    mgr.close_session(&s).await;
+}
+
+/// Events for the transaction: `TxStatus` on every change, `TxEnded` for COMMIT / ROLLBACK and the implicit commit.
+#[tokio::test]
+async fn transaction_events_and_init_sql() {
+    let (_cfg, mgr) = setup!();
+    let s = mgr.open_session("my").await.unwrap();
+    assert_ok(&run(&mgr, &s, "drop table if exists demo.scratch_ev; drop table if exists demo.scratch_ev2; create table demo.scratch_ev (i int)").await);
+    let ev = run(&mgr, &s, "begin").await;
+    assert_eq!(tx_statuses(&ev), vec![TxStatus::Active]);
+    assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Active);
+    let ev = run(&mgr, &s, "insert into demo.scratch_ev values (1)").await;
+    assert!(tx_statuses(&ev).is_empty());
+    let ev = run(&mgr, &s, "create table demo.scratch_ev2 (i int)").await;
+    assert_eq!(tx_statuses(&ev), vec![TxStatus::Idle]);
+    assert_eq!(tx_ended(&ev), vec![(true, "IMPLICIT COMMIT".to_string())]);
+    assert_ok(&run(&mgr, &s, "begin").await);
+    let ev = run(&mgr, &s, "commit").await;
+    assert_eq!(tx_ended(&ev), vec![(true, "COMMIT".to_string())]);
+    assert_eq!(tx_statuses(&ev), vec![TxStatus::Idle]);
+    assert_ok(&run(&mgr, &s, "begin").await);
+    let ev = run(&mgr, &s, "rollback").await;
+    assert_eq!(tx_ended(&ev), vec![(false, "ROLLBACK".to_string())]);
+    assert_ok(&run(&mgr, &s, "drop table demo.scratch_ev; drop table demo.scratch_ev2").await);
+    mgr.close_session(&s).await;
+
+    // init_sql
+    let s = mgr.open_session_with("my", &["use information_schema".to_string()]).await.unwrap();
+    assert_eq!(scalar(&run(&mgr, &s, "select database()").await), json!("information_schema"));
+    mgr.close_session(&s).await;
+    let e = mgr.open_session_with("my", &["use no_such_database_xyz".to_string()]).await.unwrap_err();
+    assert!(e.to_string().contains("1049"), "{e}");
+}
+
+/// A URL without a password plus the `password` field connects (the app keeps passwords out of stored URLs).
+#[tokio::test]
+async fn password_field_completes_a_url_without_password() {
+    let Some(mut cfg) = mysql_cfg() else { return };
+    let url = cfg.url_override.clone().unwrap();
+    let (auth, tail) = url.strip_prefix("mysql://").unwrap().split_once('@').unwrap();
+    let (user, pass) = auth.split_once(':').unwrap();
+    cfg.url_override = Some(format!("mysql://{user}@{tail}"));
+    let mgr = ConnectionManager::new();
+    assert!(!mgr.test_connection(&cfg).await.ok, "no password: must be refused");
+    cfg.password = Some(pass.to_string());
+    let r = mgr.test_connection(&cfg).await;
+    assert!(r.ok, "{r:?}");
+}

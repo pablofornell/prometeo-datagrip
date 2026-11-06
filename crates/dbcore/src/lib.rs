@@ -14,6 +14,7 @@ pub mod model;
 pub mod quote;
 pub mod split;
 pub mod table;
+pub mod tx;
 pub mod value;
 
 pub use conn::{Conn, Pool};

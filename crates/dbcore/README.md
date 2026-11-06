@@ -15,6 +15,8 @@ let mgr = ConnectionManager::new();
 mgr.test_connection(&cfg).await                    // -> TestResult { ok, server_version, message, elapsed_ms }
 mgr.connect(&cfg).await / mgr.disconnect(id).await // pool per data source id
 let s = mgr.open_session(id).await?;               // dedicated connection (console): tx state, SET/USE persist
+mgr.open_session_with(id, &init_sql).await?        // same, after running init_sql (re-apply search_path / USE / isolation)
+mgr.session_tx_status(&s)?                         // Idle | Active | Failed; session_in_transaction() = Active or Failed
 mgr.introspect(id, &path).await                    // -> Vec<TreeNode>, lazy; introspect_with(.., &IntrospectOptions{show_system})
 mgr.schema_snapshot(id, schema).await              // flat tables/views + columns for completion
 mgr.ddl(id, &ObjectRef).await                      // -> String
@@ -98,6 +100,24 @@ closed execution are no-ops. `Done` is sent only after the session is idle again
 A call that returns several result sets (`select 1; select 1, 2`, MySQL `CALL`) never panics:
 the grid shows the first result set of each statement, `export_query` exports the rows of the
 first column set (equally shaped result sets are appended, others skipped).
+
+### Transaction state and events
+
+`ExecEvent` carries the transaction state of the session, which reflects the **server**, not the keywords typed
+(see `src/tx.rs`): `TxStatus { status: idle | active | failed }` after the statement that changed it, and
+`TxEnded { index, committed, tag }` when a `COMMIT` / `ROLLBACK` ended a transaction. MySQL is probed after each
+statement that can change it (DDL commits implicitly, `SET autocommit = 0`), SQLite uses `sqlite3_get_autocommit`,
+PostgreSQL is tracked (sqlx hides the `ReadyForQuery` status) from `BEGIN` / `COMMIT` / `ROLLBACK` /
+`SAVEPOINT` plus errors and corrected by SQLSTATE `25P02` / `25P01`; transaction control inside `DO` blocks or
+procedures is not seen. `COMMIT` of a failed PostgreSQL transaction succeeds without an error but the server
+rolls back (tag `ROLLBACK`): it is reported as `TxEnded { committed: false, tag: "ROLLBACK" }` plus a `message`.
+`apply_changes_in_session` refuses to edit in a `failed` transaction.
+
+`Error` events carry `position` (1-based, Unicode code points, as PostgreSQL reports it) and `position_utf16`
+(1-based UTF-16 code units, for the editor), the latter computed against the statement text that was sent.
+
+dbcore keeps no session settings: pass `init_sql` to `open_session_with` to re-apply `SET search_path`, `USE db`,
+the isolation level, ... on a reopened session. A failing statement closes the connection and returns its error.
 
 ## Tests
 

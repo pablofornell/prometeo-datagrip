@@ -189,6 +189,7 @@ async fn postgres_end_to_end() {
     let csv = st.export_query_to_string(&ds, "select id, sku from shop.products order by id limit 3", opts.clone()).await.unwrap();
     assert!(csv.starts_with("id,sku\n1,SKU-0001\n"), "{csv}");
     let file = dir.path().join("out.csv");
+    st.allow_export_path(file.clone()); // what `choose_export_path` does with the dialog's answer
     let n = st.export_query(&ds, "select * from shop.products", opts, &file).await.unwrap();
     assert_eq!(n, 20);
     assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 21);
@@ -403,4 +404,105 @@ async fn os_keyring_roundtrip_when_available() {
     let id = view.cfg.id.clone();
     let left = tokio::task::spawn_blocking(move || OsKeyring.get(&id)).await.unwrap();
     assert_eq!(left.ok().flatten(), None, "keyring entry must be removed on delete");
+}
+
+/// Export targets must come from the backend's save dialog: a path the webview invents is refused.
+#[tokio::test]
+async fn export_only_writes_to_dialog_chosen_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(&dir);
+    let rs = dbcore::ResultSet { columns: vec![], rows: vec![], has_more: false, total_hint: None, row_locators: None };
+    let opts = dbcore::ExportOptions::default();
+    let target = dir.path().join("out.csv");
+
+    let e = st.export_result(rs.clone(), opts.clone(), target.clone()).await.unwrap_err();
+    assert!(e.contains("save dialog"), "{e}");
+    assert!(!target.exists(), "nothing may be written");
+    let cfg = DataSourceConfig { name: "m".into(), driver: Driver::Sqlite, file: ":memory:".into(), ..Default::default() };
+    let ds = st.save_data_source(cfg).await.unwrap().cfg.id;
+    st.connect(&ds).await.unwrap();
+    let e = st.export_query(&ds, "select 1", opts.clone(), &target).await.unwrap_err();
+    assert!(e.contains("save dialog"), "{e}");
+    assert!(!target.exists());
+
+    // the path the dialog returned works, once, and only that exact path
+    st.allow_export_path(target.clone());
+    assert!(st.export_result(rs.clone(), opts.clone(), dir.path().join("other.csv")).await.is_err());
+    assert!(!dir.path().join("other.csv").exists());
+    st.export_result(rs.clone(), opts.clone(), target.clone()).await.unwrap();
+    assert!(target.exists());
+    assert!(st.export_result(rs.clone(), opts.clone(), target.clone()).await.is_err(), "single use");
+    st.allow_export_path(target.clone());
+    assert_eq!(st.export_query(&ds, "select 1 as a union all select 2", opts.clone(), &target).await.unwrap(), 2);
+    // the string variants (clipboard) need no path
+    assert!(st.export_to_string(rs, opts).await.is_ok());
+}
+
+/// A corrupt config file does not stop the app: it is set aside and reported in `app_info`.
+#[tokio::test]
+async fn corrupt_config_files_start_the_app_with_a_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = dir.path().join("config");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(cfg_dir.join("data-sources.json"), b"\0\0garbage").unwrap();
+    std::fs::write(cfg_dir.join("ui-state.json"), b"{\"a\":").unwrap();
+    let st = state(&dir);
+    assert!(st.list_data_sources().await.unwrap().is_empty());
+    let info = st.app_info().await.unwrap();
+    let mut files: Vec<_> = info.startup_warnings.iter().map(|w| w.file.clone()).collect();
+    files.sort();
+    assert_eq!(files, ["data-sources.json", "ui-state.json"]);
+    for w in &info.startup_warnings {
+        assert!(std::path::Path::new(w.backup.as_ref().unwrap()).exists());
+    }
+    let names: Vec<_> = std::fs::read_dir(&cfg_dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert!(names.iter().any(|n| n.starts_with("data-sources.json.corrupt-")) && names.iter().any(|n| n.starts_with("ui-state.json.corrupt-")), "{names:?}");
+    // the JSON the UI gets
+    assert_eq!(serde_json::to_value(&info).unwrap()["startupWarnings"].as_array().unwrap().len(), 2);
+}
+
+/// A password typed into the URL is stored apart, never returned, and still used to connect; errors do not echo it.
+#[tokio::test]
+async fn url_password_never_reaches_the_ui_or_error_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(&dir);
+    let cfg = DataSourceConfig {
+        name: "pw".into(),
+        driver: Driver::Postgres,
+        url_override: Some("postgres://bob:Sup3rS3cret@127.0.0.1:1/x?connect_timeout=1&password=Sup3rS3cret".into()),
+        options: [("connectTimeout".to_string(), "1".to_string())].into(),
+        ..Default::default()
+    };
+    let view = st.save_data_source(cfg.clone()).await.unwrap();
+    let ui = serde_json::to_string(&st.list_data_sources().await.unwrap()).unwrap();
+    assert!(!ui.contains("Sup3rS3cret"), "{ui}");
+    assert_eq!(view.cfg.url_override.as_deref(), Some("postgres://bob@127.0.0.1:1/x?connect_timeout=1"));
+    assert!(view.has_password);
+    // no keyring in tests: the password is in the (0600) file, which is the only place it may be
+    assert!(std::fs::read_to_string(dir.path().join("config/data-sources.json")).unwrap().contains("Sup3rS3cret"));
+    // unreachable server: the error is shown, without the password
+    let id = view.cfg.id.clone();
+    let err = st.connect(&id).await.unwrap_err();
+    assert!(!err.contains("Sup3rS3cret"), "{err}");
+    let t = st.test_connection(cfg).await.unwrap();
+    assert!(!t.ok && !t.message.contains("Sup3rS3cret"), "{}", t.message);
+}
+
+/// Session settings can be applied when a session is opened; the transaction state is queryable.
+#[tokio::test]
+async fn open_session_with_init_sql_and_tx_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(&dir);
+    let cfg = DataSourceConfig { name: "m".into(), driver: Driver::Sqlite, file: ":memory:".into(), ..Default::default() };
+    let ds = st.save_data_source(cfg).await.unwrap().cfg.id;
+    st.connect(&ds).await.unwrap();
+    let s = st.open_session_with(&ds, &["pragma foreign_keys = off".to_string()]).await.unwrap();
+    let ev = run(&st, &s, "select * from pragma_foreign_keys", 10).await;
+    assert_eq!(first_rs(&ev), (1, 1, false));
+    assert_eq!(st.session_tx_status(&s).await.unwrap(), dbcore::TxStatus::Idle);
+    run(&st, &s, "begin", 10).await;
+    assert_eq!(st.session_tx_status(&s).await.unwrap(), dbcore::TxStatus::Active);
+    assert!(st.session_in_transaction(&s).await.unwrap());
+    assert_eq!(serde_json::to_value(st.session_tx_status(&s).await.unwrap()).unwrap(), "active");
+    assert!(st.open_session_with(&ds, &["select * from nope".to_string()]).await.is_err());
 }

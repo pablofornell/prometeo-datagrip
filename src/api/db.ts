@@ -13,6 +13,7 @@ import type {
   Driver,
   ExecEvent,
   ExecOptions,
+  ExportFormat,
   ExportOptions,
   FetchedRows,
   HistoryEntry,
@@ -24,6 +25,7 @@ import type {
   TableDataRequest,
   TestResult,
   TreeNode,
+  TxStatus,
 } from "./types";
 
 export * from "./types";
@@ -59,14 +61,27 @@ export const connectedDataSources = (): Promise<string[]> => invoke("connected_d
 
 // ---------------------------------------------------------------- sessions
 
-/** Dedicated connection (a console): transaction state and `SET` / `USE` persist. */
-export const openSession = (dsId: string): Promise<string> => invoke("open_session", { dsId });
+/**
+ * Dedicated connection (a console): transaction state and `SET` / `USE` persist.
+ * `initSql`: statements run, in order, on the new connection before it is returned. The backend does not
+ * remember session settings, so a reopened console (or one on a reconnected data source) re-applies its
+ * `SET search_path` / `USE db` / isolation level this way. A failing statement rejects and no session is left.
+ */
+export const openSession = (dsId: string, initSql: string[] = []): Promise<string> =>
+  invoke("open_session", { dsId, initSql });
 
 export const closeSession = (sessionId: string): Promise<void> => invoke("close_session", { sessionId });
 
-/** Heuristic: an explicit BEGIN was executed and not yet ended on this session. */
+/** True while a transaction is open on the session (`active` or `failed`), as the server sees it. */
 export const sessionInTransaction = (sessionId: string): Promise<boolean> =>
   invoke("session_in_transaction", { sessionId });
+
+/**
+ * `idle` / `active` / `failed` (see `TxStatus`). MySQL DDL ends a transaction implicitly, so this is the
+ * truth, not the keywords that were typed. The same changes arrive as `txStatus` events of `execute`.
+ */
+export const sessionTxStatus = (sessionId: string): Promise<TxStatus> =>
+  invoke("session_tx_status", { sessionId });
 
 // ---------------------------------------------------------------- introspection
 
@@ -90,6 +105,8 @@ export interface ExecHandlers {
   onUpdate?: (e: Extract<ExecEvent, { kind: "update" }>) => void;
   onError?: (e: Extract<ExecEvent, { kind: "error" }>) => void;
   onMessage?: (e: Extract<ExecEvent, { kind: "message" }>) => void;
+  onTxStatus?: (e: Extract<ExecEvent, { kind: "txStatus" }>) => void;
+  onTxEnded?: (e: Extract<ExecEvent, { kind: "txEnded" }>) => void;
   onDone?: (e: Extract<ExecEvent, { kind: "done" }>) => void;
 }
 
@@ -135,6 +152,8 @@ export async function execute(
         case "update": handlers.onUpdate?.(e); break;
         case "error": handlers.onError?.(e); break;
         case "message": handlers.onMessage?.(e); break;
+        case "txStatus": handlers.onTxStatus?.(e); break;
+        case "txEnded": handlers.onTxEnded?.(e); break;
         case "done": handlers.onDone?.(e); break;
       }
     } finally {
@@ -205,7 +224,40 @@ export const defaultExportOptions = (driver: Driver = "postgres"): ExportOptions
   rowsPerInsert: 1,
 });
 
-/** Run `sql` and stream EVERY row to `path` (chosen with the dialog plugin). Returns the row count. */
+/**
+ * Open the native Save dialog FROM THE BACKEND and resolve with the chosen path (`null` = cancelled).
+ * Only a path returned by this function is accepted by `exportQuery` / `exportResult` (once, within five
+ * minutes); any other path is refused, so the webview cannot make the backend write to an arbitrary file.
+ * Do NOT use the dialog plugin's `save()` for exports any more. `suggestedName` is a file name only.
+ */
+export const chooseExportPath = (suggestedName?: string, format?: ExportFormat): Promise<string | null> =>
+  invoke("choose_export_path", { suggestedName: suggestedName ?? null, format: format ?? null });
+
+/** `chooseExportPath` + `exportQuery`. Resolves `null` when the user cancels the dialog. */
+export async function exportQueryToFile(
+  dsId: string,
+  sql: string,
+  options: ExportOptions,
+  suggestedName?: string,
+): Promise<{ path: string; rows: number } | null> {
+  const path = await chooseExportPath(suggestedName, options.format);
+  return path === null ? null : { path, rows: await exportQuery(dsId, sql, options, path) };
+}
+
+/** `chooseExportPath` + `exportResult`. Resolves `null` when the user cancels the dialog. */
+export async function exportResultToFile(
+  result: Pick<ResultSet, "columns" | "rows">,
+  options: ExportOptions,
+  suggestedName?: string,
+): Promise<{ path: string; rows: number } | null> {
+  const path = await chooseExportPath(suggestedName, options.format);
+  return path === null ? null : { path, rows: await exportResult(result, options, path) };
+}
+
+/**
+ * Run `sql` and stream EVERY row to `path`. Returns the row count. `path` MUST come from `chooseExportPath`
+ * (the backend refuses any other path); prefer `exportQueryToFile`.
+ */
 export const exportQuery = (dsId: string, sql: string, options: ExportOptions, path: string): Promise<number> =>
   invoke("export_query", { dsId, sql, options, path });
 
@@ -213,7 +265,10 @@ export const exportQuery = (dsId: string, sql: string, options: ExportOptions, p
 export const exportQueryToString = (dsId: string, sql: string, options: ExportOptions): Promise<string> =>
   invoke("export_query_to_string", { dsId, sql, options });
 
-/** Write an in-memory result set (what the grid shows) to `path`. Returns the row count. */
+/**
+ * Write an in-memory result set (what the grid shows) to `path`. Returns the row count. `path` MUST come
+ * from `chooseExportPath` (the backend refuses any other path); prefer `exportResultToFile`.
+ */
 export const exportResult = (result: Pick<ResultSet, "columns" | "rows">, options: ExportOptions, path: string): Promise<number> =>
   invoke("export_result", { result: { hasMore: false, totalHint: null, ...result }, options, path });
 

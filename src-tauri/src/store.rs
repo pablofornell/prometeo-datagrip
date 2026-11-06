@@ -20,15 +20,233 @@ use serde_json::Value;
 
 /// Write `bytes` to `path` through a temp file + rename, so a crash never leaves half a file.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_atomic_mode(path, bytes, false)
+}
+
+/// [`write_atomic`] for files that may hold secrets: created with mode `0600` on Unix (the temp file is
+/// created with that mode, so the content is never readable by others, not even briefly).
+pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_atomic_mode(path, bytes, true)
+}
+
+/// Restrict an existing file to its owner (Unix; no-op elsewhere).
+pub fn restrict_to_owner(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+fn write_atomic_mode(path: &Path, bytes: &[u8], private: bool) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
     }
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    fs::write(&tmp, bytes).map_err(|e| format!("Cannot write {}: {e}", tmp.display()))?;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let write = opts.open(&tmp).and_then(|mut f| {
+        use std::io::Write;
+        f.write_all(bytes)
+    });
+    write.map_err(|e| format!("Cannot write {}: {e}", tmp.display()))?;
+    if private {
+        // a leftover temp file of an earlier run keeps its old mode
+        restrict_to_owner(&tmp);
+    }
     fs::rename(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         format!("Cannot replace {}: {e}", path.display())
     })
+}
+
+// ====================================================================== startup notices
+
+/// Something the app repaired while starting (a corrupt file that was set aside). The UI shows these once.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StartupNotice {
+    /// The file name inside the config directory (`data-sources.json`, `ui-state.json`).
+    pub file: String,
+    /// Human readable, ends with where the bad file went.
+    pub message: String,
+    /// Full path of the backup (`<file>.corrupt-<unix seconds>`), when it could be made.
+    pub backup: Option<String>,
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Move an unreadable `path` to `<path>.corrupt-<ts>` so the app can start with an empty file and the user
+/// can still recover the content. `reason` is the parse error.
+fn set_aside_corrupt(path: &Path, reason: &str) -> StartupNotice {
+    let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(format!(".corrupt-{}", unix_secs()));
+    let backup = PathBuf::from(backup);
+    let moved = fs::rename(path, &backup).or_else(|_| fs::copy(path, &backup).map(|_| ()));
+    let tail = match moved {
+        Ok(()) => {
+            restrict_to_owner(&backup);
+            format!("The damaged file was saved as {}.", backup.display())
+        }
+        Err(e) => format!("The damaged file could not be saved ({e}); it will be overwritten."),
+    };
+    tracing::warn!("{file} is not valid ({reason}); starting empty");
+    StartupNotice {
+        file: file.clone(),
+        message: format!("{file} could not be read ({reason}), so Prometeo started with an empty one. {tail}"),
+        backup: moved_path(&backup),
+    }
+}
+
+fn moved_path(p: &Path) -> Option<String> {
+    p.exists().then(|| p.display().to_string())
+}
+
+// ====================================================================== secrets in URLs
+
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && b.len() >= i + 3 {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Query parameters that carry a password in connection URLs.
+fn is_password_param(key: &str) -> bool {
+    matches!(pct_decode(key).to_ascii_lowercase().as_str(), "password" | "passwd" | "pwd")
+}
+
+/// Split the password out of a connection URL: `scheme://user:PASS@host/db?password=PASS&x=1` becomes
+/// `scheme://user@host/db?x=1` plus `Some(PASS)` (percent-decoded). Everything else is kept byte for byte.
+/// A URL without a password comes back unchanged with `None`.
+pub fn strip_url_password(url: &str) -> (String, Option<String>) {
+    let Some(i) = url.find("://") else { return (url.to_string(), None) };
+    let (scheme, rest) = url.split_at(i + 3);
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (auth, tail) = rest.split_at(auth_end);
+    let mut password = None;
+    let mut auth_out = auth.to_string();
+    if let Some(at) = auth.rfind('@') {
+        let (userinfo, host) = auth.split_at(at);
+        if let Some(c) = userinfo.find(':') {
+            let pw = pct_decode(&userinfo[c + 1..]);
+            if !pw.is_empty() {
+                password = Some(pw);
+            }
+            auth_out = if c == 0 { host[1..].to_string() } else { format!("{}{host}", &userinfo[..c]) };
+        }
+    }
+    // path ? query # fragment
+    let (before_frag, frag) = match tail.find('#') {
+        Some(h) => tail.split_at(h),
+        None => (tail, ""),
+    };
+    let (path, query) = match before_frag.find('?') {
+        Some(q) => (&before_frag[..q], Some(&before_frag[q + 1..])),
+        None => (before_frag, None),
+    };
+    let mut query_out = String::new();
+    if let Some(q) = query {
+        let kept: Vec<&str> = q
+            .split('&')
+            .filter(|pair| {
+                let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+                if is_password_param(k) {
+                    if !v.is_empty() {
+                        password = Some(pct_decode(v));
+                    }
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        if !kept.is_empty() {
+            query_out = format!("?{}", kept.join("&"));
+        }
+    }
+    if password.is_none() && auth_out == auth && query.map(|q| q.len() + 1).unwrap_or(0) == query_out.len() {
+        return (url.to_string(), None);
+    }
+    (format!("{scheme}{auth_out}{path}{query_out}{frag}"), password)
+}
+
+/// Does the URL carry a password?
+pub fn url_has_password(url: &str) -> bool {
+    strip_url_password(url).1.is_some()
+}
+
+/// Remove secrets from a message that is shown to the user or logged: `known` passwords, the password of any
+/// `scheme://user:PASS@host` URL and `password=...` parameters in it.
+pub fn redact(msg: &str, known: &[&str]) -> String {
+    let mut out = msg.to_string();
+    for k in known.iter().filter(|k| k.chars().count() >= 3) {
+        out = out.replace(k, "***");
+        let enc: String = k.bytes().map(|b| if b.is_ascii_alphanumeric() { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
+        if enc != *k {
+            out = out.replace(&enc, "***");
+        }
+    }
+    // scheme://user:pass@ -> scheme://user:***@
+    let mut res = String::with_capacity(out.len());
+    let mut rest = out.as_str();
+    while let Some(i) = rest.find("://") {
+        let (head, tail) = rest.split_at(i + 3);
+        res.push_str(head);
+        let end = tail.find(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '"' | '\'')).unwrap_or(tail.len());
+        let (auth, after) = tail.split_at(end);
+        match (auth.rfind('@'), auth.find(':')) {
+            (Some(at), Some(c)) if c < at => {
+                res.push_str(&auth[..c + 1]);
+                res.push_str("***");
+                res.push_str(&auth[at..]);
+            }
+            _ => res.push_str(auth),
+        }
+        rest = after;
+    }
+    res.push_str(rest);
+    // password=... / passwd=... / pwd=... until the next separator
+    let mut cleaned = String::with_capacity(res.len());
+    let lower = res.to_ascii_lowercase();
+    let mut i = 0;
+    while i < res.len() {
+        let hit = ["password=", "passwd=", "pwd="].iter().find(|k| lower[i..].starts_with(**k) && (i == 0 || !lower.as_bytes()[i - 1].is_ascii_alphanumeric()));
+        if let Some(k) = hit {
+            cleaned.push_str(&res[i..i + k.len()]);
+            cleaned.push_str("***");
+            i += k.len();
+            while i < res.len() && !matches!(res.as_bytes()[i], b'&' | b' ' | b'\n' | b'"' | b'\'' | b'#') {
+                i += 1;
+            }
+        } else {
+            let ch = res[i..].chars().next().unwrap();
+            cleaned.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    cleaned
 }
 
 // ====================================================================== secrets
@@ -96,6 +314,17 @@ impl SecretStore for NoKeyring {
 
 // ====================================================================== data sources
 
+/// Move the password out of `cfg.url_override` (PostgreSQL / MySQL URLs) and return it.
+pub fn take_url_password(cfg: &mut DataSourceConfig) -> Option<String> {
+    if cfg.driver == dbcore::Driver::Sqlite {
+        return None;
+    }
+    let url = cfg.url_override.as_deref()?;
+    let (clean, pw) = strip_url_password(url);
+    cfg.url_override = Some(clean);
+    pw
+}
+
 /// A data source as written to `data-sources.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -141,6 +370,8 @@ impl From<&StoredDs> for DataSourceView {
     fn from(s: &StoredDs) -> Self {
         let mut cfg = s.cfg.clone();
         cfg.password = None;
+        // never hand a password-bearing URL to the UI (stored URLs are clean, this is the safety net)
+        cfg.url_override = cfg.url_override.map(|u| strip_url_password(&u).0);
         DataSourceView { cfg, has_password: s.has_password, password_storage: s.password_storage }
     }
 }
@@ -154,18 +385,47 @@ pub struct DataSourceStore {
     secrets: Arc<dyn SecretStore>,
     keyring: AtomicU8,
     items: Mutex<Vec<StoredDs>>,
+    notices: Mutex<Vec<StartupNotice>>,
 }
 
 impl DataSourceStore {
+    /// Load `data-sources.json`. A file that cannot be parsed is set aside as `data-sources.json.corrupt-<ts>`
+    /// and the store starts empty (see [`notices`](Self::notices)); only an unreadable file is an error.
+    /// URLs that still carry a password (written by an older version) are migrated: the password moves to the
+    /// keyring (or the 0600 file) and the URL is stored without it.
     pub fn load(path: PathBuf, secrets: Arc<dyn SecretStore>) -> Result<Self, String> {
+        let mut notices = Vec::new();
         let items = match fs::read(&path) {
-            Ok(b) => serde_json::from_slice::<SourcesFile>(&b)
-                .map_err(|e| format!("{} is not valid: {e}", path.display()))?
-                .data_sources,
+            Ok(b) => match serde_json::from_slice::<SourcesFile>(&b) {
+                Ok(f) => f.data_sources,
+                Err(e) => {
+                    notices.push(set_aside_corrupt(&path, &e.to_string()));
+                    Vec::new()
+                }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(format!("Cannot read {}: {e}", path.display())),
         };
-        Ok(DataSourceStore { path, secrets, keyring: AtomicU8::new(KEYRING_UNKNOWN), items: Mutex::new(items) })
+        restrict_to_owner(&path);
+        let legacy: Vec<DataSourceConfig> = items
+            .iter()
+            .filter(|s| s.cfg.url_override.as_deref().is_some_and(url_has_password))
+            .map(|s| s.cfg.clone())
+            .collect();
+        let store = DataSourceStore { path, secrets, keyring: AtomicU8::new(KEYRING_UNKNOWN), items: Mutex::new(items), notices: Mutex::new(notices) };
+        for cfg in legacy {
+            let name = cfg.name.clone();
+            // `save` takes the password out of the URL
+            if let Err(e) = store.save(cfg) {
+                tracing::warn!("cannot move the password of '{name}' out of its URL: {e}");
+            }
+        }
+        Ok(store)
+    }
+
+    /// What was repaired while loading (a corrupt file that was set aside).
+    pub fn notices(&self) -> Vec<StartupNotice> {
+        self.notices.lock().unwrap().clone()
     }
 
     /// Whether new passwords go to the OS keyring (probed once, on first use).
@@ -195,7 +455,8 @@ impl DataSourceStore {
     fn persist(&self, items: &[StoredDs]) -> Result<(), String> {
         let file = SourcesFile { version: 1, data_sources: items.to_vec() };
         let json = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
-        write_atomic(&self.path, &json)
+        // may hold a password (keyring fallback): owner only
+        write_private(&self.path, &json)
     }
 
     pub fn list(&self) -> Vec<DataSourceView> {
@@ -229,6 +490,10 @@ impl DataSourceStore {
     /// Fill `cfg.password` from the stored one when the caller did not provide a password
     /// (the UI never sees stored passwords, so "unchanged" is `null`).
     pub fn with_stored_password(&self, mut cfg: DataSourceConfig) -> Result<DataSourceConfig, String> {
+        // a password typed into the URL of a draft wins over the stored one
+        if let Some(pw) = take_url_password(&mut cfg) {
+            cfg.password = Some(pw);
+        }
         if cfg.password.is_none() && !cfg.id.is_empty() && self.view(&cfg.id).is_some() {
             cfg.password = self.get(&cfg.id)?.password;
         }
@@ -244,7 +509,10 @@ impl DataSourceStore {
         if cfg.name.trim().is_empty() {
             cfg.name = "Unnamed".into();
         }
-        let new_password = cfg.password.take();
+        // a password in the URL moves to the password field (keyring); the stored URL never has one
+        let from_url = take_url_password(&mut cfg);
+        let new_password = from_url.or_else(|| cfg.password.take());
+        cfg.password = None;
         let mut items = self.items.lock().unwrap();
         let pos = items.iter().position(|s| s.cfg.id == cfg.id);
         let (mut has_password, mut storage, kept_file_pw) = match pos {
@@ -323,17 +591,32 @@ pub struct UiStateStore {
     map: Mutex<BTreeMap<String, Value>>,
     generation: AtomicU64,
     debounce: Duration,
+    notices: Vec<StartupNotice>,
 }
 
 impl UiStateStore {
     pub const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(400);
 
+    /// Load `ui-state.json`; a file that cannot be parsed is set aside as `ui-state.json.corrupt-<ts>` and
+    /// the state starts empty (see [`notices`](Self::notices)).
     pub fn load(path: PathBuf, debounce: Duration) -> Self {
-        let map = fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<BTreeMap<String, Value>>(&b).ok())
-            .unwrap_or_default();
-        UiStateStore { path, map: Mutex::new(map), generation: AtomicU64::new(0), debounce }
+        let mut notices = Vec::new();
+        let map = match fs::read(&path) {
+            Ok(b) => match serde_json::from_slice::<BTreeMap<String, Value>>(&b) {
+                Ok(m) => m,
+                Err(e) => {
+                    notices.push(set_aside_corrupt(&path, &e.to_string()));
+                    BTreeMap::new()
+                }
+            },
+            Err(_) => BTreeMap::new(),
+        };
+        UiStateStore { path, map: Mutex::new(map), generation: AtomicU64::new(0), debounce, notices }
+    }
+
+    /// What was repaired while loading.
+    pub fn notices(&self) -> Vec<StartupNotice> {
+        self.notices.clone()
     }
 
     pub fn get(&self, key: &str) -> Option<Value> {
@@ -359,7 +642,8 @@ impl UiStateStore {
     /// Write the file now.
     pub fn flush(&self) -> Result<(), String> {
         let json = serde_json::to_vec(&*self.map.lock().unwrap()).map_err(|e| e.to_string())?;
-        write_atomic(&self.path, &json)
+        // editor state can quote SQL (and so secrets): owner only
+        write_private(&self.path, &json)
     }
 }
 
@@ -551,6 +835,156 @@ mod tests {
         assert_eq!(store.get(&dup.cfg.id).unwrap().password.as_deref(), Some("pw"));
         store.delete(&v.cfg.id).unwrap();
         assert_eq!(store.list().len(), 1);
+    }
+
+    fn url_cfg(url: &str, pw: Option<&str>) -> DataSourceConfig {
+        DataSourceConfig { name: "u".into(), driver: dbcore::Driver::Postgres, url_override: Some(url.into()), password: pw.map(Into::into), ..Default::default() }
+    }
+
+    #[test]
+    fn url_password_is_split_off() {
+        let cases = [
+            ("postgres://u:s3cret@h:5432/db", "postgres://u@h:5432/db", Some("s3cret")),
+            ("postgres://u:p%40ss%3Aw@h/db?sslmode=require", "postgres://u@h/db?sslmode=require", Some("p@ss:w")),
+            ("postgres://u@h/db?password=s3cret&sslmode=require", "postgres://u@h/db?sslmode=require", Some("s3cret")),
+            ("mysql://u@h/db?sslmode=x&PASSWORD=s%20x", "mysql://u@h/db?sslmode=x", Some("s x")),
+            ("mysql://u@h/db?passwd=a", "mysql://u@h/db", Some("a")),
+            ("postgres://:pw@h/db", "postgres://h/db", Some("pw")),
+            ("postgres://u:@h/db", "postgres://u@h/db", None),
+            ("postgres://u@h:5432/db#frag", "postgres://u@h:5432/db#frag", None),
+            ("postgres://u@h/db?sslmode=require", "postgres://u@h/db?sslmode=require", None),
+            ("postgres://u:pw@/db?host=%2Ftmp", "postgres://u@/db?host=%2Ftmp", Some("pw")),
+            ("sqlite::memory:", "sqlite::memory:", None),
+            ("not a url", "not a url", None),
+        ];
+        for (input, clean, pw) in cases {
+            let (c, p) = strip_url_password(input);
+            assert_eq!((c.as_str(), p.as_deref()), (clean, pw), "{input}");
+        }
+        assert!(url_has_password("postgres://u:x@h/d"));
+        assert!(!url_has_password("postgres://u@h/d"));
+    }
+
+    #[test]
+    fn redaction() {
+        let m = redact("error connecting to postgres://bob:s3cret@db.example/x?password=s3cret&a=b: refused, tried s3cret", &["s3cret"]);
+        assert!(!m.contains("s3cret"), "{m}");
+        assert!(m.contains("postgres://bob:***@db.example/x?password=***&a=b"), "{m}");
+        let m = redact("see mysql://u:hunter2@h and PWD=zzz tail", &[]);
+        assert_eq!(m, "see mysql://u:***@h and PWD=*** tail");
+        // short passwords are not replaced blindly inside ordinary words, text without secrets is untouched
+        assert_eq!(redact("connection refused (os error 111)", &["ab"]), "connection refused (os error 111)");
+    }
+
+    #[test]
+    fn url_password_goes_to_the_keyring_and_never_back_to_the_ui() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ds.json");
+        let secrets = Arc::new(MemSecrets::default());
+        let store = DataSourceStore::load(path.clone(), secrets.clone()).unwrap();
+        let v = store.save(url_cfg("postgres://bob:s3cret@db/x?sslmode=require", None)).unwrap();
+        assert_eq!(v.cfg.url_override.as_deref(), Some("postgres://bob@db/x?sslmode=require"));
+        assert!(v.has_password);
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("s3cret"), "{on_disk}");
+        assert!(!serde_json::to_string(&store.list()).unwrap().contains("s3cret"));
+        let id = v.cfg.id.clone();
+        let full = store.get(&id).unwrap();
+        assert_eq!((full.url_override.as_deref(), full.password.as_deref()), (Some("postgres://bob@db/x?sslmode=require"), Some("s3cret")));
+
+        // a password query parameter, and the URL password wins over the password field
+        let mut c = url_cfg("postgres://bob@db/x?password=other", Some("ignored"));
+        c.id = id.clone();
+        store.save(c).unwrap();
+        assert_eq!(store.get(&id).unwrap().password.as_deref(), Some("other"));
+        assert!(!fs::read_to_string(&path).unwrap().contains("other"));
+
+        // a draft in test_connection: the URL password wins over the stored one, and is not kept in the URL
+        let draft = store.with_stored_password(url_cfg("postgres://bob:typed@db/x", None)).unwrap();
+        assert_eq!((draft.url_override.as_deref(), draft.password.as_deref()), (Some("postgres://bob@db/x"), Some("typed")));
+
+        // SQLite URLs are not touched
+        let mut lite = url_cfg("sqlite:///tmp/a:b@c.db", None);
+        lite.driver = dbcore::Driver::Sqlite;
+        assert_eq!(store.save(lite).unwrap().cfg.url_override.as_deref(), Some("sqlite:///tmp/a:b@c.db"));
+    }
+
+    #[test]
+    fn legacy_url_password_is_migrated_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ds.json");
+        fs::write(
+            &path,
+            r#"{"version":1,"dataSources":[{"id":"a","name":"a","driver":"postgres","urlOverride":"postgres://bob:legacy@db/x"}]}"#,
+        )
+        .unwrap();
+        let secrets = Arc::new(MemSecrets::default());
+        let store = DataSourceStore::load(path.clone(), secrets.clone()).unwrap();
+        let v = &store.list()[0];
+        assert_eq!(v.cfg.url_override.as_deref(), Some("postgres://bob@db/x"));
+        assert!(v.has_password);
+        assert!(!fs::read_to_string(&path).unwrap().contains("legacy"));
+        assert_eq!(store.get("a").unwrap().password.as_deref(), Some("legacy"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_with_secrets_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ds.json");
+        // an old, world readable file is tightened when the store loads it
+        fs::write(&path, b"{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let store = DataSourceStore::load(path.clone(), Arc::new(NoKeyring)).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        // the plain-text password fallback file
+        store.save(cfg("a", Some("pw"))).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("\"password\": \"pw\""));
+        assert_eq!(mode(&path), 0o600);
+        // ui state
+        let ui = UiStateStore::load(dir.path().join("ui.json"), Duration::from_millis(10));
+        ui.flush().unwrap();
+        assert_eq!(mode(&dir.path().join("ui.json")), 0o600);
+        // no temp file is left behind
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn corrupt_files_are_set_aside_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data-sources.json");
+        fs::write(&path, b"{ this is not json").unwrap();
+        let store = DataSourceStore::load(path.clone(), Arc::new(MemSecrets::default())).unwrap();
+        assert!(store.list().is_empty());
+        let n = store.notices();
+        assert_eq!(n.len(), 1, "{n:?}");
+        assert_eq!(n[0].file, "data-sources.json");
+        let backup = PathBuf::from(n[0].backup.clone().expect("backup path"));
+        assert!(backup.file_name().unwrap().to_string_lossy().starts_with("data-sources.json.corrupt-"));
+        assert_eq!(fs::read(&backup).unwrap(), b"{ this is not json");
+        assert!(n[0].message.contains("data-sources.json"), "{}", n[0].message);
+        // the app keeps working: saving creates a fresh file next to the backup
+        store.save(cfg("a", None)).unwrap();
+        assert_eq!(DataSourceStore::load(path, Arc::new(MemSecrets::default())).unwrap().list().len(), 1);
+        assert_eq!(fs::read(&backup).unwrap(), b"{ this is not json");
+
+        // a healthy file produces no notice
+        assert!(store.notices().len() == 1 && DataSourceStore::load(dir.path().join("none.json"), Arc::new(MemSecrets::default())).unwrap().notices().is_empty());
+
+        // ui-state.json: same treatment
+        let ui_path = dir.path().join("ui-state.json");
+        fs::write(&ui_path, b"[1,2").unwrap();
+        let ui = UiStateStore::load(ui_path.clone(), Duration::from_millis(10));
+        assert!(ui.get("x").is_none());
+        let n = ui.notices();
+        assert_eq!(n.len(), 1);
+        assert_eq!(fs::read(n[0].backup.as_ref().unwrap()).unwrap(), b"[1,2");
+        assert!(!ui_path.exists());
+        // valid JSON of the wrong shape is corrupt too
+        fs::write(&ui_path, b"[1,2]").unwrap();
+        assert_eq!(UiStateStore::load(ui_path, Duration::from_millis(10)).notices().len(), 1);
     }
 
     #[test]

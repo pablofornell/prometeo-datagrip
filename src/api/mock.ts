@@ -857,7 +857,7 @@ async function runExecution(
       const q = parseSelect(st.text);
       if (q.unknown) {
         firstError = `ERROR: relation "${q.unknown.name}" does not exist`;
-        send({ kind: "error", index: i, message: `[42P01] ${firstError}`, position: q.unknown.offset });
+        send({ kind: "error", index: i, message: `[42P01] ${firstError}`, position: q.unknown.offset, positionUtf16: q.unknown.offset });
         if (opts.stopOnError) break;
         continue;
       }
@@ -883,7 +883,7 @@ async function runExecution(
           rows = r;
         } catch (e) {
           firstError = typeof e === "string" ? e : String(e);
-          send({ kind: "error", index: i, message: firstError, position: null });
+          send({ kind: "error", index: i, message: firstError, position: null, positionUtf16: null });
           if (opts.stopOnError) break;
           continue;
         }
@@ -922,7 +922,7 @@ async function runExecution(
   }
   if (ex.cancelled) {
     firstError = "Statement cancelled by user";
-    send({ kind: "error", index: 0, message: "[57014] ERROR: canceling statement due to user request", position: null });
+    send({ kind: "error", index: 0, message: "[57014] ERROR: canceling statement due to user request", position: null, positionUtf16: null });
   }
   const elapsed = Math.round(performance.now() - t0);
   send({ kind: "done", elapsedMs: elapsed, executionMs: Math.round(execMs), fetchingMs: Math.round(fetchMs) });
@@ -1091,6 +1091,7 @@ export const mockHandlers: Record<string, MockHandler> = {
     state.sessions.delete(a.sessionId);
   }),
   session_in_transaction: h((a) => (state.sessions.get(a.sessionId) ?? fail(`Session '${a.sessionId}' does not exist`)).tx),
+  session_tx_status: h((a) => ((state.sessions.get(a.sessionId) ?? fail(`Session '${a.sessionId}' does not exist`)).tx ? "active" : "idle")),
 
   // ---- introspection
   introspect: h(async (a) => {
@@ -1242,6 +1243,7 @@ export const mockHandlers: Record<string, MockHandler> = {
   }),
 
   // ---- export (no file system in a browser: files are only counted)
+  choose_export_path: h((a) => `/mock/${(a.suggestedName as string | null) ?? "export.csv"}`),
   export_query: h(async (a) => {
     needConn(a.dsId);
     await sleep(100);

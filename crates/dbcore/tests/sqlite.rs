@@ -624,3 +624,33 @@ async fn memory_database_is_shared_per_data_source() {
     let s4 = mgr.open_session("m").await.unwrap();
     assert_eq!(scalar(&run(&mgr, &s4, "select count(*) from sqlite_master").await), json!(0));
 }
+
+/// The transaction state is read from the connection (`sqlite3_get_autocommit`), events report changes and ends.
+#[tokio::test]
+async fn transaction_status_events_and_init_sql() {
+    let (_d, _cfg, mgr) = setup().await;
+    let s = mgr.open_session("lite").await.unwrap();
+    assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Idle);
+    let ev = run(&mgr, &s, "begin").await;
+    assert_eq!(tx_statuses(&ev), vec![TxStatus::Active]);
+    // the savepoint-free "release" of an outer transaction: SQLite also ends it with END
+    let ev = run(&mgr, &s, "end").await;
+    assert_eq!(tx_ended(&ev), vec![(true, "COMMIT".to_string())]);
+    assert_eq!(tx_statuses(&ev), vec![TxStatus::Idle]);
+    assert_ok(&run(&mgr, &s, "begin").await);
+    let ev = run(&mgr, &s, "rollback").await;
+    assert_eq!(tx_ended(&ev), vec![(false, "ROLLBACK".to_string())]);
+    // a savepoint outside BEGIN opens a transaction (autocommit off) that only RELEASE closes
+    let ev = run(&mgr, &s, "savepoint a").await;
+    assert_eq!(tx_statuses(&ev), vec![TxStatus::Active]);
+    assert!(mgr.session_in_transaction(&s).unwrap());
+    let ev = run(&mgr, &s, "release a").await;
+    assert_eq!(tx_statuses(&ev), vec![TxStatus::Idle]);
+    mgr.close_session(&s).await;
+
+    // init_sql
+    let s = mgr.open_session_with("lite", &["pragma foreign_keys = off".to_string()]).await.unwrap();
+    assert_eq!(scalar(&run(&mgr, &s, "pragma foreign_keys").await), json!(0));
+    mgr.close_session(&s).await;
+    assert!(mgr.open_session_with("lite", &["select * from nope_nope".to_string()]).await.is_err());
+}

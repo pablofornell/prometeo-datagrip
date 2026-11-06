@@ -2,7 +2,7 @@
 //! registry of running executions.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -60,12 +60,31 @@ pub(crate) struct Session {
     pub live: Arc<Live>,
     pub conn: Arc<tokio::sync::Mutex<Option<Conn>>>,
     pub cancel: CancelTarget,
-    /// Heuristic: an explicit BEGIN/START TRANSACTION was executed and not yet ended.
-    pub in_tx: AtomicBool,
+    /// [`TxStatus`] as a number (see `tx.rs` for how it is determined per driver).
+    pub tx: AtomicU8,
+    /// MySQL: `@@autocommit` is on (statements outside a transaction commit themselves).
+    pub autocommit_on: AtomicBool,
     pub current: Mutex<Option<(String, Arc<ExecCtl>)>>,
 }
 
 impl Session {
+    pub fn tx_status(&self) -> TxStatus {
+        match self.tx.load(Ordering::Relaxed) {
+            1 => TxStatus::Active,
+            2 => TxStatus::Failed,
+            _ => TxStatus::Idle,
+        }
+    }
+
+    pub fn set_tx_status(&self, s: TxStatus) {
+        self.tx.store(s as u8, Ordering::Relaxed);
+    }
+
+    /// Is there an open transaction (active or failed)?
+    pub fn in_tx(&self) -> bool {
+        self.tx_status().is_open()
+    }
+
     /// Ask the server to stop the statement currently running on this session.
     pub async fn cancel_running(&self) {
         match &self.cancel {
@@ -226,6 +245,15 @@ impl ConnectionManager {
 
     /// Open a dedicated connection (keeps transaction state, `SET search_path`, `USE db`).
     pub async fn open_session(&self, ds_id: &str) -> Result<SessionId> {
+        self.open_session_with(ds_id, &[]).await
+    }
+
+    /// [`open_session`](Self::open_session) that first runs `init_sql` (one statement each, in order) on the
+    /// new connection: the way to re-apply per-session settings (`SET search_path`, `USE db`,
+    /// `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ...`) when a console is reopened or
+    /// its data source reconnected. dbcore does not remember session settings itself. If a statement
+    /// fails, the connection is closed and its error is returned (no session is left behind).
+    pub async fn open_session_with(&self, ds_id: &str, init_sql: &[String]) -> Result<SessionId> {
         let live = self.live(ds_id)?;
         let mut conn = live.new_conn().await?;
         let cancel = match &mut conn {
@@ -244,14 +272,41 @@ impl ConnectionManager {
             }
         };
         let id = uuid::Uuid::new_v4().to_string();
+        let autocommit_on = match &mut conn {
+            Conn::My(_) => conn_scalar(&mut conn, "select @@autocommit").await?.map(|v| v != "0").unwrap_or(true),
+            _ => true,
+        };
         let session = Arc::new(Session {
             id: id.clone(),
             live,
             conn: Arc::new(tokio::sync::Mutex::new(Some(conn))),
             cancel,
-            in_tx: AtomicBool::new(false),
+            tx: AtomicU8::new(TxStatus::Idle as u8),
+            autocommit_on: AtomicBool::new(autocommit_on),
             current: Mutex::new(None),
         });
+        if !init_sql.is_empty() {
+            let mut guard = session.conn.clone().lock_owned().await;
+            let mut failed = None;
+            if let Some(conn) = guard.as_mut() {
+                for sql in init_sql.iter().filter(|s| !s.trim().is_empty()) {
+                    if let Err(e) = crate::tx::run_tracked(&session, conn, sql).await {
+                        failed = Some(e);
+                        break;
+                    }
+                }
+            }
+            if let Some(e) = failed {
+                let conn = guard.take();
+                if let CancelTarget::Lite(h) = &session.cancel {
+                    *h.lock().unwrap() = None;
+                }
+                if let Some(c) = conn {
+                    c.close().await;
+                }
+                return Err(e);
+            }
+        }
         self.inner.sessions.lock().unwrap().insert(id.clone(), session);
         Ok(SessionId(id))
     }
@@ -288,7 +343,17 @@ impl ConnectionManager {
         Ok(sess.conn.clone().lock_owned().await)
     }
 
+    /// Is there an open transaction on the session (`Active` or `Failed`)? Same source as
+    /// [`session_tx_status`](Self::session_tx_status).
     pub fn session_in_transaction(&self, id: &SessionId) -> Result<bool> {
-        Ok(self.session(id)?.in_tx.load(Ordering::Relaxed))
+        Ok(self.session(id)?.in_tx())
+    }
+
+    /// Transaction state of the session: `Idle`, `Active`, or `Failed` (PostgreSQL: the transaction was
+    /// aborted by an error; `COMMIT` would roll back). Reflects the server, not the keywords the user
+    /// typed: MySQL DDL ends a transaction implicitly (see `tx.rs`). It is updated when a statement
+    /// finishes, so it can lag while a paged result keeps the connection busy.
+    pub fn session_tx_status(&self, id: &SessionId) -> Result<TxStatus> {
+        Ok(self.session(id)?.tx_status())
     }
 }
