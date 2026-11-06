@@ -1,0 +1,335 @@
+/* Main window shell: toolbar, islands, tool window panels, editor area, status bar. */
+
+.dg-hidden {
+  display: none !important;
+}
+.dg-dim {
+  opacity: 0.4;
+}
+
+.dg-app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--dg-window-bg);
+}
+
+/* ---------------------------------------------------------------- Main toolbar */
+.dg-main-toolbar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: none;
+  height: var(--dg-toolbar-height);
+  padding-left: 5px;
+  background: linear-gradient(
+    90deg,
+    var(--dg-toolbar-bg) 0,
+    var(--dg-toolbar-tint) var(--dg-toolbar-tint-start),
+    var(--dg-toolbar-bg) var(--dg-toolbar-tint-end)
+  );
+  color: var(--dg-toolbar-fg);
+}
+.dg-toolbar-left {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+}
+.dg-toolbar-center {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  display: flex;
+  align-items: center;
+  height: 100%;
+  gap: 12px;
+  transform: translateX(-50%);
+}
+.dg-toolbar-right {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex: 1;
+  gap: 10px;
+  height: 100%;
+  padding-right: 5px;
+}
+.dg-toolbar-btn {
+  border-radius: var(--dg-toolbar-button-radius);
+}
+.dg-toolbar-btn:hover:not(.dg-disabled) {
+  background: var(--dg-toolbar-button-hover-bg);
+}
+.dg-toolbar-btn:active:not(.dg-disabled) {
+  background: var(--dg-toolbar-button-pressed-bg);
+}
+
+.dg-toolwindow-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--dg-toolwindow-button-width);
+  height: var(--dg-toolwindow-button-height);
+  padding: 0;
+  border: 0;
+  border-radius: var(--dg-toolbar-button-radius);
+  background: transparent;
+}
+.dg-toolwindow-button:hover {
+  background: var(--dg-toolbar-button-hover-bg);
+}
+.dg-toolwindow-button.dg-selected {
+  background: var(--dg-toolwindow-button-selected-bg);
+}
+
+/* inline menu bar (hamburger expanded) */
+.dg-menubar {
+  display: flex;
+  align-items: center;
+  height: 100%;
+}
+.dg-menubar-item {
+  display: flex;
+  align-items: center;
+  height: 30px;
+  padding: 0 1px 0 6px;
+  margin-right: 5.5px;
+  border-radius: var(--dg-toolbar-button-radius);
+}
+.dg-menubar-item:hover,
+.dg-menubar-item.dg-active {
+  background: var(--dg-toolbar-button-hover-bg);
+}
+
+.dg-window-controls {
+  display: flex;
+  height: 100%;
+  margin-right: -5px;
+}
+.dg-window-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 46px;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+.dg-window-btn:hover {
+  background: var(--dg-window-btn-hover-bg);
+}
+.dg-window-close:hover {
+  background: #e81123;
+}
+.dg-window-close:hover .dg-icon {
+  filter: brightness(0) invert(1);
+}
+
+/* ---------------------------------------------------------------- Body / islands */
+.dg-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  padding: 0 var(--dg-body-pad-right) 0 var(--dg-body-pad-left);
+}
+.dg-top {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.dg-island {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--dg-island-bg);
+  border-radius: var(--dg-island-radius);
+}
+.dg-toolwindow {
+  flex: none;
+}
+.dg-toolwindow-explorer {
+  flex: none;
+}
+.dg-toolwindow-output {
+  flex: none;
+}
+.dg-editor-area {
+  flex: 1;
+}
+
+/* ---------------------------------------------------------------- Tool window panel */
+.dg-tw-header {
+  display: flex;
+  align-items: center;
+  flex: none;
+  height: var(--dg-toolwindow-header-height);
+  padding: 0 4px 0 12px;
+  border-bottom: 1px solid var(--dg-toolwindow-header-border);
+  color: var(--dg-toolwindow-header-fg);
+}
+.dg-toolwindow-output .dg-tw-header {
+  padding-right: 10px;
+}
+.dg-tw-title {
+  flex: none;
+  margin-right: 20px;
+  font-weight: 500;
+  white-space: nowrap;
+  position: relative;
+  top: -1px;
+}
+.dg-tw-header-slot {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+}
+.dg-tw-actions {
+  display: flex;
+  align-items: center;
+  flex: none;
+  gap: 4px;
+  margin-left: auto;
+  visibility: hidden;
+}
+.dg-tw-header-slot:empty + .dg-tw-actions {
+  margin-left: auto;
+}
+.dg-toolwindow:hover .dg-tw-actions,
+.dg-toolwindow:focus-within .dg-tw-actions,
+.dg-toolwindow.dg-active .dg-tw-actions {
+  visibility: visible;
+}
+.dg-tw-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+.dg-toolbar {
+  display: flex;
+  align-items: center;
+  flex: none;
+  gap: 4px;
+}
+.dg-tw-toolbar {
+  height: 34px;
+  padding: 0 8px 0 9px;
+}
+
+/* ---------------------------------------------------------------- Editor area */
+.dg-editor-body {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.dg-editor-view {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* ---------------------------------------------------------------- Placeholders */
+.dg-placeholder-center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  min-height: 0;
+  color: var(--dg-text-secondary);
+  text-align: center;
+}
+.dg-placeholder-sub {
+  margin-top: 4px;
+  font-size: var(--dg-font-size-medium);
+}
+.dg-empty-hints td {
+  padding: 3px 12px;
+}
+.dg-empty-hints .dg-key {
+  color: var(--dg-text-secondary);
+}
+
+/* ---------------------------------------------------------------- Status bar */
+.dg-statusbar {
+  display: flex;
+  align-items: center;
+  flex: none;
+  height: var(--dg-statusbar-height);
+  padding: 0 6px 4px 15px;
+  background: var(--dg-statusbar-bg);
+  color: var(--dg-statusbar-fg);
+  white-space: nowrap;
+}
+.dg-status-path {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--dg-statusbar-breadcrumb-fg);
+}
+.dg-status-crumb {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.dg-status-crumb.dg-clickable:hover {
+  color: var(--dg-statusbar-hover-fg);
+}
+.dg-status-sep {
+  margin: 0 4px;
+}
+.dg-status-right {
+  display: flex;
+  align-items: center;
+  flex: none;
+}
+.dg-status-widget {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
+}
+.dg-status-icon {
+  padding: 0 6px;
+}
+.dg-progress {
+  display: inline-block;
+  width: 100px;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--dg-progress-track);
+}
+.dg-progress-bar {
+  display: block;
+  height: 100%;
+  background: var(--dg-progress-fg);
+}
+.dg-progress-bar.dg-indeterminate {
+  animation: dg-indeterminate 1.2s ease-in-out infinite alternate;
+}
+@keyframes dg-indeterminate {
+  from {
+    margin-left: 0;
+  }
+  to {
+    margin-left: 70%;
+  }
+}
+.dg-status-cancel {
+  display: flex;
+}

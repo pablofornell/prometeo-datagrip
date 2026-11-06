@@ -1,0 +1,62 @@
+Prometeo DataGrip
+Copyright (c) 2026 Pablo Fornell. Licensed under the MIT License (see LICENSE).
+
+This product is an independent project. It is not affiliated with, endorsed by or sponsored by
+JetBrains s.r.o. "DataGrip", "IntelliJ" and "JetBrains Mono" are trademarks of JetBrains s.r.o.;
+"Inter" is a trademark of Rasmus Andersson.
+
+This product includes third-party material under the licenses below.
+
+-------------------------------------------------------------------------------
+1. JetBrains IntelliJ Platform (intellij-community) - Apache License 2.0
+-------------------------------------------------------------------------------
+Source:    https://github.com/JetBrains/intellij-community
+Copyright: Copyright 2000-2026 JetBrains s.r.o. and contributors.
+License:   Apache License, Version 2.0 - https://www.apache.org/licenses/LICENSE-2.0
+
+Files:
+  - src/assets/icons/*.svg and src/assets/icons/checkbox/*.svg
+    copied from platform/icons/src/expui/**, grid/core-impl/resources/icons/expui/** and
+    platform/platform-resources/src/themes/expUI/icons/dark/**.
+    Modifications: files renamed to a flat naming scheme (see src/assets/icons/INDEX.md); in
+    every *_dark.svg the color #CED0D6 was replaced with #C3C5CB, reproducing the
+    icons.ColorPalette of the "Islands Dark" theme (ManyIslandsDark.theme.json).
+  - Color, size and font values in src/theme/*.css and docs/ux/theme-tokens.md are derived from
+    the theme files platform/platform-resources/src/themes/** (darcula, intellijlaf, expUI,
+    islands), platform/platform-resources/src/DefaultColorSchemesManager.xml, the editor color
+    schemes under platform/platform-resources/src/themes/**, and defaults in
+    platform/util/ui/src/com/intellij/util/ui/JBUI.java and related sources.
+
+-------------------------------------------------------------------------------
+2. JetBrains DataGrip artwork - PROPRIETARY, LICENSE REVIEW REQUIRED
+-------------------------------------------------------------------------------
+Files: src/assets/icons/dg/*.svg
+These icons were extracted from a locally installed DataGrip 2026.3
+(plugins/DatabaseTools/lib/modules/intellij.database.jar, icons/expui/). The DataGrip database
+plugin is closed source and these files are NOT covered by the Apache License 2.0.
+Do not redistribute them until their license has been reviewed; replace them with
+intellij-community equivalents (see src/assets/icons/INDEX.md) or original artwork otherwise.
+Modifications: renamed; *_dark.svg recolored #CED0D6 -> #C3C5CB as above.
+
+Also derived from DataGrip (values only, no files copied): SQL_SYNTHETIC_ENTITY and
+SQL_OUTER_QUERY_COLUMN colors (intellij.database.sql.core.impl.jar colorSchemes/SqlDarcula.xml,
+SqlDefault.xml) documented in docs/ux/theme-tokens.md.
+
+-------------------------------------------------------------------------------
+3. Inter - SIL Open Font License 1.1
+-------------------------------------------------------------------------------
+Files:     src/theme/fonts/Inter-*.ttf (version 4.000)
+Copyright: Copyright 2016 The Inter Project Authors (https://github.com/rsms/inter)
+License:   SIL Open Font License, Version 1.1 - https://openfontlicense.org
+Obtained from intellij-community platform/jewel/int-ui/int-ui-standalone/src/main/resources/fonts/inter/.
+
+-------------------------------------------------------------------------------
+4. JetBrains Mono - SIL Open Font License 1.1
+-------------------------------------------------------------------------------
+Files:     src/theme/fonts/JetBrainsMono-*.ttf (version 2.304)
+Copyright: Copyright 2020 The JetBrains Mono Project Authors (https://github.com/JetBrains/JetBrainsMono)
+License:   SIL Open Font License, Version 1.1 - https://openfontlicense.org
+Obtained from intellij-community platform/jewel/int-ui/int-ui-standalone/src/main/resources/fonts/jetbrains-mono/.
+
+The OFL requires the license text to accompany the font files when they are redistributed:
+add the full OFL 1.1 text (e.g. as src/theme/fonts/OFL.txt) before shipping a build.

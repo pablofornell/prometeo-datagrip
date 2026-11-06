@@ -1,0 +1,124 @@
+/*
+ * Prometeo DataGrip - theme-independent metrics (px at 100% scale; IntelliJ JBUI scale 1.0 = 1 CSS px).
+ * IntelliJ "arc" values are DIAMETERS (RoundRectangle2D arcw/arch); CSS radius = arc / 2.
+ * Sources: see docs/ux/theme-tokens.md ("Metrics").
+ */
+:root {
+  /* ---- Fonts ---- */
+  --dg-font-ui: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;      /* LafManagerImpl INTER_NAME */
+  --dg-font-mono: "JetBrains Mono", ui-monospace, "DejaVu Sans Mono", monospace; /* FontPreferences.JETBRAINS_MONO */
+  --dg-font-size: 13px;               /* INTER_SIZE = 13 (JBFont.label) */
+  --dg-font-size-medium: 12px;        /* JBFont.medium() = label - 1 */
+  --dg-font-size-small: 11px;         /* JBFont.small() = label - 2 */
+  --dg-font-size-h4: 14px;            /* JBFont.h4() = label + 1, bold */
+  --dg-font-size-h3: 16px;            /* label + 3 */
+  --dg-font-size-h2: 18px;            /* label + 5 */
+  --dg-font-size-h1: 22px;            /* label + 9, bold */
+  --dg-line-height-ui: 16px;          /* Inter 13px line box (ascent+descent ~1.21em) */
+  --dg-editor-font-size: 13px;        /* FontPreferences.DEFAULT_FONT_SIZE (13 when JetBrains Mono) */
+  --dg-editor-line-spacing: 1.2;      /* FontPreferences.DEFAULT_LINE_SPACING */
+  --dg-editor-line-height: 21px;      /* ceil(fontHeight(17px) * 1.2) for JetBrains Mono 13px (derived) */
+
+  /* ---- Window layout (Islands) ---- */
+  --dg-titlebar-height: 40px;         /* CustomHeader HEADER_HEIGHT_NORMAL (main toolbar row, Linux/Windows) */
+  --dg-toolbar-height: 40px;          /* same row: New UI main toolbar is the title bar */
+  --dg-toolbar-button-size: 30px;     /* MainToolbar.Button.size default 30x30 */
+  --dg-toolbar-icon-size: 20px;       /* MainToolbar.Button.iconSize */
+  --dg-toolbar-button-radius: 6px;    /* MainToolbar.Button.arc 12 */
+  --dg-toolbar-dropdown-radius: 6px;  /* MainToolbar.Dropdown.arc 12 */
+  --dg-toolbar-dropdown-padding: 5px 6px 5px 10px; /* MainToolbar.Dropdown.borderInsets 5,10,5,6 (t,l,b,r) */
+  --dg-toolbar-dropdown-max-width: 350px;
+  --dg-island-radius: 10px;           /* Island.arc 20 -> quad corner of arc/2 */
+  --dg-island-gap: 6px;               /* Island.borderWidth 6: each island inset 3px, so 6px between islands */
+  --dg-island-outer-gap: 3px;         /* borderWidth / 2 next to window edge / stripe */
+  --dg-stripe-width: 40px;            /* stripe button column (StripeToolbar.Button.size 37x40 + padding) */
+  --dg-stripe-button-width: 37px;     /* StripeToolbar.Button.size */
+  --dg-stripe-button-height: 40px;
+  --dg-stripe-icon-size: 20px;        /* StripeToolbar.Button.iconSize */
+  --dg-stripe-button-radius: 6px;     /* Button.ToolWindow.arc 12 */
+  --dg-statusbar-height: 28px;        /* text height 16 + StatusBar.Widget.widgetInsets 6,8 (top+bottom 12) */
+  --dg-statusbar-widget-padding: 6px 8px;
+
+  /* ---- Tool windows ---- */
+  --dg-toolwindow-header-height: 41px;   /* JBUI ToolWindow.defaultHeaderHeight() = 41 (New UI) */
+  --dg-toolwindow-header-padding-left: 12px; /* ToolWindow.Header.labelLeftRightInsets 0,12,0,16 */
+  --dg-toolwindow-header-toolbar-padding: 0 8px 0 12px; /* toolbarLeftRightInsets 0,12,0,8 */
+  --dg-toolwindow-header-tab-padding: 0 12px; /* ToolWindow.HeaderTab.leftRightInsets 0,12 */
+
+  /* ---- Editor tabs (Islands pill) ---- */
+  --dg-tab-height: 40px;              /* SingleHeightTabs 28 - EditorTabs.tabInsets(-6,8,-6,8) top/bottom = 40 */
+  --dg-tab-pill-height: 28px;         /* IslandsTabPainter fullHeight 28, centered */
+  --dg-tab-pill-radius: 6px;          /* MainToolbar.Button.arc 12 */
+  --dg-tab-pill-hmargin: 4px;         /* getHOffsetUnscaled = 4 (top tabs) */
+  --dg-tab-padding-x: 8px;            /* EditorTabs.tabInsets left/right 8 */
+  --dg-tab-close-gap: 4px;            /* tabContentActionsRightInsets 0,4,0,2 */
+  --dg-tab-underline-height: 4px;     /* EditorTabs.underlineHeight (classic New UI only) */
+  --dg-tab-underline-radius: 2px;     /* EditorTabs.underlineArc 4 */
+
+  /* ---- Tree / list ---- */
+  --dg-tree-row-height: 24px;         /* Tree.rowHeight */
+  --dg-tree-indent: 18px;             /* Tree.leftChildIndent 7 + rightChildIndent 11 */
+  --dg-tree-padding: 4px 12px;        /* Tree.border 4,12,4,12 */
+  --dg-tree-selection-radius: 4px;    /* Tree.Selection.arc 8 */
+  --dg-tree-icon-size: 16px;
+  --dg-tree-icon-gap: 4px;            /* SimpleColoredComponent icon-text gap (JBUI default) */
+  --dg-list-row-height: 24px;         /* List.rowHeight */
+  --dg-list-padding-y: 4px;           /* List.border 4,0,4,0 */
+
+  /* ---- Popups / menus ---- */
+  --dg-popup-radius: 8px;             /* PopupMenu.borderCornerRadius 8 (OS window corner radius) */
+  --dg-popup-border-width: 1px;       /* Popup.borderWidth */
+  --dg-popup-selection-radius: 4px;   /* Popup.Selection.arc 8 */
+  --dg-popup-selection-inner-padding: 0 8px; /* Popup.Selection.innerInsets 0,8 */
+  --dg-popup-item-height: 24px;       /* list row height inside popups */
+  --dg-popup-separator-padding: 4px 8px; /* Popup.separatorInsets 4,8 */
+  --dg-popup-header-padding: 12px 10px 10px 10px; /* PopupHeader insets 12,10,10,10 */
+  --dg-popup-advertiser-padding: 8px 12px;   /* Popup.Advertiser.borderInsets 8,12,8,12 */
+  --dg-popup-shadow-size: 16px;       /* Ide.Shadow.borderInsets 16 */
+  --dg-menu-padding-y: 6px;           /* PopupMenu.borderInsets 6,1,6,1 */
+  --dg-menu-selection-radius: 4px;    /* PopupMenu.Selection.arc 8 */
+  --dg-menu-selection-inner-padding: 0 6px;  /* PopupMenu.Selection.innerInsets 0,6 */
+  --dg-menu-selection-outer-padding: 1px 7px; /* PopupMenu.Selection.outerInsets 1,7 */
+  --dg-menu-separator-height: 9px;    /* PopupMenuSeparator.height */
+
+  /* ---- Controls ---- */
+  --dg-control-height: 28px;          /* Button/TextField/ComboBox.minimumSize height 28 */
+  --dg-button-min-width: 72px;        /* Button.minimumSize 72,28 */
+  --dg-button-radius: 4px;            /* Button.arc 8 */
+  --dg-button-padding-x: 14px;        /* DarculaButtonUI.HORIZONTAL_PADDING 14 */
+  --dg-input-radius: 4px;             /* Component.arc 8 */
+  --dg-input-min-width: 49px;         /* TextField.minimumSize 49,28 */
+  --dg-input-padding: 0 8px;
+  --dg-combo-padding: 1px 6px 1px 9px; /* ComboBox.padding 1,9,1,6 */
+  --dg-combo-arrow-width: 28px;       /* Component.arrowAreaWidth */
+  --dg-focus-width: 2px;              /* Component.focusWidth */
+  --dg-border-width: 1px;
+  --dg-checkbox-size: 16px;           /* 16x16 box inside 24px icon (CheckBox.iconSize 24) */
+  --dg-checkbox-radius: 3px;          /* rect rx 2.5 at 15px + 0.5 stroke */
+  --dg-checkbox-gap: 4px;             /* CheckBox.textIconGap */
+  --dg-action-button-size: 22px;      /* ActionToolbar.DEFAULT_MINIMUM_BUTTON_SIZE 22x22 */
+  --dg-action-button-radius: 4px;
+
+  /* ---- Scrollbars ---- */
+  --dg-scrollbar-width: 10px;         /* DefaultScrollBarUI thickness (opaque) */
+  --dg-scrollbar-width-hover: 14px;   /* thicknessMax for overlay scrollbars on hover */
+  --dg-scrollbar-thumb-radius: 5px;   /* thumb arc = min(w,h) -> fully rounded */
+
+  /* ---- Tooltips / notifications / banners ---- */
+  --dg-tooltip-radius: 6px;           /* ToolTip.borderCornerRadius 6 */
+  --dg-tooltip-multiline-radius: 8px; /* ToolTip.multilineBorderCornerRadius 8 */
+  --dg-help-tooltip-padding: 12px 16px 16px 16px; /* HelpTooltip.defaultTextBorderInsets 12,16,16,16 */
+  --dg-help-tooltip-small-padding: 8px 12px 9px 12px;
+  --dg-notification-radius: 6px;      /* Notification.arc 12 */
+  --dg-notification-max-width: 384px;
+  --dg-banner-radius: 6px;            /* Banner.arc 12 */
+  --dg-validation-max-width: 384px;   /* ValidationTooltip.maxWidth */
+
+  /* ---- Tables / grid ---- */
+  --dg-table-row-height: 20px;        /* Table.rowHeight (Swing tables) */
+  --dg-table-header-height: 25px;     /* TableHeader.height (dark) - light theme uses 28 */
+  --dg-table-cell-padding: 2px 3px;   /* Table.cellNoFocusBorder 2,3,2,3 */
+  --dg-grid-row-height: 22px;         /* data grid: ceil(monoFontHeight * 1.2) + rowMargin 1 (derived) */
+  --dg-grid-font: var(--dg-font-mono);
+  --dg-grid-font-size: 13px;          /* grid uses the editor font */
+}

@@ -1,0 +1,355 @@
+/*
+ * Prometeo DataGrip - Dark theme tokens.
+ * Source of truth: JetBrains "Islands Dark" (default theme of DataGrip 2026.3), resolved through its
+ * parent chain darcula.theme.json -> expUI/expUI_dark.theme.json -> islands/ManyIslandsDark.theme.json,
+ * and editor scheme "Islands Dark" (islands/IslandSchemeDark.xml -> Darcula -> Default).
+ * See docs/ux/theme-tokens.md for every value's source file:line. Hex with 8 digits = #RRGGBBAA.
+ */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* ---- Core surfaces ---- */
+  --dg-window-bg: #26282C;              /* MainWindow.background = main-window-bg (gaps between islands) */
+  --dg-island-bg: #191A1C;              /* ToolWindow.background / editor bg = tool-window-bg */
+  --dg-panel-bg: #191A1C;               /* *.background (dialogs, panels) = tool-window-bg */
+  --dg-dialog-bg: #191A1C;              /* dialog-bg */
+  --dg-layer-1-bg: #26282C;             /* layer-1-bg (raised surface) */
+  --dg-layer-2-bg: #33353B;             /* layer-2-bg (floating toolbar, notifications) */
+  --dg-border: #26282C;                 /* Borders.color / OnePixelDivider.background */
+  --dg-separator: #33353B;              /* Separator.separatorColor / *.separatorColor */
+  --dg-splitter: #26282C;               /* OnePixelDivider.background */
+
+  /* ---- Text ---- */
+  --dg-text: #D1D3D9;                   /* text-default (*.foreground) */
+  --dg-text-secondary: #73767C;         /* text-secondary (*.infoForeground, accelerators) */
+  --dg-text-muted: #9FA2A8;             /* text-muted (stripe/status widgets) */
+  --dg-text-disabled: #4C4F56;          /* text-disabled */
+  --dg-text-over-accent: #FFFFFF;
+  --dg-text-error: #F57E84;             /* Label.errorForeground */
+  --dg-text-warning: #D59637;           /* Label.warningForeground */
+  --dg-text-success: #6DB083;           /* Label.successForeground */
+
+  /* ---- Accent / state ---- */
+  --dg-accent: #3871E1;                 /* accent-brand-bg / control-brand-bg / focusColor */
+  --dg-focus-ring: #3871E1;             /* Component.focusColor (*.focusColor) */
+  --dg-hover-bg: #FFFFFF17;             /* toolbar-bg-hovered (ActionButton.hoverBackground) */
+  --dg-pressed-bg: #FFFFFF29;           /* toolbar-bg-pressed */
+  --dg-row-hover-bg: #FFFFFF10;         /* selection-bg-hovered (Tree/List/Table.hoverBackground) */
+  --dg-selection-bg: #2A4371;           /* selection-bg-active (*.selectionBackground, focused) */
+  --dg-selection-inactive-bg: #33353B;  /* selection-bg-inactive (*.selectionInactiveBackground) */
+  --dg-selection-muted-bg: #233558;     /* selection-bg-active-muted (*.lightSelectionBackground) */
+  --dg-selection-fg: #D1D3D9;           /* *.selectionForeground */
+
+  /* ---- Main toolbar (title bar) ---- */
+  --dg-toolbar-bg: #26282C;             /* MainToolbar.background */
+  --dg-toolbar-inactive-bg: #26282C;    /* MainToolbar.inactiveBackground */
+  --dg-toolbar-fg: #D1D3D9;
+  --dg-toolbar-separator: #FFFFFF21;    /* MainToolbar.separatorColor = toolbar-border */
+  --dg-toolbar-button-hover-bg: #FFFFFF17;
+  --dg-toolbar-button-pressed-bg: #FFFFFF29;
+  --dg-toolbar-selected-bg: #2E4D89;    /* toolbar-selected-bg */
+  --dg-toolbar-run-bg: #338555;         /* toolbar-run-bg (green Run widget) */
+  --dg-toolbar-run-hover-bg: #2A6E47;
+  --dg-toolbar-stop-bg: #C54E58;        /* toolbar-stop-bg */
+  --dg-toolbar-stop-hover-bg: #A4414A;
+
+  /* ---- Tool window stripe (left/right icon bars) ---- */
+  --dg-stripe-bg: #26282C;              /* ToolWindow.Stripe.background */
+  --dg-stripe-separator: #FFFFFF21;     /* ToolWindow.Stripe.separatorColor */
+  --dg-stripe-button-fg: #9FA2A8;       /* ToolWindow.Button.foreground */
+  --dg-stripe-button-hover-bg: #FFFFFF17;
+  --dg-stripe-button-selected-bg: #3871E1; /* ToolWindow.Button.selectedBackground */
+  --dg-stripe-button-selected-fg: #FFFFFF; /* icons are drawn white on the selected button */
+
+  /* ---- Tool window ---- */
+  --dg-toolwindow-bg: #191A1C;          /* ToolWindow.background */
+  --dg-toolwindow-header-bg: #191A1C;   /* ToolWindow.Header.background */
+  --dg-toolwindow-header-inactive-bg: #191A1C;
+  --dg-toolwindow-header-border: #26282C; /* ToolWindow.Header.borderColor */
+  --dg-toolwindow-header-fg: #D1D3D9;
+
+  /* ---- Editor tabs (Islands pill style) ---- */
+  --dg-tabs-bg: #191A1C;                /* EditorTabs.background */
+  --dg-tabs-border: #26282C;            /* EditorTabs.underTabsBorderColor */
+  --dg-tab-fg: #D1D3D9;
+  --dg-tab-inactive-fg: #D1D3D9BF;      /* unselected tab text = fg at EditorTabs.unselectedAlpha 0.75 */
+  --dg-tab-hover-bg: #FFFFFF17;         /* EditorTabs.hoverBackground */
+  --dg-tab-selected-bg: #233558;        /* EditorTabs.underlinedTabBackground */
+  --dg-tab-selected-border: #2E4D89;    /* EditorTabs.underlinedBorderColor */
+  --dg-tab-selected-inactive-bg: #26282C;   /* EditorTabs.inactiveUnderlinedTabBackground (editor not focused) */
+  --dg-tab-selected-inactive-border: #40434A;
+  --dg-tab-underline: #3871E1;          /* classic New UI underline (*.underlineColor); not painted by Islands */
+  --dg-tab-inactive-underline: #40434A; /* *.inactiveUnderlineColor */
+
+  /* ---- Tree ---- */
+  --dg-tree-bg: #191A1C;                /* tool window bg (Islands repaints PanelBackground to ToolWindow.background) */
+  --dg-tree-fg: #D1D3D9;
+  --dg-tree-hover-bg: #FFFFFF10;        /* Tree.hoverBackground */
+  --dg-tree-selection-bg: #2A4371;      /* focused */
+  --dg-tree-selection-fg: #D1D3D9;
+  --dg-tree-selection-inactive-bg: #33353B; /* unfocused */
+  --dg-tree-selection-inactive-fg: #D1D3D9;
+  --dg-tree-indent-guide: #33353B;      /* tree-indent-guide-border / Tree.hash */
+  --dg-tree-secondary-fg: #73767C;      /* grey "location"/comment text in nodes */
+  --dg-tree-error-fg: #F57E84;
+
+  /* ---- List / popup / menu ---- */
+  --dg-list-bg: #26282C;                /* inside popups = Popup.background */
+  --dg-list-hover-bg: #FFFFFF10;        /* List.hoverBackground */
+  --dg-list-selection-bg: #2A4371;
+  --dg-list-selection-inactive-bg: #33353B;
+  --dg-list-selection-fg: #D1D3D9;
+  --dg-popup-bg: #26282C;               /* Popup.background = popup-bg */
+  --dg-popup-border: #33353B;           /* Popup.borderColor */
+  --dg-popup-inactive-border: #33353B;
+  --dg-popup-header-bg: #26282C;        /* Popup.Header.activeBackground */
+  --dg-popup-header-inactive-fg: #73767C;
+  --dg-popup-separator: #33353B;        /* *.separatorColor = popup-border */
+  --dg-popup-separator-fg: #73767C;
+  --dg-popup-advertiser-bg: #26282C;    /* Popup.Advertiser.background */
+  --dg-popup-advertiser-fg: #73767C;
+  --dg-popup-shadow: 0 0 16px 0 #00000020; /* Ide.Shadow.*1Color #00000020 over 16px insets */
+  --dg-menu-bg: #26282C;                /* PopupMenu.background / Menu.background */
+  --dg-menu-border: #33353B;
+  --dg-menu-accelerator-fg: #73767C;
+  --dg-completion-bg: #27282B;          /* editor scheme LOOKUP_COLOR */
+  --dg-completion-fg: #BCBEC4;
+  --dg-completion-match-fg: #538AF9;    /* CompletionPopup.matchForeground */
+  --dg-completion-selection-bg: #2A4371;
+  --dg-completion-selection-inactive-bg: #33353B;
+  --dg-speedsearch-bg: #191A1C;         /* SpeedSearch.background */
+  --dg-speedsearch-border: #40434A;
+  --dg-speedsearch-error-fg: #F57E84;
+  --dg-search-match-bg: #BA9752;        /* search-match-bg (speed-search highlight in tree/list) */
+
+  /* ---- Buttons ---- */
+  --dg-button-bg: transparent;          /* Button.startBackground = #191A1C00 */
+  --dg-button-fg: #D1D3D9;
+  --dg-button-border: #40434A;          /* Button.startBorderColor = control-border */
+  --dg-button-focus-inner: #191A1C;     /* Button.focusedBorderColor (gap between border and ring) */
+  --dg-button-primary-bg: #3871E1;      /* Button.default.startBackground */
+  --dg-button-primary-fg: #FFFFFF;
+  --dg-button-primary-border: #3871E1;
+  --dg-button-primary-focus-inner: #191A1C; /* Button.default.focusedBorderColor */
+  --dg-button-disabled-fg: #4C4F56;
+  --dg-button-disabled-border: #33353B;
+  --dg-action-button-hover-bg: #FFFFFF17;   /* ActionButton.hoverBackground (icon buttons) */
+  --dg-action-button-pressed-bg: #FFFFFF29;
+  --dg-action-button-selected-bg: #2E4D89;  /* toggled icon button */
+
+  /* ---- Text fields / combo / spinner ---- */
+  --dg-input-bg: #191A1C;               /* TextField.background = control-bg */
+  --dg-input-fg: #D1D3D9;
+  --dg-input-border: #40434A;           /* Component.borderColor = control-border */
+  --dg-input-focus-border: #3871E1;     /* Component.focusColor, 2px (Component.focusWidth) */
+  --dg-input-disabled-bg: #191A1C;
+  --dg-input-disabled-border: #33353B;
+  --dg-input-placeholder: #73767C;      /* *.infoForeground */
+  --dg-input-error-border: #C54E58;     /* Component.errorFocusColor */
+  --dg-input-error-inactive-border: #6D3136;
+  --dg-input-warning-border: #A56906;   /* Component.warningFocusColor */
+  --dg-input-warning-inactive-border: #583E21;
+  --dg-combo-bg: #26282C;               /* ComboBox.nonEditableBackground = control-bg-raised */
+  --dg-combo-editable-bg: #191A1C;      /* ComboBox.ArrowButton.background */
+  --dg-combo-arrow-fg: #9A9DA1;         /* ComboBox.ArrowButton.iconColor */
+  --dg-combo-popup-bg: #26282C;         /* ComboBox.background = popup-bg */
+
+  /* ---- Checkbox / radio (themes/expUI/icons/dark/checkBox*.svg) ---- */
+  --dg-checkbox-bg: #2B2D30;
+  --dg-checkbox-border: #5A5D63;
+  --dg-checkbox-selected-bg: #3574F0;
+  --dg-checkbox-selected-border: #3574F0;
+  --dg-checkbox-check: #FFFFFF;
+  --dg-checkbox-focus: #3574F0;
+  --dg-checkbox-disabled-bg: #393B40;
+  --dg-checkbox-disabled-border: #5A5D63;
+  --dg-checkbox-disabled-check: #6F737A;
+  --dg-toggle-on-bg: #3871E1;
+  --dg-toggle-off-bg: #FFFFFF3B;
+
+  /* ---- Scrollbars ---- */
+  --dg-scrollbar-track: #80808000;
+  --dg-scrollbar-track-hover: #8080801A;     /* ScrollBar.Transparent.hoverTrackColor */
+  --dg-scrollbar-thumb: #80808059;           /* ScrollBar.thumbColor */
+  --dg-scrollbar-thumb-border: #26262659;    /* ScrollBar.thumbBorderColor */
+  --dg-scrollbar-thumb-hover: #8080808C;     /* ScrollBar.hoverThumbColor */
+  --dg-scrollbar-thumb-hover-border: #2626268C;
+
+  /* ---- Tooltips ---- */
+  --dg-tooltip-bg: #33353B;             /* ToolTip.background = layer-2-bg */
+  --dg-tooltip-fg: #D1D3D9;
+  --dg-tooltip-border: #33353B;
+  --dg-tooltip-info-fg: #9FA2A8;
+  --dg-tooltip-shortcut-fg: #9FA2A8;
+  --dg-help-tooltip-bg: #33353B;
+  --dg-editor-tooltip-bg: #26282C;      /* Editor.ToolTip.background (error/quick-doc hints) */
+  --dg-editor-tooltip-border: #33353B;
+  --dg-editor-tooltip-error-bg: #56272B;
+  --dg-editor-tooltip-error-border: #80383E;
+  --dg-editor-tooltip-warning-bg: #44321D;
+  --dg-editor-tooltip-warning-border: #694820;
+
+  /* ---- Notifications / banners / validation ---- */
+  --dg-notification-bg: #33353B;        /* Notification.background */
+  --dg-notification-border: #33353B;
+  --dg-notification-fg: #D1D3D9;
+  --dg-notification-link: #71A1FE;
+  --dg-notification-button-bg: #33353B;
+  --dg-notification-button-border: #FFFFFF3B;
+  --dg-notification-error-bg: #56272B;  /* Notification.ToolWindow.errorBackground */
+  --dg-notification-error-border: #80383E;
+  --dg-notification-warning-bg: #44321D;
+  --dg-notification-warning-border: #694820;
+  --dg-notification-info-bg: #33353B;
+  --dg-banner-info-bg: #233558;         /* Banner.infoBackground */
+  --dg-banner-info-border: #2E4D89;
+  --dg-banner-error-bg: #56272B;
+  --dg-banner-error-border: #80383E;
+  --dg-banner-warning-bg: #44321D;
+  --dg-banner-warning-border: #694820;
+  --dg-banner-success-bg: #203B2A;
+  --dg-banner-success-border: #29583C;
+  --dg-validation-error-bg: #56272B;    /* ValidationTooltip.errorBackground */
+  --dg-validation-error-border: #80383E;
+  --dg-validation-error-fg: #D1D3D9;
+  --dg-validation-warning-bg: #44321D;
+  --dg-validation-warning-border: #694820;
+  --dg-validation-warning-fg: #D1D3D9;
+
+  /* ---- Status bar ---- */
+  --dg-statusbar-bg: #26282C;           /* StatusBar.background = main-window-bg */
+  --dg-statusbar-border: transparent;   /* StatusBar.borderColor, topBorderWidth 0 */
+  --dg-statusbar-fg: #9FA2A8;           /* StatusBar.Widget.foreground */
+  --dg-statusbar-hover-fg: #D1D3D9;
+  --dg-statusbar-hover-bg: #FFFFFF17;
+  --dg-statusbar-breadcrumb-fg: #9FA2A8;
+
+  /* ---- Links / semantic ---- */
+  --dg-link: #71A1FE;                   /* Link.activeForeground = text-link */
+  --dg-link-hover: #71A1FE;
+  --dg-link-visited: #71A1FE;
+  --dg-error: #C54E58;                  /* accent-error-bg (icons, borders) */
+  --dg-warning: #A56906;                /* accent-warning-bg */
+  --dg-success: #338555;                /* accent-success-bg */
+  --dg-counter-bg: #73767C;             /* Counter.background */
+  --dg-counter-fg: #000000;
+  --dg-progress-fg: #3871E1;            /* ProgressBar.progressColor */
+  --dg-progress-track: #40434A;         /* ProgressBar.trackColor */
+
+  /* ---- Swing tables (dialogs, e.g. driver properties) ---- */
+  --dg-table-bg: #191A1C;
+  --dg-table-grid: #26282C;             /* Table.gridColor */
+  --dg-table-stripe: #212326;           /* Table.stripeColor / alternativeRowBackground */
+  --dg-table-hover-bg: #FFFFFF10;
+  --dg-table-header-bg: #191A1C;
+  --dg-table-header-separator: #26282C; /* TableHeader.separatorColor / bottomSeparatorColor */
+  --dg-table-selection-bg: #2A4371;
+  --dg-table-selection-inactive-bg: #33353B;
+
+  /* ---- DataGrip data grid (colors come from the EDITOR scheme, grid/impl GridColorSchemeUtil) ---- */
+  --dg-grid-bg: #191A1C;                /* scheme default background */
+  --dg-grid-fg: #BCBEC4;                /* scheme default foreground */
+  --dg-grid-line: #323438;              /* INDENT_GUIDE */
+  --dg-grid-header-bg: #191A1C;
+  --dg-grid-header-fg: #D1D3D9;
+  --dg-grid-row-number-fg: #4B5059;     /* LINE_NUMBERS_COLOR */
+  --dg-grid-row-number-current-fg: #A1A3AB; /* LINE_NUMBER_ON_CARET_ROW_COLOR */
+  --dg-grid-current-row-bg: #1F2024;    /* CARET_ROW_COLOR */
+  --dg-grid-stripe-bg: #1F2024;         /* GRID_STRIPE_COLOR falls back to CARET_ROW_COLOR */
+  --dg-grid-hover-bg: #FFFFFF10;        /* Table.hoverBackground */
+  --dg-grid-selection-bg: #214283;      /* SELECTION_BACKGROUND */
+  --dg-grid-null-fg: #7A7E85;           /* GRID_NULL_VALUE -> DEFAULT_LINE_COMMENT */
+  --dg-grid-modified-bg: #385570;       /* pending UPDATE cell: CellColors.REPLACE -> DIFF_MODIFIED */
+  --dg-grid-inserted-bg: #294436;       /* pending INSERT row: DIFF_INSERTED */
+  --dg-grid-deleted-bg: #484A4A;        /* pending DELETE row: DIFF_DELETED */
+  --dg-grid-error-underline: #FA6675;   /* GRID_ERROR_VALUE -> ERRORS_ATTRIBUTES */
+
+  /* ---- Editor (scheme "Islands Dark") ---- */
+  --dg-editor-bg: #191A1C;              /* TEXT background */
+  --dg-editor-fg: #BCBEC4;              /* TEXT foreground */
+  --dg-editor-caret: #CED0D6;           /* CARET_COLOR */
+  --dg-editor-caret-row: #1F2024;       /* CARET_ROW_COLOR */
+  --dg-editor-selection-bg: #214283;    /* SELECTION_BACKGROUND (Darcula) */
+  --dg-editor-selection-inactive-bg: #4C4F56;
+  --dg-editor-gutter-bg: #191A1C;       /* New UI: EDITOR_GUTTER_BACKGROUND empty -> editor bg */
+  --dg-editor-line-number: #4B5059;     /* LINE_NUMBERS_COLOR */
+  --dg-editor-line-number-current: #A1A3AB; /* LINE_NUMBER_ON_CARET_ROW_COLOR */
+  --dg-editor-indent-guide: #323438;    /* INDENT_GUIDE */
+  --dg-editor-indent-guide-selected: #4E5157; /* SELECTED_INDENT_GUIDE */
+  --dg-editor-right-margin: #323438;    /* RIGHT_MARGIN_COLOR */
+  --dg-editor-whitespace: #6F737A;      /* WHITESPACES */
+  --dg-editor-method-separator: #43454A;
+  --dg-editor-tearline: #555555;
+  --dg-editor-added-line: #549159;      /* ADDED_LINES_COLOR (gutter VCS marker) */
+  --dg-editor-modified-line: #375FAD;
+  --dg-editor-deleted-line: #868A91;
+  --dg-editor-doc-bg: #27282B;          /* DOCUMENTATION_COLOR */
+  --dg-editor-lookup-bg: #27282B;       /* LOOKUP_COLOR (completion popup) */
+  --dg-editor-error-hint-bg: #402929;   /* ERROR_HINT */
+  --dg-editor-notification-bg: #25324D; /* NOTIFICATION_BACKGROUND (editor banners) */
+
+  /* syntax */
+  --dg-editor-keyword: #CF8E6D;         /* DEFAULT_KEYWORD; SQL_KEYWORD, SQL_TYPE fall back here */
+  --dg-editor-string: #6AAB73;          /* DEFAULT_STRING */
+  --dg-editor-string-escape: #CF8E6D;   /* DEFAULT_VALID_STRING_ESCAPE */
+  --dg-editor-number: #2AACB8;          /* DEFAULT_NUMBER */
+  --dg-editor-line-comment: #7A7E85;    /* DEFAULT_LINE_COMMENT (regular, not italic) */
+  --dg-editor-block-comment: #7A7E85;   /* DEFAULT_BLOCK_COMMENT */
+  --dg-editor-doc-comment: #5F826B;     /* DEFAULT_DOC_COMMENT, italic */
+  --dg-editor-identifier: #BCBEC4;      /* DEFAULT_IDENTIFIER; SQL_IDENT, SQL_TABLE(CLASS_NAME), SQL_LOCAL_ALIAS */
+  --dg-editor-function-call: #BCBEC4;   /* DEFAULT_FUNCTION_CALL -> DEFAULT_IDENTIFIER */
+  --dg-editor-function-declaration: #56A8F5; /* DEFAULT_FUNCTION_DECLARATION */
+  --dg-editor-static-method: #57AAF7;   /* DEFAULT_STATIC_METHOD, italic; SQL_PROCEDURE (routine calls) */
+  --dg-editor-instance-method: #57AAF7;
+  --dg-editor-parameter: #BCBEC4;       /* DEFAULT_PARAMETER -> identifier; SQL_PARAMETER */
+  --dg-editor-field: #C77DBB;           /* DEFAULT_INSTANCE_FIELD; SQL_COLUMN */
+  --dg-editor-constant: #C77DBB;        /* DEFAULT_CONSTANT, italic */
+  --dg-editor-metadata: #B3AE60;        /* DEFAULT_METADATA */
+  --dg-editor-operator: #BCBEC4;        /* DEFAULT_OPERATION_SIGN, PARENTHS, BRACES, BRACKETS, COMMA, DOT, SEMICOLON */
+  --dg-editor-sql-synthetic: #FFC66D;   /* SQL_SYNTHETIC_ENTITY (SqlDarcula.xml) */
+  --dg-editor-sql-outer-column: #9876AA; /* SQL_OUTER_QUERY_COLUMN, underlined (SqlDarcula.xml) */
+  --dg-editor-bad-char: #F75464;        /* BAD_CHARACTER fg, wave underline */
+  --dg-editor-bad-char-bg: transparent;
+  --dg-editor-error-wave: #FA6675;      /* ERRORS_ATTRIBUTES effect (wave) */
+  --dg-editor-error-stripe: #D64D5B;
+  --dg-editor-wrong-ref: #F75464;       /* WRONG_REFERENCES_ATTRIBUTES fg */
+  --dg-editor-warning-wave: #F2C55C;    /* WARNING_ATTRIBUTES effect (wave) */
+  --dg-editor-warning-bg: transparent;
+  --dg-editor-warning-stripe: #C29E4A;
+  --dg-editor-weak-warning-wave: #857042; /* INFO_ATTRIBUTES (weak warning) */
+  --dg-editor-typo-wave: #7EC482;       /* TYPO */
+  --dg-editor-unused: #6F737A;          /* NOT_USED_ELEMENT_ATTRIBUTES fg */
+  --dg-editor-deprecated: #BCBEC4;      /* DEPRECATED_ATTRIBUTES strikeout color */
+  --dg-editor-search-bg: #114957;       /* TEXT_SEARCH_RESULT_ATTRIBUTES (find in editor) */
+  --dg-editor-search-border: #165E70;
+  --dg-editor-usage-bg: #2D543F;        /* SEARCH_RESULT_ATTRIBUTES (read usage) */
+  --dg-editor-usage-write-bg: #66313F;  /* WRITE_SEARCH_RESULT_ATTRIBUTES */
+  --dg-editor-identifier-under-caret-bg: #373B39;
+  --dg-editor-identifier-under-caret-write-bg: #402F33;
+  --dg-editor-matched-brace-bg: #43454A; /* MATCHED_BRACE_ATTRIBUTES, bold */
+  --dg-editor-unmatched-brace-fg: #F75464;
+  --dg-editor-unmatched-brace-bg: transparent;
+  --dg-editor-folded-fg: #868991;       /* FOLDED_TEXT_ATTRIBUTES */
+  --dg-editor-folded-bg: #393B40;
+  --dg-editor-hyperlink: #548AF7;       /* HYPERLINK_ATTRIBUTES, underlined */
+  --dg-editor-injected-bg: #293C40;     /* INJECTED_LANGUAGE_FRAGMENT */
+  --dg-editor-inlay-fg: #868A91;        /* INLAY_DEFAULT */
+  --dg-editor-inlay-bg: #393B40;
+  --dg-editor-todo: #8BB33D;            /* TODO_DEFAULT_ATTRIBUTES, italic */
+  --dg-editor-live-template: #467FF2;
+  --dg-editor-statement-to-execute: #3D7A49; /* CONSOLE_RANGE_TO_EXECUTE (statement-at-caret frame) */
+
+  /* console / output */
+  --dg-console-bg: #191A1C;             /* CONSOLE_BACKGROUND_KEY */
+  --dg-console-fg: #BCBEC4;             /* CONSOLE_NORMAL_OUTPUT */
+  --dg-console-error: #F75464;          /* CONSOLE_ERROR_OUTPUT */
+  --dg-console-system: #BCBEC4;         /* CONSOLE_SYSTEM_OUTPUT */
+  --dg-console-user-input: #6AAB73;     /* CONSOLE_USER_INPUT, italic */
+  --dg-log-info: #E0BB65;               /* LOG_INFO_OUTPUT */
+  --dg-log-verbose: #56A8F5;
+  --dg-log-debug: #299999;
+
+  /* icons */
+  --dg-icon: #C3C5CB;                   /* icon-default-stroke (dark SVGs already recolored) */
+  --dg-icon-disabled: #5F6269;
+}

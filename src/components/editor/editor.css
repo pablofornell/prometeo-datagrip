@@ -1,0 +1,740 @@
+/*
+ * SQL editor (CodeMirror 6) styled after the DataGrip 2026.3 console editor.
+ * Geometry from docs/ux/datagrip-map.md section 4 (measured on 1:1 screenshots):
+ *   JetBrains Mono 13, 8px advance, 22px line pitch, gutter 62px + 1px separator, text origin at 65px,
+ *   line numbers (12px) right-aligned at 20px, status icons at 20..62, error stripe 13px wide at the right.
+ * Colors come from the --dg-editor-* tokens of src/theme/{dark,light}.css.
+ */
+
+.sql-editor {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  background: var(--dg-editor-bg);
+  color: var(--dg-editor-fg);
+  font-family: var(--dg-font-mono);
+  font-size: 13px;
+  overflow: hidden;
+}
+
+.sql-editor .cm-editor {
+  flex: 1 1 auto;
+  min-height: 0;
+  background: transparent;
+  color: var(--dg-editor-fg);
+  outline: none;
+  position: relative;
+}
+.sql-editor .cm-editor.cm-focused {
+  outline: none;
+}
+
+.sql-editor .cm-scroller {
+  font-family: var(--dg-font-mono);
+  font-size: 13px;
+  line-height: 22px;
+  overflow: auto;
+  scrollbar-width: none;
+}
+/* native scrollbars are replaced by the overlay thumb in the stripe; keep a slim horizontal one */
+.sql-editor .cm-scroller::-webkit-scrollbar:vertical {
+  width: 0;
+  display: none;
+}
+.sql-editor .cm-scroller::-webkit-scrollbar:horizontal {
+  height: 13px;
+}
+.sql-editor .cm-scroller::-webkit-scrollbar-track {
+  background: transparent;
+}
+.sql-editor .cm-scroller::-webkit-scrollbar-thumb {
+  background-color: var(--dg-scrollbar-thumb);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  border-radius: 7px;
+}
+.sql-editor .cm-scroller::-webkit-scrollbar-thumb:hover {
+  background-color: var(--dg-scrollbar-thumb-hover);
+}
+.sql-editor .cm-scroller::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* ---- content ------------------------------------------------------------------------------ */
+.sql-editor .cm-content {
+  padding: 0;
+  caret-color: var(--dg-editor-caret);
+  font-family: var(--dg-font-mono);
+  letter-spacing: calc(8px - 1ch); /* force the 8px cell of the IDE whatever advance the engine gives */
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
+  min-height: 100%;
+}
+.sql-editor .cm-line {
+  padding: 1px 0 0 2px; /* 1px + 21px line box = the 22px pitch, with the baseline where the IDE draws it */
+  line-height: 21px;
+}
+.sql-editor .cm-cursor,
+.sql-editor .cm-dropCursor {
+  border-left: 2px solid var(--dg-editor-caret);
+  margin-left: -1px;
+}
+.sql-editor .cm-cursor-secondary {
+  border-left-color: var(--dg-editor-caret);
+}
+.sql-editor .cm-fat-cursor {
+  background: var(--dg-editor-caret);
+}
+
+/* selection / caret row: the caret row is a layer below the selection so the selection stays visible */
+.sql-editor .cm-activeLine {
+  background: transparent;
+}
+.sql-editor .cm-caretrow {
+  background: var(--dg-editor-caret-row);
+}
+.sql-editor .cm-caretrow-layer {
+  z-index: -3;
+}
+.sql-editor .cm-selectionLayer .cm-selectionBackground,
+.sql-editor .cm-editor.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground,
+.sql-editor .cm-content ::selection {
+  background: var(--dg-editor-selection-bg);
+}
+.sql-editor .cm-editor:not(.cm-focused) > .cm-scroller > .cm-selectionLayer .cm-selectionBackground {
+  background: var(--dg-editor-selection-inactive-bg);
+}
+.sql-editor .cm-matchingBracket {
+  background: var(--dg-editor-matched-brace-bg);
+  font-weight: 700;
+  color: inherit;
+}
+.sql-editor .cm-nonmatchingBracket {
+  color: var(--dg-editor-unmatched-brace-fg);
+  background: transparent;
+}
+.sql-editor .cm-sql-idcaret {
+  background: var(--dg-editor-identifier-under-caret-bg);
+  padding: 2px 0; /* box of 21px like the IDE */
+}
+
+/* ---- right margin ------------------------------------------------------------------------- */
+.sql-editor .cm-margin-layer .cm-margin-line {
+  background: var(--dg-editor-right-margin);
+}
+
+/* ---- syntax colors ------------------------------------------------------------------------ */
+.sql-editor .cm-sql-kw {
+  color: var(--dg-editor-keyword);
+}
+.sql-editor .cm-sql-str {
+  color: var(--dg-editor-string);
+}
+.sql-editor .cm-sql-num {
+  color: var(--dg-editor-number);
+}
+.sql-editor .cm-sql-cmt {
+  color: var(--dg-editor-line-comment);
+}
+:root[data-theme="light"] .sql-editor .cm-sql-cmt {
+  font-style: italic;
+}
+.sql-editor .cm-sql-fn {
+  color: var(--dg-editor-static-method);
+  font-style: italic;
+}
+.sql-editor .cm-sql-col {
+  color: var(--dg-editor-field);
+}
+.sql-editor .cm-sql-bad {
+  color: var(--dg-editor-wrong-ref);
+}
+.sql-editor .cm-sql-param {
+  color: var(--dg-editor-parameter);
+}
+.sql-editor .cm-sql-error-wave {
+  text-decoration: underline wavy var(--dg-editor-error-wave);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+/* ---- search matches ----------------------------------------------------------------------- */
+.sql-editor .cm-searchMatch {
+  background: var(--dg-editor-search-bg);
+  outline: 1px solid var(--dg-editor-search-border);
+  outline-offset: -1px;
+  border-radius: 2px;
+}
+.sql-editor .cm-searchMatch.cm-searchMatch-selected {
+  background: var(--dg-editor-search-bg);
+  outline: 1px solid var(--dg-editor-keyword);
+}
+:root[data-theme="light"] .sql-editor .cm-searchMatch,
+:root[data-theme="light"] .sql-editor .cm-searchMatch.cm-searchMatch-selected {
+  color: #000;
+}
+
+/* ---- gutter ------------------------------------------------------------------------------- */
+.sql-editor .cm-gutters {
+  background: var(--dg-editor-gutter-bg);
+  color: var(--dg-editor-line-number);
+  border: none;
+  border-right: 1px solid var(--dg-editor-indent-guide);
+  padding: 0;
+  font-family: var(--dg-font-mono);
+  font-size: 12px;
+  z-index: 200;
+}
+.sql-editor .cm-gutterElement {
+  box-sizing: border-box;
+  padding-top: 1px;
+  line-height: 21px;
+}
+.sql-editor .cm-lineNumbers .cm-gutterElement {
+  padding: 1px 0 0;
+  min-width: 20px;
+  text-align: right;
+  color: var(--dg-editor-line-number);
+}
+.sql-editor .cm-status-gutter {
+  width: 42px;
+}
+.sql-editor .cm-status-gutter .cm-gutterElement {
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+}
+.sql-editor .cm-gutterElement.cm-activeLineGutter {
+  background: var(--dg-editor-caret-row);
+  color: var(--dg-editor-line-number-current);
+}
+.sql-editor .cm-exec-icon {
+  width: 16px;
+  height: 16px;
+  margin-left: 5px;
+  line-height: 0;
+}
+.sql-editor .cm-exec-icon svg {
+  display: block;
+}
+.sql-editor .cm-exec-ok {
+  color: #5fb865;
+}
+.sql-editor .cm-exec-err {
+  color: var(--dg-editor-error-stripe);
+}
+.sql-editor .cm-exec-hint {
+  font-family: var(--dg-font-ui);
+  font-size: 11px;
+  color: var(--dg-text-secondary);
+  letter-spacing: 0;
+  margin-left: 16px;
+  user-select: none;
+  pointer-events: none;
+}
+
+/* ---- statement frame / fill --------------------------------------------------------------- */
+.sql-editor .cm-stmt-frame-layer {
+  pointer-events: none;
+  z-index: 120;
+}
+.sql-editor .cm-stmt-frame {
+  position: absolute;
+  color: var(--dg-editor-statement-to-execute);
+  overflow: visible;
+  pointer-events: none;
+}
+.sql-editor .cm-stmt-fill-layer {
+  z-index: -2;
+}
+.sql-editor .cm-stmt-fill {
+  background: var(--dg-editor-usage-bg);
+}
+:root[data-theme="light"] .sql-editor .cm-stmt-frame {
+  color: #baa8ff;
+}
+
+/* ---- error stripe, inspection widget, scrollbar thumb -------------------------------------- */
+.sql-editor .cm-stripe {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 1px;
+  width: 13px;
+  pointer-events: none;
+  z-index: 300;
+}
+.sql-editor .cm-stripe-marks {
+  position: absolute;
+  inset: 0;
+}
+.sql-editor .cm-stripe-mark {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+}
+.sql-editor .cm-stripe-range {
+  position: absolute;
+  left: 0;
+  right: 0;
+  background: #42bd77;
+}
+.sql-editor .cm-stripe-id {
+  background: #5b786a;
+}
+:root[data-theme="light"] .sql-editor .cm-stripe-range {
+  position: absolute;
+  left: 0;
+  right: 0;
+  background: #42bd77;
+}
+.sql-editor .cm-stripe-id {
+  background: #d0a1ff;
+}
+.sql-editor .cm-stripe-err {
+  background: var(--dg-editor-error-stripe);
+}
+.sql-editor .cm-stripe-thumb {
+  position: absolute;
+  left: 2px;
+  width: 9px;
+  border-radius: 5px;
+  background: var(--dg-scrollbar-thumb);
+  pointer-events: auto;
+  display: none;
+}
+.sql-editor .cm-stripe-thumb:hover,
+.sql-editor .cm-stripe-thumb.dragging {
+  background: var(--dg-scrollbar-thumb-hover);
+}
+.sql-editor .cm-inspect {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  z-index: 310;
+  font-family: var(--dg-font-ui);
+  font-size: 12px;
+  color: var(--dg-text);
+  user-select: none;
+}
+.sql-editor .cm-inspect-icon {
+  display: inline-flex;
+  width: 16px;
+  height: 16px;
+}
+.sql-editor .cm-inspect-ok .cm-inspect-icon {
+  color: #5fb865;
+}
+.sql-editor .cm-inspect-err .cm-inspect-icon {
+  color: var(--dg-editor-error-stripe);
+}
+.sql-editor .cm-inspect-count {
+  margin: 0 6px 0 2px;
+}
+.sql-editor .cm-inspect-nav {
+  display: inline-flex;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--dg-text-secondary);
+  cursor: default;
+}
+.sql-editor .cm-inspect-nav:hover {
+  background: var(--dg-hover-bg);
+}
+
+/* ---- tooltips (error message) ------------------------------------------------------------- */
+.sql-editor .cm-tooltip,
+.cm-tooltip.cm-tooltip-hover {
+  border: 1px solid var(--dg-editor-tooltip-border);
+  background: var(--dg-editor-tooltip-bg);
+  color: var(--dg-text);
+  border-radius: 6px;
+}
+.cm-error-tip {
+  padding: 6px 10px;
+  max-width: 520px;
+  font-family: var(--dg-font-ui);
+  font-size: 13px;
+  line-height: 16px;
+  white-space: pre-wrap;
+  background: var(--dg-editor-tooltip-error-bg);
+  border-radius: 5px;
+  color: var(--dg-text);
+}
+
+/* ---- completion popup ---------------------------------------------------------------------- */
+.cm-tooltip.cm-tooltip-autocomplete {
+  min-width: 576px;
+  box-sizing: border-box;
+  margin-left: -34px;
+  margin-top: 1px;
+  padding: 4px 4px 0;
+  background: var(--dg-editor-lookup-bg);
+  border: 1px solid var(--dg-popup-inactive-border);
+  border-radius: 6px;
+  box-shadow: none;
+  font-family: var(--dg-font-mono);
+  font-size: 13px;
+  color: var(--dg-completion-fg);
+  overflow: hidden;
+}
+.cm-tooltip.cm-tooltip-autocomplete::after {
+  content: "Press Enter to insert, Tab to replace";
+  display: block;
+  margin: 4px -4px 0;
+  padding: 0 12px;
+  height: 28px;
+  line-height: 28px;
+  font-family: var(--dg-font-ui);
+  font-size: 11px;
+  color: var(--dg-text-secondary);
+  background: var(--dg-popup-advertiser-bg);
+}
+.cm-tooltip.cm-tooltip-autocomplete.cm-tooltip-autocomplete > ul {
+  max-height: 276px;
+  font-family: var(--dg-font-mono);
+  font-size: 13px;
+  letter-spacing: 0.2px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--dg-scrollbar-thumb) transparent;
+}
+.cm-tooltip.cm-tooltip-autocomplete > ul > li {
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
+  height: 24px;
+  padding: 0 13px 0 8px !important;
+  line-height: 22px !important;
+  border-radius: 4px;
+  color: var(--dg-completion-fg);
+  white-space: nowrap;
+}
+.cm-tooltip.cm-tooltip-autocomplete > ul > li[aria-selected] {
+  background: var(--dg-completion-selection-inactive-bg);
+  color: var(--dg-completion-fg);
+}
+.cm-tooltip.cm-tooltip-autocomplete > ul > li .cm-completionLabel {
+  color: var(--dg-completion-fg);
+}
+.cm-tooltip.cm-tooltip-autocomplete > ul > li .cm-completionDetail {
+  margin-left: 8px;
+  font-style: normal;
+  color: var(--dg-text-secondary);
+  opacity: 1;
+}
+.cm-tooltip.cm-tooltip-autocomplete .cm-completionMatchedText {
+  text-decoration: none;
+  font-weight: 700;
+  color: var(--dg-completion-match-fg);
+}
+.cm-tooltip.cm-tooltip-autocomplete .cm-completionHint {
+  margin-left: auto;
+  padding-left: 24px;
+  color: var(--dg-text-secondary);
+}
+.cm-tooltip.cm-tooltip-autocomplete .dg-icon {
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  margin-right: 4px;
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 16px 16px;
+}
+.dg-icon-table {
+  background-image: url("../../assets/icons/dg/table_dark.svg");
+}
+.dg-icon-view {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16' fill='none'><path d='M3 2.5H13C13.8 2.5 14.5 3.2 14.5 4V8M2 5.5H14M5.5 3V13M10.5 3V8M7 13.5H3C2.2 13.5 1.5 12.8 1.5 12V4C1.5 3.2 2.2 2.5 3 2.5' stroke='%23C3C5CB'/><circle cx='11' cy='11' r='2.4' stroke='%23548AF7'/><path d='M12.8 12.8L14.6 14.6' stroke='%23548AF7'/></svg>");
+}
+.dg-icon-column {
+  background-image: url("../../assets/icons/dg/column_dark.svg");
+}
+.dg-icon-column-pk {
+  background-image: url("../../assets/icons/dg/column-gold-key_dark.svg");
+}
+.dg-icon-column-fk {
+  background-image: url("../../assets/icons/dg/column-blue-key_dark.svg");
+}
+.dg-icon-function {
+  background-image: url("../../assets/icons/dg/function_dark.svg");
+}
+.dg-icon-schema {
+  background-image: url("../../assets/icons/dg/schema_dark.svg");
+}
+.dg-icon-sequence {
+  background-image: url("../../assets/icons/dg/sequence_dark.svg");
+}
+.dg-icon-keyword {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16' fill='none'><path d='M6 9.5V6.2C6 5 6.8 4 8 4s2 1 2 2.2V9.5' stroke='%23C3C5CB'/><path d='M3 12.5h10M4 9.5h8v3H4z' stroke='%23C3C5CB' stroke-linejoin='round'/></svg>");
+}
+:root[data-theme="light"] .dg-icon-table {
+  background-image: url("../../assets/icons/dg/table.svg");
+}
+:root[data-theme="light"] .dg-icon-view {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16' fill='none'><path d='M3 2.5H13C13.8 2.5 14.5 3.2 14.5 4V8M2 5.5H14M5.5 3V13M10.5 3V8M7 13.5H3C2.2 13.5 1.5 12.8 1.5 12V4C1.5 3.2 2.2 2.5 3 2.5' stroke='%236C707E'/><circle cx='11' cy='11' r='2.4' stroke='%233574F0'/><path d='M12.8 12.8L14.6 14.6' stroke='%233574F0'/></svg>");
+}
+:root[data-theme="light"] .dg-icon-column {
+  background-image: url("../../assets/icons/dg/column.svg");
+}
+:root[data-theme="light"] .dg-icon-column-pk {
+  background-image: url("../../assets/icons/dg/column-gold-key.svg");
+}
+:root[data-theme="light"] .dg-icon-column-fk {
+  background-image: url("../../assets/icons/dg/column-blue-key.svg");
+}
+:root[data-theme="light"] .dg-icon-function {
+  background-image: url("../../assets/icons/dg/function.svg");
+}
+:root[data-theme="light"] .dg-icon-schema {
+  background-image: url("../../assets/icons/dg/schema.svg");
+}
+:root[data-theme="light"] .dg-icon-sequence {
+  background-image: url("../../assets/icons/dg/sequence.svg");
+}
+:root[data-theme="light"] .dg-icon-keyword {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16' fill='none'><path d='M6 9.5V6.2C6 5 6.8 4 8 4s2 1 2 2.2V9.5' stroke='%236C707E'/><path d='M3 12.5h10M4 9.5h8v3H4z' stroke='%236C707E' stroke-linejoin='round'/></svg>");
+}
+
+/* ---- Statements chooser -------------------------------------------------------------------- */
+.sql-editor .cm-statements-popup {
+  position: absolute;
+  z-index: 400;
+  width: 366px;
+  box-sizing: border-box;
+  background: var(--dg-popup-bg);
+  border: 1px solid var(--dg-popup-inactive-border);
+  border-radius: 2px;
+  box-shadow: none;
+  font-family: var(--dg-font-ui);
+  font-size: 13px;
+  color: var(--dg-text);
+  overflow: hidden;
+}
+.sql-editor .cm-statements-title {
+  height: 36px;
+  line-height: 42px;
+  text-align: center;
+  font-weight: 600;
+}
+.sql-editor .cm-statements-list {
+  padding: 3px 8px 0;
+}
+.sql-editor .cm-statements-row {
+  height: 24px;
+  line-height: 24px;
+  padding: 0 8px;
+  border-radius: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: clip;
+  cursor: default;
+}
+.sql-editor .cm-statements-row.selected {
+  background: var(--dg-list-selection-bg);
+}
+.sql-editor .cm-statements-foot {
+  margin-top: 8px;
+  height: 19px;
+  line-height: 19px;
+  padding: 0 3px;
+  background: var(--dg-editor-bg);
+}
+.sql-editor .cm-statements-foot a {
+  color: var(--dg-editor-hyperlink);
+  cursor: default;
+}
+
+/* ---- Find / Replace panel ------------------------------------------------------------------ */
+.sql-editor .cm-panels {
+  background: transparent;
+  color: var(--dg-text);
+  border: none;
+  z-index: 250;
+}
+.sql-editor .cm-panels-top {
+  border-bottom: 1px solid var(--dg-border);
+}
+.sql-editor .cm-find {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  background: var(--dg-layer-1-bg);
+  font-family: var(--dg-font-ui);
+  font-size: 13px;
+  color: var(--dg-text);
+}
+.sql-editor .cm-find-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 28px;
+}
+.sql-editor .cm-find-field {
+  display: flex;
+  align-items: center;
+  flex: 0 1 360px;
+  min-width: 160px;
+  height: 28px;
+  padding: 0 4px 0 6px;
+  box-sizing: border-box;
+  background: var(--dg-input-bg);
+  border: 1px solid var(--dg-input-border);
+  border-radius: 6px;
+}
+.sql-editor .cm-find-field:focus-within {
+  border-color: var(--dg-input-focus-border);
+  box-shadow: 0 0 0 1px var(--dg-input-focus-border);
+}
+.sql-editor .cm-find-field img {
+  flex: none;
+  opacity: 0.9;
+}
+.sql-editor .cm-find-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 24px;
+  padding: 0 6px;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--dg-input-fg);
+  font-family: var(--dg-font-ui);
+  font-size: 13px;
+}
+.sql-editor .cm-find-input::placeholder {
+  color: var(--dg-input-placeholder);
+}
+.sql-editor .cm-find-toggle,
+.sql-editor .cm-find-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  cursor: default;
+  flex: none;
+}
+.sql-editor .cm-find-btn {
+  width: 26px;
+  height: 26px;
+}
+.sql-editor .cm-find-toggle:hover,
+.sql-editor .cm-find-btn:hover {
+  background: var(--dg-action-button-hover-bg);
+}
+.sql-editor .cm-find-toggle.on {
+  background: var(--dg-action-button-selected-bg);
+}
+.sql-editor .cm-find-count {
+  min-width: 70px;
+  padding: 0 6px;
+  color: var(--dg-text-secondary);
+  white-space: nowrap;
+}
+.sql-editor .cm-find.no-match .cm-find-count {
+  color: var(--dg-text-error);
+}
+.sql-editor .cm-find.no-match .cm-find-field {
+  border-color: var(--dg-input-error-border);
+}
+.sql-editor .cm-find-text-btn {
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid var(--dg-button-border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dg-button-fg);
+  font-family: var(--dg-font-ui);
+  font-size: 13px;
+  cursor: default;
+}
+.sql-editor .cm-find-text-btn:hover {
+  background: var(--dg-action-button-hover-bg);
+}
+
+/* ---- Go to line ---------------------------------------------------------------------------- */
+.sql-editor .cm-goto {
+  position: absolute;
+  z-index: 420;
+  top: 40px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 260px;
+  padding: 10px 12px 8px;
+  background: var(--dg-popup-bg);
+  border: 1px solid var(--dg-popup-border);
+  border-radius: 8px;
+  box-shadow: var(--dg-popup-shadow);
+  font-family: var(--dg-font-ui);
+  font-size: 13px;
+  color: var(--dg-text);
+}
+.sql-editor .cm-goto-title {
+  margin-bottom: 6px;
+  font-weight: 500;
+}
+.sql-editor .cm-goto-input {
+  width: 100%;
+  height: 28px;
+  box-sizing: border-box;
+  padding: 0 8px;
+  background: var(--dg-input-bg);
+  color: var(--dg-input-fg);
+  border: 1px solid var(--dg-input-border);
+  border-radius: 6px;
+  outline: none;
+  font-family: var(--dg-font-ui);
+  font-size: 13px;
+}
+.sql-editor .cm-goto-input:focus {
+  border-color: var(--dg-input-focus-border);
+  box-shadow: 0 0 0 1px var(--dg-input-focus-border);
+}
+.sql-editor .cm-goto-input.invalid {
+  border-color: var(--dg-input-error-border);
+}
+.sql-editor .cm-goto-hint {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--dg-text-secondary);
+}
+
+/* ---- read-only (DDL view) and no-gutter variants ------------------------------------------- */
+.sql-editor.sql-editor-readonly .cm-cursor {
+  border-left-color: var(--dg-editor-caret);
+}
+
+.sql-editor.sql-editor-single {
+  height: auto;
+  min-height: 22px;
+}
+.sql-editor.sql-editor-single .cm-scroller {
+  overflow: hidden;
+}
+.sql-editor.sql-editor-single .cm-content {
+  min-height: 22px;
+}
+.sql-editor .cm-placeholder {
+  color: var(--dg-input-placeholder);
+}

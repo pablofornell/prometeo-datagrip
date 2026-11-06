@@ -1,0 +1,101 @@
+/* Table data editor (features/table). Toolbar, filter bar, grid and pill styles come from components/grid. */
+.dgt-view {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  background: var(--dg-grid-bg, #191a1c);
+}
+.dgt-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+.dgt-message {
+  padding: 24px;
+  color: var(--dg-text-secondary, #73767c);
+  font: 13px / 18px var(--dg-font-ui, "Inter", sans-serif);
+}
+.dgt-body > .dgt-message {
+  position: absolute;
+  inset: 0;
+}
+.dgt-error { color: var(--dg-error-fg, #f75464); white-space: pre-wrap; }
+.dgt-link { color: var(--dg-link, #548af7); cursor: default; }
+.dgt-link:hover { text-decoration: underline; }
+
+/* WHERE | ORDER BY: the SQL editors fill the half after the label */
+.dgt-fb-half { min-width: 0; }
+.dgt-fb-half .dgt-fb-editor { flex: 1; min-width: 0; height: 30px; flex-direction: row; align-items: center; background: transparent; }
+.dgt-fb-half .dgt-fb-editor .cm-content { min-height: 22px; align-self: center; }
+.dgt-fb-half .dgt-fb-editor .cm-editor { width: 100%; height: 30px; background: transparent; outline: none; }
+.dgt-fb-half .dgt-fb-editor .cm-editor.cm-focused { outline: none; }
+.dgt-fb-half .dgt-fb-editor .cm-scroller { font: inherit; line-height: 22px; }
+
+/* SQL preview popup (60-grid-preview-pending-changes-popup) */
+.dgt-sqlpop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 3000;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 18vh;
+}
+.dgt-sqlpop {
+  width: 712px;
+  max-width: calc(100vw - 32px);
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  background: var(--dg-popup-bg, #26282c);
+  border: 1px solid var(--dg-popup-border, #33353b);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px #00000066;
+  outline: none;
+}
+.dgt-sqlpop-editor {
+  height: 310px;
+  margin: 8px 8px 0;
+  overflow: hidden;
+  background: var(--dg-editor-bg, #191a1c);
+  border-radius: 4px;
+}
+.dgt-sqlpop-editor.compact { height: 120px; }
+.dgt-sqlpop-editor .sql-editor { height: 100%; }
+.dgt-sqlpop-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 8px 10px;
+}
+
+/* column filter popover */
+.dgt-colfilter {
+  position: fixed;
+  z-index: 3000;
+  width: 290px;
+  box-sizing: border-box;
+  padding: 10px;
+  background: var(--dg-popup-bg, #26282c);
+  border: 1px solid var(--dg-popup-border, #33353b);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px #00000066;
+  font: 13px / 18px var(--dg-font-ui, "Inter", sans-serif);
+  color: var(--dg-text, #dfe1e5);
+}
+.dgt-colfilter-title { font-weight: 600; margin-bottom: 8px; }
+.dgt-colfilter-row { display: flex; gap: 6px; align-items: center; }
+.dgt-colfilter-field { flex: 1; min-width: 0; }
+.dgt-colfilter-footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+
+/* export dialog */
+.dgt-export {
+  display: grid;
+  grid-template-columns: 90px 1fr;
+  align-items: center;
+  gap: 10px 8px;
+  font: 13px / 18px var(--dg-font-ui, "Inter", sans-serif);
+}
+.dgt-choice { font: 13px / 18px var(--dg-font-ui, "Inter", sans-serif); white-space: pre-wrap; }

@@ -1,0 +1,28 @@
+[package]
+name = "prometeo-datagrip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Prometeo DataGrip - a DataGrip clone built with Tauri 2"
+
+[lib]
+name = "prometeo_datagrip_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"
+dbcore = { path = "../crates/dbcore" }
+keyring = { version = "3", default-features = false, features = ["async-secret-service", "tokio", "crypto-rust"] }
+uuid = { version = "1", features = ["v4"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

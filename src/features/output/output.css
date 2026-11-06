@@ -1,0 +1,156 @@
+/* Database Output tool window. */
+.dgo-header {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+}
+.dgo-source {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  height: 26px;
+  margin-left: auto;
+  padding: 0 2px 0 4px;
+  border: 0;
+  border-radius: var(--dg-action-button-radius);
+  background: transparent;
+  color: var(--dg-text);
+  font: inherit;
+  white-space: nowrap;
+  cursor: default;
+}
+.dgo-source:hover {
+  background: var(--dg-action-button-hover-bg);
+}
+.dgo-source-ms {
+  color: var(--dg-text-secondary);
+}
+.dgo-spinner {
+  width: 14px;
+  height: 14px;
+  box-sizing: border-box;
+  border: 2px solid var(--dg-text-secondary);
+  border-top-color: var(--dg-accent);
+  border-radius: 50%;
+  animation: dgo-spin 0.8s linear infinite;
+}
+@keyframes dgo-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.dgo-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+.dgo-pane,
+.dgo-result {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  min-width: 0;
+  outline: none;
+}
+.dgo-result > .dgg {
+  flex: 1;
+}
+
+/* log toolbar */
+.dgo-logtb {
+  height: 34px;
+  padding: 0 8px 0 9px;
+  border-bottom: 1px solid var(--dg-border);
+}
+.dgo-tx {
+  display: inline-flex;
+  align-items: flex-start;
+  height: 22px;
+  padding: 3px 6px 0 6px;
+  border: 0;
+  border-radius: var(--dg-action-button-radius);
+  background: transparent;
+  color: var(--dg-text);
+  font: inherit;
+  font-size: 12px;
+  cursor: default;
+}
+.dgo-tx:hover {
+  background: var(--dg-action-button-hover-bg);
+}
+.dgo-tx-mark {
+  width: 0;
+  height: 0;
+  margin: 10px 0 0 1px;
+  border-left: 2px solid transparent;
+  border-right: 2px solid transparent;
+  border-top: 3px solid var(--dg-icon);
+}
+
+/* log */
+.dgo-logwrap {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+}
+.dgo-log {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  padding: 4px 0 4px 10px;
+  background: var(--dg-editor-bg);
+  color: var(--dg-editor-fg);
+  font-family: var(--dg-font-mono);
+  font-size: 13px;
+  line-height: 22px;
+  outline: none;
+  user-select: text;
+}
+.dgo-line {
+  white-space: pre;
+  min-height: 22px;
+}
+.dgo-log.wrap .dgo-line {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.dgo-line.err {
+  color: var(--dg-editor-wrong-ref);
+}
+.dgo-line .k {
+  color: var(--dg-editor-keyword);
+}
+.dgo-line .s {
+  color: var(--dg-editor-string);
+}
+.dgo-line .n {
+  color: var(--dg-editor-number);
+}
+.dgo-line .c {
+  color: var(--dg-editor-line-comment);
+}
+.dgo-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--dg-text-secondary);
+  font-family: var(--dg-font-ui);
+}
+.dgo-vtb {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  flex: none;
+  gap: 4px;
+  width: 38px;
+  padding-top: 6px;
+  background: var(--dg-editor-bg);
+}
+.dgo-vtb .dg-action-button {
+  color: var(--dg-icon);
+}

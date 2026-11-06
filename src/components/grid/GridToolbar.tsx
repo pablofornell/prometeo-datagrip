@@ -1,0 +1,315 @@
+/**
+ * Presentational pieces around the grid, all driven by props/callbacks:
+ *   GridToolbar     - the 34px action toolbar (reload, add/remove row, revert, preview, submit, Tx, export...)
+ *   GridFilterBar   - the table-editor WHERE | ORDER BY row (30px)
+ *   GridPagingPill  - the floating "N rows" pill with the page-size menu
+ * TODO: use the shared tooltip / ContextMenu of src/components/ui once available (native `title` for now).
+ */
+import { Show, createSignal, type JSX } from "solid-js";
+import { GridMenu, type MenuItem } from "./GridMenu";
+import type { ViewMode } from "./types";
+import "./grid.css";
+
+type Icon =
+  | "reload"
+  | "stop"
+  | "add"
+  | "remove"
+  | "revert"
+  | "preview"
+  | "submit"
+  | "find"
+  | "filter"
+  | "record"
+  | "export"
+  | "openTab"
+  | "columns"
+  | "viewAs"
+  | "gear"
+  | "more"
+  | "chevron"
+  | "sortBy"
+  | "table"
+  | "text";
+
+function Btn(props: {
+  icon: Icon;
+  title: string;
+  shortcut?: string;
+  disabled?: boolean;
+  selected?: boolean;
+  green?: boolean;
+  onClick?: (e: MouseEvent) => void;
+}): JSX.Element {
+  return (
+    <button
+      class="dgg-tbtn"
+      classList={{ selected: props.selected, green: props.green }}
+      disabled={props.disabled}
+      title={props.shortcut ? `${props.title}  ${props.shortcut}` : props.title}
+      onClick={(e) => props.onClick?.(e)}
+      tabIndex={-1}
+    >
+      <i class={"dgg-i i-" + props.icon} />
+    </button>
+  );
+}
+
+const Sep = () => <span class="dgg-tsep" />;
+
+export interface GridToolbarProps {
+  /** Result can be edited (table results): enables the edit group. */
+  editable?: boolean;
+  /** Pending changes exist: enables revert / preview / submit (submit turns green). */
+  hasChanges?: boolean;
+  /** A statement is running: enables "Cancel Running Statements". */
+  running?: boolean;
+  viewMode?: ViewMode;
+  onViewModeChange?: (m: ViewMode) => void;
+
+  /** Transaction mode label ("Auto" / "Manual"); the Tx widget is shown for editable results only. */
+  txMode?: string;
+  onTxMenu?: (anchor: DOMRect) => void;
+
+  /** Extractor format shown in the `CSV ⌄` widget. */
+  extractor?: string;
+  onExtractorMenu?: (anchor: DOMRect) => void;
+
+  onReload?: () => void;
+  onCancel?: () => void;
+  onAddRow?: () => void;
+  onDeleteRows?: () => void;
+  onRevert?: () => void;
+  onPreview?: () => void;
+  onSubmit?: () => void;
+  onDDL?: () => void;
+  onFind?: () => void;
+  onLocalFilter?: () => void;
+  onRecordView?: () => void;
+  onSql?: () => void;
+  onOpenInEditor?: () => void;
+  onExport?: () => void;
+  onManageColumns?: () => void;
+  onOptions?: (anchor: DOMRect) => void;
+}
+
+export function GridToolbar(props: GridToolbarProps): JSX.Element {
+  const [menu, setMenu] = createSignal<{ x: number; y: number; items: MenuItem[] } | null>(null);
+  const mode = () => props.viewMode ?? "table";
+  const ed = () => !!props.editable;
+
+  const openViewAs = (e: MouseEvent) => {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const pick = (m: ViewMode) => () => props.onViewModeChange?.(m);
+    setMenu({
+      x: r.right,
+      y: r.bottom + 2,
+      items: [
+        { label: "Transpose", primary: true, disabled: true },
+        { separator: true },
+        { label: "Table", checked: mode() === "table", onSelect: pick("table") },
+        { label: "Tree", disabled: true },
+        { label: "Text", checked: mode() === "text", onSelect: pick("text") },
+      ],
+    });
+  };
+
+  return (
+    <div class="dgg-tb" role="toolbar">
+      <Btn icon="table" title={mode() === "table" ? "Switch to Text" : "Switch to Table"} selected={mode() === "table"} onClick={() => props.onViewModeChange?.(mode() === "table" ? "text" : "table")} />
+      <Sep />
+      <Btn icon="reload" title="Reload Page" shortcut="Ctrl+F5" onClick={props.onReload} />
+      <Btn icon="stop" title="Cancel Running Statements" shortcut="Ctrl+F2" disabled={!props.running} onClick={props.onCancel} />
+      <Sep />
+      <Btn icon="add" title="Add Row" shortcut="Alt+Insert" disabled={!ed()} onClick={props.onAddRow} />
+      <Btn icon="remove" title="Delete Rows" shortcut="Ctrl+Y" disabled={!ed()} onClick={props.onDeleteRows} />
+      <Btn icon="revert" title="Revert Selected" shortcut="Ctrl+Alt+Z" disabled={!ed() || !props.hasChanges} onClick={props.onRevert} />
+      <Btn icon="preview" title="Preview Pending Changes" disabled={!ed() || !props.hasChanges} onClick={props.onPreview} />
+      <Btn icon="submit" title="Submit" shortcut="Ctrl+Enter" disabled={!ed() || !props.hasChanges} green={ed() && !!props.hasChanges} onClick={props.onSubmit} />
+      <Show when={ed()}>
+        <button
+          class="dgg-tbtn text tx"
+          title="Transaction Mode"
+          tabIndex={-1}
+          onClick={(e) => props.onTxMenu?.((e.currentTarget as HTMLElement).getBoundingClientRect())}
+        >
+          Tx: {props.txMode ?? "Auto"}
+          <i class="dgg-i i-chevron" />
+        </button>
+      </Show>
+      <Sep />
+      <button class="dgg-tbtn text" title="Go to DDL" tabIndex={-1} onClick={() => props.onDDL?.()} disabled={!props.onDDL}>
+        DDL
+      </button>
+      <Sep />
+      <Btn icon="find" title="Find on Current Page" shortcut="Ctrl+F" disabled={!props.onFind} onClick={props.onFind} />
+      <Btn icon="filter" title="Table Result Local Filter" disabled={!props.onLocalFilter} onClick={props.onLocalFilter} />
+      <Btn icon="record" title="Record View" shortcut="Ctrl+Shift+Enter" disabled={!props.onRecordView} onClick={props.onRecordView} />
+
+      <span class="dgg-tspacer" />
+
+      <button class="dgg-tbtn text" title="Show the query that produced this result set" tabIndex={-1} onClick={() => props.onSql?.()} disabled={!props.onSql}>
+        SQL
+      </button>
+      <Btn icon="openTab" title="Open in Editor Tab" disabled={!props.onOpenInEditor} onClick={props.onOpenInEditor} />
+      <Sep />
+      <button
+        class="dgg-tbtn text fmt"
+        title="Extractor"
+        tabIndex={-1}
+        onClick={(e) => props.onExtractorMenu?.((e.currentTarget as HTMLElement).getBoundingClientRect())}
+      >
+        {props.extractor ?? "CSV"}
+        <i class="dgg-i i-chevron" />
+      </button>
+      <Sep />
+      <Btn icon="export" title="Export Data" disabled={!props.onExport} onClick={props.onExport} />
+      <Sep />
+      <Btn icon="columns" title="Manage Columns" shortcut="Ctrl+F12" disabled={!props.onManageColumns} onClick={props.onManageColumns} />
+      <Btn icon="viewAs" title="View as" onClick={openViewAs} />
+      <Btn icon="gear" title="Show Options Menu" disabled={!props.onOptions} onClick={(e) => props.onOptions?.((e.currentTarget as HTMLElement).getBoundingClientRect())} />
+
+      <Show when={menu()}>{(m) => <GridMenu x={m().x} y={m().y} items={m().items} alignRight onClose={() => setMenu(null)} />}</Show>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+
+export interface GridFilterBarProps {
+  where: string;
+  orderBy: string;
+  onWhereChange: (v: string) => void;
+  onOrderByChange: (v: string) => void;
+  /** Enter in either field. */
+  onApply: () => void;
+}
+
+/** `WHERE | ORDER BY` row of the table data editor. */
+export function GridFilterBar(props: GridFilterBarProps): JSX.Element {
+  const half = (
+    kind: "where" | "order",
+    label: string,
+    value: () => string,
+    set: (v: string) => void,
+  ): JSX.Element => (
+    <div class="dgg-fb-half">
+      <i class={"dgg-i " + (kind === "where" ? "i-filter" : "i-sortBy")} />
+      <span class="dgg-fb-label" classList={{ filled: value().length > 0 }}>
+        {label}
+      </span>
+      <input
+        class="dgg-fb-input"
+        value={value()}
+        spellcheck={false}
+        autocomplete="off"
+        onInput={(e) => set(e.currentTarget.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            props.onApply();
+          } else if (e.key === "Escape" && value()) {
+            e.preventDefault();
+            set("");
+          }
+        }}
+      />
+      <Show when={value().length > 0}>
+        <button
+          class="dgg-fb-clear"
+          title="Clear"
+          tabIndex={-1}
+          onClick={() => {
+            set("");
+            props.onApply();
+          }}
+        >
+          {"×"}
+        </button>
+      </Show>
+    </div>
+  );
+  return (
+    <div class="dgg-fb">
+      {half("where", "WHERE", () => props.where, props.onWhereChange)}
+      {half("order", "ORDER BY", () => props.orderBy, props.onOrderByChange)}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+
+export type PageSize = number | "all";
+
+export interface GridPagingPillProps {
+  /** Rows currently loaded. */
+  rowCount: number;
+  /** Known total (after "Count Rows"); shown as `N of M rows`. */
+  totalRows?: number | null;
+  pageSize: PageSize;
+  defaultPageSize?: number;
+  onPageSizeChange?: (size: PageSize) => void;
+  onCountRows?: () => void;
+  onFirstPage?: () => void;
+  onPreviousPage?: () => void;
+  onNextPage?: () => void;
+  onLastPage?: () => void;
+}
+
+const SIZES: PageSize[] = [10, 100, 250, 500, 1000, "all"];
+
+/** Floating pill at the bottom center of the grid. Place it as a child of `<DataGrid>`. */
+export function GridPagingPill(props: GridPagingPillProps): JSX.Element {
+  const [menu, setMenu] = createSignal<{ x: number; y: number; items: MenuItem[] } | null>(null);
+  const label = () => {
+    const n = props.rowCount.toLocaleString("en-US");
+    const noun = props.rowCount === 1 ? "row" : "rows";
+    return props.totalRows != null ? `${n} of ${props.totalRows.toLocaleString("en-US")} ${noun}` : `${n} ${noun}`;
+  };
+  const def = () => props.defaultPageSize ?? 500;
+
+  const openSizes = (e: MouseEvent) => {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    setMenu({
+      x: r.left,
+      y: r.top - 4,
+      items: [
+        { label: "Count Rows", primary: true, disabled: !props.onCountRows, onSelect: props.onCountRows },
+        { separator: true },
+        { label: "Page Size", header: true },
+        ...SIZES.map<MenuItem>((s) => ({
+          label: s === "all" ? "All" : s.toLocaleString("en-US") + (s === def() ? "  Default" : ""),
+          checked: props.pageSize === s,
+          onSelect: () => props.onPageSizeChange?.(s),
+        })),
+      ],
+    });
+  };
+  const openMore = (e: MouseEvent) => {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    setMenu({
+      x: r.left,
+      y: r.top - 4,
+      items: [
+        { label: "First Page", disabled: !props.onFirstPage, onSelect: props.onFirstPage },
+        { label: "Previous Page", shortcut: "Ctrl+Alt+Up", disabled: !props.onPreviousPage, onSelect: props.onPreviousPage },
+        { label: "Next Page", shortcut: "Ctrl+Alt+Down", disabled: !props.onNextPage, onSelect: props.onNextPage },
+        { label: "Last Page", disabled: !props.onLastPage, onSelect: props.onLastPage },
+      ],
+    });
+  };
+
+  return (
+    <div class="dgg-pill">
+      <button class="dgg-pill-main" onClick={openSizes} tabIndex={-1}>
+        <span>{label()}</span>
+        <i class="dgg-i i-chevron" />
+      </button>
+      <span class="dgg-pill-sep" />
+      <button class="dgg-pill-more" onClick={openMore} tabIndex={-1} title="More">
+        <i class="dgg-i i-more" />
+      </button>
+      <Show when={menu()}>{(m) => <GridMenu x={m().x} y={m().y} items={m().items} onClose={() => setMenu(null)} />}</Show>
+    </div>
+  );
+}

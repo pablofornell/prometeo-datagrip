@@ -1,0 +1,15 @@
+/*
+ * Bundled fonts (SIL Open Font License 1.1, see NOTICE).
+ * Inter 4.000 (rsms) - New UI font, 13px.  JetBrains Mono 2.304 - editor/grid font, 13px.
+ * Copied from intellij-community platform/jewel/int-ui/int-ui-standalone/src/main/resources/fonts/.
+ */
+@font-face { font-family: "Inter"; src: url("./fonts/Inter-Regular.ttf") format("truetype"); font-weight: 400; font-style: normal; font-display: block; }
+@font-face { font-family: "Inter"; src: url("./fonts/Inter-Italic.ttf") format("truetype"); font-weight: 400; font-style: italic; font-display: block; }
+@font-face { font-family: "Inter"; src: url("./fonts/Inter-Medium.ttf") format("truetype"); font-weight: 500; font-style: normal; font-display: block; }
+@font-face { font-family: "Inter"; src: url("./fonts/Inter-SemiBold.ttf") format("truetype"); font-weight: 600; font-style: normal; font-display: block; }
+@font-face { font-family: "Inter"; src: url("./fonts/Inter-Bold.ttf") format("truetype"); font-weight: 700; font-style: normal; font-display: block; }
+
+@font-face { font-family: "JetBrains Mono"; src: url("./fonts/JetBrainsMono-Regular.ttf") format("truetype"); font-weight: 400; font-style: normal; font-display: block; }
+@font-face { font-family: "JetBrains Mono"; src: url("./fonts/JetBrainsMono-Italic.ttf") format("truetype"); font-weight: 400; font-style: italic; font-display: block; }
+@font-face { font-family: "JetBrains Mono"; src: url("./fonts/JetBrainsMono-Bold.ttf") format("truetype"); font-weight: 700; font-style: normal; font-display: block; }
+@font-face { font-family: "JetBrains Mono"; src: url("./fonts/JetBrainsMono-BoldItalic.ttf") format("truetype"); font-weight: 700; font-style: italic; font-display: block; }

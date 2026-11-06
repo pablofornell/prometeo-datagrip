@@ -1,0 +1,63 @@
+/*
+ * Tokens that src/theme does not define (or where the measured 2026.3 screenshots differ from the theme
+ * metrics). Loaded after src/theme/*.css. Measured values: docs/ux/datagrip-map.md section 1.
+ */
+:root {
+  /* Window geometry measured at 1600x1000 (the theme metrics use the IntelliJ defaults). */
+  --dg-toolbar-height: 43px;
+  --dg-statusbar-height: 34px;
+  --dg-toolwindow-header-height: 41px;   /* 40px header + 1px bottom border */
+  --dg-body-pad-left: 7px;               /* window bg left of the islands */
+  --dg-body-pad-right: 6px;
+  --dg-gap: 5px;                         /* gap (= splitter) between islands */
+  --dg-island-radius: 10px;
+  --dg-tree-indent: 19px;                /* measured: 19px per level (theme says 18) */
+  --dg-action-button-radius: 6px;
+
+  --dg-toolwindow-button-width: 28px;    /* main toolbar tool window button: 28x30, 20px icon, 40px pitch */
+  --dg-toolwindow-button-height: 30px;
+  --dg-toolbar-tint-start: 70px;
+  --dg-toolbar-tint-end: 700px;
+
+  --dg-menu-row-height: 26px;            /* 24px highlight + 1px margins */
+  --dg-menu-compact-row-height: 24px;
+  --dg-menu-shortcut-gap: 40px;
+
+  --dg-notification-width: 370px;
+  --dg-notification-radius: 8px;
+
+  --dg-dialog-titlebar-height: 40px;
+  --dg-dialog-radius: 10px;
+
+  --dg-font-ui-weight-title: 600;
+}
+
+:root[data-theme="dark"] {
+  --dg-toolbar-tint: #404B2E;                    /* project colour tint fading out from the left */
+  --dg-toolwindow-button-selected-bg: #393A3E;   /* visible tool window button */
+  --dg-toolbar-group-sep: #323438;               /* hairline between toolbar groups */
+  --dg-button-primary-hover-bg: #4A80EE;
+  --dg-button-primary-pressed-bg: #3366CC;
+  --dg-window-btn-hover-bg: #FFFFFF1A;
+  --dg-menu-shadow: 0 6px 20px #00000066;
+  --dg-dialog-overlay: #00000052;
+  --dg-tab-close-hover-bg: #FFFFFF1F;
+  --dg-tab-modified-dot: #9AA7BD;                /* unsaved-changes dot in the tab close slot (guess, see datagrip-map) */
+  --dg-tree-badge-border: #43454A;
+  --dg-spinner-track: #FFFFFF26;
+}
+
+:root[data-theme="light"] {
+  --dg-toolbar-tint: #E3F1D1;
+  --dg-toolwindow-button-selected-bg: #D9D9DD;
+  --dg-toolbar-group-sep: #EBECF0;
+  --dg-button-primary-hover-bg: #4A80EE;
+  --dg-button-primary-pressed-bg: #3366CC;
+  --dg-window-btn-hover-bg: #0000001A;
+  --dg-menu-shadow: 0 6px 20px #00000033;
+  --dg-dialog-overlay: #00000033;
+  --dg-tab-close-hover-bg: #0000001A;
+  --dg-tab-modified-dot: #6C707E;
+  --dg-tree-badge-border: #D1D3D9;
+  --dg-spinner-track: #00000026;
+}

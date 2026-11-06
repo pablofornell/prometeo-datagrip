@@ -1,0 +1,742 @@
+/* UI kit (src/components/ui). Only --dg-* tokens; no hard-coded colors except shadows. */
+
+.dg-icon {
+  display: block;
+  flex: none;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* ---------------------------------------------------------------- ActionButton */
+.dg-action-button {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  padding: 0;
+  border: 0;
+  border-radius: var(--dg-action-button-radius);
+  background: transparent;
+  cursor: default;
+}
+.dg-action-button:hover:not(.dg-disabled) {
+  background: var(--dg-action-button-hover-bg);
+}
+.dg-action-button:active:not(.dg-disabled) {
+  background: var(--dg-action-button-pressed-bg);
+}
+.dg-action-button.dg-selected {
+  background: var(--dg-toolwindow-button-selected-bg);
+}
+.dg-action-button.dg-disabled .dg-icon {
+  opacity: 0.4;
+}
+.dg-action-button-arrow {
+  position: absolute;
+  right: 3px;
+  bottom: 4px;
+  width: 0;
+  height: 0;
+  border-left: 2px solid transparent;
+  border-right: 2px solid transparent;
+  border-top: 2px solid var(--dg-icon);
+  transform: rotate(-45deg) scale(1.2);
+}
+.dg-toolbar-sep {
+  flex: none;
+  width: 1px;
+  height: 16px;
+  margin-left: 1px;
+  background: var(--dg-toolbar-group-sep);
+}
+
+/* ---------------------------------------------------------------- Button */
+.dg-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: var(--dg-control-height);
+  min-width: var(--dg-button-min-width);
+  padding: 0 var(--dg-button-padding-x);
+  border: 1px solid var(--dg-button-border);
+  border-radius: var(--dg-button-radius);
+  background: var(--dg-button-bg);
+  color: var(--dg-button-fg);
+  cursor: default;
+  white-space: nowrap;
+}
+.dg-button:hover:not(:disabled) {
+  background: var(--dg-hover-bg);
+}
+.dg-button:active:not(:disabled) {
+  background: var(--dg-pressed-bg);
+}
+.dg-button:focus-visible {
+  border-color: var(--dg-focus-ring);
+  box-shadow: 0 0 0 1px var(--dg-focus-ring);
+}
+.dg-button:disabled {
+  color: var(--dg-button-disabled-fg);
+  border-color: var(--dg-button-disabled-border);
+}
+.dg-button-primary {
+  background: var(--dg-button-primary-bg);
+  border-color: var(--dg-button-primary-border);
+  color: var(--dg-button-primary-fg);
+}
+.dg-button-primary:hover:not(:disabled) {
+  background: var(--dg-button-primary-hover-bg);
+}
+.dg-button-primary:active:not(:disabled) {
+  background: var(--dg-button-primary-pressed-bg);
+}
+.dg-button-primary:focus-visible {
+  box-shadow: 0 0 0 1px var(--dg-button-primary-focus-inner), 0 0 0 3px var(--dg-focus-ring);
+}
+
+/* ---------------------------------------------------------------- TextField */
+.dg-textfield {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--dg-control-height);
+  min-width: var(--dg-input-min-width);
+  padding: var(--dg-input-padding);
+  background: var(--dg-input-bg);
+  border: 1px solid var(--dg-input-border);
+  border-radius: var(--dg-input-radius);
+}
+.dg-textfield input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--dg-input-fg);
+}
+.dg-textfield input::placeholder {
+  color: var(--dg-input-placeholder);
+}
+.dg-textfield:focus-within {
+  border-color: var(--dg-input-focus-border);
+  box-shadow: inset 0 0 0 1px var(--dg-input-focus-border);
+}
+.dg-textfield.dg-error {
+  border-color: var(--dg-input-error-border);
+  box-shadow: inset 0 0 0 1px var(--dg-input-error-border);
+}
+.dg-textfield.dg-disabled {
+  border-color: var(--dg-input-disabled-border);
+  color: var(--dg-text-disabled);
+}
+.dg-textfield-affix {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+}
+
+/* ---------------------------------------------------------------- Checkbox */
+.dg-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--dg-checkbox-gap);
+  cursor: default;
+}
+.dg-checkbox-box {
+  position: relative;
+  flex: none;
+  width: var(--dg-checkbox-size);
+  height: var(--dg-checkbox-size);
+  border: 1px solid var(--dg-checkbox-border);
+  border-radius: var(--dg-checkbox-radius);
+  background: var(--dg-checkbox-bg);
+  color: var(--dg-checkbox-check);
+}
+.dg-checkbox-box svg {
+  position: absolute;
+  inset: -1px;
+}
+.dg-checkbox.dg-checked .dg-checkbox-box {
+  background: var(--dg-checkbox-selected-bg);
+  border-color: var(--dg-checkbox-selected-border);
+}
+.dg-checkbox:focus-visible .dg-checkbox-box {
+  box-shadow: 0 0 0 2px var(--dg-checkbox-focus);
+}
+.dg-checkbox.dg-disabled {
+  color: var(--dg-text-disabled);
+}
+.dg-checkbox.dg-disabled .dg-checkbox-box {
+  background: var(--dg-checkbox-disabled-bg);
+  border-color: var(--dg-checkbox-disabled-border);
+  color: var(--dg-checkbox-disabled-check);
+}
+
+/* ---------------------------------------------------------------- ComboBox */
+.dg-combo {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  height: var(--dg-control-height);
+  padding: var(--dg-combo-padding);
+  background: var(--dg-combo-bg);
+  border: 1px solid var(--dg-input-border);
+  border-radius: var(--dg-input-radius);
+  text-align: left;
+  cursor: default;
+}
+.dg-combo:focus-visible {
+  border-color: var(--dg-input-focus-border);
+  box-shadow: inset 0 0 0 1px var(--dg-input-focus-border);
+}
+.dg-combo-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dg-combo-text.dg-placeholder {
+  color: var(--dg-input-placeholder);
+}
+.dg-combo-arrow {
+  display: flex;
+  flex: none;
+  opacity: 0.9;
+}
+.dg-combo.dg-disabled {
+  color: var(--dg-text-disabled);
+}
+
+/* ---------------------------------------------------------------- Tabs (Islands pills) */
+.dg-tabs {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.dg-tabs-list {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  gap: 7px;
+  overflow: hidden;
+}
+.dg-tab {
+  display: flex;
+  align-items: center;
+  flex: none;
+  height: var(--dg-tab-pill-height);
+  padding: 0 3px 0 var(--dg-tab-padding-x);
+  border: 1px solid transparent;
+  border-radius: var(--dg-tab-pill-radius);
+  color: var(--dg-tab-inactive-fg);
+  white-space: nowrap;
+}
+.dg-tab:hover:not(.dg-selected) {
+  background: var(--dg-tab-hover-bg);
+}
+.dg-tab.dg-selected {
+  color: var(--dg-tab-fg);
+  background: var(--dg-tab-selected-inactive-bg);
+  border-color: var(--dg-tab-selected-inactive-border);
+}
+/* Focused island: the selected tab gets the blue pill. */
+.dg-island:focus-within .dg-tab.dg-selected,
+.dg-tabs-focused .dg-tab.dg-selected {
+  background: var(--dg-tab-selected-bg);
+  border-color: var(--dg-tab-selected-border);
+}
+.dg-tab-title {
+  margin: 0 4px;
+}
+.dg-tab-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  opacity: 0;
+}
+.dg-tab:hover .dg-tab-close,
+.dg-tab.dg-selected .dg-tab-close,
+.dg-tab-pin {
+  opacity: 1;
+}
+.dg-tab-close:hover {
+  background: var(--dg-tab-close-hover-bg);
+}
+/* modified tab: a dot in the close slot, the × only while the pointer is over the button */
+.dg-tab-close.dg-tab-modified {
+  opacity: 1;
+}
+.dg-tab-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--dg-tab-modified-dot);
+}
+.dg-tab-modified .dg-tab-x,
+.dg-tab-modified:hover .dg-tab-dot {
+  display: none;
+}
+.dg-tab-modified:hover .dg-tab-x {
+  display: block;
+}
+
+/* editor strip: 40px + 1px border, pills 28px */
+.dg-tabs-editor {
+  height: 41px;
+  padding: 0 6px;
+  border-bottom: 1px solid var(--dg-tabs-border);
+}
+
+
+/* result tabs (Database Output header): same 28px pills as the editor tabs, without the strip border */
+.dg-tabs-result .dg-tabs-list {
+  gap: 7px;
+}
+.dg-tabs-result .dg-tab-title {
+  margin: 0 7px 0 4px;
+}
+
+/* dialog pages: text pills */
+.dg-tabs-dialog .dg-tabs-list {
+  gap: 8px;
+}
+.dg-tabs-dialog .dg-tab {
+  height: 26px;
+  padding: 0 8px;
+}
+.dg-tabs-dialog .dg-tab-title {
+  margin: 0;
+}
+.dg-tabs-dialog .dg-tab.dg-selected {
+  background: var(--dg-tab-selected-bg);
+  border-color: var(--dg-tab-selected-border);
+}
+
+/* ---------------------------------------------------------------- Splitter */
+.dg-splitter {
+  flex: none;
+  position: relative;
+  z-index: 5;
+}
+.dg-splitter-vertical {
+  width: var(--dg-gap);
+  cursor: col-resize;
+}
+.dg-splitter-horizontal {
+  height: var(--dg-gap);
+  cursor: row-resize;
+}
+
+/* ---------------------------------------------------------------- Menu / list popup */
+.dg-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 2100; /* above .dg-dialog-overlay (2000): menus and combos open from dialogs */
+}
+.dg-menu {
+  position: fixed;
+  z-index: 2101;
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 8px);
+  overflow-y: auto;
+  padding: 4px 6px 5px;
+  background: var(--dg-menu-bg);
+  border: 1px solid var(--dg-menu-border);
+  border-radius: var(--dg-popup-radius);
+  box-shadow: var(--dg-menu-shadow);
+  white-space: nowrap;
+}
+.dg-menu-row {
+  display: flex;
+  align-items: center;
+  flex: none;
+  height: 24px;
+  margin: 1px 0;
+  padding: 0 5px 0 8px;
+  border-radius: var(--dg-menu-selection-radius);
+}
+.dg-menu-row.dg-active:not(.dg-disabled) {
+  background: var(--dg-list-selection-bg);
+  color: var(--dg-list-selection-fg);
+}
+.dg-menu-row.dg-disabled {
+  color: var(--dg-text-disabled);
+}
+.dg-menu-row.dg-disabled .dg-icon {
+  opacity: 0.4;
+}
+.dg-menu-icon {
+  display: flex;
+  flex: none;
+  width: 16px;
+  margin-right: 5px;
+}
+.dg-menu-label {
+  flex: 1;
+}
+.dg-menu-badge {
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--dg-accent);
+  color: var(--dg-text-over-accent);
+  font-size: 11px;
+  line-height: 15px;
+}
+.dg-menu-shortcut {
+  padding-left: var(--dg-menu-shortcut-gap);
+  color: var(--dg-menu-accelerator-fg);
+}
+.dg-menu-row.dg-disabled .dg-menu-shortcut {
+  color: var(--dg-text-disabled);
+}
+.dg-menu-arrow {
+  display: flex;
+  flex: none;
+  margin-left: 24px;
+  opacity: 0.9;
+}
+.dg-menu-sep {
+  position: relative;
+  flex: none;
+  height: var(--dg-menu-separator-height);
+}
+.dg-menu-sep::after {
+  content: "";
+  position: absolute;
+  left: 1px;
+  right: 1px;
+  top: 4px;
+  height: 1px;
+  background: var(--dg-popup-separator);
+}
+.dg-menu-header {
+  flex: none;
+  padding: 5px 8px 3px 17px;
+  color: var(--dg-popup-separator-fg);
+  font-size: var(--dg-font-size-medium);
+  line-height: 15px;
+}
+.dg-menu-hint {
+  flex: none;
+  max-width: 260px;
+  padding: 6px 17px 8px;
+  color: var(--dg-popup-separator-fg);
+  font-size: var(--dg-font-size-medium);
+  line-height: 15px;
+  white-space: normal;
+}
+.dg-menu-title {
+  flex: none;
+  padding: 6px 0 11px;
+  text-align: center;
+  font-weight: var(--dg-font-ui-weight-title);
+  line-height: 16px;
+}
+.dg-menu-compact {
+  padding: 4px 8px;
+}
+.dg-menu-compact .dg-menu-row {
+  height: var(--dg-menu-compact-row-height);
+  margin: 0;
+}
+
+/* ---------------------------------------------------------------- Tooltip */
+.dg-tooltip {
+  position: fixed;
+  z-index: 3000;
+  max-width: 420px;
+  padding: 7px 12px 8px;
+  border-radius: var(--dg-tooltip-radius);
+  background: var(--dg-tooltip-bg);
+  border: 1px solid var(--dg-tooltip-border);
+  color: var(--dg-tooltip-fg);
+  line-height: 17px;
+  pointer-events: none;
+  box-shadow: var(--dg-menu-shadow);
+}
+.dg-tooltip-shortcut {
+  margin-left: 9px;
+  color: var(--dg-tooltip-shortcut-fg);
+}
+.dg-tooltip-desc {
+  color: var(--dg-tooltip-info-fg);
+}
+
+/* ---------------------------------------------------------------- Notifications */
+.dg-notifications {
+  position: fixed;
+  right: 14px;
+  bottom: calc(var(--dg-statusbar-height) + 8px);
+  z-index: 1500;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: var(--dg-notification-width);
+}
+.dg-notification {
+  display: flex;
+  gap: 6px;
+  padding: 10px 12px 13px 16px;
+  border-radius: var(--dg-notification-radius);
+  background: var(--dg-notification-bg);
+  color: var(--dg-notification-fg);
+  box-shadow: var(--dg-menu-shadow);
+  line-height: 17px;
+}
+.dg-notification-error {
+  background: var(--dg-notification-error-bg);
+}
+.dg-notification-warning {
+  background: var(--dg-notification-warning-bg);
+}
+.dg-notification-icon {
+  margin-top: 1px;
+}
+.dg-notification-content {
+  flex: 1;
+  min-width: 0;
+}
+.dg-notification-title {
+  font-weight: var(--dg-font-ui-weight-title);
+  line-height: 18px;
+  margin-bottom: 2px;
+}
+.dg-notification-actions {
+  display: flex;
+  gap: 12px;
+  margin-top: 2px;
+}
+.dg-notification-close {
+  display: flex;
+  flex: none;
+  height: 16px;
+  opacity: 0.7;
+  visibility: hidden;
+}
+.dg-notification:hover .dg-notification-close {
+  visibility: visible;
+}
+.dg-link {
+  color: var(--dg-notification-link);
+}
+
+/* ---------------------------------------------------------------- Dialog */
+.dg-dialog-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--dg-dialog-overlay);
+}
+.dg-dialog {
+  display: flex;
+  flex-direction: column;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 32px);
+  background: var(--dg-dialog-bg);
+  border: 1px solid var(--dg-popup-border);
+  border-radius: var(--dg-dialog-radius);
+  box-shadow: var(--dg-menu-shadow);
+  overflow: hidden;
+}
+.dg-dialog-titlebar {
+  display: flex;
+  align-items: center;
+  flex: none;
+  height: var(--dg-dialog-titlebar-height);
+  padding: 0 8px 0 16px;
+}
+.dg-dialog-title {
+  flex: 1;
+  font-weight: var(--dg-font-ui-weight-title);
+}
+.dg-dialog-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+}
+.dg-dialog-close:hover {
+  background: var(--dg-action-button-hover-bg);
+}
+.dg-dialog-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px 16px 16px;
+}
+.dg-dialog-body.dg-flush {
+  padding: 0;
+}
+.dg-dialog-footer {
+  display: flex;
+  align-items: center;
+  flex: none;
+  gap: 13px;
+  padding: 13px 15px;
+  border-top: 1px solid var(--dg-border);
+}
+.dg-dialog-footer-left {
+  flex: 1;
+}
+
+/* ---------------------------------------------------------------- Speed search + Tree */
+.dg-speedsearch {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 116px;
+  height: var(--dg-control-height);
+  padding: 0 6px;
+  background: var(--dg-speedsearch-bg);
+  border: 1px solid var(--dg-accent);
+  border-radius: var(--dg-input-radius);
+}
+.dg-speedsearch-text {
+  flex: 1;
+}
+.dg-speedsearch.dg-nomatch .dg-speedsearch-text {
+  color: var(--dg-speedsearch-error-fg);
+}
+.dg-speedsearch-filter {
+  display: flex;
+  border-radius: 4px;
+  opacity: 0.8;
+}
+.dg-speedsearch-filter.dg-on {
+  background: var(--dg-action-button-selected-bg);
+  opacity: 1;
+}
+mark.dg-search-match {
+  background: var(--dg-search-match-bg);
+  color: var(--dg-text-over-accent);
+  border-radius: 2px;
+}
+
+.dg-tree {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 5px 12px 4px;
+  color: var(--dg-tree-fg);
+}
+.dg-tree-inner {
+  position: relative;
+}
+.dg-tree-search {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  height: 0;
+}
+.dg-tree-search > .dg-speedsearch {
+  position: absolute;
+  top: -2px;
+  left: -4px;
+}
+.dg-tree-row {
+  position: absolute;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  height: 24px;
+  border-radius: var(--dg-tree-selection-radius);
+  white-space: nowrap;
+}
+.dg-tree-row.dg-selected {
+  background: var(--dg-tree-selection-inactive-bg);
+  color: var(--dg-tree-selection-inactive-fg);
+}
+.dg-tree:focus-within .dg-tree-row.dg-selected {
+  background: var(--dg-tree-selection-bg);
+  color: var(--dg-tree-selection-fg);
+}
+.dg-tree-chevron {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin-right: 5px;
+}
+.dg-tree-icon {
+  margin-right: 6px;
+}
+.dg-tree-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dg-tree-hint {
+  margin-left: 7px;
+  color: var(--dg-tree-secondary-fg);
+  font-size: var(--dg-font-size-small);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dg-tree-badge {
+  margin-left: 6px;
+  padding: 0 3px;
+  border: 1px solid var(--dg-tree-badge-border);
+  border-radius: 3px;
+  color: var(--dg-tree-secondary-fg);
+  font-size: var(--dg-font-size-small);
+  line-height: 17px;
+}
+.dg-tree-error {
+  margin-left: 7px;
+  color: var(--dg-tree-error-fg);
+  font-size: var(--dg-font-size-small);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dg-tree-empty {
+  padding: 8px;
+  color: var(--dg-text-secondary);
+}
+.dg-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--dg-spinner-track);
+  border-top-color: var(--dg-accent);
+  border-radius: 50%;
+  animation: dg-spin 0.8s linear infinite;
+}
+@keyframes dg-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* main menu bar dropdowns (Swing-style: tighter insets, full-bleed separators) */
+.dg-menu-bar-menu {
+  padding-top: 4px;
+}
+.dg-menu-bar-menu .dg-menu-row {
+  padding-left: 5px;
+}
+.dg-menu-bar-menu .dg-menu-icon {
+  margin-right: 4px;
+}
+.dg-menu-bar-menu .dg-menu-sep::after {
+  left: -6px;
+  right: -6px;
+}

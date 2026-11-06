@@ -1,0 +1,87 @@
+/* Base reset and page-level rules. Components: ui.css, shell.css. Colors/metrics: src/theme, tokens-extra.css. */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--dg-font-ui);
+  font-size: var(--dg-font-size);
+  line-height: 16px;
+  background: var(--dg-window-bg);
+  color: var(--dg-text);
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeSpeed;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+input,
+textarea {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+
+a {
+  color: var(--dg-link);
+  text-decoration: none;
+}
+
+:focus {
+  outline: none;
+}
+
+body.dg-resizing-col,
+body.dg-resizing-col * {
+  cursor: col-resize !important;
+}
+body.dg-resizing-row,
+body.dg-resizing-row * {
+  cursor: row-resize !important;
+}
+
+/* DataGrip scrollbars: 7px rounded translucent thumb, 3px from the edge, no track. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+  background: transparent;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background-color: var(--dg-scrollbar-thumb);
+  background-clip: padding-box;
+  border-radius: 5px;
+  border: 0 solid transparent;
+  border-right-width: 3px;
+}
+::-webkit-scrollbar-thumb:horizontal {
+  border-right-width: 0;
+  border-bottom-width: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--dg-scrollbar-thumb-hover);
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}

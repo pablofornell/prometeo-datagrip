@@ -1,0 +1,357 @@
+/*
+ * Prometeo DataGrip - Light theme tokens.
+ * Source of truth: JetBrains "Islands Light" (DataGrip 2026.3), resolved through its parent chain
+ * darcula.theme.json -> intellijlaf.theme.json -> expUI/expUI_light.theme.json ->
+ * expUI/expUI_light_with_light_header.theme.json -> islands/ManyIslandsLight.theme.json,
+ * and editor scheme "Light" (expUI/expUI_lightScheme.xml -> Default).
+ * See docs/ux/theme-tokens.md for every value's source file:line. Hex with 8 digits = #RRGGBBAA.
+ * Token names are identical to dark.css.
+ */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  /* ---- Core surfaces ---- */
+  --dg-window-bg: #E9EAEE;
+  --dg-island-bg: #FFFFFF;
+  --dg-panel-bg: #F7F8F9;               /* *.background = dialog-bg */
+  --dg-dialog-bg: #F7F8F9;
+  --dg-layer-1-bg: #F7F8F9;
+  --dg-layer-2-bg: #FFFFFF;
+  --dg-border: #E9EAEE;
+  --dg-separator: #E9EAEE;
+  --dg-splitter: #E9EAEE;
+
+  /* ---- Text ---- */
+  --dg-text: #000000;
+  --dg-text-secondary: #73767C;
+  --dg-text-muted: #5F6269;
+  --dg-text-disabled: #9FA2A8;
+  --dg-text-over-accent: #FFFFFF;
+  --dg-text-error: #C54E58;
+  --dg-text-warning: #A56906;
+  --dg-text-success: #338555;
+
+  /* ---- Accent / state ---- */
+  --dg-accent: #3871E1;
+  --dg-focus-ring: #3871E1;
+  --dg-hover-bg: #00000012;
+  --dg-pressed-bg: #00000020;
+  --dg-row-hover-bg: #00000008;
+  --dg-selection-bg: #D0DFFE;
+  --dg-selection-inactive-bg: #E9EAEE;
+  --dg-selection-muted-bg: #E3EBFE;
+  --dg-selection-fg: #000000;
+
+  /* ---- Main toolbar ---- */
+  --dg-toolbar-bg: #E9EAEE;
+  --dg-toolbar-inactive-bg: #E9EAEE;
+  --dg-toolbar-fg: #000000;
+  --dg-toolbar-separator: #00000020;
+  --dg-toolbar-button-hover-bg: #00000012;
+  --dg-toolbar-button-pressed-bg: #00000020;
+  --dg-toolbar-selected-bg: #D0DFFE;
+  --dg-toolbar-run-bg: #4E9D6C;
+  --dg-toolbar-run-hover-bg: #338555;
+  --dg-toolbar-stop-bg: #E4656E;
+  --dg-toolbar-stop-hover-bg: #C54E58;
+
+  /* ---- Tool window stripe ---- */
+  --dg-stripe-bg: #E9EAEE;
+  --dg-stripe-separator: #00000020;
+  --dg-stripe-button-fg: #5F6269;
+  --dg-stripe-button-hover-bg: #00000012;
+  --dg-stripe-button-selected-bg: #3871E1;
+  --dg-stripe-button-selected-fg: #FFFFFF;
+
+  /* ---- Tool window ---- */
+  --dg-toolwindow-bg: #FFFFFF;
+  --dg-toolwindow-header-bg: #FFFFFF;   /* header is transparent over ToolWindow.background */
+  --dg-toolwindow-header-inactive-bg: #FFFFFF;
+  --dg-toolwindow-header-border: #E9EAEE;
+  --dg-toolwindow-header-fg: #000000;
+
+  /* ---- Editor tabs (Islands pill style) ---- */
+  --dg-tabs-bg: #FFFFFF;
+  --dg-tabs-border: #E9EAEE;
+  --dg-tab-fg: #000000;
+  --dg-tab-inactive-fg: #000000BF;      /* EditorTabs.unselectedAlpha 0.75 */
+  --dg-tab-hover-bg: #00000012;
+  --dg-tab-selected-bg: #E3EBFE;
+  --dg-tab-selected-border: #A7C5FF;
+  --dg-tab-selected-inactive-bg: #E9EAEE;
+  --dg-tab-selected-inactive-border: #D1D3D9;
+  --dg-tab-underline: #3871E1;
+  --dg-tab-inactive-underline: #DDDFE4;
+
+  /* ---- Tree ---- */
+  --dg-tree-bg: #FFFFFF;                /* inside tool windows (Tree.background #F7F8F9 elsewhere) */
+  --dg-tree-fg: #000000;
+  --dg-tree-hover-bg: #00000008;
+  --dg-tree-selection-bg: #D0DFFE;
+  --dg-tree-selection-fg: #000000;
+  --dg-tree-selection-inactive-bg: #E9EAEE;
+  --dg-tree-selection-inactive-fg: #000000;
+  --dg-tree-indent-guide: #E9EAEE;
+  --dg-tree-secondary-fg: #73767C;
+  --dg-tree-error-fg: #C54E58;
+
+  /* ---- List / popup / menu ---- */
+  --dg-list-bg: #FFFFFF;
+  --dg-list-hover-bg: #00000008;
+  --dg-list-selection-bg: #D0DFFE;
+  --dg-list-selection-inactive-bg: #E9EAEE;
+  --dg-list-selection-fg: #000000;
+  --dg-popup-bg: #FFFFFF;
+  --dg-popup-border: #D1D3D9;
+  --dg-popup-inactive-border: #ABABAB;
+  --dg-popup-header-bg: #FFFFFF;
+  --dg-popup-header-inactive-fg: #73767C;
+  --dg-popup-separator: #E9EAEE;
+  --dg-popup-separator-fg: #73767C;
+  --dg-popup-advertiser-bg: #F7F8F9;
+  --dg-popup-advertiser-fg: #73767C;
+  --dg-popup-shadow: 0 0 16px 0 #00000010;
+  --dg-menu-bg: #FFFFFF;
+  --dg-menu-border: #E9EAEE;
+  --dg-menu-accelerator-fg: #73767C;
+  --dg-completion-bg: #FFFFFF;          /* LOOKUP_COLOR */
+  --dg-completion-fg: #080808;
+  --dg-completion-match-fg: #2F5EB9;
+  --dg-completion-selection-bg: #D0DFFE;
+  --dg-completion-selection-inactive-bg: #E9EAEE;
+  --dg-speedsearch-bg: #FFFFFF;
+  --dg-speedsearch-border: #D1D3D9;
+  --dg-speedsearch-error-fg: #C54E58;
+  --dg-search-match-bg: #FEE6B1;
+
+  /* ---- Buttons ---- */
+  --dg-button-bg: #FFFFFF;
+  --dg-button-fg: #000000;
+  --dg-button-border: #D1D3D9;
+  --dg-button-focus-inner: #F7F8F9;
+  --dg-button-primary-bg: #3871E1;
+  --dg-button-primary-fg: #FFFFFF;
+  --dg-button-primary-border: #3871E1;
+  --dg-button-primary-focus-inner: #F7F8F9;
+  --dg-button-disabled-fg: #9FA2A8;
+  --dg-button-disabled-border: #DDDFE4;
+  --dg-action-button-hover-bg: #00000012;
+  --dg-action-button-pressed-bg: #00000020;
+  --dg-action-button-selected-bg: #D0DFFE;
+
+  /* ---- Text fields / combo ---- */
+  --dg-input-bg: #FFFFFF;
+  --dg-input-fg: #000000;
+  --dg-input-border: #D1D3D9;
+  --dg-input-focus-border: #3871E1;
+  --dg-input-disabled-bg: #F7F8F9;
+  --dg-input-disabled-border: #DDDFE4;
+  --dg-input-placeholder: #73767C;
+  --dg-input-error-border: #E4656E;
+  --dg-input-error-inactive-border: #FFC4C5;
+  --dg-input-warning-border: #C28013;
+  --dg-input-warning-inactive-border: #F4CD9A;
+  --dg-combo-bg: #FFFFFF;
+  --dg-combo-editable-bg: #FFFFFF;
+  --dg-combo-arrow-fg: #6E6E6E;
+  --dg-combo-popup-bg: #FFFFFF;
+
+  /* ---- Checkbox / radio (Islands Light icons.ColorPalette) ---- */
+  --dg-checkbox-bg: #FFFFFF;
+  --dg-checkbox-border: #A8ADBD;
+  --dg-checkbox-selected-bg: #3574F0;
+  --dg-checkbox-selected-border: #3574F0;
+  --dg-checkbox-check: #FFFFFF;
+  --dg-checkbox-focus: #3574F0;
+  --dg-checkbox-disabled-bg: #F7F8FA;
+  --dg-checkbox-disabled-border: #DFE1E5;
+  --dg-checkbox-disabled-check: #C9CCD6;
+  --dg-toggle-on-bg: #3871E1;
+  --dg-toggle-off-bg: #00000030;
+
+  /* ---- Scrollbars ---- */
+  --dg-scrollbar-track: #80808000;
+  --dg-scrollbar-track-hover: #8080801A;
+  --dg-scrollbar-thumb: #73737333;
+  --dg-scrollbar-thumb-border: #59595933;
+  --dg-scrollbar-thumb-hover: #73737347;
+  --dg-scrollbar-thumb-hover-border: #59595947;
+
+  /* ---- Tooltips ---- */
+  --dg-tooltip-bg: #FFFFFF;
+  --dg-tooltip-fg: #000000;
+  --dg-tooltip-border: #D1D3D9;
+  --dg-tooltip-info-fg: #5F6269;
+  --dg-tooltip-shortcut-fg: #73767C;
+  --dg-help-tooltip-bg: #FFFFFF;
+  --dg-editor-tooltip-bg: #FFFFFF;
+  --dg-editor-tooltip-border: #D1D3D9;
+  --dg-editor-tooltip-error-bg: #FFF6F5;
+  --dg-editor-tooltip-error-border: #FFC4C5;
+  --dg-editor-tooltip-warning-bg: #FFF6E9;
+  --dg-editor-tooltip-warning-border: #F4CD9A;
+
+  /* ---- Notifications / banners / validation ---- */
+  --dg-notification-bg: #FFFFFF;
+  --dg-notification-border: #D1D3D9;
+  --dg-notification-fg: #000000;
+  --dg-notification-link: #2F5EB9;
+  --dg-notification-button-bg: #FFFFFF;
+  --dg-notification-button-border: #00000030;
+  --dg-notification-error-bg: #FFF6F5;
+  --dg-notification-error-border: #FFC4C5;
+  --dg-notification-warning-bg: #FFF6E9;
+  --dg-notification-warning-border: #F4CD9A;
+  --dg-notification-info-bg: #FFFFFF;
+  --dg-banner-info-bg: #F7F8FF;
+  --dg-banner-info-border: #BDD3FF;
+  --dg-banner-error-bg: #FFF6F5;
+  --dg-banner-error-border: #FFC4C5;
+  --dg-banner-warning-bg: #FFF6E9;
+  --dg-banner-warning-border: #F4CD9A;
+  --dg-banner-success-bg: #F5FAF3;
+  --dg-banner-success-border: #BBDBC2;
+  --dg-validation-error-bg: #FFF6F5;
+  --dg-validation-error-border: #FFC4C5;
+  --dg-validation-error-fg: #000000;
+  --dg-validation-warning-bg: #FFF6E9;
+  --dg-validation-warning-border: #F4CD9A;
+  --dg-validation-warning-fg: #000000;
+
+  /* ---- Status bar ---- */
+  --dg-statusbar-bg: #E9EAEE;
+  --dg-statusbar-border: transparent;
+  --dg-statusbar-fg: #5F6269;
+  --dg-statusbar-hover-fg: #000000;
+  --dg-statusbar-hover-bg: #00000012;
+  --dg-statusbar-breadcrumb-fg: #5F6269;
+
+  /* ---- Links / semantic ---- */
+  --dg-link: #2F5EB9;
+  --dg-link-hover: #2F5EB9;
+  --dg-link-visited: #2F5EB9;
+  --dg-error: #E4656E;
+  --dg-warning: #C28013;
+  --dg-success: #4E9D6C;
+  --dg-counter-bg: #8B8E94;
+  --dg-counter-fg: #FFFFFF;
+  --dg-progress-fg: #3871E1;
+  --dg-progress-track: #DDDFE4;
+
+  /* ---- Swing tables ---- */
+  --dg-table-bg: #F7F8F9;
+  --dg-table-grid: #E9EAEE;
+  --dg-table-stripe: #FFFFFF;
+  --dg-table-hover-bg: #00000008;
+  --dg-table-header-bg: #F7F8F9;
+  --dg-table-header-separator: #E9EAEE;
+  --dg-table-selection-bg: #D0DFFE;
+  --dg-table-selection-inactive-bg: #E9EAEE;
+
+  /* ---- DataGrip data grid (editor-scheme driven) ---- */
+  --dg-grid-bg: #FFFFFF;
+  --dg-grid-fg: #080808;
+  --dg-grid-line: #EBECF0;              /* INDENT_GUIDE */
+  --dg-grid-header-bg: #FFFFFF;
+  --dg-grid-header-fg: #000000;
+  --dg-grid-row-number-fg: #AEB3C2;
+  --dg-grid-row-number-current-fg: #767A8A;
+  --dg-grid-current-row-bg: #F5F8FE;    /* CARET_ROW_COLOR */
+  --dg-grid-stripe-bg: #F5F8FE;
+  --dg-grid-hover-bg: #00000008;
+  --dg-grid-selection-bg: #A6D2FF;      /* SELECTION_BACKGROUND */
+  --dg-grid-null-fg: #8C8C8C;           /* DEFAULT_LINE_COMMENT, italic */
+  --dg-grid-modified-bg: #C2D8F2;       /* DIFF_MODIFIED */
+  --dg-grid-inserted-bg: #BEE6BE;       /* DIFF_INSERTED */
+  --dg-grid-deleted-bg: #D6D6D6;        /* DIFF_DELETED */
+  --dg-grid-error-underline: #FF0000;
+
+  /* ---- Editor (scheme "Light") ---- */
+  --dg-editor-bg: #FFFFFF;
+  --dg-editor-fg: #080808;
+  --dg-editor-caret: #000000;
+  --dg-editor-caret-row: #F5F8FE;
+  --dg-editor-selection-bg: #A6D2FF;
+  --dg-editor-selection-inactive-bg: #B5B7BD;
+  --dg-editor-gutter-bg: #FFFFFF;
+  --dg-editor-line-number: #AEB3C2;
+  --dg-editor-line-number-current: #767A8A;
+  --dg-editor-indent-guide: #EBECF0;
+  --dg-editor-indent-guide-selected: #AEB3C2;
+  --dg-editor-right-margin: #EBECF0;
+  --dg-editor-whitespace: #ADADAD;
+  --dg-editor-method-separator: #DFE1E5;
+  --dg-editor-tearline: #D4D4D4;
+  --dg-editor-added-line: #7FC784;
+  --dg-editor-modified-line: #88ADF7;
+  --dg-editor-deleted-line: #767A8A;
+  --dg-editor-doc-bg: #FFFFFF;
+  --dg-editor-lookup-bg: #FFFFFF;
+  --dg-editor-error-hint-bg: #FFE8E8;
+  --dg-editor-notification-bg: #FFF8E3;
+
+  /* syntax */
+  --dg-editor-keyword: #0033B3;
+  --dg-editor-string: #067D17;
+  --dg-editor-string-escape: #0037A6;
+  --dg-editor-number: #1750EB;
+  --dg-editor-line-comment: #8C8C8C;    /* italic */
+  --dg-editor-block-comment: #8C8C8C;   /* italic */
+  --dg-editor-doc-comment: #8C8C8C;     /* italic */
+  --dg-editor-identifier: #000000;
+  --dg-editor-function-call: #000000;
+  --dg-editor-function-declaration: #00627A;
+  --dg-editor-static-method: #00627A;   /* italic; SQL_PROCEDURE */
+  --dg-editor-instance-method: #00627A; /* not set in Light: falls back to function declaration */
+  --dg-editor-parameter: #000000;
+  --dg-editor-field: #871094;           /* SQL_COLUMN */
+  --dg-editor-constant: #871094;        /* italic */
+  --dg-editor-metadata: #9E880D;
+  --dg-editor-operator: #080808;        /* Light leaves operators/punctuation at TEXT color */
+  --dg-editor-sql-synthetic: #080808;   /* SQL_SYNTHETIC_ENTITY -> PREDEFINED_SYMBOL (italic only) */
+  --dg-editor-sql-outer-column: #660E7A; /* SQL_OUTER_QUERY_COLUMN bold + underline (SqlDefault.xml) */
+  --dg-editor-bad-char: #080808;        /* BAD_CHARACTER: bg #FFCCCC, no fg */
+  --dg-editor-bad-char-bg: #FFCCCC;
+  --dg-editor-error-wave: #FF0000;
+  --dg-editor-error-stripe: #CF5B56;
+  --dg-editor-wrong-ref: #F50000;
+  --dg-editor-warning-wave: #F2BF57;    /* Light WARNING_ATTRIBUTES uses bg #FCF4D4 + stripe #F2BF57 */
+  --dg-editor-warning-bg: #FCF4D4;
+  --dg-editor-warning-stripe: #F2BF57;
+  --dg-editor-weak-warning-wave: #CCCCCC;
+  --dg-editor-typo-wave: #B0D1AB;
+  --dg-editor-unused: #808080;
+  --dg-editor-deprecated: #404040;
+  --dg-editor-search-bg: #FCD47E;
+  --dg-editor-search-border: transparent;
+  --dg-editor-usage-bg: #CCCCFF;
+  --dg-editor-usage-write-bg: #FFCDFF;
+  --dg-editor-identifier-under-caret-bg: #EDEBFC;
+  --dg-editor-identifier-under-caret-write-bg: #FCE8F4;
+  --dg-editor-matched-brace-bg: #93D9D9;
+  --dg-editor-unmatched-brace-fg: #080808;
+  --dg-editor-unmatched-brace-bg: #FFDCDC;
+  --dg-editor-folded-fg: #414D41;
+  --dg-editor-folded-bg: #E9F5E6;
+  --dg-editor-hyperlink: #006DCC;
+  --dg-editor-injected-bg: #EDFCED;
+  --dg-editor-inlay-fg: #7A7A7A;
+  --dg-editor-inlay-bg: #EDEDED;
+  --dg-editor-todo: #008DDE;
+  --dg-editor-live-template: #0055FF;
+  --dg-editor-statement-to-execute: #3D7A49; /* not set in Light/Default; dark value reused (gap) */
+
+  /* console / output */
+  --dg-console-bg: #FFFFFF;
+  --dg-console-fg: #000000;
+  --dg-console-error: #7F0000;
+  --dg-console-system: #00007F;
+  --dg-console-user-input: #007F00;
+  --dg-log-info: #00CD00;
+  --dg-log-verbose: #0000EE;
+  --dg-log-debug: #00CCCC;
+
+  /* icons */
+  --dg-icon: #6C707E;                   /* light SVG stroke as shipped (icon-default-stroke token is #73767C) */
+  --dg-icon-disabled: #C3C5CB;
+}

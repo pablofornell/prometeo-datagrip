@@ -1,0 +1,107 @@
+/* Database Explorer: only what the shared Tree / toolbar styles do not cover. */
+.dg-explorer-ds-icon {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+}
+.dg-explorer-ds-icon .dg-icon {
+  margin: 0;
+}
+.dg-explorer-ds-icon .dg-spinner {
+  flex: none;
+}
+/* "connected" marker: small green dot at the lower right of the DBMS icon */
+.dg-explorer-dot {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #1fd11f;
+  box-shadow: 0 0 0 1px rgba(25, 26, 28, 0.55);
+}
+.dg-explorer-synth {
+  color: var(--dg-tree-secondary-fg);
+  font-size: var(--dg-font-size-medium);
+}
+.dg-explorer-loading {
+  color: var(--dg-tree-secondary-fg);
+  font-style: italic;
+}
+.dg-explorer-error {
+  color: var(--dg-tree-error-fg);
+}
+.dg-explorer-toolbar {
+  position: relative;
+}
+/* speed search field replaces the first toolbar buttons while typing (DataGrip) */
+.dg-explorer-search {
+  position: absolute;
+  top: 3px;
+  left: 8px;
+  z-index: 2;
+}
+.dg-explorer-ddl {
+  width: auto !important;
+  padding: 0 4px;
+  font-size: var(--dg-font-size-medium);
+  font-weight: 400;
+  color: var(--dg-icon);
+}
+.dg-explorer-ddl.dg-disabled {
+  opacity: 0.4;
+}
+/* names stay whole; the gray hint is what gets cut at the right edge */
+.dg-explorer-tree .dg-tree-label {
+  flex: none;
+}
+.dg-explorer-tree .dg-tree-hint {
+  min-width: 0;
+  margin-left: 10px;
+}
+.dg-explorer-tree .dg-tree-hint.dg-explorer-count {
+  margin-left: 8px;
+}
+.dg-explorer-sql {
+  margin: 10px 0 0;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: var(--dg-layer-1-bg);
+  font-family: var(--dg-font-mono, "JetBrains Mono", monospace);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.dg-explorer-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px 0;
+}
+.dg-explorer-empty-label {
+  padding: 4px 2px 2px;
+  color: var(--dg-text-secondary);
+  font-size: var(--dg-font-size-medium);
+}
+.dg-explorer-empty-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--dg-layer-1-bg);
+  color: var(--dg-text);
+  font: inherit;
+  text-align: left;
+  cursor: default;
+}
+.dg-explorer-empty-btn:hover {
+  background: var(--dg-layer-2-bg);
+}
