@@ -31,7 +31,7 @@ describe("settings page tree", () => {
 
   it("builds visible rows from the expanded set", () => {
     const rows = visibleRows(PAGES, (id) => id === "editor");
-    expect(rows.map((r) => r.node.id)).toEqual(["database", "appearance-behavior", "keymap", "editor", "editor.general", "editor.font"]);
+    expect(rows.map((r) => r.node.id)).toEqual(["database", "appearance-behavior", "keymap", "editor", "editor.general", "editor.font", "editor.color-scheme", "editor.code-style"]);
     expect(rows.find((r) => r.node.id === "editor.general")?.depth).toBe(1);
   });
 
@@ -39,5 +39,16 @@ describe("settings page tree", () => {
     expect(pathOf("editor.general.appearance")!.map((n) => n.title)).toEqual(["Editor", "General", "Appearance"]);
     expect(findNode("keymap")?.title).toBe("Keymap");
     expect(firstLeaf(filterTree("theme"))?.id).toBe("appearance");
+  });
+});
+
+describe("settings search finds the new pages", () => {
+  it("by their option texts", () => {
+    expect(ids(filterTree("font"))).toEqual(expect.arrayContaining(["appearance", "editor.font"]));
+    expect(ids(filterTree("bad token"))).toContain("editor.color-scheme.sql");
+    expect(ids(filterTree("keywords case"))).toContain("editor.code-style.sql");
+    expect(ids(filterTree("compact mode"))).toContain("appearance");
+    expect(ids(filterTree("alternate row"))).toContain("database.data-editor");
+    expect(ids(filterTree("add keyboard shortcut"))).toContain("keymap");
   });
 });

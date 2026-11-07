@@ -1,11 +1,17 @@
 import { For, Show, type JSX } from "solid-js";
 import { AGGREGATORS, aggregatorChoice, aggregatorText, focusArea, setAggregator, status, tasks } from "../../state/status";
+import { hideToolWindow, isToolWindowVisible, showToolWindow } from "../../state/layout";
 import { activeTabId } from "../../state/tabs";
 import { Icon } from "../ui/Icon";
-import { openMenu } from "../ui";
+import { openMenu, tip, unreadNotificationCount } from "../ui";
 
 /** The result grid of the active console tab, while it has the focus: its cell position / aggregate replace the caret. */
 const gridStatus = () => (focusArea() === "grid" && status.grid?.tabId === activeTabId() ? status.grid : null);
+/** `, 2 line breaks` of a multi-line selection (the caret widget reads `1:19 (5 chars, 2 line breaks)`). */
+const selBreaks = (c: object): string => {
+  const b = (c as { breaks?: number }).breaks ?? 0;
+  return b ? `, ${b} line break${b === 1 ? "" : "s"}` : "";
+};
 const position = () => (gridStatus() ? gridStatus()!.pos : status.caret);
 /** Aggregator widget: only while a grid has the focus (it is a grid selection aggregate). */
 const aggregator = () => {
@@ -95,6 +101,9 @@ export function StatusBar(): JSX.Element {
           {(c) => (
             <span class="dg-status-widget">
               {c().line}:{c().col}
+              <Show when={"chars" in c() && (c() as { chars?: number }).chars}>
+                {(n) => <>{` (${n()} char${n() === 1 ? "" : "s"}${selBreaks(c())})`}</>}
+              </Show>
             </span>
           )}
         </Show>
@@ -113,6 +122,18 @@ export function StatusBar(): JSX.Element {
             <Icon name="dg/locked" class={status.readOnly ? "" : "dg-dim"} />
           </span>
         </Show>
+        {/* notifications bell: opens the Notifications tool window; the blue dot marks unread entries */}
+        <span
+          class="dg-status-widget dg-status-icon dg-status-bell dg-clickable"
+          {...tip("Notifications")}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => (isToolWindowVisible("notifications") ? hideToolWindow("notifications") : showToolWindow("notifications"))}
+        >
+          <Icon name="notifications" />
+          <Show when={unreadNotificationCount() > 0 && !isToolWindowVisible("notifications")}>
+            <i class="dg-status-dot" />
+          </Show>
+        </span>
       </div>
     </footer>
   );

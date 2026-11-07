@@ -11,7 +11,7 @@
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,8 @@ pub use tokio_util::sync::CancellationToken;
 use crate::conn::Conn;
 use crate::error::{DbError, Result};
 use crate::exec::open_stream;
-use crate::manager::ConnectionManager;
+use crate::fsutil;
+use crate::manager::{cancel_target_of, interrupt, ConnectionManager};
 use crate::model::Driver;
 use crate::quote::{qualified, quote_ident, quote_literal};
 
@@ -123,6 +124,8 @@ pub struct RecordReader<R: Read> {
     fed: u64,
     delim: Vec<u8>,
     quote: Option<u8>,
+    /// Checked before every read, so a huge file can be cancelled while it is scanned.
+    cancel: Option<CancellationToken>,
 }
 
 impl<R: Read> RecordReader<R> {
@@ -154,7 +157,13 @@ impl<R: Read> RecordReader<R> {
             fed: 0,
             delim,
             quote,
+            cancel: None,
         })
+    }
+
+    /// Makes reading fail with [`DbError::Cancelled`] once `token` is cancelled.
+    pub fn set_cancel(&mut self, token: CancellationToken) {
+        self.cancel = Some(token);
     }
 
     /// Bytes read from the source and already consumed by returned records.
@@ -163,6 +172,9 @@ impl<R: Read> RecordReader<R> {
     }
 
     fn fill(&mut self) -> Result<()> {
+        if self.cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+            return Err(DbError::Cancelled);
+        }
         if self.pos > 0 && self.pos == self.buf.len() {
             self.buf.clear();
             self.pos = 0;
@@ -208,13 +220,23 @@ impl<R: Read> RecordReader<R> {
                 }
                 Parsed::End => return Ok(None),
                 Parsed::NeedMore => {
-                    if self.buf.len() - self.pos > MAX_RECORD_BYTES {
+                    let have = self.buf.len() - self.pos;
+                    if have > MAX_RECORD_BYTES {
                         return Err(DbError::InvalidArgument(
                             "A record is longer than 64 MB: is a quote character unbalanced?"
                                 .into(),
                         ));
                     }
-                    self.fill()?;
+                    // The record is parsed again from its start after every read: read until the part
+                    // buffered doubles (not one chunk at a time), so the total work stays linear in
+                    // the size of the record instead of quadratic.
+                    let target = (have * 2).clamp(have + 1, MAX_RECORD_BYTES + 1);
+                    loop {
+                        self.fill()?;
+                        if self.eof || self.buf.len() - self.pos >= target {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -307,6 +329,11 @@ pub struct Source {
 }
 
 impl Source {
+    /// Makes reading rows fail with [`DbError::Cancelled`] once `token` is cancelled.
+    pub fn set_cancel(&mut self, token: CancellationToken) {
+        self.reader.set_cancel(token);
+    }
+
     pub fn open(path: &Path, fmt: &ImportFormat) -> Result<Source> {
         let file = File::open(path).map_err(|e| {
             DbError::InvalidArgument(format!("Cannot read {}: {e}", path.display()))
@@ -683,10 +710,26 @@ pub fn category(type_name: &str) -> Category {
     if t == "bool" || t == "boolean" || t.starts_with("tinyint(1)") {
         return Category::Bool;
     }
+    // exact names only: `point`, `int4range` or the arrays `integer[]` / `int4[]` are text
     let base = t.split(['(', ' ']).next().unwrap_or("");
-    if base.contains("serial")
-        || (base.starts_with("int") && base != "interval")
-        || base.ends_with("int")
+    if matches!(
+        base,
+        "int"
+            | "int2"
+            | "int4"
+            | "int8"
+            | "integer"
+            | "smallint"
+            | "mediumint"
+            | "bigint"
+            | "tinyint"
+            | "serial"
+            | "serial2"
+            | "serial4"
+            | "serial8"
+            | "smallserial"
+            | "bigserial"
+    ) || t.starts_with("unsigned big int")
     {
         Category::Int
     } else if matches!(
@@ -729,6 +772,17 @@ fn to_literal(d: Driver, cat: Category, v: Option<&str>) -> std::result::Result<
         return Ok("NULL".into());
     };
     if cat == Category::Text {
+        if v.contains('\0') && d != Driver::MySql {
+            return Err(format!(
+                "'{}' contains a NUL character, which {} cannot store in text",
+                clip(&v.replace('\0', "\\0")),
+                if d == Driver::Postgres {
+                    "PostgreSQL"
+                } else {
+                    "SQLite"
+                }
+            ));
+        }
         return Ok(quote_literal(d, v));
     }
     let t = v.trim();
@@ -812,6 +866,11 @@ pub struct ImportOptions {
     pub abort_on_error: bool,
     /// Where to write the failing rows; nothing is written when no row fails.
     pub error_file: Option<PathBuf>,
+    /// `error_file` is a place the user picked in a save dialog (which asked before replacing): an existing file
+    /// is replaced. Otherwise an existing file is never touched: the rows go to `name-2.ext`, `name-3.ext`...
+    /// Set by the backend only, never read from the request.
+    #[serde(skip)]
+    pub error_file_replace: bool,
     /// Rows per `INSERT` (default 500).
     pub batch_size: usize,
 }
@@ -822,6 +881,7 @@ impl Default for ImportOptions {
             insert_inconvertible_as_null: false,
             abort_on_error: false,
             error_file: None,
+            error_file_replace: false,
             batch_size: 500,
         }
     }
@@ -918,9 +978,27 @@ async fn run(conn: &mut Conn, sql: &str) -> Result<()> {
     Ok(())
 }
 
+/// [`run`], abandoned with [`DbError::Cancelled`] as soon as `cancel` fires (a statement blocked on a lock does
+/// not return by itself). The connection is in an unknown state then: the caller interrupts the server and
+/// closes it.
+async fn run_c(conn: &mut Conn, sql: &str, cancel: &CancellationToken) -> Result<()> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(DbError::Cancelled),
+        r = run(conn, sql) => r,
+    }
+}
+
+/// How long closing an abandoned connection may take.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Writes the failing rows lazily (no file unless something fails).
 struct ErrorLog {
     path: Option<PathBuf>,
+    /// Replace an existing file at `path` (see [`ImportOptions::error_file_replace`]).
+    replace: bool,
+    /// Where the rows really went (`path`, or the free name next to it).
+    written_to: Option<PathBuf>,
     out: Option<BufWriter<File>>,
     failed_to_open: Option<String>,
     first: Vec<ImportRowError>,
@@ -938,8 +1016,16 @@ impl ErrorLog {
         }
         if self.out.is_none() && self.failed_to_open.is_none() {
             if let Some(p) = &self.path {
-                match File::create(p) {
-                    Ok(f) => self.out = Some(BufWriter::new(f)),
+                let opened = if self.replace {
+                    fsutil::create_or_truncate_nofollow(p).map(|f| (f, p.clone()))
+                } else {
+                    fsutil::create_new_unique(p)
+                };
+                match opened {
+                    Ok((f, at)) => {
+                        self.out = Some(BufWriter::new(f));
+                        self.written_to = Some(at);
+                    }
                     Err(e) => {
                         self.failed_to_open = Some(format!("Cannot create {}: {e}", p.display()))
                     }
@@ -999,6 +1085,14 @@ impl ConnectionManager {
         if req.table.trim().is_empty() {
             return Err(DbError::InvalidArgument("The table name is empty".into()));
         }
+        if req.table.contains('\0')
+            || req.schema.as_deref().is_some_and(|s| s.contains('\0'))
+            || req.columns.iter().any(|c| c.name.contains('\0'))
+        {
+            return Err(DbError::InvalidArgument(
+                "A name contains a NUL character".into(),
+            ));
+        }
         let active: Vec<&ImportColumn> =
             req.columns.iter().filter(|c| c.source.is_some()).collect();
         if active.is_empty() {
@@ -1039,6 +1133,7 @@ impl ConnectionManager {
             None
         };
         let mut src = Source::open(&req.path, &req.format)?;
+        src.set_cancel(cancel.clone());
         let width = src.columns.len();
         let table = qualified(d, req.schema.as_deref(), &req.table);
         let head = format!(
@@ -1052,8 +1147,12 @@ impl ConnectionManager {
         let batch_rows = req.options.batch_size.clamp(1, 5000);
 
         let mut conn = live.new_conn().await?;
+        let cancel_target = cancel_target_of(&mut conn).await?;
         let mut res = ImportResult::default();
-        if let Some(sql) = &create_sql {
+        // MySQL commits DDL at once, so the table is created before the transaction; PostgreSQL and SQLite create
+        // it inside, where a rollback takes it away again
+        let ddl_in_tx = d != Driver::MySql;
+        if let (Some(sql), false) = (&create_sql, ddl_in_tx) {
             run(&mut conn, sql).await?;
             res.created_table = true;
         }
@@ -1064,13 +1163,19 @@ impl ConnectionManager {
         };
         let mut log = ErrorLog {
             path: req.options.error_file.clone(),
+            replace: req.options.error_file_replace,
+            written_to: None,
             out: None,
             failed_to_open: None,
             first: Vec::new(),
             count: 0,
         };
         let outcome = async {
-            run(&mut conn, begin).await?;
+            run_c(&mut conn, begin, cancel).await?;
+            if let (Some(sql), true) = (&create_sql, ddl_in_tx) {
+                run_c(&mut conn, sql, cancel).await?;
+                res.created_table = true;
+            }
             let mut batch: Vec<Pending> = Vec::new();
             let mut aborted = false;
             let mut ended = false;
@@ -1137,7 +1242,7 @@ impl ConnectionManager {
                     break;
                 }
                 // ---- insert it: whole batch in a savepoint, row by row when it fails
-                run(&mut conn, "savepoint prometeo_import").await?;
+                run_c(&mut conn, "savepoint prometeo_import", cancel).await?;
                 let sql = format!(
                     "{head}{}",
                     batch
@@ -1146,26 +1251,40 @@ impl ConnectionManager {
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
-                match run(&mut conn, &sql).await {
+                match run_c(&mut conn, &sql, cancel).await {
                     Ok(()) => {
-                        run(&mut conn, "release savepoint prometeo_import").await?;
+                        run_c(&mut conn, "release savepoint prometeo_import", cancel).await?;
                         res.imported += batch.len() as u64;
                     }
-                    Err(e) if e.is_connection_lost() => return Err(e),
+                    Err(e) if e.is_connection_lost() || matches!(e, DbError::Cancelled) => {
+                        return Err(e)
+                    }
                     Err(_) => {
-                        run(&mut conn, "rollback to savepoint prometeo_import").await?;
-                        run(&mut conn, "release savepoint prometeo_import").await?;
+                        run_c(&mut conn, "rollback to savepoint prometeo_import", cancel).await?;
+                        run_c(&mut conn, "release savepoint prometeo_import", cancel).await?;
                         for p in &batch {
-                            run(&mut conn, "savepoint prometeo_import").await?;
-                            match run(&mut conn, &format!("{head}{}", p.tuple)).await {
+                            run_c(&mut conn, "savepoint prometeo_import", cancel).await?;
+                            match run_c(&mut conn, &format!("{head}{}", p.tuple), cancel).await {
                                 Ok(()) => {
-                                    run(&mut conn, "release savepoint prometeo_import").await?;
+                                    run_c(&mut conn, "release savepoint prometeo_import", cancel)
+                                        .await?;
                                     res.imported += 1;
                                 }
-                                Err(e) if e.is_connection_lost() => return Err(e),
+                                Err(e)
+                                    if e.is_connection_lost()
+                                        || matches!(e, DbError::Cancelled) =>
+                                {
+                                    return Err(e)
+                                }
                                 Err(e) => {
-                                    run(&mut conn, "rollback to savepoint prometeo_import").await?;
-                                    run(&mut conn, "release savepoint prometeo_import").await?;
+                                    run_c(
+                                        &mut conn,
+                                        "rollback to savepoint prometeo_import",
+                                        cancel,
+                                    )
+                                    .await?;
+                                    run_c(&mut conn, "release savepoint prometeo_import", cancel)
+                                        .await?;
                                     log.add(
                                         p.row,
                                         &first_line(&e),
@@ -1197,15 +1316,31 @@ impl ConnectionManager {
         res.error_file = log
             .out
             .is_some()
-            .then(|| {
-                req.options
-                    .error_file
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-            })
+            .then(|| log.written_to.as_ref().map(|p| p.display().to_string()))
             .flatten();
         res.error_file_error = log.failed_to_open.take();
 
+        // cancelled while reading the file or in the middle of a statement: the connection is not used again
+        let interrupted = matches!(outcome, Err(DbError::Cancelled));
+        if interrupted {
+            res.cancelled = true;
+            // stop what the server is running (a statement waiting for a lock), then drop the connection: the
+            // server rolls the open transaction back
+            interrupt(&live.pool, &cancel_target).await;
+            let _ = tokio::time::timeout(CLOSE_TIMEOUT, conn.close()).await;
+            if res.created_table && !ddl_in_tx {
+                let _ = tokio::time::timeout(
+                    CLOSE_TIMEOUT * 2,
+                    live.pool.exec(&format!("drop table if exists {table}")),
+                )
+                .await;
+            }
+            res.rolled_back = true;
+            res.created_table = false;
+            res.imported = 0;
+            res.elapsed_ms = started.elapsed().as_millis() as u64;
+            return Ok(res);
+        }
         let keep =
             outcome.is_ok() && !res.cancelled && !(req.options.abort_on_error && res.failed > 0);
         if keep {
@@ -1402,6 +1537,69 @@ mod tests {
         assert_eq!(category("date"), Category::Date);
         assert_eq!(category("character varying(20)"), Category::Text);
         assert_eq!(category("uuid"), Category::Text);
+        // exact names: no suffix / prefix guessing
+        assert_eq!(category("point"), Category::Text);
+        assert_eq!(category("int4range"), Category::Text);
+        assert_eq!(category("integer[]"), Category::Text);
+        assert_eq!(category("int4[]"), Category::Text);
+        assert_eq!(category("_int4"), Category::Text);
+        assert_eq!(category("bigint[]"), Category::Text);
+        assert_eq!(category("mediumint unsigned"), Category::Int);
+        assert_eq!(category("int8"), Category::Int);
+        assert_eq!(category("bigserial"), Category::Int);
+    }
+
+    #[test]
+    fn nul_in_text_is_a_row_error_except_on_mysql() {
+        let v = Some("a\0b");
+        for d in [Driver::Postgres, Driver::Sqlite] {
+            let e = to_literal(d, Category::Text, v).unwrap_err();
+            assert!(e.contains("NUL"), "{e}");
+        }
+        assert!(to_literal(Driver::MySql, Category::Text, v).is_ok());
+        assert!(to_literal(Driver::Postgres, Category::Date, v).is_err());
+    }
+
+    #[test]
+    fn an_unbalanced_quote_in_a_huge_file_fails_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f.csv");
+        let mut f = File::create(&p).unwrap();
+        f.write_all(b"a,b\n1,\"open\n").unwrap();
+        let chunk = vec![b'x'; 1 << 20];
+        for _ in 0..70 {
+            f.write_all(&chunk).unwrap();
+        }
+        drop(f);
+        let mut s = Source::open(&p, &ImportFormat::default()).unwrap();
+        let t = Instant::now();
+        let e = s.next_row().unwrap_err();
+        assert!(e.to_string().contains("longer than"), "{e}");
+        // a rescan after every 64 KB read took minutes
+        assert!(t.elapsed() < Duration::from_secs(30), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn reading_stops_when_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f.csv");
+        std::fs::write(&p, format!("a\n{}", "123456\n".repeat(50_000))).unwrap();
+        let mut s = Source::open(&p, &ImportFormat::default()).unwrap();
+        let token = CancellationToken::new();
+        s.set_cancel(token.clone());
+        assert!(s.next_row().unwrap().is_some());
+        token.cancel();
+        // the rows already buffered are still returned; the next read of the file fails
+        let mut n = 1;
+        let e = loop {
+            match s.next_row() {
+                Ok(Some(_)) => n += 1,
+                Ok(None) => panic!("the whole file was read after the cancel"),
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(e, DbError::Cancelled), "{e}");
+        assert!(n < 50_000);
     }
 
     #[test]

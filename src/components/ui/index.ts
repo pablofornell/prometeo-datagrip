@@ -14,8 +14,18 @@ export { Splitter } from "./Splitter";
 export { MenuHost, openMenu, closeMenu, isMenuOpen } from "./Menu";
 export type { MenuItem, OpenMenuOptions } from "./Menu";
 export { TooltipHost, tip } from "./Tooltip";
-export { NotificationHost, notify, dismissNotification } from "./Notification";
-export type { NotificationOptions } from "./Notification";
+export {
+  NotificationHost,
+  notify,
+  dismissNotification,
+  hideNotification,
+  markAllNotificationsRead,
+  expireNotifications,
+  clearNotifications,
+  notificationHistory,
+  unreadNotificationCount,
+} from "./Notification";
+export type { NotificationOptions, NotificationRecord } from "./Notification";
 export { Dialog } from "./Dialog";
 export type { DialogButton, DialogProps } from "./Dialog";
 export { createSpeedSearch, matchRanges, Highlighted, SpeedSearchField } from "./SpeedSearch";

@@ -1,11 +1,15 @@
-/** DDL view (`editor.view.ddl`): 34px toolbar (reload, open data) over a read-only SQL editor (`73-ddl-view`). */
+/**
+ * DDL view (`editor.view.ddl`): 34px toolbar (reload, open data) over a SQL editor (`73-ddl-view`). The text is
+ * editable; once it differs from the generated one a banner offers `Submit` (the text goes to a new query console of
+ * the data source, where it is run) and `Revert`. Names of the object's own schema are written unqualified.
+ */
 import { Show, createEffect, createSignal, on, onMount, type JSX } from "solid-js";
-import { getDdl } from "../../api/db";
+import { createConsole, getDdl, writeConsole } from "../../api/db";
 import { SqlEditor, type SqlEditorHandle } from "../../components/editor";
 import { ActionButton, notify } from "../../components/ui";
 import { setStatus } from "../../state/status";
 import type { EditorTab } from "../../state/tabs";
-import { ensureConnected } from "../explorer";
+import { ensureConnected, openConsoleTab } from "../explorer";
 import { type ObjectTabData, openTableTab } from "../table/commands";
 import { dsInfo, errText, loadDataSources } from "../table/ds";
 import "./ddl.css";
@@ -26,7 +30,11 @@ function columnOffset(text: string, column: string): number | null {
 
 function Ddl(props: { tab: EditorTab; active: boolean; dsId: string; objectRef: NonNullable<ObjectTabData>["objectRef"] }): JSX.Element {
   const ref = props.objectRef;
+  /** What the editor shows (set on load and Revert; typing only changes `current`). */
   const [text, setText] = createSignal("");
+  /** The generated DDL the edits are compared with. */
+  const [original, setOriginal] = createSignal("");
+  const [current, setCurrent] = createSignal("");
   const [loaded, setLoaded] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const ds = () => dsInfo(props.dsId);
@@ -36,7 +44,10 @@ function Ddl(props: { tab: EditorTab; active: boolean; dsId: string; objectRef: 
     try {
       await loadDataSources();
       await ensureConnected(props.dsId);
-      setText(await getDdl(props.dsId, ref));
+      const ddl = await getDdl(props.dsId, ref, true);
+      setOriginal(ddl);
+      setCurrent(ddl);
+      setText(ddl);
       setError(null);
       setLoaded(true);
     } catch (e) {
@@ -47,6 +58,22 @@ function Ddl(props: { tab: EditorTab; active: boolean; dsId: string; objectRef: 
     }
   }
   onMount(() => void load());
+
+  const modified = () => loaded() && current() !== original();
+  const revert = () => {
+    setCurrent(original());
+    setText(original());
+  };
+  /** Submit: the modified DDL opens in a new console of the data source, ready to run. */
+  const submit = async (): Promise<void> => {
+    try {
+      const name = await createConsole(props.dsId);
+      await writeConsole(props.dsId, name, current());
+      openConsoleTab(props.dsId, name);
+    } catch (e) {
+      notify({ kind: "error", title: "Cannot create a query console", body: errText(e) });
+    }
+  };
 
   // Ctrl+B on a column in a console: the caret goes to that column's definition
   let editor: SqlEditorHandle | undefined;
@@ -73,12 +100,24 @@ function Ddl(props: { tab: EditorTab; active: boolean; dsId: string; objectRef: 
           <ActionButton icon="dg/table" title="Open Table Data" onClick={() => void openTableTab(props.dsId, ref)} />
         </Show>
       </div>
+      <Show when={modified()}>
+        <div class="dgd-banner" role="status">
+          <span>The DDL was modified.</span>
+          <a class="dgd-banner-link" onClick={() => void submit()} title="Open the modified DDL in a query console to run it">
+            Submit
+          </a>
+          <span class="dgd-banner-sep" />
+          <a class="dgd-banner-link" onClick={revert}>
+            Revert
+          </a>
+        </div>
+      </Show>
       <div class="dgd-body">
         <Show when={loaded()}>
           <SqlEditor
             value={text()}
             dialect={ds()?.driver ?? "postgres"}
-            readOnly
+            onChange={setCurrent}
             statementFrame={false}
             onCaretChange={onCaret}
             ref={(h) => {

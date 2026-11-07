@@ -341,3 +341,230 @@ async fn refuses_a_read_only_data_source() {
         .unwrap_err();
     assert!(e.to_string().contains("read-only"), "{e}");
 }
+
+/// A NUL byte in a text value fails that row (PostgreSQL and SQLite cannot store it); the connection and the
+/// rest of the import survive. Rows with the byte become NULL under `insertInconvertibleAsNull`.
+async fn nul_scenario(cfg: DataSourceConfig, schema: Option<&str>) {
+    let mgr = connected(&cfg).await;
+    let sess = mgr.open_session(&cfg.id).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let table = format!("imp_nul_{}", SEQ.fetch_add(1, Ordering::SeqCst));
+    let q = match schema {
+        Some(s) => format!("{s}.{table}"),
+        None => table.clone(),
+    };
+    assert_ok(&run(&mgr, &sess, &format!("drop table if exists {q}")).await);
+    let csv = dir.path().join("nul.csv");
+    std::fs::write(&csv, "id,name\n1,ok\n2,bad\0byte\n3,fine\n").unwrap();
+    let mut req = request(
+        &csv,
+        &table,
+        true,
+        vec![
+            column("id", Some(0), "integer"),
+            column("name", Some(1), "text"),
+        ],
+        json!({}),
+    );
+    req.schema = schema.map(str::to_string);
+    let res = mgr
+        .import_file(&cfg.id, &req, &CancellationToken::new(), &|_| {})
+        .await
+        .unwrap();
+    assert_eq!((res.imported, res.failed), (2, 1), "{res:?}");
+    assert_eq!(res.errors[0].row, 3);
+    assert!(res.errors[0].message.contains("NUL"), "{:?}", res.errors);
+    assert_eq!(count(&mgr, &sess, &q).await, "2");
+    assert_ok(&run(&mgr, &sess, &format!("drop table if exists {q}")).await);
+    mgr.close_session(&sess).await;
+}
+
+#[tokio::test]
+async fn nul_in_text_fails_only_its_row_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    nul_scenario(lite_cfg(&dir.path().join("nul.db")), None).await;
+}
+
+#[tokio::test]
+async fn nul_in_text_fails_only_its_row_postgres() {
+    let Some(cfg) = pg_cfg() else { return };
+    nul_scenario(cfg, Some("public")).await;
+}
+
+/// The table an import creates is part of its transaction: a cancelled import leaves no table behind.
+async fn cancel_with_create_scenario(cfg: DataSourceConfig, schema: Option<&str>) {
+    let mgr = connected(&cfg).await;
+    let sess = mgr.open_session(&cfg.id).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let table = format!("imp_cc_{}", SEQ.fetch_add(1, Ordering::SeqCst));
+    let q = match schema {
+        Some(s) => format!("{s}.{table}"),
+        None => table.clone(),
+    };
+    assert_ok(&run(&mgr, &sess, &format!("drop table if exists {q}")).await);
+    let csv = dir.path().join("big.csv");
+    let mut big = String::from("a\n");
+    for i in 0..2000 {
+        big.push_str(&format!("{i}\n"));
+    }
+    std::fs::write(&csv, big).unwrap();
+    let mut req = request(
+        &csv,
+        &table,
+        true,
+        vec![column("a", Some(0), "integer")],
+        json!({ "batchSize": 100 }),
+    );
+    req.schema = schema.map(str::to_string);
+    let token = CancellationToken::new();
+    let t2 = token.clone();
+    let res = mgr
+        .import_file(&cfg.id, &req, &token, &move |p| {
+            if p.rows >= 300 {
+                t2.cancel();
+            }
+        })
+        .await
+        .unwrap();
+    assert!(
+        res.cancelled && res.rolled_back && !res.created_table,
+        "{res:?}"
+    );
+    let ev = run(&mgr, &sess, &format!("select count(*) from {q}")).await;
+    assert!(!errors(&ev).is_empty(), "the table must be gone");
+    mgr.close_session(&sess).await;
+}
+
+#[tokio::test]
+async fn cancel_removes_the_created_table_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    cancel_with_create_scenario(lite_cfg(&dir.path().join("cc.db")), None).await;
+}
+
+#[tokio::test]
+async fn cancel_removes_the_created_table_postgres() {
+    let Some(cfg) = pg_cfg() else { return };
+    cancel_with_create_scenario(cfg, Some("public")).await;
+}
+
+#[tokio::test]
+async fn cancel_removes_the_created_table_mysql() {
+    let Some(cfg) = mysql_cfg() else { return };
+    cancel_with_create_scenario(cfg, None).await;
+}
+
+/// Cancel reaches a statement that waits for a lock: the import returns promptly, rolled back.
+async fn cancel_blocked_scenario(
+    cfg: DataSourceConfig,
+    schema: Option<&str>,
+    lock_sql: &str,
+    unlock_sql: &str,
+) {
+    let mgr = connected(&cfg).await;
+    let sess = mgr.open_session(&cfg.id).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let table = format!("imp_blk_{}", SEQ.fetch_add(1, Ordering::SeqCst));
+    let q = match schema {
+        Some(s) => format!("{s}.{table}"),
+        None => table.clone(),
+    };
+    assert_ok(&run(&mgr, &sess, &format!("drop table if exists {q}")).await);
+    assert_ok(&run(&mgr, &sess, &format!("create table {q} (a integer)")).await);
+    // this session holds a lock that blocks the import's INSERT
+    assert_ok(&run(&mgr, &sess, &lock_sql.replace("{t}", &q)).await);
+    let csv = dir.path().join("a.csv");
+    std::fs::write(&csv, "a\n1\n2\n3\n").unwrap();
+    let mut req = request(
+        &csv,
+        &table,
+        false,
+        vec![column("a", Some(0), "integer")],
+        json!({}),
+    );
+    req.schema = schema.map(str::to_string);
+    let token = CancellationToken::new();
+    let t2 = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        t2.cancel();
+    });
+    let started = std::time::Instant::now();
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        mgr.import_file(&cfg.id, &req, &token, &|_| {}),
+    )
+    .await
+    .expect("a blocked import must react to cancel")
+    .unwrap();
+    assert!(
+        res.cancelled && res.rolled_back && res.imported == 0,
+        "{res:?}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    assert_ok(&run(&mgr, &sess, unlock_sql).await);
+    assert_eq!(count(&mgr, &sess, &q).await, "0");
+    assert_ok(&run(&mgr, &sess, &format!("drop table if exists {q}")).await);
+    mgr.close_session(&sess).await;
+}
+
+#[tokio::test]
+async fn cancel_reaches_a_statement_blocked_on_a_lock_postgres() {
+    let Some(cfg) = pg_cfg() else { return };
+    cancel_blocked_scenario(
+        cfg,
+        Some("public"),
+        "begin; lock table {t} in access exclusive mode",
+        "rollback",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn cancel_reaches_a_statement_blocked_on_a_lock_mysql() {
+    let Some(cfg) = mysql_cfg() else { return };
+    cancel_blocked_scenario(cfg, None, "lock tables {t} write", "unlock tables").await;
+}
+
+#[tokio::test]
+async fn an_existing_error_file_is_never_overwritten() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = lite_cfg(&dir.path().join("ef.db"));
+    let mgr = connected(&cfg).await;
+    let csv = dir.path().join("a.csv");
+    std::fs::write(&csv, "a\n1\nx\n").unwrap();
+    let err_file = dir.path().join("a_errors.txt");
+    std::fs::write(&err_file, "precious").unwrap();
+    let req = request(
+        &csv,
+        "t",
+        true,
+        vec![column("a", Some(0), "integer")],
+        json!({ "errorFile": err_file }),
+    );
+    let res = mgr
+        .import_file(&cfg.id, &req, &CancellationToken::new(), &|_| {})
+        .await
+        .unwrap();
+    assert_eq!((res.imported, res.failed), (1, 1), "{res:?}");
+    let second = dir.path().join("a_errors-2.txt");
+    assert_eq!(res.error_file.as_deref(), Some(second.to_str().unwrap()));
+    assert_eq!(std::fs::read_to_string(&err_file).unwrap(), "precious");
+    assert!(std::fs::read_to_string(&second).unwrap().contains("row 3"));
+    // a place picked in the save dialog (which asked before replacing) is replaced
+    let mut req = request(
+        &csv,
+        "t2",
+        true,
+        vec![column("a", Some(0), "integer")],
+        json!({ "errorFile": err_file }),
+    );
+    req.options.error_file_replace = true;
+    let res = mgr
+        .import_file(&cfg.id, &req, &CancellationToken::new(), &|_| {})
+        .await
+        .unwrap();
+    assert_eq!(res.error_file.as_deref(), Some(err_file.to_str().unwrap()));
+    assert!(std::fs::read_to_string(&err_file)
+        .unwrap()
+        .contains("row 3"));
+}

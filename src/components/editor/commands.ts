@@ -1,7 +1,10 @@
-import { EditorSelection, type SelectionRange } from "@codemirror/state";
-import { type Command, EditorView } from "@codemirror/view";
+import { EditorSelection, type Extension, StateEffect, StateField, type SelectionRange } from "@codemirror/state";
+import { type Command, EditorView, type Tooltip, showTooltip } from "@codemirror/view";
+import type { MenuItem } from "../ui/Menu";
 import { docAnalysis } from "./highlight";
+import { functionsFor } from "./keywords";
 import { configField } from "./state";
+import { statementIndexAt } from "./split";
 
 /** Ctrl+D: duplicate the selection (or the line when there is no selection). */
 export const duplicate: Command = (view) => {
@@ -322,5 +325,177 @@ export const toggleBlock: Command = (view) => {
     };
   });
   view.dispatch(state.update(tr, { userEvent: "input.comment", scrollIntoView: true }));
+  return true;
+};
+
+// ---------------------------------------------------------------------------------------------
+// Complete statement (Ctrl+Shift+Enter). Toggle Case / Join Lines (Ctrl+Shift+U / J) are the Edit menu's actions.
+
+/** Ctrl+Shift+Enter: ends the statement at the caret with `;` (when missing) and opens a new line below it. */
+export const completeStatement: Command = (view) => {
+  if (view.state.readOnly) return false;
+  const { state } = view;
+  const head = state.selection.main.head;
+  const a = docAnalysis(state.doc, state.field(configField).dialect);
+  const si = statementIndexAt(a.statements, head);
+  const st = si === null ? undefined : a.statements[si];
+  const changes: { from: number; insert: string }[] = [];
+  let endPos = state.doc.lineAt(head).to;
+  if (st && st.text.trim()) {
+    if (st.fullEnd === st.end) {
+      changes.push({ from: st.end, insert: ";" });
+      endPos = st.end;
+    } else endPos = st.fullEnd;
+  }
+  const lineTo = state.doc.lineAt(endPos).to;
+  const nl = "\n" + /^\s*/.exec(state.doc.lineAt(st ? st.start : head).text)![0];
+  view.dispatch({
+    changes: [...changes, { from: lineTo, insert: nl }],
+    selection: EditorSelection.cursor(lineTo + changes.length + nl.length),
+    scrollIntoView: true,
+    userEvent: "input.complete",
+  });
+  return true;
+};
+
+// ---------------------------------------------------------------------------------------------
+// Paste from history (Ctrl+Shift+V): the last 10 texts copied in the editors
+
+const clips: string[] = [];
+
+/** Remembers a copied / cut text (newest first, 10 kept, no doubles). */
+export function recordClip(text: string): void {
+  if (!text.trim()) return;
+  const i = clips.indexOf(text);
+  if (i >= 0) clips.splice(i, 1);
+  clips.unshift(text);
+  clips.length = Math.min(clips.length, 10);
+}
+
+/** Texts copied so far, newest first (tests). */
+export const clipHistory = (): readonly string[] => clips;
+
+/** `copy` / `cut` of the editor's own DOM events feed the history. */
+export const clipRecorder: Extension = EditorView.domEventHandlers({
+  copy(_e, view) {
+    recordClip(view.state.selection.ranges.filter((r) => !r.empty).map((r) => view.state.sliceDoc(r.from, r.to)).join("\n"));
+  },
+  cut(_e, view) {
+    recordClip(view.state.selection.ranges.filter((r) => !r.empty).map((r) => view.state.sliceDoc(r.from, r.to)).join("\n"));
+  },
+});
+
+const oneLine = (t: string): string => {
+  const x = t.replace(/\s*\n\s*/g, " ⏎ ").trim();
+  return x.length > 80 ? x.slice(0, 80) + "…" : x;
+};
+
+export const pasteFromHistory: Command = (view) => {
+  if (view.state.readOnly) return false;
+  if (!clips.length) return true;
+  const items: MenuItem[] = clips.map((t) => ({
+    label: oneLine(t),
+    run: () => {
+      view.focus();
+      view.dispatch(view.state.replaceSelection(t), { userEvent: "input.paste", scrollIntoView: true });
+    },
+  }));
+  const c = view.coordsAtPos(view.state.selection.main.head);
+  // lazy: the menu needs the DOM (this module is also loaded by the DOM-free tests)
+  void import("../ui/Menu").then((m) => m.openMenu(items, { x: c?.left ?? 0, y: (c?.bottom ?? 0) + 2, compact: true, minWidth: 260, selected: "first", title: "Choose Content to Paste" }));
+  return true;
+};
+
+// ---------------------------------------------------------------------------------------------
+// Parameter info (Ctrl+P): the signature of the routine call around the caret
+
+export interface CallInfo {
+  name: string;
+  args: string[];
+  /** Index of the argument the caret is in. */
+  current: number;
+  ret?: string;
+}
+
+/** The innermost unclosed call before `pos`: its name and the argument index (from the token text, strings skipped). */
+export function callAt(text: string, pos: number): { name: string; current: number } | null {
+  let depth = 0;
+  let commas = 0;
+  for (let i = pos - 1; i >= 0; i--) {
+    const c = text[i];
+    if (c === ")") depth++;
+    else if (c === "(") {
+      if (depth === 0) {
+        const m = /([A-Za-z_][A-Za-z0-9_$]*)\s*$/.exec(text.slice(Math.max(0, i - 80), i));
+        return m ? { name: m[1], current: commas } : null;
+      }
+      depth--;
+    } else if (c === "," && depth === 0) commas++;
+    else if (c === ";") return null;
+  }
+  return null;
+}
+
+/** Signature of function `name` from the introspected routines first, then the built-ins. */
+export function signatureOf(state: import("@codemirror/state").EditorState, name: string): { args: string[]; ret?: string } | null {
+  const cfg = state.field(configField);
+  const lower = name.toLowerCase();
+  for (const s of cfg.index.list) {
+    const r = s.routines.find((x) => x.name.toLowerCase() === lower);
+    if (r) return { args: splitArgs(r.args), ret: r.returns };
+  }
+  const f = functionsFor(cfg.dialect).find((x) => x.name.toLowerCase() === lower);
+  return f ? { args: splitArgs(f.args), ret: f.ret } : null;
+}
+
+const splitArgs = (a: string): string[] => (a.trim() ? a.split(",").map((x) => x.trim()) : []);
+
+const setParamInfo = StateEffect.define<Tooltip | null>();
+const paramInfoField = StateField.define<Tooltip | null>({
+  create: () => null,
+  update(v, tr) {
+    for (const e of tr.effects) if (e.is(setParamInfo)) return e.value;
+    // the hint stays while the caret moves inside the call, and goes with any edit that leaves it
+    if (v && (tr.docChanged || tr.selection)) return null;
+    return v;
+  },
+  provide: (f) => showTooltip.compute([f], (st) => st.field(f)),
+});
+
+export const parameterInfoExtension: Extension = paramInfoField;
+
+/** Ctrl+P. */
+export const parameterInfo: Command = (view) => {
+  const head = view.state.selection.main.head;
+  const call = callAt(view.state.doc.sliceString(0, head), head);
+  const sig = call ? signatureOf(view.state, call.name) : null;
+  if (!call || !sig) {
+    view.dispatch({ effects: setParamInfo.of(null) });
+    return true;
+  }
+  const tip: Tooltip = {
+    pos: head,
+    above: true,
+    arrow: false,
+    create() {
+      const dom = document.createElement("div");
+      dom.className = "cm-param-info";
+      if (!sig.args.length) {
+        const none = document.createElement("span");
+        none.className = "cm-param-none";
+        none.textContent = "<no parameters>";
+        dom.append(none);
+      }
+      sig.args.forEach((a, i) => {
+        if (i) dom.append(", ");
+        const span = document.createElement("span");
+        span.textContent = a;
+        if (i === Math.min(call.current, sig.args.length - 1)) span.className = "cm-param-current";
+        dom.append(span);
+      });
+      return { dom };
+    },
+  };
+  view.dispatch({ effects: setParamInfo.of(tip) });
   return true;
 };

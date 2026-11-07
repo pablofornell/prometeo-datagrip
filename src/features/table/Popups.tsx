@@ -5,6 +5,7 @@ import type { ColumnMeta, Driver, ExportFormat, ExportOptions } from "../../api/
 import { SqlEditor } from "../../components/editor";
 import { chooseExportPath, defaultExportPath } from "../../api/db";
 import { Button, Checkbox, ComboBox, Dialog, Icon, TextField, tip } from "../../components/ui";
+import { EXTRACTORS } from "../output/extractors";
 import { FILTER_OPS, type FilterOp } from "./sql";
 
 // ---------------------------------------------------------------- SQL popup (`60-grid-preview-pending-changes-popup`)
@@ -124,13 +125,7 @@ export function ColumnFilterPopup(props: ColumnFilterProps): JSX.Element {
 
 // ---------------------------------------------------------------- export dialog
 
-export const EXPORT_FORMATS: { value: ExportFormat; label: string; ext: string; mime: string }[] = [
-  { value: "csv", label: "CSV", ext: "csv", mime: "text/csv" },
-  { value: "tsv", label: "TSV", ext: "tsv", mime: "text/tab-separated-values" },
-  { value: "json", label: "JSON", ext: "json", mime: "application/json" },
-  { value: "sqlInsert", label: "SQL Inserts", ext: "sql", mime: "application/sql" },
-  { value: "markdown", label: "Markdown", ext: "md", mime: "text/markdown" },
-];
+export const EXPORT_FORMATS: { value: ExportFormat; label: string; ext: string; mime: string }[] = EXTRACTORS.map((x) => ({ value: x.id, label: x.label, ext: x.ext, mime: x.mime }));
 
 export type ExportTarget = "file" | "clipboard";
 
@@ -170,7 +165,9 @@ export function ExportDialog(props: ExportDialogProps): JSX.Element {
   const [preview, setPreview] = createSignal("");
   const [error, setError] = createSignal("");
   const fmt = () => opts().format;
-  const textual = () => ["csv", "tsv", "markdown"].includes(fmt());
+  const textual = () => ["csv", "tsv", "markdown", "csvPipe", "csvSemicolon"].includes(fmt());
+  const nullable = () => textual() || ["html", "pretty"].includes(fmt());
+  const sqlTable = () => ["sqlInsert", "sqlUpdate"].includes(fmt());
   const out = (): ExportPath => ({ path: path().trim(), chosen: chosen() });
   const canExport = () => path().trim().length > 0;
 
@@ -231,7 +228,7 @@ export function ExportDialog(props: ExportDialogProps): JSX.Element {
             <Checkbox checked={opts().header} disabled={!textual()} onChange={(v) => patch({ header: v })} label="Add column header" />
             <Checkbox checked={!!opts().rowHeader} disabled={!textual()} onChange={(v) => patch({ rowHeader: v })} label="Add row header" />
           </div>
-          <Show when={textual()}>
+          <Show when={nullable()}>
             <div class="dgt-export-opts">
               <label>NULL text:</label>
               <TextField value={opts().nullText} onInput={(v) => patch({ nullText: v })} />
@@ -243,12 +240,14 @@ export function ExportDialog(props: ExportDialogProps): JSX.Element {
               </Show>
             </div>
           </Show>
-          <Show when={fmt() === "sqlInsert"}>
+          <Show when={sqlTable()}>
             <div class="dgt-export-opts">
               <label>Table name:</label>
               <TextField value={opts().tableName ?? ""} onInput={(v) => patch({ tableName: v || null })} />
-              <label>Rows per INSERT:</label>
-              <TextField value={String(opts().rowsPerInsert)} onInput={(v) => patch({ rowsPerInsert: Math.max(1, parseInt(v, 10) || 1) })} />
+              <Show when={fmt() === "sqlInsert"}>
+                <label>Rows per INSERT:</label>
+                <TextField value={String(opts().rowsPerInsert)} onInput={(v) => patch({ rowsPerInsert: Math.max(1, parseInt(v, 10) || 1) })} />
+              </Show>
             </div>
           </Show>
           <label>Output file:</label>

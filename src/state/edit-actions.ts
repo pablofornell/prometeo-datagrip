@@ -64,6 +64,8 @@ const inputSelection = (el: HTMLInputElement | HTMLTextAreaElement): string => {
   const e = el.selectionEnd ?? 0;
   return s === e ? "" : el.value.slice(s, e);
 };
+/** Paste / Delete change cells: only an editable result grid takes them (the grid root carries `data-editable`). */
+const gridEditable = (el: HTMLElement): boolean => el.hasAttribute("data-editable");
 const inputWritable = (el: HTMLInputElement | HTMLTextAreaElement): boolean => !el.readOnly && !el.disabled;
 
 // ---------------------------------------------------------------- clipboard
@@ -336,7 +338,7 @@ export function registerEditActions(): () => void {
       menuOnly: true,
       enabled: () => {
         const t = editTarget();
-        return t?.kind === "cm" ? cmEditable(t.view) : t?.kind === "input" ? inputWritable(t.el) : t?.kind === "grid";
+        return t?.kind === "cm" ? cmEditable(t.view) : t?.kind === "input" ? inputWritable(t.el) : t?.kind === "grid" && gridEditable(t.el);
       },
       run: async () => {
         const t = editTarget();
@@ -360,7 +362,7 @@ export function registerEditActions(): () => void {
       menuOnly: true,
       enabled: () => {
         const t = editTarget();
-        return t?.kind === "cm" ? cmEditable(t.view) : t?.kind === "input" ? inputWritable(t.el) : t?.kind === "grid";
+        return t?.kind === "cm" ? cmEditable(t.view) : t?.kind === "input" ? inputWritable(t.el) : t?.kind === "grid" && gridEditable(t.el);
       },
       run: () => {
         const t = editTarget();

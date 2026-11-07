@@ -17,10 +17,10 @@ export function unregisterSession(tabId: string): void {
 }
 export const sessionOf = (tabId: string): ConsoleSession | undefined => sessions().get(tabId);
 
-/** Session of the active editor tab (undefined for table / DDL tabs). */
+/** Session of the active editor tab (a console, or a file with a data source; undefined for table / DDL tabs). */
 export function activeSession(): ConsoleSession | undefined {
   const t = activeTab();
-  return t?.kind === "console" ? sessions().get(t.id) : undefined;
+  return t?.kind === "console" || t?.kind === "file" ? sessions().get(t.id) : undefined;
 }
 
 /** Every open console session. */

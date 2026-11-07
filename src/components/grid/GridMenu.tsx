@@ -17,6 +17,8 @@ export interface MenuItem {
   /** Highlighted "primary" first row (like "Count Rows" in the paging menu). */
   primary?: boolean;
   submenu?: MenuItem[];
+  /** Small icon in the left column (name of a `.dgg-menu-ico.i-*` class, see grid.css); `fx` draws the SQL-expression mark. */
+  icon?: string;
   onSelect?: () => void;
 }
 
@@ -27,12 +29,14 @@ interface Props {
   onClose: () => void;
   /** Open to the left of x (for right-aligned anchors). */
   alignRight?: boolean;
+  /** Highlight the first selectable item without hover (the header menu's `Copy Column Name`). */
+  preselect?: boolean;
 }
 
 export function GridMenu(props: Props): JSX.Element {
   let el!: HTMLDivElement;
   const [pos, setPos] = createSignal({ x: props.x, y: props.y });
-  const [hover, setHover] = createSignal(-1);
+  const [hover, setHover] = createSignal(props.preselect ? props.items.findIndex((it) => !it.separator && !it.header && !it.disabled) : -1);
   const [subFor, setSubFor] = createSignal(-1);
 
   const isSelectable = (it: MenuItem) => !it.separator && !it.header && !it.disabled;
@@ -95,81 +99,104 @@ export function GridMenu(props: Props): JSX.Element {
   return (
     <Portal>
       <div ref={el} class="dgg-menu" style={{ left: pos().x + "px", top: pos().y + "px" }} onContextMenu={(e) => e.preventDefault()}>
-        <For each={props.items}>
-          {(it, i) => (
-            <Show
-              when={!it.separator}
-              fallback={<div class="dgg-menu-sep" />}
-            >
-              <Show
-                when={!it.header}
-                fallback={<div class="dgg-menu-header">{it.label}</div>}
-              >
-                <div
-                  class="dgg-menu-item"
-                  classList={{
-                    hover: hover() === i() && !it.disabled,
-                    disabled: it.disabled,
-                    primary: it.primary,
-                  }}
-                  onMouseEnter={() => {
-                    setHover(i());
-                    setSubFor(it.submenu && !it.disabled ? i() : -1);
-                  }}
-                  onClick={() => choose(it)}
-                >
-                  <span class="dgg-menu-check">{it.checked ? "✓" : ""}</span>
-                  <span class="dgg-menu-label">{it.label}</span>
-                  <Show when={it.shortcut}>
-                    <span class="dgg-menu-shortcut">{it.shortcut}</span>
-                  </Show>
-                  <Show when={it.submenu}>
-                    <span class="dgg-menu-arrow">{"›"}</span>
-                    <Show when={subFor() === i()}>
-                      <SubMenu items={it.submenu!} parent={el} onClose={props.onClose} />
-                    </Show>
-                  </Show>
-                </div>
-              </Show>
-            </Show>
-          )}
-        </For>
+        <MenuRows
+          items={props.items}
+          hover={hover()}
+          sub={subFor()}
+          onHover={(i, it) => {
+            setHover(i);
+            setSubFor(it.submenu && !it.disabled ? i : -1);
+          }}
+          onChoose={choose}
+          onClose={props.onClose}
+        />
       </div>
     </Portal>
   );
 }
 
-function SubMenu(props: { items: MenuItem[]; parent: HTMLElement; onClose: () => void }): JSX.Element {
-  let el!: HTMLDivElement;
-  const [flip, setFlip] = createSignal(false);
-  onMount(() => {
-    const r = el.getBoundingClientRect();
-    if (r.right > window.innerWidth - 4) setFlip(true);
-  });
+function MenuMark(props: { it: MenuItem }): JSX.Element {
   return (
-    <div ref={el} class="dgg-menu dgg-submenu" classList={{ flip: flip() }}>
-      <For each={props.items}>
-        {(it) => (
-          <Show when={!it.separator} fallback={<div class="dgg-menu-sep" />}>
+    <span class="dgg-menu-check">
+      <Show when={props.it.icon} fallback={props.it.checked ? "✓" : ""}>
+        <Show when={props.it.icon === "fx"} fallback={<i class={"dgg-menu-ico i-" + props.it.icon} />}>
+          <i class="dgg-menu-fx">fx</i>
+        </Show>
+      </Show>
+    </span>
+  );
+}
+
+/** The rows of one menu level; items with a `submenu` open a nested level on hover (recursive). */
+function MenuRows(props: {
+  items: MenuItem[];
+  hover: number;
+  sub: number;
+  onHover: (i: number, it: MenuItem) => void;
+  onChoose: (it: MenuItem) => void;
+  onClose: () => void;
+}): JSX.Element {
+  return (
+    <For each={props.items}>
+      {(it, i) => (
+        <Show when={!it.separator} fallback={<div class="dgg-menu-sep" />}>
+          <Show when={!it.header} fallback={<div class="dgg-menu-header">{it.label}</div>}>
             <div
               class="dgg-menu-item"
-              classList={{ disabled: it.disabled }}
+              classList={{ hover: props.hover === i() && !it.disabled, disabled: it.disabled, primary: it.primary }}
+              onMouseEnter={() => props.onHover(i(), it)}
               onClick={(e) => {
                 e.stopPropagation();
-                if (it.disabled) return;
-                props.onClose();
-                it.onSelect?.();
+                props.onChoose(it);
               }}
             >
-              <span class="dgg-menu-check">{it.checked ? "✓" : ""}</span>
+              <MenuMark it={it} />
               <span class="dgg-menu-label">{it.label}</span>
               <Show when={it.shortcut}>
                 <span class="dgg-menu-shortcut">{it.shortcut}</span>
               </Show>
+              <Show when={it.submenu}>
+                <span class="dgg-menu-arrow">{"›"}</span>
+                <Show when={props.sub === i()}>
+                  <SubMenu items={it.submenu!} onClose={props.onClose} />
+                </Show>
+              </Show>
             </div>
           </Show>
-        )}
-      </For>
+        </Show>
+      )}
+    </For>
+  );
+}
+
+function SubMenu(props: { items: MenuItem[]; onClose: () => void }): JSX.Element {
+  let el!: HTMLDivElement;
+  const [flip, setFlip] = createSignal(false);
+  const [dy, setDy] = createSignal(0);
+  const [hover, setHover] = createSignal(-1);
+  const [sub, setSub] = createSignal(-1);
+  onMount(() => {
+    const r = el.getBoundingClientRect();
+    if (r.right > window.innerWidth - 4) setFlip(true);
+    if (r.bottom > window.innerHeight - 4) setDy(window.innerHeight - 4 - r.bottom);
+  });
+  return (
+    <div ref={el} class="dgg-menu dgg-submenu" classList={{ flip: flip() }} style={dy() ? { transform: `translateY(${dy()}px)` } : undefined}>
+      <MenuRows
+        items={props.items}
+        hover={hover()}
+        sub={sub()}
+        onHover={(i, it) => {
+          setHover(i);
+          setSub(it.submenu && !it.disabled ? i : -1);
+        }}
+        onChoose={(it) => {
+          if (it.disabled || it.submenu) return;
+          props.onClose();
+          it.onSelect?.();
+        }}
+        onClose={props.onClose}
+      />
     </div>
   );
 }

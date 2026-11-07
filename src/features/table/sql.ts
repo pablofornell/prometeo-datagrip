@@ -5,7 +5,7 @@
  */
 import type { Cell as ApiCell, ColumnMeta, Driver, ObjectRef, RowChange } from "../../api/types";
 // direct module paths: the grid barrel pulls in the Solid components (not loadable in the node test environment)
-import { classifyType, isBinaryCell, isDefaultCell } from "../../components/grid/format";
+import { classifyType, isBinaryCell, isDefaultCell, isExprCell } from "../../components/grid/format";
 import type { Cell, GridChange, SortSpec } from "../../components/grid/types";
 
 const SIMPLE_IDENT = /^[a-z_][a-z0-9_$]*$/;
@@ -112,6 +112,7 @@ export function quoteString(driver: Driver | undefined, v: string): string {
 export function literal(v: Cell, typeName: string, driver?: Driver): string {
   if (v === null || v === undefined) return "null";
   if (isDefaultCell(v)) return "DEFAULT";
+  if (isExprCell(v)) return v.$expr;
   const kind = classifyType(typeName);
   if (typeof v === "number") return Number.isFinite(v) ? String(v) : "null";
   if (typeof v === "boolean") return v ? "true" : "false";

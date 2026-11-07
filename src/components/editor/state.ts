@@ -12,6 +12,8 @@ export interface EditorConfig {
   statementFrame: boolean;
   /** Table every column reference resolves against (table-editor WHERE / ORDER BY fields). */
   implicit?: TableRef[];
+  /** Single-line fields: no live templates. */
+  noTemplates?: boolean;
 }
 
 export const setConfig = StateEffect.define<EditorConfig>();

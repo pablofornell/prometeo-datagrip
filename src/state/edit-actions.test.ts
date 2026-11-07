@@ -27,3 +27,48 @@ describe("editor commands of the Edit menu", () => {
     expect(run(sortLines, "z\nc\nb\na", [2, 5]).doc).toBe("z\nb\nc\na");
   });
 });
+
+describe("enabled state of Paste / Delete by focus target", () => {
+  const fake = (attrs: string[]) => ({
+    closest: (sel: string) => (sel === ".dgg" ? self : null),
+    hasAttribute: (n: string) => attrs.includes(n),
+  });
+  let self: ReturnType<typeof fake>;
+
+  async function enabled(id: string, active: unknown): Promise<boolean> {
+    class Stub {}
+    const g = globalThis as Record<string, unknown>;
+    g.HTMLTextAreaElement = Stub;
+    g.HTMLInputElement = Stub;
+    g.document = { activeElement: active };
+    const { registerEditActions } = await import("./edit-actions");
+    const { getAction, isActionEnabled } = await import("./actions");
+    const off = registerEditActions();
+    try {
+      return isActionEnabled(getAction(id));
+    } finally {
+      off();
+    }
+  }
+
+  const grid = (editable: boolean) => {
+    const el = {
+      closest: (sel: string) => (sel === ".dgg" ? el : sel === ".cm-editor" ? null : null),
+      hasAttribute: (n: string) => editable && n === "data-editable",
+    };
+    return el;
+  };
+
+  it("a read-only result grid cannot paste or delete, an editable one can", async () => {
+    self = fake([]);
+    expect(await enabled("edit.paste", grid(false))).toBe(false);
+    expect(await enabled("edit.delete", grid(false))).toBe(false);
+    expect(await enabled("edit.paste", grid(true))).toBe(true);
+    expect(await enabled("edit.delete", grid(true))).toBe(true);
+  });
+
+  it("Copy and Select All stay available in a read-only grid", async () => {
+    expect(await enabled("edit.copy", grid(false))).toBe(true);
+    expect(await enabled("edit.selectAll", grid(false))).toBe(true);
+  });
+});

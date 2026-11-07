@@ -29,11 +29,13 @@ export const TOOL_WINDOWS: ToolWindowDef[] = [
   { id: "explorer", title: "Database Explorer", anchor: "left", icon: "dg/dbms@20x20", shortcut: "Alt+1", size: 490, pinned: true },
   { id: "files", title: "Files", anchor: "right", icon: "project@20x20", shortcut: "Alt+4", size: 520, pinned: true },
   { id: "output", title: "Database Output", anchor: "bottom", icon: "dg/database-output@20x20", menuIcon: "dg/dbms-output", shortcut: "Alt+8", size: 480, pinned: true },
+  { id: "notifications", title: "Notifications", anchor: "right", icon: "notifications@20x20", menuIcon: "notifications", size: 380, pinned: false },
   { id: "services", title: "Services", anchor: "bottom", icon: "services@20x20", size: 480, pinned: false },
+  { id: "run", title: "Run", anchor: "bottom", icon: "run", size: 480, pinned: false },
 ];
 
 /** Left-to-right order of the main toolbar buttons (DataGrip: Explorer, Output, Files, ...). */
-const TOOLBAR_ORDER = ["explorer", "output", "files", "services"];
+const TOOLBAR_ORDER = ["explorer", "output", "files", "notifications", "services"];
 
 export const toolWindowDef = (id: string): ToolWindowDef | undefined => TOOL_WINDOWS.find((t) => t.id === id);
 
@@ -195,7 +197,10 @@ const setMaximized = setMaxId;
 export const isMaximized = (id: string): boolean => maxId() === id;
 export function toggleMaximizeToolWindow(id: string): void {
   if (!layout.visible[id]) return;
-  setMaxId(maxId() === id ? null : id);
+  const on = maxId() !== id;
+  setMaxId(on ? id : null);
+  // the editor behind a maximized window is hidden: the keyboard focus moves into the window
+  if (on) focusToolWindow(id);
 }
 
 // ---- tool window visibility / focus
@@ -211,6 +216,8 @@ let hiddenByHideAll: string[] | null = null;
 /** Shows a window; the one it replaces at the same anchor is hidden (Services <-> Database Output). */
 export function showToolWindow(id: string, focus = true): void {
   hiddenByHideAll = null;
+  // a window maximized over the editor hides all the others: opening another one leaves the maximized state
+  if (maxId() !== null && maxId() !== id) setMaxId(null);
   const a = anchorOf(id);
   for (const t of TOOL_WINDOWS) {
     if (t.id !== id && layout.visible[t.id] && anchorOf(t.id) === a) {
@@ -245,6 +252,7 @@ export function moveToolWindow(id: string, anchor: ToolWindowAnchor): void {
 }
 
 export function focusToolWindow(id: string): void {
+  if (maxId() !== null && maxId() !== id) setMaxId(null); // the maximized window hides the others
   setActiveTw(id);
   queueMicrotask(() => {
     const el = document.querySelector<HTMLElement>(`[data-toolwindow="${id}"]`);
@@ -267,6 +275,12 @@ export function currentToolWindow(): string | undefined {
   const el = document.activeElement as HTMLElement | null;
   const host = el?.closest<HTMLElement>("[data-toolwindow]");
   const id = host?.dataset.toolwindow ?? activeTw();
+  return id && layout.visible[id] ? id : undefined;
+}
+
+/** Id of the visible tool window that holds the keyboard focus right now (none while the focus is in the editor). */
+export function focusedToolWindow(): string | undefined {
+  const id = (document.activeElement as HTMLElement | null)?.closest<HTMLElement>("[data-toolwindow]")?.dataset.toolwindow;
   return id && layout.visible[id] ? id : undefined;
 }
 

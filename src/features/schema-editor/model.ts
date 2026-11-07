@@ -34,12 +34,16 @@ export interface KeyDef {
   name: string;
   primary: boolean;
   columns: string[];
+  /** `uid` of the column behind each entry of `columns` ("" for none): see `bindColumnRefs`. */
+  columnUids?: string[];
 }
 
 export interface FkDef {
   uid: string;
   name: string;
   columns: string[];
+  /** `uid` of the column behind each entry of `columns`. */
+  columnUids?: string[];
   refSchema: string;
   refTable: string;
   refColumns: string[];
@@ -53,6 +57,8 @@ export interface IndexDef {
   unique: boolean;
   /** Column names or (PostgreSQL / SQLite) expressions. */
   columns: string[];
+  /** `uid` of the column behind each entry of `columns` ("" for an expression). */
+  columnUids?: string[];
   /** PostgreSQL access method (`btree`, `hash`, ...); empty = default. */
   method: string;
   /** An index the dialog cannot rebuild faithfully (partial, INCLUDE): it can be dropped, not edited. */
@@ -147,6 +153,68 @@ export function emptyTable(schema: string, name = "table_name"): TableDef {
 }
 
 export const cloneTable = (t: TableDef): TableDef => JSON.parse(JSON.stringify(t)) as TableDef;
+
+// ---------------------------------------------------------------- column references by uid
+//
+// Keys, foreign keys and indexes list their columns by name (that is what the generator writes), next to it
+// `columnUids` says which column each name stands for. While the user types a new name for a column the names are
+// ambiguous for a moment (`name2` -> `name` -> `name3`, with another column called `name`): the uid is what tells
+// whose reference an entry is, so a rename or a removal follows the uid, never the name.
+
+type Refs = { columns: string[]; columnUids?: string[] };
+
+/** Fills the uids that are missing (names of columns of the table; anything else is an expression). */
+export function bindColumnRefs(t: TableDef): void {
+  const byName = new Map<string, string>();
+  for (const c of t.columns) if (!byName.has(c.name)) byName.set(c.name, c.uid);
+  const bind = (r: Refs) => {
+    const have = r.columnUids ?? [];
+    r.columnUids = r.columns.map((n, i) => have[i] || byName.get(n) || "");
+  };
+  t.keys.forEach(bind);
+  t.fks.forEach(bind);
+  t.indexes.forEach(bind);
+}
+
+/** Renames a column and the entries of keys, foreign keys and indexes that stand for it. */
+export function renameColumnRefs(t: TableDef, uid: string, name: string): void {
+  bindColumnRefs(t);
+  const c = t.columns.find((x) => x.uid === uid);
+  if (!c) return;
+  c.name = name;
+  const swap = (r: Refs) => (r.columns = r.columns.map((n, i) => (r.columnUids?.[i] === uid ? name : n)));
+  t.keys.forEach(swap);
+  t.fks.forEach(swap);
+  t.indexes.forEach(swap);
+}
+
+/** Removes a column; keys and indexes lose the entry (and go when empty), foreign keys on it go. */
+export function removeColumnRefs(t: TableDef, uid: string): void {
+  bindColumnRefs(t);
+  t.columns = t.columns.filter((c) => c.uid !== uid);
+  const strip = (r: Refs) => {
+    const keep = r.columns.map((_, i) => r.columnUids?.[i] !== uid);
+    r.columns = r.columns.filter((_, i) => keep[i]);
+    r.columnUids = (r.columnUids ?? []).filter((_, i) => keep[i]);
+  };
+  t.keys.forEach(strip);
+  t.keys = t.keys.filter((k) => k.columns.length > 0);
+  t.indexes.forEach(strip);
+  t.indexes = t.indexes.filter((i) => i.columns.length > 0);
+  t.fks = t.fks.filter((f) => !f.columnUids?.includes(uid));
+}
+
+/** Sets the column list of a key / foreign key / index to `names`, keeping the uid of the entries that stay. */
+export function setColumnRefs(t: TableDef, list: "keys" | "fks" | "indexes", uid: string, names: string[]): void {
+  bindColumnRefs(t);
+  const item = (t[list] as (Refs & { uid: string })[]).find((x) => x.uid === uid);
+  if (!item) return;
+  const known = new Map(item.columns.map((n, i) => [n, item.columnUids?.[i] ?? ""]));
+  const byName = new Map<string, string>();
+  for (const c of t.columns) if (!byName.has(c.name)) byName.set(c.name, c.uid);
+  item.columnUids = names.map((n) => known.get(n) || byName.get(n) || "");
+  item.columns = names;
+}
 
 /** The types offered by the Data Type combo of each dialect. */
 export const TYPES: Record<Driver, string[]> = {

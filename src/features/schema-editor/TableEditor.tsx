@@ -4,7 +4,7 @@
  * session and reloads the table in the explorer. See `docs/ux/screens/104-*.png`, `105-*.png`.
  */
 import { Match, Show, Switch, createEffect, createMemo, createResource, createSignal, on, untrack, type JSX } from "solid-js";
-import { createStore, produce, unwrap } from "solid-js/store";
+import { createStore, produce, reconcile, unwrap } from "solid-js/store";
 import { Checkbox, type MenuItem, Tree, type TreeController, type TreeItem, openMenu } from "../../components/ui";
 import { createConsole, writeConsole } from "../../api/db";
 import { type ColumnContext, columnIcon, iconOf } from "../explorer/model";
@@ -12,16 +12,17 @@ import { NodeIcon } from "../explorer/NodeIcon";
 import { LOCAL } from "../explorer/icons";
 import { openConsoleTab } from "../explorer/commands";
 import { askChoice } from "../table/dialogs";
-import { runPlan } from "./apply";
+import { PlanError, runPlan } from "./apply";
 import { ColumnList, Choice, Field, Text, TypeCombo } from "./fields";
 import { ArrowDown, ArrowUp, EditorFrame, TbButton } from "./Frame";
-import { type EditorCtx, errText, loadColumnNames, loadTableNames } from "./load";
+import { type EditorCtx, errText, loadColumnNames, loadTable, loadTableNames } from "./load";
 import {
   type ColumnDef,
   FK_ACTIONS,
   PG_INDEX_METHODS,
   type TableDef,
   TYPES,
+  bindColumnRefs,
   cloneTable,
   emptyTable,
   newCheck,
@@ -30,6 +31,9 @@ import {
   newIndex,
   newKey,
   newUid,
+  removeColumnRefs,
+  renameColumnRefs,
+  setColumnRefs,
 } from "./model";
 import { alterTablePlan, createTablePlan, planText, validateTable } from "./sqlgen";
 import { Icon } from "../../components/ui";
@@ -57,11 +61,14 @@ const FOLDERS: { key: ListKey; label: string; id: string; prefix: string }[] = [
 export function TableEditor(props: TableEditorProps): JSX.Element {
   const { ctx } = props;
   const d = ctx.driver;
-  const create = !props.orig;
-  const orig = props.orig;
-  const initial = orig ? cloneTable(orig) : emptyTable(ctx.schema);
+  // the loaded table: replaced when a failed MySQL plan left the table half changed (see `ok`)
+  const [origT, setOrig] = createSignal<TableDef | undefined>(props.orig);
+  const orig = origT;
+  const create = (): boolean => !orig();
+  const initial = props.orig ? cloneTable(props.orig) : emptyTable(ctx.schema);
+  bindColumnRefs(initial);
   const [cur, setCur] = createStore<TableDef>(initial);
-  const initialJson = JSON.stringify(initial);
+  let initialJson = JSON.stringify(initial);
   const dirty = () => JSON.stringify(unwrap(cur)) !== initialJson;
 
   const [sel, setSel] = createSignal("root");
@@ -71,7 +78,10 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
   const [applyError, setApplyError] = createSignal("");
   let tree: TreeController | undefined;
 
-  const plan = createMemo(() => (orig ? alterTablePlan(d, orig, cur) : createTablePlan(d, cur)));
+  const plan = createMemo(() => {
+    const o = orig();
+    return o ? alterTablePlan(d, o, cur) : createTablePlan(d, cur);
+  });
   const problem = createMemo(() => validateTable(d, cur)[0] ?? plan().error);
 
   // ---------------------------------------------------------------- selection
@@ -143,38 +153,38 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
   const roots = createMemo<TreeItem[]>(() => {
     const icons = ctxIcons();
     const pkCols = new Set(cur.keys.filter((k) => k.primary).flatMap((k) => k.columns));
-    const fresh = (list: { uid: string }[] | undefined, uid: string): string | undefined => (!orig || !list?.some((x) => x.uid === uid) ? "dgse-new" : undefined);
+    const fresh = (list: { uid: string }[] | undefined, uid: string): string | undefined => (!orig() || !list?.some((x) => x.uid === uid) ? "dgse-new" : undefined);
     const columns: TreeItem[] = cur.columns.map((c) => ({
       id: "col:" + c.uid,
-      labelClass: fresh(orig?.columns, c.uid),
+      labelClass: fresh(orig()?.columns, c.uid),
       label: tbl(c.name),
       hint: [c.type, c.default && `= ${c.default.length > 20 ? c.default.slice(0, 18) + "…" : c.default}`].filter(Boolean).join(" "),
       data: columnIcon({ name: c.name, extra: { isPk: pkCols.has(c.name), nullable: !c.notNull } } as never, icons),
     }));
     const keys: TreeItem[] = cur.keys.map((k, i) => ({
       id: "key:" + k.uid,
-      labelClass: fresh(orig?.keys, k.uid),
+      labelClass: fresh(orig()?.keys, k.uid),
       label: k.name || synthetic("key", i + 1) || tbl(k.name),
       hint: `(${k.columns.join(", ")})`,
       data: iconOf(k.primary ? "primaryKey" : "uniqueKey"),
     }));
     const fks: TreeItem[] = cur.fks.map((f, i) => ({
       id: "fk:" + f.uid,
-      labelClass: fresh(orig?.fks, f.uid),
+      labelClass: fresh(orig()?.fks, f.uid),
       label: f.name || synthetic("foreign-key", i + 1) || tbl(f.name),
       hint: f.refTable ? `(${f.columns.join(", ")}) → ${f.refTable}` : `(${f.columns.join(", ")})`,
       data: iconOf("foreignKey"),
     }));
     const indexes: TreeItem[] = cur.indexes.map((x) => ({
       id: "idx:" + x.uid,
-      labelClass: fresh(orig?.indexes, x.uid),
+      labelClass: fresh(orig()?.indexes, x.uid),
       label: tbl(x.name),
       hint: `(${x.columns.join(", ")})${x.unique ? " UNIQUE" : ""}`,
       data: iconOf("index", { extra: { unique: x.unique, primary: false } } as never),
     }));
     const checks: TreeItem[] = cur.checks.map((x, i) => ({
       id: "chk:" + x.uid,
-      labelClass: fresh(orig?.checks, x.uid),
+      labelClass: fresh(orig()?.checks, x.uid),
       label: x.name || synthetic("check", i + 1) || tbl(x.name),
       hint: x.expr.length > 26 ? `(${x.expr.slice(0, 22)}…)` : `(${x.expr})`,
       data: iconOf("check"),
@@ -183,7 +193,7 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
     return [
       {
         id: "root",
-        labelClass: orig ? undefined : "dgse-new",
+        labelClass: orig() ? undefined : "dgse-new",
         label: tbl(cur.name),
         hint: `${ctx.schema} [${ctx.dsName}]`,
         data: iconOf("table"),
@@ -220,36 +230,16 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
     setCur(list, (x) => x.uid === uid, "name" as never, name as never);
   }
 
+  // keys, foreign keys and indexes follow a column by its uid, not by its name (see `renameColumnRefs`)
   function renameColumn(uid: string, name: string): void {
-    const old = colOf(uid)?.name;
-    setCur(
-      produce((t) => {
-        const c = t.columns.find((x) => x.uid === uid);
-        if (!c) return;
-        c.name = name;
-        if (old === undefined || old === name) return;
-        const swap = (l: string[]) => l.map((x) => (x === old ? name : x));
-        t.keys.forEach((k) => (k.columns = swap(k.columns)));
-        t.fks.forEach((f) => (f.columns = swap(f.columns)));
-        t.indexes.forEach((i) => (i.columns = swap(i.columns)));
-      }),
-    );
+    setCur(produce((t) => renameColumnRefs(t, uid, name)));
   }
 
   function removeColumn(uid: string): void {
-    const name = colOf(uid)?.name;
-    setCur(
-      produce((t) => {
-        t.columns = t.columns.filter((c) => c.uid !== uid);
-        if (!name) return;
-        t.keys.forEach((k) => (k.columns = k.columns.filter((x) => x !== name)));
-        t.keys = t.keys.filter((k) => k.columns.length > 0);
-        t.indexes.forEach((i) => (i.columns = i.columns.filter((x) => x !== name)));
-        t.indexes = t.indexes.filter((i) => i.columns.length > 0);
-        t.fks = t.fks.filter((f) => !f.columns.includes(name));
-      }),
-    );
+    setCur(produce((t) => removeColumnRefs(t, uid)));
   }
+
+  const setRefs = (list: "keys" | "fks" | "indexes", uid: string, names: string[]): void => setCur(produce((t) => setColumnRefs(t, list, uid, names)));
 
   function add(kind: ListKey): void {
     const n = cur[kind].length + 1;
@@ -367,7 +357,7 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
 
   const canMove = (delta: -1 | 1): boolean => {
     const { kind, uid } = parse(sel());
-    if (kind !== "col" || (!create && d !== "mysql")) return false;
+    if (kind !== "col" || (!create() && d !== "mysql")) return false;
     const i = cur.columns.findIndex((c) => c.uid === uid);
     return i + delta >= 0 && i + delta < cur.columns.length;
   };
@@ -391,19 +381,44 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
 
   async function ok(): Promise<void> {
     if (busy()) return;
-    if (!create && !dirty()) return props.onClose();
+    if (!create() && !dirty()) return props.onClose();
     setBusy(true);
     setApplyError("");
     try {
       await runPlan(ctx.dsId, plan());
     } catch (e) {
-      setApplyError(errText(e));
+      // MySQL does not roll back: when part of the plan went through, the dialog must start from what the table is now
+      // (a retry would replay the statements that already ran)
+      const msg = errText(e);
+      setApplyError(e instanceof PlanError && e.applied > 0 ? await resync(msg) : msg);
       setBusy(false);
       return;
     }
     setBusy(false);
     props.onApplied();
     props.onClose();
+  }
+
+  /** Reloads the table after a plan that stopped half way; returns the message to show. */
+  async function resync(msg: string): Promise<string> {
+    const names = [...new Set([orig()?.name, cur.name].filter((n): n is string => !!n))];
+    let fresh: TableDef | undefined;
+    for (const n of names) {
+      try {
+        fresh = await loadTable(ctx, n);
+        break;
+      } catch {
+        /* not under that name */
+      }
+    }
+    props.onApplied();
+    if (!fresh) return `${msg}\nPart of the changes was applied, but the table could not be reloaded: close the dialog and check it.`;
+    bindColumnRefs(fresh);
+    setOrig(fresh);
+    const copy = cloneTable(fresh);
+    setCur(reconcile(copy));
+    initialJson = JSON.stringify(copy);
+    return `${msg}\nPart of the changes was already applied. The table was reloaded from the database; check the remaining changes and press OK again.`;
   }
 
   async function cancel(): Promise<void> {
@@ -434,7 +449,7 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
   }
 
   // preselect (Modify Column…)
-  if (props.select && orig) {
+  if (props.select && orig()) {
     const list = { col: cur.columns, key: cur.keys, fk: cur.fks, idx: cur.indexes, chk: cur.checks }[props.select.kind] as { uid: string; name: string }[];
     const hit = list.find((x) => x.name === props.select!.name);
     if (hit) {
@@ -464,7 +479,7 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
               <Text value={cur.owner} onInput={(v) => setCur("owner", v)} />
             </Field>
             <Field label="Tablespace">
-              <Text value={cur.tablespace} onInput={(v) => setCur("tablespace", v)} disabled={!create} />
+              <Text value={cur.tablespace} onInput={(v) => setCur("tablespace", v)} disabled={!create()} />
             </Field>
           </Show>
         </Match>
@@ -496,7 +511,7 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
   };
 
   const colNames = () => cur.columns.map((c) => c.name).filter(Boolean);
-  const inOrig = (uid: string) => !!orig?.columns.some((c) => c.uid === uid);
+  const inOrig = (uid: string) => !!orig()?.columns.some((c) => c.uid === uid);
 
   function ColumnSheet(p: { uid: string }): JSX.Element {
     const c = () => colOf(p.uid)!;
@@ -576,7 +591,7 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
           />
         </Field>
         <Field label="Columns" top>
-          <ColumnList all={colNames()} value={k()!.columns} onChange={(v) => setCur("keys", (x) => x.uid === p.uid, "columns", v)} />
+          <ColumnList all={colNames()} value={k()!.columns} onChange={(v) => setRefs("keys", p.uid, v)} />
         </Field>
       </Show>
     );
@@ -584,7 +599,7 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
 
   function FkSheet(p: { uid: string }): JSX.Element {
     const f = () => cur.fks.find((x) => x.uid === p.uid);
-    const self = () => f()?.refTable === cur.name || (!!orig && f()?.refTable === orig.name);
+    const self = () => f()?.refTable === cur.name || (!!orig() && f()?.refTable === orig()!.name);
     const [targetCols] = createResource(
       () => ({ t: f()?.refTable, self: self() }),
       async ({ t, self }) => (!t ? [] : self ? colNames() : loadColumnNames(ctx, t)),
@@ -608,7 +623,7 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
           />
         </Field>
         <Field label="Columns" top>
-          <ColumnList all={colNames()} value={f()!.columns} onChange={(v) => setF({ columns: v })} />
+          <ColumnList all={colNames()} value={f()!.columns} onChange={(v) => setRefs("fks", p.uid, v)} />
         </Field>
         <Field label="Target Columns" top>
           <ColumnList all={targetCols() ?? []} value={f()!.refColumns} onChange={(v) => setF({ refColumns: v })} disabled={!f()!.refTable} />
@@ -641,10 +656,10 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
           </Field>
         </Show>
         <Field label="Columns" top>
-          <ColumnList all={colNames()} value={i()!.columns} onChange={(v) => set({ columns: v })} disabled={i()!.locked} />
+          <ColumnList all={colNames()} value={i()!.columns} onChange={(v) => setRefs("indexes", p.uid, v)} disabled={i()!.locked} />
         </Field>
         <Show when={i()!.locked}>
-          <div class="dgse-note">This index has a condition or included columns: it can only be dropped here.</div>
+          <div class="dgse-note">This index has a condition, an expression or included columns: it can only be dropped here.</div>
         </Show>
       </Show>
     );
@@ -721,7 +736,7 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
       sheet={<div class="dgse-sheet">{sheet()}</div>}
       preview={planText(plan())}
       dialect={d}
-      unchanged={!create && plan().statements.length === 0}
+      unchanged={!create() && plan().statements.length === 0}
       problem={problem()}
       warnings={plan().warnings}
       busy={busy()}

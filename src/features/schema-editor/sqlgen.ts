@@ -16,6 +16,8 @@ import {
   type KeyDef,
   type TableDef,
 } from "./model";
+import { isKeyword } from "./keywords";
+import { type Rewrite, indexColumnsStart, rewriteColumns, triggerName } from "./sqliteRefs";
 
 export interface Plan {
   /** Run before the transaction (SQLite pragmas). */
@@ -36,22 +38,9 @@ export const planIsEmpty = (p: Plan): boolean => p.statements.length === 0;
 
 // ---------------------------------------------------------------- quoting
 
-const RESERVED = new Set(
-  (
-    "all analyse analyze and any array as asc asymmetric authorization between binary both case cast check collate column " +
-    "constraint create cross current_date current_time current_timestamp current_user default deferrable desc distinct do " +
-    "else end except false fetch for foreign from full grant group having ilike in initially inner intersect into is isnull " +
-    "join leading left like limit localtime localtimestamp natural not notnull null offset on only or order outer overlaps " +
-    "placing primary references returning right select session_user similar some symmetric table then to trailing true " +
-    "union unique user using variadic verbose when where with index key keys database schema view range rows row regexp " +
-    "rlike trigger update delete insert values set drop alter add describe explain show use read write rename replace " +
-    "if exists interval match option partition procedure condition cursor database databases delayed div"
-  ).split(" "),
-);
-
 export function ident(d: Driver, name: string): string {
   const simple = d === "postgres" ? /^[a-z_][a-z0-9_$]*$/ : /^[A-Za-z_][A-Za-z0-9_$]*$/;
-  if (simple.test(name) && !RESERVED.has(name.toLowerCase())) return name;
+  if (simple.test(name) && !isKeyword(d, name)) return name;
   return d === "mysql" ? "`" + name.replace(/`/g, "``") + "`" : '"' + name.replace(/"/g, '""') + '"';
 }
 
@@ -86,6 +75,31 @@ function mysqlDefault(v: string): string {
   return `(${t})`;
 }
 
+/** Whether the whole text is one parenthesised expression: `(datetime('now'))`, not `(a) + (b)`. */
+function wrapped(t: string): boolean {
+  if (!t.startsWith("(") || !t.endsWith(")")) return false;
+  let depth = 0;
+  let quote = "";
+  for (let i = 0; i < t.length; i++) {
+    const ch = t[i];
+    if (quote) {
+      if (ch === quote) quote = "";
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") quote = ch;
+    else if (ch === "(") depth++;
+    else if (ch === ")" && --depth === 0) return i === t.length - 1;
+  }
+  return false;
+}
+
+/** SQLite's `default` takes a literal, `current_*` or a parenthesised expression (`pragma table_info` gives it without them). */
+const SQLITE_LITERAL = /^([+-]?(\d+(\.\d*)?|\.\d+)(e[+-]?\d+)?|0x[0-9a-f]+|'(?:[^']|'')*'|"(?:[^"]|"")*"|x'[0-9a-f]*'|null|true|false|current_(date|time|timestamp))$/i;
+function sqliteDefault(v: string): string {
+  const t = v.trim();
+  return SQLITE_LITERAL.test(t) || wrapped(t) ? t : `(${t})`;
+}
+
 interface ColOpts {
   /** SQLite: the column is a single-column primary key written inline. */
   inlinePk?: boolean;
@@ -115,7 +129,7 @@ function columnType(d: Driver, c: ColumnDef, o: ColOpts = {}): string {
   } else {
     if (o.inlinePk) parts.push(c.autoIncrement ? "primary key autoincrement" : "primary key");
     if (c.notNull) parts.push("not null");
-    if (c.default.trim() && !c.generated) parts.push(`default ${c.default.trim()}`);
+    if (c.default.trim() && !c.generated) parts.push(`default ${sqliteDefault(c.default)}`);
     if (c.generated) parts.push(`generated always as (${c.generated}) ${c.generatedStored ? "stored" : "virtual"}`);
   }
   return parts.join(" ");
@@ -361,14 +375,16 @@ function pgAlter(orig: TableDef, cur: TableDef, df: Diff): Plan {
 
 function myAlter(orig: TableDef, cur: TableDef, df: Diff): Plan {
   const d: Driver = "mysql";
+  // One ALTER for the whole change: MySQL checks the end result, not every step (dropping and adding the primary
+  // key of an auto_increment column fails as two statements), and the change is atomic. The exception is a foreign key
+  // that is dropped and added again under its name: MySQL refuses that in one statement.
+  const T = qualified(d, orig.schema, orig.name);
+  const clauses: string[] = [];
   const out: string[] = [];
-  let T = qualified(d, orig.schema, orig.name);
-  if (orig.name !== cur.name) {
-    out.push(`alter table ${T} rename to ${qualified(d, cur.schema, cur.name)};`);
-    T = qualified(d, cur.schema, cur.name);
-  }
-  const alter = (s: string) => out.push(`alter table ${T} ${s};`);
-  for (const f of [...df.fks.dropped, ...df.fks.changed.map((x) => x.o), ...df.fks.renamed.map((x) => x.o)]) alter(`drop foreign key ${ident(d, f.name)}`);
+  const alter = (s: string) => clauses.push(s);
+  const sameName = df.fks.changed.filter((x) => x.o.name === x.c.name).map((x) => x.o);
+  if (sameName.length) out.push(`alter table ${T} ${sameName.map((f) => `drop foreign key ${ident(d, f.name)}`).join(", ")};`);
+  for (const f of [...df.fks.dropped, ...df.fks.changed.filter((x) => x.o.name !== x.c.name).map((x) => x.o), ...df.fks.renamed.map((x) => x.o)]) alter(`drop foreign key ${ident(d, f.name)}`);
   for (const c of [...df.checks.dropped, ...df.checks.changed.map((x) => x.o), ...df.checks.renamed.map((x) => x.o)]) alter(`drop check ${ident(d, c.name)}`);
   for (const k of [...df.keys.dropped, ...df.keys.changed.map((x) => x.o)]) alter(k.primary ? "drop primary key" : `drop index ${ident(d, k.name)}`);
   for (const i of [...df.indexes.dropped, ...df.indexes.changed.map((x) => x.o)]) alter(`drop index ${ident(d, i.name)}`);
@@ -403,9 +419,12 @@ function myAlter(orig: TableDef, cur: TableDef, df: Diff): Plan {
   for (const k of [...df.keys.changed.map((x) => x.c), ...df.keys.added]) if (k.columns.length) alter(`add ${keyClause(d, k)}`);
   for (const f of [...df.fks.changed.map((x) => x.c), ...df.fks.added, ...df.fks.renamed.map((x) => x.c)]) if (f.columns.length && f.refTable) alter(`add ${fkClause(d, f)}`);
   for (const c of [...df.checks.changed.map((x) => x.c), ...df.checks.added, ...df.checks.renamed.map((x) => x.c)]) if (c.expr.trim()) alter(`add ${checkClause(d, c)}`);
-  for (const i of [...df.indexes.changed.map((x) => x.c), ...df.indexes.added]) if (i.name.trim() && i.columns.length) out.push(indexStmt(d, cur, i));
   for (const { o, c } of [...df.keys.renamed, ...df.indexes.renamed]) if (!(o as KeyDef).primary) alter(`rename index ${ident(d, o.name)} to ${ident(d, c.name)}`);
   if (orig.comment !== cur.comment) alter(`comment = ${literal(d, cur.comment)}`);
+  if (orig.name !== cur.name) alter(`rename to ${qualified(d, cur.schema, cur.name)}`);
+  if (clauses.length === 1) out.push(`alter table ${T} ${clauses[0]};`);
+  else if (clauses.length) out.push(`alter table ${T}\n${clauses.map((c) => "    " + c).join(",\n")};`);
+  for (const i of [...df.indexes.changed.map((x) => x.c), ...df.indexes.added]) if (i.name.trim() && i.columns.length) out.push(indexStmt(d, cur, i));
   return { pre: [], statements: out, post: [], transactional: false, warnings: [] };
 }
 
@@ -464,9 +483,11 @@ function liteAlter(orig: TableDef, cur: TableDef, df: Diff): Plan {
   const simple = sqliteSimple(orig, cur, df);
   if (simple) return { pre: [], statements: simple, post: [], transactional: true, warnings: [] };
 
-  // the DataGrip-style rebuild
+  // the DataGrip-style rebuild; it runs under the name the table has, a rename follows as a statement of its own
+  // (renaming `_dg_tmp` straight to the new name would leave the foreign keys of other tables on the old name)
   const T = qualified(d, orig.schema, orig.name);
-  const tmpName = `${cur.name}_dg_tmp`;
+  const tmpName = `${orig.name}_dg_tmp`;
+  const renamed = orig.name !== cur.name;
   const warnings = [...cur.warnings];
   const plan: Plan = { pre: [], statements: [], post: [], transactional: true, warnings };
   if (cur.columns.some((c) => c.generated === "?")) {
@@ -476,13 +497,44 @@ function liteAlter(orig: TableDef, cur: TableDef, df: Diff): Plan {
   plan.pre = ["pragma foreign_keys = off;", "pragma legacy_alter_table = on;"];
   plan.post = ["pragma legacy_alter_table = off;", "pragma foreign_keys = on;"];
   const st = plan.statements;
-  st.push(createTableStatement(d, { ...cur, name: tmpName }));
+  // a foreign key of the table to itself already names the new table: it points to the old one until the rename
+  const back = (f: FkDef): FkDef => (renamed && f.refTable === cur.name && (!f.refSchema || f.refSchema === cur.schema) ? { ...f, refTable: orig.name } : f);
+  st.push(createTableStatement(d, { ...cur, name: tmpName, fks: cur.fks.map(back) }));
   const copy = df.keptCols.filter((k) => !k.c.generated);
   if (copy.length) st.push(`insert into ${qualified(d, cur.schema, tmpName)} (${copy.map((k) => ident(d, k.c.name)).join(", ")})\nselect ${copy.map((k) => ident(d, k.o.name)).join(", ")}\nfrom ${T};`);
   st.push(`drop table ${T};`);
-  st.push(`alter table ${qualified(d, cur.schema, tmpName)} rename to ${ident(d, cur.name)};`);
-  for (const i of cur.indexes) if (i.name.trim() && i.columns.length) st.push(indexStmt(d, cur, i));
-  if (orig.name === cur.name) for (const t of orig.triggers) st.push(t.trim().endsWith(";") ? t.trim() : t.trim() + ";");
-  else if (orig.triggers.length) warnings.push("Triggers of the table are not recreated after a rename.");
+  st.push(`alter table ${qualified(d, cur.schema, tmpName)} rename to ${ident(d, orig.name)};`);
+
+  // what is recreated from its SQL follows the renamed columns
+  const map = new Map<string, string | null>();
+  for (const [o, c] of df.rename) if (o !== c) map.set(o, c);
+  for (const c of df.droppedCols) map.set(c.name, null);
+  const quote = (n: string) => ident(d, n);
+  // a reference that cannot be followed is an error: recreating the statement as it is would break it later
+  const note = (what: string, r: Rewrite) => {
+    const names = (l: string[]) => l.map((n) => `'${n}'`).join(", ");
+    if (r.loose.length) plan.error ??= `${what} mentions the column ${names(r.loose)} in a way the dialog cannot update. Drop or edit it in a console first, then change the table.`;
+    if (r.gone.length) plan.error ??= `${what} uses the column ${names(r.gone)} that is dropped here. Drop or edit it in a console first, then change the table.`;
+  };
+  const keep = { ...cur, name: orig.name };
+  for (const i of cur.indexes) {
+    if (!i.name.trim() || !i.columns.length) continue;
+    if (i.locked && i.definition && map.size) {
+      const r = rewriteColumns(i.definition, map, quote, { bare: true, from: indexColumnsStart(i.definition) });
+      note(`Index '${i.name}'`, r);
+      st.push(indexStmt(d, keep, { ...i, definition: r.sql }));
+    } else st.push(indexStmt(d, keep, i));
+  }
+  for (const t of orig.triggers) {
+    const r = map.size ? rewriteColumns(t, map, quote) : { sql: t, loose: [], gone: [] };
+    if (map.size) note(`Trigger '${triggerName(t)}'`, r);
+    const sql = r.sql.trim();
+    st.push(sql.endsWith(";") ? sql : sql + ";");
+  }
+  if (renamed) {
+    // with the legacy behaviour off the server also updates the foreign keys, triggers and views that name the table
+    st.push("pragma legacy_alter_table = off;");
+    st.push(`alter table ${T} rename to ${ident(d, cur.name)};`);
+  }
   return plan;
 }

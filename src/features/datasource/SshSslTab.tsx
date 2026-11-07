@@ -1,11 +1,27 @@
-import { Checkbox, ComboBox, Icon, TextField } from "../../components/ui";
+import { isTauri } from "../../api/db";
+import { Checkbox, ComboBox, TextField, notify } from "../../components/ui";
 import { DBMS } from "./drivers";
 
 const PREVIEW_MODES = DBMS.postgres.sslModes;
 import type { Session } from "./session";
-import { Row } from "./widgets";
+import { FileField, Row } from "./widgets";
 
-/** SSH tunnel (not supported by the backend yet) and SSL (sslmode is wired through `options.sslmode`). */
+/** Picks a certificate / key file with the desktop file chooser. */
+async function browseCert(title: string, onPick: (path: string) => void) {
+  if (!isTauri()) {
+    notify({ title: "File chooser", body: "The file chooser is available in the desktop app. Type the path instead.", kind: "info" });
+    return;
+  }
+  try {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const p = await open({ multiple: false, directory: false, title });
+    if (typeof p === "string") onPick(p);
+  } catch (e) {
+    notify({ title: "File chooser", body: String(e), kind: "error" });
+  }
+}
+
+/** SSH tunnel (not supported by the backend yet) and SSL (`options.sslmode`, `sslrootcert`, `sslcert`, `sslkey`). */
 export function SshSslTab(props: { s: Session }) {
   const s = props.s;
   const f = () => s.current()!.form;
@@ -38,15 +54,22 @@ export function SshSslTab(props: { s: Session }) {
           label="Use SSL"
         />
       </div>
-      <Row label="CA file:" labelWidth={139} disabled>
-        <TextField disabled frameClass="ds-fill" suffix={<Icon name="folder" />} />
-      </Row>
-      <Row label="Client certificate file:" labelWidth={139} disabled>
-        <TextField disabled frameClass="ds-fill" suffix={<Icon name="folder" />} />
-      </Row>
-      <Row label="Client key file:" labelWidth={139} disabled>
-        <TextField disabled frameClass="ds-fill" suffix={<Icon name="folder" />} />
-      </Row>
+      {(
+        [
+          ["CA file:", "sslrootcert", "Select CA File"],
+          ["Client certificate file:", "sslcert", "Select Client Certificate File"],
+          ["Client key file:", "sslkey", "Select Client Key File"],
+        ] as const
+      ).map(([label, key, title]) => (
+        <Row label={label} labelWidth={139} disabled={!sslOn()}>
+          <FileField
+            value={f().options[key] ?? ""}
+            disabled={!sslOn()}
+            onInput={(v) => s.setOption(key, v)}
+            onBrowse={() => void browseCert(title, (p) => s.setOption(key, p))}
+          />
+        </Row>
+      ))}
       <Row label="Mode:" labelWidth={139} disabled={!sslOn()}>
         <div class="ds-ssl-mode">
           <ComboBox
@@ -62,7 +85,7 @@ export function SshSslTab(props: { s: Session }) {
           ? "SSL does not apply to SQLite"
           : f().connType === "url"
             ? "In URL only mode set the SSL parameters in the URL"
-            : "Certificate files are not supported yet"}
+            : "The CA file is used by the Verify modes; the client files only when the server asks for a certificate"}
       </div>
     </div>
   );

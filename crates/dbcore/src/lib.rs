@@ -6,7 +6,9 @@ pub mod conn;
 pub mod ddl;
 pub mod error;
 pub mod exec;
+pub mod explain;
 pub mod export;
+pub mod fsutil;
 pub mod history;
 pub mod import;
 pub mod introspect;
@@ -20,6 +22,7 @@ pub mod value;
 
 pub use conn::{Conn, Pool};
 pub use error::{DbError, Result, ServerError};
+pub use explain::{ExplainPlan, PlanNode, PlanProp};
 pub use export::{export_result, export_to_string, ExportFormat, ExportOptions, Exporter};
 pub use history::{HistoryEntry, QueryHistory};
 pub use import::{

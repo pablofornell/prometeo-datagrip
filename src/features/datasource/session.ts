@@ -9,8 +9,10 @@ import { friendlyConnectionError } from "../../state/connection-errors";
 import { deleteDataSource, listDataSources, saveDataSource, testConnection } from "../../api/db";
 import type { DataSource, DataSourceConfig } from "../../api/db";
 import { forgetVisibleSchemas } from "../../state/schema-filter";
+import { forgetDsGroup } from "../../state/ds-folders";
 import { saveVisibleSchemas } from "./schemas";
 import { DBMS, type Dbms, buildUrl, parseUrl, sqliteFileOfUrl } from "./drivers";
+import type { UrlPrefill } from "./urlParse";
 import {
   type Draft,
   type Form,
@@ -250,8 +252,17 @@ export function createSession() {
   }
 
   // ---- list operations
-  function addNew(dbms: Dbms) {
+  function addNew(dbms: Dbms, prefill?: UrlPrefill) {
     const form = defaultForm(dbms);
+    if (prefill) {
+      // "Data Source from URL": the parsed fields replace the defaults
+      if (prefill.host !== undefined) form.host = prefill.host;
+      if (prefill.port) form.port = prefill.port;
+      if (prefill.database !== undefined) form.database = prefill.database;
+      if (prefill.user) form.user = prefill.user;
+      if (prefill.file) form.file = prefill.file;
+      form.url = buildUrl(dbms, form);
+    }
     const taken = drafts.map((d) => d.form.name);
     form.name = uniqueName(autoName(form), taken);
     const d: Draft = {
@@ -259,7 +270,7 @@ export function createSession() {
       id: null,
       saved: null,
       form,
-      password: { value: "", touched: false },
+      password: prefill?.password ? { value: prefill.password, touched: true } : { value: "", touched: false },
       nameAuto: true,
       base: snapshot(form),
       test: { state: "idle" },
@@ -381,6 +392,7 @@ export function createSession() {
       for (const id of deletedIds()) {
         await deleteDataSource(id);
         forgetVisibleSchemas(id);
+        forgetDsGroup(id);
       }
       setDeletedIds([]);
       const keys = drafts.filter((d) => isNew(d) || isModified(d)).map((d) => d.key);

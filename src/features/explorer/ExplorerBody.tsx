@@ -1,7 +1,7 @@
 import { For, type JSX, Show } from "solid-js";
-import { Highlighted, Icon, Tree } from "../../components/ui";
+import { Highlighted, Icon, Tree, openMenu } from "../../components/ui";
 import { theme } from "../../state/theme";
-import { DRIVERS, showContextMenu } from "./actions";
+import { DRIVERS, driverItems, showContextMenu } from "./actions";
 import {
   cancelRename,
   commitRename,
@@ -20,8 +20,8 @@ import {
   loaded,
   onExpandedChange,
   onSelect,
-  roots,
   saved,
+  treeRoots,
   setController,
   setSearchQuery,
 } from "./core";
@@ -161,7 +161,7 @@ function renderLabel(item: ENode, query: string): JSX.Element {
   );
 }
 
-const EMPTY_STATE_DBMS = ["postgres", "mysql", "sqlite"] as const;
+const EMPTY_STATE_DBMS = ["postgres", "mysql", "mariadb", "sqlite"] as const;
 
 /** Empty state (no data sources): one button per supported DBMS. */
 function EmptyState(): JSX.Element {
@@ -176,6 +176,18 @@ function EmptyState(): JSX.Element {
           </button>
         )}
       </For>
+      {/* the rest of the DBMS list is one click away, as the `Data Source >` submenu */}
+      <button
+        type="button"
+        class="dg-explorer-empty-btn"
+        onClick={(e) => openMenu(driverItems(), { anchor: e.currentTarget, compact: true, minWidth: 200 })}
+      >
+        <Icon name="dg/dbms" />
+        <span>All Data Sources</span>
+        <span class="dg-explorer-empty-more">
+          <Icon name="chevron-right" />
+        </span>
+      </button>
     </div>
   );
 }
@@ -186,7 +198,7 @@ export function ExplorerBody(): JSX.Element {
       <Show when={loaded()}>
         <Tree<ENode>
           class="dg-explorer-tree"
-          roots={roots()}
+          roots={treeRoots()}
           loadChildren={loadChildren}
           initialExpanded={saved.expanded}
           selectedId={saved.selected}

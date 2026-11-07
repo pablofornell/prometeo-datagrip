@@ -4,7 +4,8 @@ import { EditorSelection } from "@codemirror/state";
 import { type Command, EditorView } from "@codemirror/view";
 import { isTauri } from "../../api/tauri";
 import { type MenuItem, openMenu } from "../ui";
-import { duplicate, goToLine } from "./commands";
+import { duplicate, goToLine, recordClip } from "./commands";
+import { showIntentions } from "./intentionsPopup";
 import { type NavHandlers, referenceAtCaret } from "./navigate";
 
 export async function writeText(text: string): Promise<void> {
@@ -52,9 +53,13 @@ const selectedText = (view: EditorView): string =>
     .map((r) => view.state.sliceDoc(r.from, r.to))
     .join("\n");
 
-const copy = (view: EditorView): void => void writeText(selectedText(view));
+const copy = (view: EditorView): void => {
+  recordClip(selectedText(view));
+  void writeText(selectedText(view));
+};
 
 const cut = (view: EditorView): void => {
+  recordClip(selectedText(view));
   void writeText(selectedText(view));
   view.dispatch(view.state.replaceSelection(""), { userEvent: "delete.cut", scrollIntoView: true });
 };
@@ -97,6 +102,8 @@ export function openEditorMenu(view: EditorView, e: MouseEvent, o: EditorMenuOpt
     };
   const items: MenuItem[] = [];
 
+  if (!o.single && !ro) items.push({ label: "Show Context Actions", icon: "intention-bulb", shortcut: "Alt+Enter", run: () => { view.focus(); showIntentions(view); } }, sep);
+
   const edit: MenuItem[] = [];
   if (hasSel && !ro) edit.push({ label: "Cut", shortcut: "Ctrl+X", run: () => cut(view) });
   if (hasSel) edit.push({ label: "Copy", icon: "copy", shortcut: "Ctrl+C", run: () => copy(view) });
@@ -124,7 +131,10 @@ export function openEditorMenu(view: EditorView, e: MouseEvent, o: EditorMenuOpt
     );
   }
 
-  if (!o.single && o.canExecute) items.push({ action: "sql.execute" }, { action: "sql.executeScript" });
+  if (!o.single && o.canExecute) {
+    items.push({ label: "Explain Plan", icon: "explain-plan", children: [{ action: "sql.explainPlan" }, { action: "sql.explainAnalyse" }] });
+    items.push({ action: "sql.execute" }, { action: "sql.executeScript" });
+  }
 
   openMenu(items, { x: e.clientX, y: e.clientY, minWidth: 340 });
 }

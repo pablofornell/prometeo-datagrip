@@ -16,7 +16,7 @@ export interface StatusState {
   /** Navigation path, left side: Database Consoles › postgres@localhost › console [postgres@localhost]. */
   path: Crumb[];
   /** Editor caret (1-based). null hides the widget. */
-  caret: { line: number; col: number } | null;
+  caret: { line: number; col: number; /** Size of the selection: `1:19 (5 chars)`. */ chars?: number; breaks?: number } | null;
   lineSeparator: "LF" | "CRLF" | "CR" | null;
   encoding: string | null;
   /** Indentation widget ("4 spaces"). undefined: derived (shown next to the caret, like DataGrip). */

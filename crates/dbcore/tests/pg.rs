@@ -95,12 +95,64 @@ async fn introspection_tree() {
     assert!(cur.has_children);
     // the database comment (hover tooltip of the explorer node) travels in `extra`
     assert!(
-        dbs.iter().all(|d| d.extra["comment"].is_string()),
+        dbs.iter()
+            .filter(|d| d.kind == NodeKind::Database)
+            .all(|d| d.extra["comment"].is_string()),
         "{dbs:?}"
     );
     let db = cur.name.as_str();
+    // `Server Objects` closes the list: roles and tablespaces
+    let server = dbs.last().unwrap();
+    assert_eq!(
+        (server.kind, server.name.as_str(), server.has_children),
+        (NodeKind::Folder, "Server Objects", true)
+    );
+    let groups = children(&mgr, "pg", &["$server"]).await;
+    assert_eq!(names(&groups), ["roles", "tablespaces"]);
+    let roles = children(&mgr, "pg", &["$server", "roles"]).await;
+    let pg = roles
+        .iter()
+        .find(|r| r.name == "postgres")
+        .expect("role postgres");
+    assert_eq!(
+        (pg.kind, pg.hint.as_deref()),
+        (NodeKind::Role, Some("superuser"))
+    );
+    assert!(roles.iter().all(|r| !r.name.starts_with("pg_")));
+    let spaces = names(&children(&mgr, "pg", &["$server", "tablespaces"]).await);
+    assert!(spaces.contains(&"pg_default".to_string()), "{spaces:?}");
 
     let schemas = children(&mgr, "pg", &[db]).await;
+    // schemas alphabetical (case-insensitive), `Database Objects` after them; one schema is the default one
+    let plain: Vec<_> = schemas
+        .iter()
+        .filter(|s| s.kind == NodeKind::Schema)
+        .collect();
+    let lowered: Vec<String> = plain.iter().map(|s| s.name.to_lowercase()).collect();
+    assert!(lowered.windows(2).all(|w| w[0] <= w[1]), "{lowered:?}");
+    assert_eq!(
+        plain
+            .iter()
+            .filter(|s| s.extra["default"] == json!(true))
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        ["public"]
+    );
+    let objs = schemas.last().unwrap();
+    assert_eq!(
+        (objs.kind, objs.name.as_str()),
+        (NodeKind::Folder, "Database Objects")
+    );
+    assert_eq!(
+        names(&children(&mgr, "pg", &[db, "$objects"]).await),
+        ["extensions"]
+    );
+    let exts = children(&mgr, "pg", &[db, "$objects", "extensions"]).await;
+    assert!(
+        exts.iter()
+            .any(|e| e.kind == NodeKind::Extension && e.name == "plpgsql" && e.hint.is_some()),
+        "{exts:?}"
+    );
     let sn = names(&schemas);
     assert!(
         sn.contains(&"shop".to_string()) && sn.contains(&"public".to_string()),
@@ -171,8 +223,12 @@ async fn introspection_tree() {
         names(&children(&mgr, "pg", &[db, "shop", "materialized_views"]).await),
         ["mv_sales_by_category"]
     );
-    let seqs = names(&children(&mgr, "pg", &[db, "shop", "sequences"]).await);
+    let seq_nodes = children(&mgr, "pg", &[db, "shop", "sequences"]).await;
+    let seqs = names(&seq_nodes);
     assert!(seqs.contains(&"invoice_seq".to_string()), "{seqs:?}");
+    // a sequence's hint is its data type
+    let inv = seq_nodes.iter().find(|n| n.name == "invoice_seq").unwrap();
+    assert_eq!(inv.hint.as_deref(), Some("bigint"));
     let routines = children(&mgr, "pg", &[db, "shop", "routines"]).await;
     assert_eq!(
         names(&routines),
@@ -332,6 +388,24 @@ async fn ddl_generation() {
         table: None,
         signature: None,
     };
+
+    // the DDL view writes the names of the object's own schema unqualified
+    let plain = mgr
+        .ddl_with("pg", &t("orders", NodeKind::Table), true)
+        .await
+        .unwrap();
+    assert!(plain.contains("create table orders\n"), "{plain}");
+    assert!(plain.contains("alter table orders\n"), "{plain}");
+    assert!(
+        !plain.contains("shop.orders") && !plain.contains("shop.customers"),
+        "{plain}"
+    );
+    assert!(plain.contains("references customers"), "{plain}");
+    let scripted = mgr.ddl("pg", &t("orders", NodeKind::Table)).await.unwrap();
+    assert!(
+        scripted.contains("create table shop.orders\n"),
+        "{scripted}"
+    );
 
     let ddl = mgr
         .ddl("pg", &t("products", NodeKind::Table))
@@ -2474,4 +2548,94 @@ async fn password_field_completes_a_url_without_password() {
     cfg.password = Some(pass);
     let r = mgr.test_connection(&cfg).await;
     assert!(r.ok, "{r:?}");
+}
+
+#[tokio::test]
+async fn explain_plan_and_analyse() {
+    let (_cfg, mgr) = setup!();
+    let s = mgr.open_session("pg").await.unwrap();
+    let sql = "select o.id from shop.orders o join shop.customers c on c.id = o.customer_id where c.id > 0;";
+    let plan = mgr.explain(&s, sql, false).await.unwrap();
+    assert!(!plan.analyze);
+    assert_eq!(plan.root.operation, "Select");
+    fn flat<'a>(n: &'a PlanNode, out: &mut Vec<&'a PlanNode>) {
+        out.push(n);
+        n.children.iter().for_each(|c| flat(c, out));
+    }
+    let mut all = Vec::new();
+    flat(&plan.root, &mut all);
+    assert!(all.len() >= 3, "{all:#?}");
+    assert!(
+        all.iter().any(|n| n.params.contains("table: orders;")),
+        "{all:#?}"
+    );
+    assert!(all.iter().any(|n| n.total_cost.is_some()));
+    // ANALYZE runs the statement: the plan carries actual rows and the execution time
+    let a = mgr.explain(&s, sql, true).await.unwrap();
+    assert!(a.analyze);
+    assert!(
+        a.root.props.iter().any(|p| p.name == "Execution Time"),
+        "{:?}",
+        a.root.props
+    );
+    // a broken statement is the server's error
+    let e = mgr
+        .explain(&s, "select * from shop.nope", false)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("nope"), "{e}");
+    // the session is still usable
+    assert_ok(&run(&mgr, &s, "select 1").await);
+    mgr.close_session(&s).await;
+}
+
+/// Driver properties of the Advanced tab reach the connection: `statement_timeout`, `options`, `application_name`;
+/// a missing certificate file is reported by name.
+#[tokio::test]
+async fn advanced_properties_and_ssl_files_are_honoured() {
+    let Some(mut cfg) = pg_cfg() else { return };
+    cfg.id = "pg-adv".into();
+    cfg.options
+        .insert("statement_timeout".into(), "4321".into());
+    cfg.options.insert(
+        "options".into(),
+        "-c search_path=shop -c lock_timeout=777".into(),
+    );
+    cfg.options
+        .insert("application_name".into(), "adv-test".into());
+    let mgr = ConnectionManager::new();
+    mgr.connect(&cfg).await.unwrap();
+    let s = mgr.open_session("pg-adv").await.unwrap();
+    for (sql, want) in [
+        ("show statement_timeout", "4321ms"),
+        ("show lock_timeout", "777ms"),
+        ("select current_schema()", "shop"),
+        ("show application_name", "adv-test"),
+    ] {
+        assert_eq!(scalar(&run(&mgr, &s, sql).await), json!(want), "{sql}");
+    }
+    mgr.close_session(&s).await;
+
+    let mut bad = pg_cfg().unwrap();
+    bad.options
+        .insert("sslrootcert".into(), "/nonexistent/ca.pem".into());
+    let r = mgr.test_connection(&bad).await;
+    assert!(!r.ok);
+    assert!(
+        r.message
+            .contains("SSL CA file not found: /nonexistent/ca.pem"),
+        "{}",
+        r.message
+    );
+}
+
+/// The test connection reports whether the session is encrypted, as negotiated.
+#[tokio::test]
+async fn test_connection_reports_the_negotiated_ssl_state() {
+    let Some(mut cfg) = pg_cfg() else { return };
+    cfg.options.insert("sslmode".into(), "disable".into());
+    let mgr = ConnectionManager::new();
+    let r = mgr.test_connection(&cfg).await;
+    assert!(r.ok, "{r:?}");
+    assert_eq!(r.ssl, Some(false), "{r:?}");
 }

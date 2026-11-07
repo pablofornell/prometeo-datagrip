@@ -265,6 +265,7 @@
   --dg-grid-modified-bg: #C2D8F2;       /* DIFF_MODIFIED */
   --dg-grid-inserted-bg: #BEE6BE;       /* DIFF_INSERTED */
   --dg-grid-deleted-bg: #D6D6D6;        /* DIFF_DELETED */
+  --dg-grid-pinned-line: #C9CCD6;          /* pinned columns: right border of the frozen block */
   --dg-grid-error-underline: #FF0000;
 
   /* ---- Editor (scheme "Light") ---- */
@@ -319,6 +320,8 @@
   --dg-editor-warning-wave: #F2BF57;    /* Light WARNING_ATTRIBUTES uses bg #FCF4D4 + stripe #F2BF57 */
   --dg-editor-warning-bg: #FCF4D4;
   --dg-editor-warning-stripe: #F2BF57;
+  --dg-editor-bulb: #F2BF57;               /* intention bulb (Alt+Enter available) */
+  --dg-editor-bulb-error: #E55765;         /* intention bulb on a problem */
   --dg-editor-weak-warning-wave: #CCCCCC;
   --dg-editor-typo-wave: #B0D1AB;
   --dg-editor-unused: #808080;
@@ -358,4 +361,16 @@
 
   /* tool windows */
   --dg-services-connected-dot: #1FB61F;      /* green "connected" dot on data source / session icons (Services) */
+
+  /* hard-coded colours moved out of component CSS (SHELL-24) */
+  --dg-icon-success: #369650;                /* gutter / inspection widget check mark (expUI Green4 light) */
+  --dg-icon-idle: #C3C5CB;                   /* idle "Cancel Running Statements" square (= icon-disabled) */
+  --dg-stripe-change: #42BD77;
+  --dg-stripe-id: #D0A1FF;
+  --dg-editor-stmt-frame-fg: #BAA8FF;
+  --dg-editor-search-fg: #000000;
+  --dg-ds-connected-dot-ring: #FFFFFF8C;
+  --dg-pill-border: #EBEBEB;
+  --dg-pill-bg: #FFFFFF;
+  --dg-grid-alt-row-bg: #F7F8FA;
 }

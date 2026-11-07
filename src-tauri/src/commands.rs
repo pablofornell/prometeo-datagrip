@@ -5,15 +5,16 @@
 use std::path::PathBuf;
 
 use dbcore::{
-    ApplyResult, ConnectInfo, DataSourceConfig, Driver, ExecEvent, ExecOptions, ExportFormat,
-    ExportOptions, FetchedRows, HistoryEntry, ImportFormat, ImportPreview, ImportProgress,
-    ImportRequest, ImportResult, ObjectRef, ResultSet, RowChange, SessionState, SnapshotObject,
-    Statement, TableDataRequest, TestResult, TreeNode, TxStatus,
+    ApplyResult, ConnectInfo, DataSourceConfig, Driver, ExecEvent, ExecOptions, ExplainPlan,
+    ExportFormat, ExportOptions, FetchedRows, HistoryEntry, ImportFormat, ImportPreview,
+    ImportProgress, ImportRequest, ImportResult, ObjectRef, ResultSet, RowChange, SessionState,
+    SnapshotObject, Statement, TableDataRequest, TestResult, TreeNode, TxStatus,
 };
 use serde_json::Value;
 use tauri::ipc::Channel;
 use tauri::State;
 
+use crate::files::{FileAccess, FileContent, FileInfo, FileRoots};
 use crate::state::{AppInfo, AppState};
 use crate::store::DataSourceView;
 
@@ -128,8 +129,15 @@ pub async fn introspect(
 }
 
 #[tauri::command]
-pub async fn get_ddl(state: State<'_, AppState>, ds_id: String, object: ObjectRef) -> Res<String> {
-    state.get_ddl(&ds_id, object).await
+pub async fn get_ddl(
+    state: State<'_, AppState>,
+    ds_id: String,
+    object: ObjectRef,
+    unqualified: Option<bool>,
+) -> Res<String> {
+    state
+        .get_ddl_with(&ds_id, object, unqualified.unwrap_or(false))
+        .await
 }
 
 #[tauri::command]
@@ -179,6 +187,22 @@ pub async fn cancel(state: State<'_, AppState>, execution_id: String) -> Res<()>
 #[tauri::command]
 pub async fn close_execution(state: State<'_, AppState>, execution_id: String) -> Res<()> {
     state.close_execution(&execution_id).await
+}
+
+/// The plan of a statement (`EXPLAIN`); `analyze` runs it. Fails on SQLite when `analyze`.
+#[tauri::command]
+pub async fn explain_plan(
+    state: State<'_, AppState>,
+    session_id: String,
+    sql: String,
+    analyze: bool,
+) -> Res<ExplainPlan> {
+    state.explain(&session_id, &sql, analyze).await
+}
+
+#[tauri::command]
+pub async fn cancel_session(state: State<'_, AppState>, session_id: String) -> Res<()> {
+    state.cancel_session(&session_id).await
 }
 
 // ---------------------------------------------------------------- table data
@@ -231,6 +255,23 @@ pub async fn apply_changes_in_session(
 
 // ---------------------------------------------------------------- export
 
+/// File extension and dialog label of an export format (none: CSV).
+fn export_extension(format: Option<ExportFormat>) -> (&'static str, &'static str) {
+    match format {
+        Some(ExportFormat::Tsv) => ("tsv", "TSV"),
+        Some(ExportFormat::Json) => ("json", "JSON"),
+        Some(ExportFormat::SqlInsert | ExportFormat::SqlUpdate | ExportFormat::WhereClause) => {
+            ("sql", "SQL")
+        }
+        Some(ExportFormat::Markdown) => ("md", "Markdown"),
+        Some(ExportFormat::JsonLines) => ("jsonl", "JSON Lines"),
+        Some(ExportFormat::Html) => ("html", "HTML"),
+        Some(ExportFormat::Xml) => ("xml", "XML"),
+        Some(ExportFormat::Pretty) => ("txt", "Text"),
+        _ => ("csv", "CSV"),
+    }
+}
+
 /// Open the native "Save" dialog from the backend and return the chosen path (`null` = cancelled). Only a path
 /// returned here is accepted by `export_query` / `export_result` (once, for five minutes): the webview cannot
 /// make the backend write to an arbitrary file.
@@ -243,13 +284,7 @@ pub async fn choose_export_path(
     format: Option<ExportFormat>,
 ) -> Res<Option<String>> {
     use tauri_plugin_dialog::DialogExt;
-    let (ext, label) = match format {
-        Some(ExportFormat::Tsv) => ("tsv", "TSV"),
-        Some(ExportFormat::Json) => ("json", "JSON"),
-        Some(ExportFormat::SqlInsert) => ("sql", "SQL"),
-        Some(ExportFormat::Markdown) => ("md", "Markdown"),
-        _ => ("csv", "CSV"),
-    };
+    let (ext, label) = export_extension(format);
     let mut dlg = app
         .dialog()
         .file()
@@ -300,33 +335,85 @@ pub async fn default_export_path(file_name: String) -> Res<Option<String>> {
         .map(|(h, n)| h.join(n).display().to_string()))
 }
 
-/// May the backend write a NEW file at `path` without the save dialog? Only a file that does not exist yet,
-/// directly inside an existing folder under `home`, with no hidden (dot) component below `home`: the user
-/// typed it in the Export Data dialog, but it cannot overwrite anything or reach `~/.ssh`, `~/.bashrc`...
-fn typed_export_path_ok(path: &std::path::Path, home: &std::path::Path) -> bool {
+/// Folders below the home directory whose files programs run or load on their own (macOS agents and launch
+/// items, Windows autostart and profile data).
+const AUTORUN_HOME_DIRS: [&str; 2] = ["library", "appdata"];
+
+/// May the backend write a NEW file at `path` without the save dialog? Only a file that does not exist yet
+/// (not even as a dangling symlink), named with the extension of the export `format`, in an existing folder
+/// that is, after resolving every symlink, below `home` with no hidden (dot) component and outside the
+/// autostart folders: the user typed it in the Export Data dialog, but it cannot overwrite anything, run as
+/// code (`.bashrc`, `conftest.py`, `LaunchAgents/*.plist`...) or leave the home folder through a link.
+///
+/// Returns the path to write: the resolved folder plus the file name (the caller writes there, so a folder
+/// replaced by a symlink after this check is not followed).
+fn typed_export_path_ok(
+    path: &std::path::Path,
+    home: &std::path::Path,
+    format: Option<ExportFormat>,
+) -> Option<PathBuf> {
     use std::path::Component;
-    let Ok(rel) = path.strip_prefix(home) else {
-        return false;
-    };
-    if !path.is_absolute() || rel.as_os_str().is_empty() {
-        return false;
+    if !path.is_absolute() {
+        return None;
     }
-    let plain = rel.components().all(|c| match c {
-        Component::Normal(n) => !n.to_string_lossy().starts_with('.'),
+    // "..", "." and the like are never typed on purpose
+    if path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return None;
+    }
+    let name = path.file_name()?;
+    let name_text = name.to_string_lossy();
+    let (ext, _) = export_extension(format);
+    let stem_ok = std::path::Path::new(name)
+        .file_stem()
+        .is_some_and(|s| !s.is_empty() && !s.to_string_lossy().starts_with('.'));
+    let ext_ok = std::path::Path::new(name)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case(ext));
+    if name_text.starts_with('.') || !stem_ok || !ext_ok {
+        return None;
+    }
+    let home = home.canonicalize().ok()?;
+    let dir = path.parent()?.canonicalize().ok()?;
+    if !dir.is_dir() {
+        return None;
+    }
+    let rel = dir.strip_prefix(&home).ok()?;
+    let plain = rel.components().enumerate().all(|(i, c)| match c {
+        Component::Normal(n) => {
+            let n = n.to_string_lossy();
+            !n.starts_with('.')
+                && !(i == 0 && AUTORUN_HOME_DIRS.contains(&n.to_lowercase().as_str()))
+        }
         _ => false,
     });
-    plain && !path.exists() && path.parent().is_some_and(|d| d.is_dir())
+    if !plain {
+        return None;
+    }
+    let target = dir.join(name);
+    // symlink_metadata: a dangling symlink "does not exist" for exists(), but File::create would follow it
+    match std::fs::symlink_metadata(&target) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(target),
+        _ => None,
+    }
 }
 
 /// The Export Data dialog's typed "Output file": permits `export_query` / `export_result` to write that path
-/// when it is a new file under the home directory (see [`typed_export_path_ok`]). `false`: the caller must
-/// go through `choose_export_path` (the save dialog asks before it overwrites).
+/// when it is a new file of the right type under the home directory (see [`typed_export_path_ok`]). `false`:
+/// the caller must go through `choose_export_path` (the save dialog asks before it overwrites).
 #[tauri::command]
-pub async fn approve_export_path(state: State<'_, AppState>, path: String) -> Res<bool> {
+pub async fn approve_export_path(
+    state: State<'_, AppState>,
+    path: String,
+    format: Option<ExportFormat>,
+) -> Res<bool> {
     let path = PathBuf::from(path);
-    let ok = home_dir().is_some_and(|h| typed_export_path_ok(&path, &h));
-    if ok {
-        state.allow_export_path(path);
+    let resolved = home_dir().and_then(|h| typed_export_path_ok(&path, &h, format));
+    let ok = resolved.is_some();
+    if let Some(resolved) = resolved {
+        state.allow_typed_export_path(path, resolved);
     }
     Ok(ok)
 }
@@ -580,29 +667,241 @@ pub async fn rename_console(
     state.rename_console(&ds_id, &from, &to).await
 }
 
+// ---------------------------------------------------------------- files (scratches, opened .sql files, folders)
+
+/// File IO off the async workers; `FileAccess` enforces the path policy (see `files.rs`).
+async fn file_job<T: Send + 'static>(
+    state: &State<'_, AppState>,
+    f: impl FnOnce(&FileAccess) -> Res<T> + Send + 'static,
+) -> Res<T> {
+    let files = state.files.clone();
+    tokio::task::spawn_blocking(move || f(&files))
+        .await
+        .map_err(|e| format!("internal error: {e}"))?
+}
+
+/// Native "Open" dialog (multi-select, `*.sql` first). The chosen files may be read and written afterwards;
+/// the webview cannot reach any other path.
+#[tauri::command]
+pub async fn choose_open_files(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Res<Vec<FileInfo>> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_parent(&window)
+        .add_filter("SQL files", &["sql"])
+        .add_filter("All files", &["*"])
+        .pick_files(move |p| {
+            let _ = tx.send(p);
+        });
+    let Some(chosen) = rx
+        .await
+        .map_err(|_| "The open dialog was closed".to_string())?
+    else {
+        return Ok(Vec::new());
+    };
+    let paths: Vec<PathBuf> = chosen
+        .into_iter()
+        .filter_map(|p| p.into_path().ok())
+        .collect();
+    file_job(&state, move |f| {
+        paths.iter().map(|p| f.approve_file(p)).collect()
+    })
+    .await
+}
+
+/// Native folder dialog; the folder joins the Files window and everything below it becomes readable.
+#[tauri::command]
+pub async fn choose_attach_folder(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Res<Option<FileInfo>> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_parent(&window)
+        .pick_folder(move |p| {
+            let _ = tx.send(p);
+        });
+    let Some(chosen) = rx
+        .await
+        .map_err(|_| "The folder dialog was closed".to_string())?
+    else {
+        return Ok(None);
+    };
+    let path = chosen.into_path().map_err(|e| e.to_string())?;
+    file_job(&state, move |f| f.attach_folder(&path).map(Some)).await
+}
+
+/// Forget an opened file / attached folder (the file stays on disk).
+#[tauri::command]
+pub async fn detach_file_root(state: State<'_, AppState>, path: String) -> Res<()> {
+    file_job(&state, move |f| f.detach(&path)).await
+}
+
+#[tauri::command]
+pub async fn file_roots(state: State<'_, AppState>) -> Res<FileRoots> {
+    file_job(&state, |f| Ok(f.roots())).await
+}
+
+#[tauri::command]
+pub async fn read_file(state: State<'_, AppState>, path: String) -> Res<FileContent> {
+    file_job(&state, move |f| f.read(&path)).await
+}
+
+/// Returns the new modification time. `expected_mtime_ms`: refuse when the file changed on disk since.
+#[tauri::command]
+pub async fn write_file(
+    state: State<'_, AppState>,
+    path: String,
+    text: String,
+    expected_mtime_ms: Option<u64>,
+) -> Res<u64> {
+    file_job(&state, move |f| f.write(&path, &text, expected_mtime_ms)).await
+}
+
+#[tauri::command]
+pub async fn list_dir(state: State<'_, AppState>, path: String) -> Res<Vec<FileInfo>> {
+    file_job(&state, move |f| f.list_dir(&path)).await
+}
+
+#[tauri::command]
+pub async fn list_scratches(state: State<'_, AppState>) -> Res<Vec<FileInfo>> {
+    file_job(&state, |f| f.list_scratches()).await
+}
+
+#[tauri::command]
+pub async fn create_scratch(state: State<'_, AppState>) -> Res<FileInfo> {
+    file_job(&state, |f| f.create_scratch()).await
+}
+
+#[tauri::command]
+pub async fn delete_scratch(state: State<'_, AppState>, path: String) -> Res<()> {
+    file_job(&state, move |f| f.delete_scratch(&path)).await
+}
+
+#[tauri::command]
+pub async fn rename_scratch(state: State<'_, AppState>, path: String, to: String) -> Res<FileInfo> {
+    file_job(&state, move |f| f.rename_scratch(&path, &to)).await
+}
+
 #[cfg(test)]
 mod tests {
-    use super::typed_export_path_ok;
+    use super::{typed_export_path_ok, ExportFormat};
+    use std::path::Path;
+
+    fn ok(p: &Path, h: &Path, f: Option<ExportFormat>) -> bool {
+        typed_export_path_ok(p, h, f).is_some()
+    }
 
     #[test]
     fn typed_export_paths() {
         let home = tempfile::tempdir().unwrap();
         let h = home.path();
+        let csv = Some(ExportFormat::Csv);
         std::fs::create_dir(h.join("docs")).unwrap();
         std::fs::create_dir(h.join(".ssh")).unwrap();
         std::fs::write(h.join("old.csv"), "x").unwrap();
-        assert!(typed_export_path_ok(&h.join("new.csv"), h));
-        assert!(typed_export_path_ok(&h.join("docs/new.csv"), h));
+        assert!(ok(&h.join("new.csv"), h, csv));
+        assert!(ok(&h.join("docs/new.csv"), h, csv));
+        assert!(ok(&h.join("NEW.CSV"), h, None));
         // exists, hidden, missing folder, outside home, traversal, the home itself
-        assert!(!typed_export_path_ok(&h.join("old.csv"), h));
-        assert!(!typed_export_path_ok(&h.join(".bashrc"), h));
-        assert!(!typed_export_path_ok(&h.join(".ssh/authorized_keys"), h));
-        assert!(!typed_export_path_ok(&h.join("nope/new.csv"), h));
-        assert!(!typed_export_path_ok(
-            std::path::Path::new("/etc/new.csv"),
-            h
+        assert!(!ok(&h.join("old.csv"), h, csv));
+        assert!(!ok(&h.join(".bashrc"), h, csv));
+        assert!(!ok(&h.join(".hidden.csv"), h, csv));
+        assert!(!ok(&h.join(".ssh/authorized_keys"), h, csv));
+        assert!(!ok(&h.join(".ssh/new.csv"), h, csv));
+        assert!(!ok(&h.join("nope/new.csv"), h, csv));
+        assert!(!ok(Path::new("/etc/new.csv"), h, csv));
+        assert!(!ok(&h.join("docs/../../x.csv"), h, csv));
+        assert!(!ok(h, h, csv));
+        assert!(!ok(Path::new("new.csv"), h, csv));
+    }
+
+    #[test]
+    fn typed_export_needs_the_extension_of_the_format() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        let f = |fmt| Some(fmt);
+        assert!(ok(&h.join("a.json"), h, f(ExportFormat::Json)));
+        assert!(ok(&h.join("a.sql"), h, f(ExportFormat::SqlInsert)));
+        assert!(ok(&h.join("a.md"), h, f(ExportFormat::Markdown)));
+        assert!(ok(&h.join("a.csv"), h, f(ExportFormat::CsvSemicolon)));
+        assert!(ok(&h.join("a.txt"), h, f(ExportFormat::Pretty)));
+        assert!(!ok(&h.join("a.json"), h, f(ExportFormat::Csv)));
+        assert!(!ok(&h.join("a.csv"), h, f(ExportFormat::Json)));
+        assert!(!ok(&h.join("conftest.py"), h, f(ExportFormat::Csv)));
+        assert!(!ok(&h.join("build.rs"), h, f(ExportFormat::Csv)));
+        assert!(!ok(&h.join("job.plist"), h, f(ExportFormat::Xml)));
+        assert!(!ok(&h.join("noext"), h, f(ExportFormat::Csv)));
+        assert!(!ok(&h.join("a.csv.py"), h, f(ExportFormat::Csv)));
+        assert!(ok(&h.join("a.csv"), h, None));
+        assert!(!ok(&h.join("a.json"), h, None));
+    }
+
+    #[test]
+    fn typed_export_returns_the_resolved_path() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path().canonicalize().unwrap();
+        std::fs::create_dir(h.join("docs")).unwrap();
+        let got = typed_export_path_ok(&h.join("docs/new.csv"), &h, None).unwrap();
+        assert_eq!(got, h.join("docs/new.csv"));
+    }
+
+    #[test]
+    fn typed_export_skips_autostart_folders() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        std::fs::create_dir_all(h.join("Library/LaunchAgents")).unwrap();
+        std::fs::create_dir_all(h.join("AppData/Roaming")).unwrap();
+        assert!(!ok(
+            &h.join("Library/LaunchAgents/x.xml"),
+            h,
+            Some(ExportFormat::Xml)
         ));
-        assert!(!typed_export_path_ok(&h.join("docs/../../x.csv"), h));
-        assert!(!typed_export_path_ok(h, h));
+        assert!(!ok(&h.join("AppData/Roaming/x.csv"), h, None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_export_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let h = root.path().join("home");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(h.join("docs")).unwrap();
+        std::fs::create_dir_all(h.join(".config")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        // a folder link out of the home folder, and one into a hidden folder
+        symlink(&outside, h.join("out")).unwrap();
+        symlink(h.join(".config"), h.join("cfg")).unwrap();
+        // a link to a folder inside the home folder is fine: it is judged by where it leads
+        symlink(h.join("docs"), h.join("alias")).unwrap();
+        assert!(!ok(&h.join("out/new.csv"), &h, None));
+        assert!(!ok(&h.join("cfg/new.csv"), &h, None));
+        assert_eq!(
+            typed_export_path_ok(&h.join("alias/new.csv"), &h, None),
+            Some(h.canonicalize().unwrap().join("docs/new.csv"))
+        );
+        // dangling and live links as the file itself
+        symlink(outside.join("victim.csv"), h.join("dangling.csv")).unwrap();
+        std::fs::write(outside.join("real.csv"), "x").unwrap();
+        symlink(outside.join("real.csv"), h.join("live.csv")).unwrap();
+        assert!(!ok(&h.join("dangling.csv"), &h, None));
+        assert!(!ok(&h.join("live.csv"), &h, None));
+        assert!(!outside.join("victim.csv").exists());
+        // a home folder that is itself reached through a link
+        symlink(&h, root.path().join("homelink")).unwrap();
+        assert!(ok(
+            &root.path().join("homelink/new.csv"),
+            &root.path().join("homelink"),
+            None
+        ));
     }
 }

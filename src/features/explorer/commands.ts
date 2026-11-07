@@ -37,6 +37,8 @@ import { canRenameNode, renameSqlOf } from "./rename";
 import { confirmEndTransactions } from "../console/txguard";
 import { reconnectsOnSave } from "../datasource/model";
 import { forgetVisibleSchemas } from "../../state/schema-filter";
+import { parseDataSourceUrl } from "../datasource/urlParse";
+import { addDsFolder, forgetDsGroup, moveToDsFolder, removeDsFolder, renameDsFolder } from "../../state/ds-folders";
 
 const errText = (e: unknown) => String((e as Error)?.message ?? e).replace(/^Error:\s*/, "");
 const fail = (title: string, e: unknown): void => {
@@ -256,7 +258,9 @@ export async function duplicateDs(dsId: string): Promise<void> {
 export type DialogState =
   | { kind: "drop"; node: ENode; sql: string; what: string }
   | { kind: "rename"; node: ENode; sql: string; what: string; newName: string }
-  | { kind: "removeDs"; ds: DataSource };
+  | { kind: "removeDs"; ds: DataSource }
+  /** One text field (new folder name...). `accept` returns an error text to keep the dialog open, or null when done. */
+  | { kind: "prompt"; title: string; label: string; value: string; width?: number; accept: (v: string) => string | null };
 
 export const [dialog, setDialog] = createSignal<DialogState | null>(null);
 
@@ -451,6 +455,7 @@ export async function confirmRemoveDs(ds: DataSource): Promise<void> {
   try {
     await deleteDataSource(ds.id);
     forgetVisibleSchemas(ds.id);
+    forgetDsGroup(ds.id);
   } catch (e) {
     return fail("Cannot remove the data source", e);
   }
@@ -461,3 +466,54 @@ export async function confirmRemoveDs(ds: DataSource): Promise<void> {
 
 export const isTableLike = (n: ENode | undefined) => !!n && TABLE_LIKE.includes(n.data.kind);
 export const isTableRelated = (n: ENode | undefined) => !!n && (TABLE_LIKE.includes(n.data.kind) || TABLE_CHILD.includes(n.data.kind));
+
+// ---------------------------------------------------------------- data source folders
+
+/** New > Folder: asks for the name. With `thenMove` the data source goes into the new folder (Move > New Folder…). */
+export function newFolder(thenMove?: string): void {
+  setDialog({
+    kind: "prompt",
+    title: "New Folder",
+    label: "Name:",
+    value: "",
+    accept: (v) => {
+      const name = addDsFolder(v);
+      if (!name) return v.trim() ? `Folder "${v.trim()}" already exists` : "Name is empty";
+      if (thenMove) moveToDsFolder(thenMove, name);
+      return null;
+    },
+  });
+}
+
+export function renameFolder(name: string): void {
+  setDialog({
+    kind: "prompt",
+    title: "Rename Folder",
+    label: "Name:",
+    value: name,
+    accept: (v) => (v.trim() === name || renameDsFolder(name, v) ? null : v.trim() ? `Folder "${v.trim()}" already exists` : "Name is empty"),
+  });
+}
+
+export const removeFolder = (name: string): void => removeDsFolder(name);
+export const moveDataSource = (dsId: string, folder: string | null): void => moveToDsFolder(dsId, folder);
+
+/** New > Data Source from URL: a connection URL or the path of a SQLite file fills in a new data source. */
+export function newDataSourceFromUrl(): void {
+  setDialog({
+    kind: "prompt",
+    title: "Data Source from URL",
+    label: "URL:",
+    value: "",
+    width: 520,
+    accept: (v) => {
+      const p = parseDataSourceUrl(v);
+      if (!p) return v.trim() ? "Unsupported URL. Use jdbc:postgresql://host:port/db, mysql://..., or the path of a SQLite file." : "URL is empty";
+      void runAction("db.newDataSourceFromUrl", p);
+      return null;
+    },
+  });
+}
+
+/** New > Driver: the Drivers page of the Data Sources dialog. */
+export const openDrivers = (): void => void runAction("db.drivers");

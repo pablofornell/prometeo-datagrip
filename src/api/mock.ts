@@ -20,6 +20,7 @@ import type {
   Driver,
   ExecEvent,
   ExecOptions,
+  ExplainPlan,
   ExportOptions,
   HistoryEntry,
   ImportFormat,
@@ -30,6 +31,7 @@ import type {
   ImportRowError,
   NodeKind,
   ObjectRef,
+  PlanNode,
   ResultSet,
   RowChange,
   SnapshotObject,
@@ -428,15 +430,33 @@ function introspect(ds: string, path: string[], showSystem: boolean): TreeNode[]
       return [
         node(ds, "database", DB_NAME, null, [DB_NAME], true, { current: true, encoding: "UTF8" }),
         node(ds, "database", "postgres", null, ["postgres"], false, { current: false, encoding: "UTF8", comment: "default administrative connection database" }),
+        node(ds, "folder", "Server Objects", null, ["$server"], true, { folder: "$server", group: true }),
       ];
     case 1: {
+      if (path[0] === "$server")
+        return [folder(ds, path, "roles", 2, "", undefined), folder(ds, path, "tablespaces", 2, "", undefined)].map((f) => ({ ...f, extra: { ...f.extra, schema: null } }));
       if (path[0] !== DB_NAME)
         fail(`Database '${path[0]}' is not the one this data source is connected to ('${DB_NAME}'). Create a data source for it.`);
-      return Object.entries(SCHEMAS)
-        .filter(([, s]) => showSystem || !s.system)
-        .map(([name, s]) => node(ds, "schema", name, s.comment ?? null, [...path, name], true, { schema: name, owner: "postgres", system: !!s.system }));
+      return [
+        ...Object.entries(SCHEMAS)
+          .filter(([, s]) => showSystem || !s.system)
+          .sort(([a], [b]) => a.localeCompare(b, undefined, { sensitivity: "base" }))
+          .map(([name, s]) => node(ds, "schema", name, s.comment ?? null, [...path, name], true, { schema: name, owner: "postgres", system: !!s.system, default: name === "public" })),
+        node(ds, "folder", "Database Objects", null, [...path, "$objects"], true, { folder: "$objects", group: true }),
+      ];
     }
     case 2: {
+      if (path[0] === "$server" && path[1] === "roles")
+        return [
+          node(ds, "role", "postgres", "superuser", [...path, "postgres"], false, { superuser: true, login: true, comment: "" }),
+          node(ds, "role", "shop_app", "login", [...path, "shop_app"], false, { superuser: false, login: true, comment: "" }),
+        ];
+      if (path[0] === "$server" && path[1] === "tablespaces")
+        return [
+          node(ds, "tablespace", "pg_default", null, [...path, "pg_default"], false, { owner: "postgres", location: "" }),
+          node(ds, "tablespace", "pg_global", null, [...path, "pg_global"], false, { owner: "postgres", location: "" }),
+        ];
+      if (path[1] === "$objects") return [{ ...folder(ds, path, "extensions", 2, ""), extra: { folder: "extensions", count: 2 } }];
       const sc = path[1];
       const s = SCHEMAS[sc] ?? fail(`Schema ${sc} not found`);
       const counts: [string, number][] = [
@@ -450,6 +470,11 @@ function introspect(ds: string, path: string[], showSystem: boolean): TreeNode[]
     }
     case 3: {
       const [, sc, key] = path;
+      if (sc === "$objects" && key === "extensions")
+        return [
+          node(ds, "extension", "pg_trgm", "1.6", [...path, "pg_trgm"], false, { version: "1.6", owner: "postgres", schema: "public", comment: "text similarity measurement and index searching based on trigrams" }),
+          node(ds, "extension", "plpgsql", "1.0", [...path, "plpgsql"], false, { version: "1.0", owner: "postgres", schema: "pg_catalog", comment: "PL/pgSQL procedural language" }),
+        ];
       const s = SCHEMAS[sc] ?? fail(`Schema ${sc} not found`);
       if (key === "routines")
         return s.routines.map((r) =>
@@ -464,7 +489,7 @@ function introspect(ds: string, path: string[], showSystem: boolean): TreeNode[]
           ),
         );
       if (key === "sequences")
-        return s.sequences.map((q) => node(ds, "sequence", q, null, [...path, q], false, { schema: sc, relkind: "S", rowEstimate: 1 }));
+        return s.sequences.map((q) => node(ds, "sequence", q, "bigint", [...path, q], false, { schema: sc, relkind: "S", rowEstimate: 1 }));
       const want = { tables: "table", views: "view", materialized_views: "materializedView" }[key] as TableDef["kind"] | undefined;
       if (!want) fail(`Unknown tree path: /${path.join("/")}`);
       return s.tables
@@ -959,29 +984,61 @@ function exportText(src: Pick<ResultSet, "columns" | "rows">, o: ExportOptions):
       rows: src.columns.map((c, i) => [c.name, ...src.rows.map((r) => r[i] ?? null)]),
     };
   }
-  if (o.rowHeader && ["csv", "tsv", "markdown"].includes(o.format)) {
+  if (o.rowHeader && ["csv", "tsv", "markdown", "csvPipe", "csvSemicolon"].includes(o.format)) {
     res = { columns: [{ name: "", typeName: "int4", nullable: false, isPk: false, tableRef: null }, ...res.columns], rows: res.rows.map((r, i) => [i + 1, ...r]) };
   }
   const txt = (v: Cell): string =>
     v === null ? o.nullText : typeof v === "object" ? ("$bin" in (v as object) ? "0x" + (v as { $bin: string }).$bin : JSON.stringify(v)) : String(v);
   const names = res.columns.map((x) => x.name);
   const q = (s: string, d: string) => (s.includes(d) || s.includes(o.quote) || /[\r\n]/.test(s) ? o.quote + s.split(o.quote).join(o.quote + o.quote) + o.quote : s);
+  const key = (): number[] => {
+    const pk = res.columns.flatMap((c, i) => (c.isPk ? [i] : []));
+    return pk.length ? pk : res.columns.map((_, i) => i);
+  };
+  const lit = (v: Cell) => (v === null ? "NULL" : typeof v === "number" || typeof v === "boolean" ? String(v) : `'${txt(v).replace(/'/g, "''")}'`);
+  const qi = (n: string) => `"${n}"`;
+  const tbl = (o.tableName ?? "table_name").split(".").map(qi).join(".");
+  const xml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   switch (o.format) {
     case "csv":
+    case "csvPipe":
+    case "csvSemicolon":
     case "tsv": {
-      const d = o.format === "tsv" ? "\t" : o.delimiter ?? ",";
+      const d = o.format === "tsv" ? "\t" : o.format === "csvPipe" ? "|" : o.format === "csvSemicolon" ? ";" : o.delimiter ?? ",";
       const lines = res.rows.map((r) => r.map((v) => (o.format === "tsv" ? txt(v).replace(/[\t\r\n]/g, " ") : q(txt(v), d))).join(d));
       return [...(o.header ? [names.join(d)] : []), ...lines].join("\n") + "\n";
     }
     case "json":
       return JSON.stringify(res.rows.map((r) => Object.fromEntries(names.map((n, i) => [n, r[i]]))), null, 2) + "\n";
+    case "jsonLines":
+      return res.rows.map((r) => JSON.stringify(Object.fromEntries(names.map((n, i) => [n, r[i]])))).join("\n") + "\n";
+    case "sqlUpdate": {
+      const k = key();
+      const set = res.columns.map((_, i) => i).filter((i) => !k.includes(i) || k.length === names.length);
+      const eq = (r: Cell[], i: number) => (r[i] === null ? `${qi(names[i])} is null` : `${qi(names[i])} = ${lit(r[i])}`);
+      return res.rows.map((r) => `update ${tbl} set ${set.map((i) => `${qi(names[i])} = ${lit(r[i])}`).join(", ")} where ${k.map((i) => eq(r, i)).join(" and ")};`).join("\n") + "\n";
+    }
+    case "whereClause": {
+      const k = key();
+      if (!res.rows.length) return "";
+      if (k.length === 1) return `where ${qi(names[k[0]])} in (${res.rows.map((r) => lit(r[k[0]])).join(", ")})\n`;
+      return "where " + res.rows.map((r) => `(${k.map((i) => (r[i] === null ? `${qi(names[i])} is null` : `${qi(names[i])} = ${lit(r[i])}`)).join(" and ")})`).join("\n   or ") + "\n";
+    }
+    case "html":
+      return `<table>\n  <thead>\n    <tr>\n${names.map((n) => `      <th>${xml(n)}</th>\n`).join("")}    </tr>\n  </thead>\n  <tbody>\n${res.rows.map((r) => `    <tr>\n${r.map((v) => `      <td>${xml(txt(v))}</td>\n`).join("")}    </tr>\n`).join("")}  </tbody>\n</table>\n`;
+    case "xml":
+      return `<?xml version="1.0" encoding="UTF-8"?>\n<result>\n${res.rows.map((r) => `  <row>\n${r.map((v, i) => (v === null ? `    <${names[i]} null="true"/>\n` : `    <${names[i]}>${xml(txt(v))}</${names[i]}>\n`)).join("")}  </row>\n`).join("")}</result>\n`;
+    case "pretty": {
+      const all = [names, ...res.rows.map((r) => r.map(txt))];
+      const w = names.map((_, i) => Math.max(...all.map((r) => (r[i] ?? "").length)));
+      const line = (r: string[]) => r.map((c, i) => c.padEnd(w[i])).join(" | ").trimEnd();
+      return [line(all[0]), w.map((n) => "-".repeat(n)).join("-+-"), ...all.slice(1).map(line)].join("\n") + "\n";
+    }
     case "markdown": {
       const row = (a: string[]) => `| ${a.map((s) => s.replace(/\|/g, "\\|").replace(/\n/g, " ")).join(" | ")} |`;
       return [row(names), row(names.map(() => "---")), ...res.rows.map((r) => row(r.map(txt)))].join("\n") + "\n";
     }
     case "sqlInsert": {
-      const lit = (v: Cell) => (v === null ? "NULL" : typeof v === "number" || typeof v === "boolean" ? String(v) : `'${txt(v).replace(/'/g, "''")}'`);
-      const tbl = (o.tableName ?? "table").split(".").map((s) => `"${s}"`).join(".");
       const cols = names.map((n) => `"${n}"`).join(", ");
       const per = Math.max(1, o.rowsPerInsert);
       const out: string[] = [];
@@ -1012,6 +1069,35 @@ const natural = (a: string, b: string) => {
   const na = a === "console" ? 0 : Number(/_(\d+)$/.exec(a)?.[1] ?? Infinity);
   const nb = b === "console" ? 0 : Number(/_(\d+)$/.exec(b)?.[1] ?? Infinity);
   return na === nb ? a.localeCompare(b) : na - nb;
+};
+
+// ---------------------------------------------------------------- files (virtual file system in localStorage)
+
+interface MockFile {
+  text: string;
+  mtimeMs: number;
+}
+interface MockFs {
+  files: Record<string, MockFile>;
+  /** Paths approved by the "dialogs" and attached folders, like the backend's file-access.json. */
+  opened: string[];
+  folders: string[];
+}
+const MOCK_SCRATCHES = "/mock/scratches";
+const MOCK_OPEN_FILE = "/mock/queries/report.sql";
+const MOCK_FOLDER = "/mock/projects/shop";
+const loadFs = (): MockFs => loadJson<MockFs>("fs", { files: {}, opened: [], folders: [] });
+const saveFs = (f: MockFs) => saveJson("fs", f);
+const baseName = (p: string) => p.slice(p.lastIndexOf("/") + 1);
+const fileInfo = (path: string, f?: MockFile) => ({ path, name: baseName(path), isDir: !f, size: f ? utf8Len(f.text) : 0, mtimeMs: f?.mtimeMs ?? 0 });
+const fsAllowed = (f: MockFs, p: string) => p.startsWith(MOCK_SCRATCHES + "/") || f.opened.includes(p) || f.folders.some((d) => p.startsWith(d + "/") || p === d);
+const fsFile = (f: MockFs, p: string): MockFile => {
+  if (!fsAllowed(f, p)) fail(`Refusing to access ${p}: files must be opened with the Open dialog, attached as a folder, or live in the scratches folder`);
+  return f.files[p] ?? fail(`Cannot open ${p}: No such file or directory (os error 2)`);
+};
+const scratchOrder = (n: string) => {
+  const stem = n.replace(/\.[^.]*$/, "");
+  return stem === "scratch" ? 0 : Number(/^scratch_(\d+)$/.exec(stem)?.[1] ?? Infinity);
 };
 
 // ---------------------------------------------------------------- handlers
@@ -1144,7 +1230,7 @@ export const mockHandlers: Record<string, MockHandler> = {
       return { ok: false, serverVersion: null, message: `failed to lookup address information: Name or service not known (${cfg.host})`, elapsedMs: 350 };
     if (cfg.password === "wrong")
       return { ok: false, serverVersion: null, message: `[28P01] FATAL: password authentication failed for user "${cfg.user ?? "postgres"}"`, elapsedMs: 351 };
-    return { ok: true, serverVersion: SERVER_VERSION, message: `Succeeded. ${SERVER_VERSION}`, elapsedMs: 38 };
+    return { ok: true, serverVersion: SERVER_VERSION, message: `Succeeded. ${SERVER_VERSION}`, elapsedMs: 38, ssl: cfg.driver === "sqlite" ? null : false };
   }),
   connect: h(async (a) => {
     ds(a.id);
@@ -1190,7 +1276,11 @@ export const mockHandlers: Record<string, MockHandler> = {
       case "table":
       case "view":
       case "materializedView":
-        return tableDdl(sc, findTable(sc, o.name) ?? fail(`Table ${sc}.${o.name} not found`));
+      {
+        const ddl = tableDdl(sc, findTable(sc, o.name) ?? fail(`Table ${sc}.${o.name} not found`));
+        // the DDL view writes the object's own schema unqualified (the backend's `unqualified` flag)
+        return a.unqualified ? ddl.split(`${sc}.`).join("") : ddl;
+      }
       case "sequence":
         return `-- auto-generated definition\ncreate sequence ${sc}.${o.name}\n    as bigint\n    start with 1000\n    increment by 5\n    minvalue 1\n    maxvalue 9223372036854775807\n    cache 1;\n\nalter sequence ${sc}.${o.name} owner to postgres;`;
       case "function":
@@ -1263,6 +1353,36 @@ export const mockHandlers: Record<string, MockHandler> = {
     const ex = state.execs.get(a.executionId);
     if (ex) ex.table = undefined;
   }),
+  explain_plan: h(async (a): Promise<ExplainPlan> => {
+    const sess = state.sessions.get(a.sessionId) ?? fail(`Session '${a.sessionId}' does not exist`);
+    const driver = ds(sess.ds).driver;
+    if (a.analyze && driver === "sqlite") fail("SQLite has no EXPLAIN ANALYZE");
+    const sql = String(a.sql).trim().replace(/;+$/, "");
+    if (!sql) fail("There is no statement to explain");
+    await sleep(60);
+    const q = parseSelect(sql);
+    if (q.unknown) fail(`[42P01] ERROR: relation "${q.unknown.name}" does not exist`);
+    const table = q.table?.def.name ?? "orders";
+    const node = (operation: string, params: string, rows: number | null, total: number | null, startup: number | null, children: PlanNode[] = []): PlanNode => ({
+      operation,
+      params,
+      rows,
+      totalCost: total,
+      startupCost: startup,
+      raw: "Parallel Aware = false;Async Capable = false",
+      props: [
+        { name: "Operation", value: operation },
+        { name: "Parallel Aware", value: "false" },
+        { name: "Async Capable", value: "false" },
+      ],
+      children,
+    });
+    const scan = node(driver === "sqlite" ? "Full Scan (SCAN)" : "Full Scan (Seq Scan)", `table: ${table};`, driver === "sqlite" ? null : 1020, driver === "sqlite" ? null : 20.2, driver === "sqlite" ? null : 0);
+    const root = node("Select", "", null, null, null, [scan]);
+    root.props = [{ name: "Operation", value: "select" }, ...(a.analyze ? [{ name: "Execution Time", value: "0.412 ms" }] : [])];
+    return { driver, analyze: !!a.analyze, sql, root, elapsedMs: 3 };
+  }),
+  cancel_session: h(() => undefined),
 
   // ---- table data / editing
   table_data: h(async (a): Promise<ResultSet> => {
@@ -1473,5 +1593,95 @@ export const mockHandlers: Record<string, MockHandler> = {
     all[a.to] = all[a.from];
     delete all[a.from];
     saveJson(consoleKey(a.dsId), all);
+  }),
+
+  // ---- files
+  choose_open_files: h(() => {
+    const f = loadFs();
+    f.files[MOCK_OPEN_FILE] ??= { text: "-- monthly revenue report\nselect date_trunc('month', created_at) as month, sum(total) as revenue\nfrom shop.orders\ngroup by 1\norder by 1;\n", mtimeMs: Date.now() };
+    if (!f.opened.includes(MOCK_OPEN_FILE)) f.opened.push(MOCK_OPEN_FILE);
+    saveFs(f);
+    return [fileInfo(MOCK_OPEN_FILE, f.files[MOCK_OPEN_FILE])];
+  }),
+  choose_attach_folder: h(() => {
+    const f = loadFs();
+    const now = Date.now();
+    f.files[`${MOCK_FOLDER}/schema.sql`] ??= { text: "create table demo (id int primary key);\n", mtimeMs: now };
+    f.files[`${MOCK_FOLDER}/queries/top-customers.sql`] ??= { text: "select * from shop.customers limit 10;\n", mtimeMs: now };
+    if (!f.folders.includes(MOCK_FOLDER)) f.folders.push(MOCK_FOLDER);
+    saveFs(f);
+    return fileInfo(MOCK_FOLDER);
+  }),
+  detach_file_root: h((a) => {
+    const f = loadFs();
+    f.opened = f.opened.filter((p) => p !== a.path);
+    f.folders = f.folders.filter((p) => p !== a.path);
+    saveFs(f);
+  }),
+  file_roots: h(() => {
+    const f = loadFs();
+    return { files: f.opened.filter((p) => f.files[p]).map((p) => fileInfo(p, f.files[p])), folders: f.folders.map((p) => fileInfo(p)) };
+  }),
+  read_file: h((a) => {
+    const file = fsFile(loadFs(), a.path as string);
+    return { text: file.text, mtimeMs: file.mtimeMs };
+  }),
+  write_file: h((a) => {
+    const f = loadFs();
+    const file = fsFile(f, a.path as string);
+    if (a.expectedMtimeMs != null && a.expectedMtimeMs !== file.mtimeMs) fail(`${a.path} was changed on disk`);
+    file.text = a.text as string;
+    file.mtimeMs = Date.now();
+    saveFs(f);
+    return file.mtimeMs;
+  }),
+  list_dir: h((a) => {
+    const f = loadFs();
+    const dir = (a.path as string).replace(/\/$/, "");
+    if (!fsAllowed(f, dir)) fail(`Refusing to access ${dir}: files must be opened with the Open dialog, attached as a folder, or live in the scratches folder`);
+    const dirs = new Set<string>();
+    const out: ReturnType<typeof fileInfo>[] = [];
+    for (const [p, file] of Object.entries(f.files)) {
+      if (!p.startsWith(dir + "/")) continue;
+      const rest = p.slice(dir.length + 1);
+      const slash = rest.indexOf("/");
+      if (slash < 0) out.push(fileInfo(p, file));
+      else dirs.add(rest.slice(0, slash));
+    }
+    out.sort((x, y) => x.name.toLowerCase().localeCompare(y.name.toLowerCase()));
+    return [...[...dirs].sort().map((d) => fileInfo(`${dir}/${d}`)), ...out];
+  }),
+  list_scratches: h(() => {
+    const f = loadFs();
+    return Object.entries(f.files)
+      .filter(([p]) => p.startsWith(MOCK_SCRATCHES + "/"))
+      .map(([p, file]) => fileInfo(p, file))
+      .sort((x, y) => scratchOrder(x.name) - scratchOrder(y.name) || x.name.localeCompare(y.name));
+  }),
+  create_scratch: h(() => {
+    const f = loadFs();
+    let path = `${MOCK_SCRATCHES}/scratch.sql`;
+    for (let i = 1; path in f.files; i++) path = `${MOCK_SCRATCHES}/scratch_${i}.sql`;
+    f.files[path] = { text: "", mtimeMs: Date.now() };
+    saveFs(f);
+    return fileInfo(path, f.files[path]);
+  }),
+  delete_scratch: h((a) => {
+    const f = loadFs();
+    if (!(a.path as string).startsWith(MOCK_SCRATCHES + "/")) fail(`${a.path} is not a scratch file`);
+    delete f.files[a.path as string];
+    saveFs(f);
+  }),
+  rename_scratch: h((a) => {
+    const f = loadFs();
+    const from = a.path as string;
+    const to = `${MOCK_SCRATCHES}/${a.to}`;
+    if (!from.startsWith(MOCK_SCRATCHES + "/") || !f.files[from]) fail(`${from} is not a scratch file`);
+    if (!/^[\w .()@-]+$/.test(a.to as string) || (a.to as string).startsWith(".")) fail(`Invalid file name '${a.to}'`);
+    if (to in f.files) fail(`'${a.to}' already exists`);
+    f.files[to] = f.files[from];
+    delete f.files[from];
+    saveFs(f);
+    return fileInfo(to, f.files[to]);
   }),
 };

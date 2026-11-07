@@ -25,6 +25,7 @@ import {
   onCleanup,
   onMount,
 } from "solid-js";
+import { settings } from "../../state/settings";
 import { Icon } from "./Icon";
 import { Highlighted, SpeedSearchField, createSpeedSearch, matchRanges } from "./SpeedSearch";
 
@@ -93,7 +94,9 @@ export interface TreeProps<T extends TreeItem = TreeItem> {
   class?: string;
 }
 
-const ROW_H = 24;
+/** Row height and indent per level: Appearance > Compact mode (22 px rows), Tree Views > Use smaller indents. */
+const rowHeight = (): number => (settings.compactMode ? 22 : 24);
+const indentPx = (): number => (settings.treeSmallIndents ? 12 : 19);
 const OVERSCAN = 8;
 
 interface Row<T> {
@@ -254,11 +257,11 @@ export function Tree<T extends TreeItem = TreeItem>(props: TreeProps<T>): JSX.El
   const scrollToId = (id: string | null) => {
     const i = indexOfId(id);
     if (i < 0 || !scroller) return;
-    const top = i * ROW_H;
+    const top = i * rowHeight();
     const pad = 4;
     if (top < scroller.scrollTop) scroller.scrollTop = Math.max(0, top - pad);
-    else if (top + ROW_H > scroller.scrollTop + scroller.clientHeight - pad)
-      scroller.scrollTop = top + ROW_H - scroller.clientHeight + pad;
+    else if (top + rowHeight() > scroller.scrollTop + scroller.clientHeight - pad)
+      scroller.scrollTop = top + rowHeight() - scroller.clientHeight + pad;
   };
 
   const collapseAll = () => {
@@ -350,7 +353,7 @@ export function Tree<T extends TreeItem = TreeItem>(props: TreeProps<T>): JSX.El
       if (!rs.length) return;
       select(rs[Math.max(0, Math.min(rs.length - 1, i))].item.id);
     };
-    const page = Math.max(1, Math.floor(scroller.clientHeight / ROW_H) - 1);
+    const page = Math.max(1, Math.floor(scroller.clientHeight / rowHeight()) - 1);
     let handled = true;
     switch (e.key) {
       case "ArrowDown":
@@ -412,8 +415,8 @@ export function Tree<T extends TreeItem = TreeItem>(props: TreeProps<T>): JSX.El
   });
 
   const range = createMemo(() => {
-    const first = Math.max(0, Math.floor(scrollTop() / ROW_H) - OVERSCAN);
-    const last = Math.min(rows().length, Math.ceil((scrollTop() + viewH()) / ROW_H) + OVERSCAN);
+    const first = Math.max(0, Math.floor(scrollTop() / rowHeight()) - OVERSCAN);
+    const last = Math.min(rows().length, Math.ceil((scrollTop() + viewH()) / rowHeight()) + OVERSCAN);
     return [first, last] as const;
   });
   const visible = createMemo(() => {
@@ -460,7 +463,7 @@ export function Tree<T extends TreeItem = TreeItem>(props: TreeProps<T>): JSX.El
           />
         </div>
       </Show>
-      <div class="dg-tree-inner" style={{ height: rows().length * ROW_H + "px" }}>
+      <div class="dg-tree-inner" style={{ height: rows().length * rowHeight() + "px" }}>
         <Index each={visible()}>
           {(v) => {
             const r = () => v().r;
@@ -472,7 +475,7 @@ export function Tree<T extends TreeItem = TreeItem>(props: TreeProps<T>): JSX.El
               role="treeitem"
               aria-expanded={r().hasChildren ? r().expanded : undefined}
               aria-selected={r().item.id === selId()}
-              style={{ top: v().i * ROW_H + "px", "padding-left": r().depth * 19 + "px", "--dg-row-tint": props.rowColor?.(r().item) }}
+              style={{ top: v().i * rowHeight() + "px", "padding-left": r().depth * indentPx() + "px", "--dg-tree-guide-w": r().depth * indentPx() + "px", "--dg-tree-indent-w": indentPx() + "px", "--dg-row-tint": props.rowColor?.(r().item) }}
               data-tip={r().item.tooltip}
               data-tip-mono={r().item.tooltip && r().item.tooltipMono ? "" : undefined}
               onDblClick={() => {

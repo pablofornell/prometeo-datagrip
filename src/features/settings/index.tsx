@@ -1,10 +1,11 @@
 /**
- * Settings dialog (operative pages: Appearance, Editor > Font / General > Appearance, Database > Query Execution /
- * Data Editor and Viewer, Keymap). The values live in `src/state/settings.ts` (+ the theme in `state/theme.ts`).
+ * Settings dialog (operative pages: Database > Query Execution / Data Editor and Viewer, Appearance, Keymap, Editor >
+ * General > Appearance / Font / Color Scheme > SQL / Code Style > SQL). The values live in `src/state/settings.ts` (+ the
+ * theme in `state/theme.ts`); the keymap edits go to the action registry, the color scheme to `state/colorScheme.ts`.
  *
  *   openSettings(pageId?)   open the dialog (or jump to a page of the open one). Page ids: see ./model.ts
- *                           (`appearance`, `editor.font`, `editor.general.appearance`, `database.query-execution`,
- *                           `database.data-editor`, `keymap`).
+ *                           (`appearance`, `keymap`, `editor.font`, `editor.general.appearance`, `editor.color-scheme.sql`,
+ *                           `editor.code-style.sql`, `database.query-execution`, `database.data-editor`).
  *
  * Action: `app.settings` (Ctrl+Alt+S).
  */

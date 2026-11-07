@@ -3,6 +3,7 @@ import { completionStatus } from "@codemirror/autocomplete";
 import { EditorView, ViewPlugin, type ViewUpdate } from "@codemirror/view";
 import { identifierAtCaret } from "./highlight";
 import { previewField } from "./frame";
+import { templateActive } from "./templates";
 import { jumpProblem } from "./inspect";
 import { errorsField, problemsField } from "./state";
 
@@ -46,7 +47,8 @@ class StripeView {
       u.startState.field(errorsField) !== u.state.field(errorsField) ||
       u.startState.field(problemsField) !== u.state.field(problemsField) ||
       u.startState.field(previewField) !== u.state.field(previewField) ||
-      completionStatus(u.startState) !== completionStatus(u.state)
+      completionStatus(u.startState) !== completionStatus(u.state) ||
+      templateActive(u.startState) !== templateActive(u.state)
     )
       this.schedule();
   }
@@ -106,8 +108,8 @@ class StripeView {
 
   private drawWidget(count: number): void {
     const w = this.widget;
-    if (completionStatus(this.view.state) === "active") {
-      // DataGrip pauses the analysis while the completion popup is open
+    if (completionStatus(this.view.state) === "active" || templateActive(this.view.state)) {
+      // DataGrip pauses the analysis while the completion popup is open or a live template is being filled in
       w.className = "cm-inspect cm-inspect-paused";
       w.textContent = "Paused…";
       return;

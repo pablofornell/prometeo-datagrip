@@ -30,8 +30,8 @@
   width: 4px;
   height: 4px;
   border-radius: 50%;
-  background: #1fd11f;
-  box-shadow: 0 0 0 1px rgba(25, 26, 28, 0.55);
+  background: var(--dg-services-connected-dot);
+  box-shadow: 0 0 0 1px var(--dg-ds-connected-dot-ring);
 }
 .dg-explorer-synth {
   color: var(--dg-tree-secondary-fg);
@@ -113,6 +113,11 @@
 .dg-explorer-empty-btn:hover {
   background: var(--dg-layer-2-bg);
 }
+.dg-explorer-empty-more {
+  display: flex;
+  margin-left: auto;
+  color: var(--dg-text-secondary);
+}
 
 /* Schema selector popup (badge click) */
 .dg-schemasel {
@@ -120,8 +125,8 @@
   z-index: 2101;
   display: flex;
   flex-direction: column;
-  width: 320px;
-  max-height: 336px;
+  width: 340px;
+  max-height: 400px;
   background: var(--dg-popup-bg);
   border: 1px solid var(--dg-menu-border);
   border-radius: var(--dg-popup-radius);
@@ -133,20 +138,14 @@
   overflow-y: auto;
   padding: 6px 8px;
 }
-.dg-schemasel-row {
+.dg-schemasel-toolbar {
   display: flex;
-  align-items: center;
-  height: 24px;
-  padding-left: 6px;
-}
-.dg-schemasel-child {
-  padding-left: 28px;
-}
-.dg-schemasel-db {
-  font-weight: 600;
-}
-.dg-schemasel-note {
-  color: var(--dg-text-secondary);
+  justify-content: flex-end;
+  gap: 4px;
+  flex: none;
+  height: 28px;
+  padding: 4px 8px 0;
+  box-sizing: border-box;
 }
 .dg-schemasel-foot {
   height: 28px;
@@ -303,4 +302,25 @@
 }
 .dg-quickdoc-link:hover {
   text-decoration: underline;
+}
+
+/* ---- context menu open: the right-clicked row is shown as unfocused selection (the tree keeps the focus) */
+.dg-explorer-tree.dg-menu-open:focus-within .dg-tree-row.dg-selected {
+  background: var(--dg-tree-selection-inactive-bg);
+  color: var(--dg-tree-selection-inactive-fg);
+}
+
+/* ---- prompt dialog (New Folder) */
+.dg-explorer-prompt {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.dg-explorer-prompt-field {
+  flex: 1;
+}
+.dg-explorer-prompt-error {
+  margin-top: 6px;
+  color: var(--dg-text-error);
+  font-size: var(--dg-font-size-small);
 }

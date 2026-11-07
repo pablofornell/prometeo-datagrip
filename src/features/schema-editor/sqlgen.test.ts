@@ -32,6 +32,22 @@ describe("identifiers", () => {
     expect(ident("mysql", "Order Items")).toBe("`Order Items`");
     expect(ident("sqlite", 'a"b')).toBe('"a""b"');
   });
+
+  it("quotes the reserved words of each dialect", () => {
+    for (const w of ["rank", "system", "lock", "groups", "window", "row", "rows", "lateral", "key", "index", "select", "function", "cube"])
+      expect(ident("mysql", w), w).toBe(`\`${w}\``);
+    for (const w of ["window", "lateral", "user", "table", "order", "analyse", "variadic", "end", "offset"]) expect(ident("postgres", w), w).toBe(`"${w}"`);
+    for (const w of ["order", "group", "window", "without", "values", "index", "transaction"]) expect(ident("sqlite", w), w).toBe(`"${w}"`);
+    for (const w of ["RANK", "System"]) expect(ident("mysql", w)).toBe(`\`${w}\``);
+  });
+
+  it("leaves ordinary names alone", () => {
+    for (const w of ["name", "id", "created_at", "price", "status", "title", "comment"]) {
+      expect(ident("mysql", w)).toBe(w);
+      expect(ident("postgres", w)).toBe(w);
+      expect(ident("sqlite", w)).toBe(w);
+    }
+  });
 });
 
 describe("create table", () => {
@@ -178,12 +194,16 @@ describe("alter table (mysql)", () => {
       },
       base(),
     );
+    // one ALTER, so MySQL validates the end result and the change is atomic
     expect(plan.statements).toEqual([
-      "alter table demo.t drop index ix_b;",
-      "alter table demo.t add column n int default 5 after a;",
-      "alter table demo.t modify column b varchar(50);",
-      "alter table demo.t change column c d text;",
-      "alter table demo.t comment = 'hi';",
+      [
+        "alter table demo.t",
+        "    drop index ix_b,",
+        "    add column n int default 5 after a,",
+        "    modify column b varchar(50),",
+        "    change column c d text,",
+        "    comment = 'hi';",
+      ].join("\n"),
     ]);
     expect(plan.transactional).toBe(false);
   });
@@ -212,10 +232,42 @@ describe("alter table (mysql)", () => {
       b,
     );
     expect(plan.statements).toEqual([
+      [
+        "alter table demo.t",
+        "    drop foreign key fk1,",
+        "    drop primary key,",
+        "    add primary key (a, b),",
+        "    add constraint fk2 foreign key (b) references demo.o (id);",
+      ].join("\n"),
+    ]);
+  });
+
+  it("drops and adds the primary key of an auto_increment column in one statement (error 1075 otherwise)", () => {
+    const b = base();
+    b.columns[0].autoIncrement = true;
+    const plan = alter("mysql", (t) => (t.keys[0].columns = ["a", "b"]), b);
+    expect(plan.statements).toHaveLength(1);
+    expect(plan.statements[0]).toBe("alter table demo.t\n    drop primary key,\n    add primary key (a, b);");
+  });
+
+  it("a foreign key redefined under its name is dropped first (error 1826 in one statement)", () => {
+    const b = base();
+    b.fks = [newFk({ name: "fk1", columns: ["b"], refSchema: "demo", refTable: "o", refColumns: ["id"] })];
+    const plan = alter("mysql", (t) => (t.fks[0].onDelete = "CASCADE"), b);
+    expect(plan.statements).toEqual([
       "alter table demo.t drop foreign key fk1;",
-      "alter table demo.t drop primary key;",
-      "alter table demo.t add primary key (a, b);",
-      "alter table demo.t add constraint fk2 foreign key (b) references demo.o (id);",
+      "alter table demo.t add constraint fk1 foreign key (b) references demo.o (id) on delete cascade;",
+    ]);
+  });
+
+  it("renames the table inside the same ALTER and creates changed indexes afterwards under the new name", () => {
+    const plan = alter("mysql", (t) => {
+      t.name = "t2";
+      t.indexes[0].columns = ["b", "c"];
+    }, base());
+    expect(plan.statements).toEqual([
+      "alter table demo.t\n    drop index ix_b,\n    rename to demo.t2;",
+      "create index ix_b on demo.t2 (b, c);",
     ]);
   });
 });

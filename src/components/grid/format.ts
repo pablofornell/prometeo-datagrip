@@ -1,10 +1,14 @@
-import type { BinaryCell, Cell, ColumnKind, DefaultCell, GridColumn } from "./types";
+import type { BinaryCell, Cell, ColumnKind, DefaultCell, GridColumn, SqlExprCell } from "./types";
 
 /** Shared sentinel for "set DEFAULT" (serialises to `{"$default": true}` as dbcore expects). */
 export const DEFAULT_VALUE: DefaultCell = Object.freeze({ $default: true }) as DefaultCell;
 
 export function isDefaultCell(v: Cell): v is DefaultCell {
   return v === DEFAULT_VALUE || (typeof v === "object" && v !== null && (v as DefaultCell).$default === true);
+}
+
+export function isExprCell(v: Cell): v is SqlExprCell {
+  return typeof v === "object" && v !== null && typeof (v as SqlExprCell).$expr === "string";
 }
 
 export function isBinaryCell(v: Cell): v is BinaryCell {
@@ -53,6 +57,7 @@ export function displayCell(v: Cell, kind: ColumnKind, maxChars = MAX_DISPLAY, n
   if (typeof v === "boolean") return { text: v ? "• true" : "  false", cls: " b" };
   if (typeof v === "number") return { text: String(v), cls: "" };
   if (isDefaultCell(v)) return { text: "<default>", cls: " nul" };
+  if (isExprCell(v)) return { text: v.$expr, cls: " expr" };
   if (isBinaryCell(v)) {
     const more = v.truncated || (v.len !== undefined && v.len * 2 > v.$bin.length);
     return { text: "0x" + v.$bin.toUpperCase() + (more ? "…" : ""), cls: " bin" };
@@ -77,6 +82,7 @@ export function editText(v: Cell): string {
   if (v === null || v === undefined || isDefaultCell(v)) return "";
   if (typeof v === "string") return v;
   if (typeof v === "number" || typeof v === "boolean") return String(v);
+  if (isExprCell(v)) return v.$expr;
   if (isBinaryCell(v)) return "0x" + v.$bin;
   try {
     return JSON.stringify(v, null, 2);
@@ -134,6 +140,7 @@ export function sortKey(v: Cell, kind: ColumnKind): number | string | null {
     return v;
   }
   if (isBinaryCell(v)) return v.$bin;
+  if (isExprCell(v)) return v.$expr;
   try {
     return JSON.stringify(v);
   } catch {

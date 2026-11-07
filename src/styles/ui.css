@@ -448,7 +448,10 @@
 }
 .dg-menu-hint {
   flex: none;
-  max-width: 260px;
+  /* wraps within the width the items give the menu (it never widens it) */
+  width: 0;
+  min-width: 100%;
+  box-sizing: border-box;
   padding: 6px 17px 8px;
   color: var(--dg-popup-separator-fg);
   font-size: var(--dg-font-size-medium);
@@ -546,9 +549,16 @@
 .dg-notification-close {
   display: flex;
   flex: none;
+  gap: 2px;
   height: 16px;
-  opacity: 0.7;
   visibility: hidden;
+}
+.dg-notification-close > span {
+  display: flex;
+  opacity: 0.7;
+}
+.dg-notification-close > span:hover {
+  opacity: 1;
 }
 .dg-notification:hover .dg-notification-close {
   visibility: visible;

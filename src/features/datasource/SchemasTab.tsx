@@ -1,25 +1,22 @@
-import { For, Show, createEffect, createMemo, createSignal, on, untrack } from "solid-js";
+import { Show, createEffect, createMemo, createSignal, on, untrack } from "solid-js";
 import { introspect, type TreeNode } from "../../api/db";
-import { Checkbox, Icon, TextField, tip } from "../../components/ui";
+import { Icon, TextField, tip } from "../../components/ui";
+import { SchemaFilterTree, type SchemaTreeGroup } from "./SchemaFilterTree";
 import { withConnection } from "./remote";
-import { parseVisibleSchemas, pathKey } from "./schemas";
+import { type SchemaFilter, type SchemaItem, filterOrDefault, pathKey, parsePatternText, patternText, serializeFilter } from "./schemaModel";
 import type { Session } from "./session";
 
-interface Node {
-  path: string[];
-  name: string;
-  /** Schema / database leaf or a PG database with schema children. */
-  children: Node[] | null;
-}
+const byName = (a: SchemaItem, b: SchemaItem) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
 
 export function SchemasTab(props: { s: Session }) {
   const s = props.s;
   const d = () => s.current()!;
-  const [nodes, setNodes] = createSignal<Node[] | null>(null);
+  const [groups, setGroups] = createSignal<SchemaTreeGroup[] | null>(null);
   const [loading, setLoading] = createSignal(false);
   const [err, setErr] = createSignal<string | null>(null);
-  const [collapsed, setCollapsed] = createSignal<Set<string>>(new Set());
-  const [filter, setFilter] = createSignal("");
+  const [collapsed, setCollapsed] = createSignal<ReadonlySet<string>>(new Set());
+  const [filterText, setFilterText] = createSignal("");
+  const [typed, setTyped] = createSignal<string | null>(null);
 
   const canLoad = () => !!d().id && !s.isModified(d());
 
@@ -28,22 +25,34 @@ export function SchemasTab(props: { s: Session }) {
     if (!id) return;
     setLoading(true);
     setErr(null);
+    const driver = d().form.dbms;
+    const dbName = d().form.database;
     try {
       const tree = await withConnection(id, async () => {
+        const items = (nodes: TreeNode[]): SchemaItem[] =>
+          nodes
+            .filter((n) => n.kind === "schema")
+            .map((n) => ({
+              path: n.path,
+              name: n.name,
+              system: !!n.extra.system,
+              isDefault: driver === "postgres" ? !!n.extra.default : driver === "sqlite" ? n.name === "main" : n.name === dbName,
+            }))
+            .sort(byName);
+        const top = await introspect(id, [], true);
         // PostgreSQL: only the database the data source is connected to can be introspected
-        const mk = async (n: TreeNode): Promise<Node | null> => {
-          if (n.kind !== "database") return { path: n.path, name: n.name, children: null };
+        if (driver !== "postgres") return [{ name: null, items: items(top) }];
+        const out: SchemaTreeGroup[] = [];
+        for (const n of top.filter((x) => x.kind === "database" && (x.hasChildren || x.extra.current))) {
           try {
-            const kids = (await introspect(id, n.path)).filter((c) => c.kind === "schema");
-            return { path: n.path, name: n.name, children: kids.map((c) => ({ path: c.path, name: c.name, children: null })) };
+            out.push({ name: n.name, items: items(await introspect(id, n.path, true)) });
           } catch {
-            return null;
+            /* a database we cannot read is left out */
           }
-        };
-        const top = await introspect(id, []);
-        return (await Promise.all(top.filter((n) => n.kind === "database" || n.kind === "schema").map(mk))).filter((n): n is Node => n !== null);
+        }
+        return out;
       });
-      setNodes(tree);
+      setGroups(tree);
     } catch (e) {
       setErr(String(e));
     } finally {
@@ -56,56 +65,19 @@ export function SchemasTab(props: { s: Session }) {
     on(
       () => d().key,
       () => {
-        setNodes(null);
-        setFilter("");
+        setGroups(null);
+        setFilterText("");
         setCollapsed(new Set<string>());
         if (untrack(canLoad)) void load();
       },
     ),
   );
 
-  const leaves = createMemo(() => {
-    const out: string[][] = [];
-    for (const n of nodes() ?? []) {
-      if (n.children) for (const c of n.children) out.push(c.path);
-      else out.push(n.path);
-    }
-    return out;
-  });
-  const sel = createMemo(() => {
-    const v = parseVisibleSchemas(d().form.options.visibleSchemas); // the draft; Apply stores it in the UI state
-    return v ? new Set(v.map(pathKey)) : null; // null = all
-  });
-  const isOn = (path: string[]) => sel() === null || sel()!.has(pathKey(path));
-
-  function write(next: Set<string>) {
-    const all = leaves();
-    if (all.every((p) => next.has(pathKey(p)))) s.setOption("visibleSchemas", undefined);
-    else s.setOption("visibleSchemas", JSON.stringify(all.filter((p) => next.has(pathKey(p)))));
-  }
-  function toggle(paths: string[][], on: boolean) {
-    const cur = new Set(leaves().filter(isOn).map(pathKey));
-    for (const p of paths) on ? cur.add(pathKey(p)) : cur.delete(pathKey(p));
-    write(cur);
-  }
-  const state = (paths: string[][]) => {
-    const n = paths.filter(isOn).length;
-    return { checked: n > 0 && n === paths.length, partial: n > 0 && n < paths.length };
-  };
-
-  const matches = (n: Node) => {
-    const q = filter().trim().toLowerCase();
-    if (!q) return true;
-    return n.name.toLowerCase().includes(q) || !!n.children?.some((c) => c.name.toLowerCase().includes(q));
-  };
-
-  const toggleCollapse = (n: Node) =>
-    setCollapsed((c) => {
-      const next = new Set(c);
-      const k = pathKey(n.path);
-      next.has(k) ? next.delete(k) : next.add(k);
-      return next;
-    });
+  const items = createMemo(() => (groups() ?? []).flatMap((g) => g.items));
+  /** The draft's filter (Apply stores it in the UI state). */
+  const filter = createMemo<SchemaFilter>(() => filterOrDefault(d().form.options.visibleSchemas, items()));
+  const write = (f: SchemaFilter) => s.setOption("visibleSchemas", serializeFilter(f, items()));
+  const dbKeys = () => (groups() ?? []).filter((g) => g.name).map((g) => pathKey([g.name!]));
 
   return (
     <div class="ds-schemas">
@@ -116,60 +88,61 @@ export function SchemasTab(props: { s: Session }) {
         <button type="button" class="dg-action-button ds-tb" onClick={() => setCollapsed(new Set())} {...tip("Expand All")}>
           <Icon name="expand-all" />
         </button>
-        <button
-          type="button"
-          class="dg-action-button ds-tb"
-          onClick={() => setCollapsed(new Set((nodes() ?? []).filter((n) => n.children).map((n) => pathKey(n.path))))}
-          {...tip("Collapse All")}
-        >
+        <button type="button" class="dg-action-button ds-tb" onClick={() => setCollapsed(new Set(dbKeys()))} {...tip("Collapse All")}>
           <Icon name="collapse-all" />
         </button>
         <div class="ds-schemas-search">
-          <TextField value={filter()} onInput={setFilter} prefix={<Icon name="search" />} />
+          <TextField value={filterText()} onInput={setFilterText} prefix={<Icon name="search" />} />
         </div>
       </div>
 
       <div class="ds-schemas-tree">
-        <Show when={nodes()} fallback={<SchemasPlaceholder s={s} loading={loading()} err={err()} canLoad={canLoad()} load={load} />}>
-          <div class="ds-tree-row">
-            <span class="ds-tree-gap" />
-            <Checkbox
-              checked={state(leaves()).checked}
-              indeterminate={state(leaves()).partial}
-              onChange={(c) => toggle(leaves(), c)}
-              label="All schemas"
+        <Show when={groups()} fallback={<SchemasPlaceholder s={s} loading={loading()} err={err()} canLoad={canLoad()} load={load} />}>
+          {(g) => (
+            <SchemaFilterTree
+              groups={g()}
+              filter={filter()}
+              onChange={write}
+              collapsed={collapsed()}
+              onToggleCollapse={(k) =>
+                setCollapsed((c) => {
+                  const n = new Set(c);
+                  n.has(k) ? n.delete(k) : n.add(k);
+                  return n;
+                })
+              }
+              query={filterText()}
             />
-          </div>
-          <For each={nodes()!.filter(matches)}>
-            {(n) => (
-              <>
-                <div class="ds-tree-row">
-                  <Show when={n.children} fallback={<span class="ds-tree-gap" />}>
-                    <span class="ds-tree-chevron" onClick={() => toggleCollapse(n)}>
-                      <Icon name={collapsed().has(pathKey(n.path)) ? "chevron-right" : "chevron-down"} />
-                    </span>
-                  </Show>
-                  <Checkbox
-                    checked={state(n.children ? n.children.map((c) => c.path) : [n.path]).checked}
-                    indeterminate={state(n.children ? n.children.map((c) => c.path) : [n.path]).partial}
-                    onChange={(c) => toggle(n.children ? n.children.map((x) => x.path) : [n.path], c)}
-                    label={n.name}
-                  />
-                </div>
-                <Show when={n.children && !collapsed().has(pathKey(n.path))}>
-                  <For each={n.children!.filter((c) => matches(n) || matches({ ...c, children: null }))}>
-                    {(c) => (
-                      <div class="ds-tree-row ds-tree-child">
-                        <span class="ds-tree-gap" />
-                        <Checkbox checked={isOn(c.path)} onChange={(on) => toggle([c.path], on)} label={c.name} />
-                      </div>
-                    )}
-                  </For>
-                </Show>
-              </>
-            )}
-          </For>
+          )}
         </Show>
+      </div>
+
+      <div class="ds-schemas-fields">
+        <div class="ds-schemas-field">
+          <span class="ds-label">Schema pattern:</span>
+          <TextField
+            // the text being typed stays as typed; it is rewritten from the filter (`db:schema`) when the field loses the focus
+            value={typed() ?? (serializeFilter(filter(), items()) === undefined ? "" : patternText(filter(), items()))}
+            disabled={!groups()}
+            placeholder="postgres:public,sales,!temp*"
+            frameClass="ds-fill"
+            onInput={(v) => {
+              setTyped(v);
+              write(parsePatternText(v, items(), filter()));
+            }}
+            onBlur={() => setTyped(null)}
+          />
+        </div>
+        <div class="ds-schemas-field">
+          <span class="ds-label">Object filter:</span>
+          <TextField
+            value={filter().objects}
+            disabled={!groups()}
+            placeholder="Table and view names, e.g. tmp_*, !audit*"
+            frameClass="ds-fill"
+            onInput={(v) => write({ ...filter(), objects: v })}
+          />
+        </div>
       </div>
     </div>
   );

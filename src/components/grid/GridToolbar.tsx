@@ -67,6 +67,8 @@ const Sep = () => <span class="dgg-tsep" />;
 export interface GridToolbarProps {
   /** Result can be edited (table results): enables the edit group. */
   editable?: boolean;
+  /** The result has no rows (and no pending new row): Delete Rows is disabled. */
+  emptyResult?: boolean;
   /** Pending changes exist: enables revert / preview / submit (submit turns green). */
   hasChanges?: boolean;
   /** A statement is running: enables "Cancel Running Statements". */
@@ -171,7 +173,7 @@ export function GridToolbar(props: GridToolbarProps): JSX.Element {
       {/* a read-only result (join, aggregate, view) has no edit group, like DataGrip */}
       <Show when={ed()}>
         <Btn icon="add" title="Add Row" shortcut="Alt+Insert" onClick={props.onAddRow} />
-        <Btn icon="remove" title="Delete Rows" shortcut="Ctrl+Y" onClick={props.onDeleteRows} />
+        <Btn icon="remove" title="Delete Rows" shortcut="Ctrl+Y" disabled={props.emptyResult} onClick={props.onDeleteRows} />
         <Btn icon="revert" title="Revert Selected" shortcut="Ctrl+Alt+Z" disabled={!props.hasChanges} onClick={props.onRevert} />
         <Btn icon="preview" title="Preview Pending Changes" disabled={!props.hasChanges} onClick={props.onPreview} />
         <Btn icon="submit" title="Submit" shortcut="Ctrl+Enter" disabled={!props.hasChanges} green={!!props.hasChanges} onClick={props.onSubmit} />
@@ -331,6 +333,9 @@ export interface GridPagingPillProps {
   onCountRows?: () => void;
   /** The statement still runs: `of N+` after the count (the total is not known yet). */
   loading?: boolean;
+  /** Gray `of N` segment: the rows loaded in all pages; `ofMore` makes it `of N+` (the server has more). */
+  ofTotal?: number;
+  ofMore?: boolean;
   onFirstPage?: () => void;
   onPreviousPage?: () => void;
   onNextPage?: () => void;
@@ -348,6 +353,10 @@ export function GridPagingPill(props: GridPagingPillProps): JSX.Element {
     return props.totalRows != null ? `${n} of ${props.totalRows.toLocaleString("en-US")} ${noun}` : `${n} ${noun}`;
   };
   const def = () => props.defaultPageSize ?? 500;
+  const ofText = () => {
+    if (props.ofTotal != null) return `of ${props.ofTotal.toLocaleString("en-US")}${props.ofMore ? "+" : ""}`;
+    return props.loading ? `of ${props.rowCount.toLocaleString("en-US")}+` : null;
+  };
 
   const openSizes = (e: MouseEvent) => {
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
@@ -386,9 +395,13 @@ export function GridPagingPill(props: GridPagingPillProps): JSX.Element {
         <span>{label()}</span>
         <i class="dgg-i i-chevron" />
       </button>
-      <Show when={props.loading}>
-        <span class="dgg-pill-sep" />
-        <span class="dgg-pill-of">of {props.rowCount.toLocaleString("en-US")}+</span>
+      <Show when={ofText()}>
+        {(t) => (
+          <>
+            <span class="dgg-pill-sep" />
+            <span class="dgg-pill-of">{t()}</span>
+          </>
+        )}
       </Show>
       <span class="dgg-pill-sep" />
       <button class="dgg-pill-more" onClick={openMore} tabIndex={-1} {...tip("More")}>

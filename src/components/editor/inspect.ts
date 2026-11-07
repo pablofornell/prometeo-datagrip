@@ -6,6 +6,7 @@
 import { type EditorState, EditorSelection, RangeSetBuilder, type Extension } from "@codemirror/state";
 import { Decoration, type DecorationSet, EditorView, ViewPlugin, type ViewUpdate, hoverTooltip } from "@codemirror/view";
 import { docAnalysis, LARGE_DOC } from "./highlight";
+import { intentionsAt, intentionHostFacet } from "./intentions";
 import { analyzeStatement } from "./semantic";
 import { configField, errorsField, type Problem, problemsField, setConfig, setProblems } from "./state";
 import { syntaxProblems } from "./syntax";
@@ -82,10 +83,38 @@ function tipFor(kind: Problem["kind"], hoverTime: number): Extension {
         pos: p.from,
         end: p.to,
         above: false,
-        create() {
+        create(v) {
           const dom = document.createElement("div");
           dom.className = "cm-inspect-tip";
-          dom.textContent = p.message;
+          const msg = document.createElement("div");
+          msg.textContent = p.message;
+          dom.append(msg);
+          // footer: the first fix (Alt+Shift+Enter) and `More actions…` (Alt+Enter), when there is something to offer
+          const list = intentionsAt(v.state, p.from, { host: v.state.facet(intentionHostFacet) });
+          if (list.length) {
+            const foot = document.createElement("div");
+            foot.className = "cm-inspect-foot";
+            const link = (label: string, key: string, run: () => void): void => {
+              const a = document.createElement("a");
+              a.className = "cm-inspect-link";
+              a.append(label + " ");
+              const k = document.createElement("span");
+              k.className = "cm-inspect-key";
+              k.textContent = key;
+              a.append(k);
+              a.addEventListener("mousedown", (e) => {
+                e.preventDefault();
+                v.dispatch({ selection: EditorSelection.cursor(p.from) });
+                v.focus();
+                run();
+              });
+              foot.append(a);
+            };
+            const first = list.find((x) => x.kind === "fix");
+            if (first) link(first.label, "Alt+Shift+Enter", () => first.apply(v));
+            link("More actions…", "Alt+Enter", () => void import("./intentionsPopup").then((m) => m.showIntentions(v))); // lazy: the popup needs the DOM menu
+            dom.append(foot);
+          }
           return { dom };
         },
       };

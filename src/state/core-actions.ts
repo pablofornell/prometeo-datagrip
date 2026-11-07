@@ -12,7 +12,8 @@ import {
   type ToolWindowAnchor,
   TOOL_WINDOWS,
   activeToolWindow,
-  currentToolWindow,
+  anchorOf,
+  focusedToolWindow,
   focusToolWindow,
   hideActiveToolWindow,
   hideAllToolWindows,
@@ -28,7 +29,7 @@ import { goBack, goForward, canGoBack, canGoForward, initNavHistory } from "./na
 import { DEFAULT_SETTINGS, settings, updateSettings } from "./settings";
 import { activeTabId, closeAllTabs, closeOtherTabs, closeTab, cycleTab } from "./tabs";
 import { type ThemePref, setThemePref, themePref } from "./theme";
-import { menuBarOpen, setAboutOpen, setMenuBarOpen } from "./ui";
+import { isModalOpen, menuBarOpen, setAboutOpen, setMenuBarOpen } from "./ui";
 
 
 /** Ids of actions other modules are expected to implement (kept in one place for discoverability). */
@@ -60,7 +61,7 @@ export function registerCoreActions(): () => void {
     { id: "window.minimize", title: "Minimize", run: () => void minimizeWindow() },
     { id: "window.maximize", title: "Maximize / Restore", run: () => void toggleMaximizeWindow() },
     { id: "help.about", title: "About Prometeo DataGrip", run: () => void setAboutOpen(true) },
-    { id: ACTION_IDS.menu, title: "Main Menu", shortcut: "Alt+\\", checked: () => menuBarOpen(), run: () => void setMenuBarOpen(!menuBarOpen()) },
+    { id: ACTION_IDS.menu, title: "Main Menu", shortcut: "Alt+\\", checked: () => menuBarOpen(), enabled: () => menuBarOpen() || !isModalOpen(), run: () => void setMenuBarOpen(!menuBarOpen()) },
     { id: "window.resetLayout", title: "Restore Default Layout", run: () => resetLayout() },
     stub(ACTION_IDS.settings, "Settings…", "Ctrl+Alt+S", "settings"),
     stub(ACTION_IDS.dataSources, "Data Sources…", "Ctrl+Alt+Shift+S", "dg/manage-data-sources"),
@@ -83,7 +84,15 @@ export function registerCoreActions(): () => void {
       checked: () => isToolWindowVisible(t.id),
       run: () => toggleToolWindow(t.id),
     })),
-    { id: "toolwindow.maximize", title: "Maximize Tool Window", shortcut: "Ctrl+Shift+'", enabled: () => !!currentToolWindow(), run: () => toggleMaximizeToolWindow(currentToolWindow()!) },
+    {
+      id: "toolwindow.maximize",
+      title: "Maximize Tool Window",
+      shortcut: "Ctrl+Shift+'",
+      // only while a tool window has focus: from the editor it would maximize the last active window behind the user's back
+      when: () => !!focusedToolWindow(),
+      enabled: () => !!focusedToolWindow(),
+      run: () => toggleMaximizeToolWindow(focusedToolWindow()!),
+    },
     ...(
       [
         ["left", "Stretch to Left", "Ctrl+Shift+Left"],
@@ -96,12 +105,12 @@ export function registerCoreActions(): () => void {
       title,
       shortcut,
       // only while a tool window has focus: in the editor Ctrl+Shift+Arrow extends the selection
-      when: () => !!(document.activeElement as HTMLElement | null)?.closest("[data-toolwindow]"),
+      when: () => !!focusedToolWindow(),
       enabled: () => {
-        const id = currentToolWindow();
+        const id = focusedToolWindow();
         return !!id && stretchDirsOf(id).includes(dir);
       },
-      run: () => stretchToolWindow(currentToolWindow()!, dir),
+      run: () => stretchToolWindow(focusedToolWindow()!, dir),
     })),
     ...(
       [
@@ -112,8 +121,11 @@ export function registerCoreActions(): () => void {
     ).map<Action>(([anchor, title]) => ({
       id: "toolwindow.moveTo." + anchor,
       title,
-      enabled: () => !!currentToolWindow(),
-      run: () => moveToolWindow(currentToolWindow()!, anchor),
+      enabled: () => {
+        const id = focusedToolWindow();
+        return !!id && anchorOf(id) !== anchor;
+      },
+      run: () => moveToolWindow(focusedToolWindow()!, anchor),
     })),
     { id: "toolwindow.hideActive", title: "Hide Active Tool Window", shortcut: "Shift+Escape", run: () => hideActiveToolWindow() },
     { id: "toolwindow.hideAll", title: "Hide All Windows", shortcut: "Ctrl+Shift+F12", run: () => hideAllToolWindows() },
@@ -214,7 +226,10 @@ function lastToolWindow(): string | undefined {
 /** Puts the keyboard focus back into the active editor (falls back to the editor island itself). */
 function focusEditorArea(): void {
   const area = document.querySelector<HTMLElement>("[data-editor-area]");
+  const view = ".dg-editor-view:not(.dg-hidden) .cm-content, .dg-editor-view:not(.dg-hidden) .dgg";
   const target =
-    area?.querySelector<HTMLElement>(".dg-editor-view:not(.dg-hidden) .cm-content, .dg-editor-view:not(.dg-hidden) .dgg") ?? area;
+    area?.querySelector<HTMLElement>(".dg-pane-focused " + view.replace(", ", ", .dg-pane-focused ")) ??
+    area?.querySelector<HTMLElement>(view) ??
+    area;
   target?.focus({ preventScroll: true });
 }

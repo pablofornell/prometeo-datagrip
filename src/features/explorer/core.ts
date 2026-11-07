@@ -5,7 +5,7 @@
  * Children are loaded into the items themselves (`node.children`) and the shared `Tree` is asked to
  * re-read them with `refresh(id)`; until then `loadChildren` answers with a "Loading..." row.
  */
-import { createSignal } from "solid-js";
+import { createMemo, createRoot, createSignal } from "solid-js";
 import {
   type DataSource,
   type ObjectRef,
@@ -36,7 +36,8 @@ import {
   tabIconOf,
 } from "./model";
 import { theme } from "../../state/theme";
-import { isSchemaVisible, visibleSchemas, visibleSchemasRaw } from "../datasource/schemas";
+import { dsFolders, dsGroupOf } from "../../state/ds-folders";
+import { isObjectVisible, isSchemaVisible, visibleSchemas, visibleSchemasRaw } from "../datasource/schemas";
 
 // ---------------------------------------------------------------- signals
 
@@ -52,6 +53,8 @@ export const [selectedNode, setSelectedNode] = createSignal<ENode | undefined>(u
 export const [searchQuery, setSearchQuery] = createSignal("");
 export const [showSystemObjects, setShowSystemObjectsSignal] = createSignal(false);
 export const [loaded, setLoaded] = createSignal(false);
+/** View Options > Sort Alphabetically: the data sources are listed by name (default) instead of in creation order. */
+export const [sortAlphabetically, setSortAlphabeticallySignal] = createSignal(true);
 
 let ctrl: TreeController<ENode> | undefined;
 export const setController = (c: TreeController<ENode> | undefined) => (ctrl = c);
@@ -59,6 +62,35 @@ export const controller = () => ctrl;
 
 /** Every node ever created, by id. */
 export const nodes = new Map<string, ENode>();
+
+/** The data source folders of the tree (stable nodes: their members and count follow the data source list). */
+const folderNodes = new Map<string, ENode>();
+export const isDsFolder = (n: ENode | undefined): boolean => !!n?.data.extra.dsFolder;
+
+/** What the explorer tree lists at the top: the folders (alphabetical), then the data sources outside any folder. */
+export const treeRoots = createRoot(() =>
+  createMemo<ENode[]>(() => {
+    const list = roots();
+    const folders = dsFolders();
+    const top = list.filter((n) => !dsGroupOf(n.id));
+    const nodesOfFolders = folders.map((name) => {
+      const id = "dsfolder:" + name;
+      const members = list.filter((n) => dsGroupOf(n.id) === name);
+      let f = folderNodes.get(id);
+      if (!f) {
+        f = { id, label: name, icon: iconOf("folder"), hasChildren: true, data: { dsId: "", kind: "folder", name, path: [], extra: { dsFolder: true }, driver: "postgres", icon: iconOf("folder") } };
+        folderNodes.set(id, f);
+        nodes.set(id, f);
+      }
+      f.hint = String(members.length);
+      f.hasChildren = members.length > 0;
+      f.children = members;
+      return f;
+    });
+    for (const id of [...folderNodes.keys()]) if (!folders.some((n) => "dsfolder:" + n === id)) (folderNodes.delete(id), nodes.delete(id));
+    return [...nodesOfFolders, ...top];
+  }),
+);
 const pending = new Map<string, Promise<void>>();
 const generation = new Map<string, number>();
 const raw = new Map<string, Promise<TreeNode[]>>();
@@ -81,6 +113,7 @@ interface Saved {
   badges: Record<string, string>;
   showSystem: boolean;
   nodeColors: Record<string, string>;
+  sortAlphabetically?: boolean;
 }
 
 const LS_KEY = "prometeo.ui.explorer.state";
@@ -111,6 +144,7 @@ export async function loadSaved(): Promise<Saved> {
   setBadges(saved.badges ?? {});
   setNodeColors(saved.nodeColors ?? {});
   setShowSystemObjectsSignal(!!saved.showSystem);
+  setSortAlphabeticallySignal(saved.sortAlphabetically !== false);
   return saved;
 }
 
@@ -124,6 +158,7 @@ export function saveState(): void {
       badges: badges(),
       showSystem: showSystemObjects(),
       nodeColors: nodeColors(),
+      sortAlphabetically: sortAlphabetically(),
     };
     saved = st;
     try {
@@ -155,6 +190,12 @@ export function colorOfNode(n: ENode): string | undefined {
   return undefined;
 }
 
+export function setSortAlphabetically(v: boolean): void {
+  setSortAlphabeticallySignal(v);
+  saveState();
+  void reloadDataSources().catch(() => {});
+}
+
 export function setShowSystemObjects(v: boolean): void {
   setShowSystemObjectsSignal(v);
   saveState();
@@ -177,8 +218,12 @@ function dsNode(ds: DataSource): ENode {
   return n;
 }
 
+/** DataGrip lists the data sources alphabetically (case-insensitive); with "Sort Alphabetically" off: creation order. */
+export const sortDataSources = <T extends { name: string }>(list: T[], sorted: boolean): T[] =>
+  sorted ? [...list].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) : list;
+
 export async function reloadDataSources(): Promise<void> {
-  const list = await listDataSources();
+  const list = sortDataSources(await listDataSources(), sortAlphabetically());
   const prev = new Map(roots().map((n) => [n.id, n]));
   setDataSources(list);
   let changed = prev.size !== list.length;
@@ -250,13 +295,19 @@ interface LoadTrack {
 /** One status bar task per data source while any of its loads runs (they come and go as the tree is expanded). */
 const tracks = new Map<string, LoadTrack>();
 /** Data sources whose next loads are a complete introspection (new data source, Refresh): the task is named so. */
-const fullIntrospection = new Map<string, number>();
+const fullIntrospection = new Map<string, { delayMs: number; timer: number }>();
 
 /** Called by Refresh / the new data source flow: the loads that follow belong to a complete introspection. */
 export function markFullIntrospection(dsId: string, delayMs = 300): void {
-  fullIntrospection.set(dsId, delayMs);
-  // not consumed (nothing expanded, nothing to load): forget it so that a later expand is a plain load
-  window.setTimeout(() => fullIntrospection.delete(dsId), 2000);
+  const prev = fullIntrospection.get(dsId);
+  if (prev) window.clearTimeout(prev.timer);
+  // not consumed (nothing expanded, nothing to load): forget it so that a later expand is a plain load.
+  // The timer only removes its own mark: a newer one (marked again meanwhile) keeps its full 2 s.
+  const mark = { delayMs, timer: 0 };
+  mark.timer = window.setTimeout(() => {
+    if (fullIntrospection.get(dsId) === mark) fullIntrospection.delete(dsId);
+  }, 2000);
+  fullIntrospection.set(dsId, mark);
 }
 
 /**
@@ -266,8 +317,10 @@ export function markFullIntrospection(dsId: string, delayMs = 300): void {
 export function beginIntrospection(dsId: string): { end: () => void; task: TaskHandle } {
   let t = tracks.get(dsId);
   if (!t) {
-    const delay = fullIntrospection.get(dsId);
+    const mark = fullIntrospection.get(dsId);
+    if (mark) window.clearTimeout(mark.timer);
     fullIntrospection.delete(dsId);
+    const delay = mark?.delayMs;
     const title = delay === undefined ? `Loading ${dsName(dsId)}` : `Performing complete introspection (${driverLabel(dsId)})`;
     t = { count: 0, task: startTask(title, { cancel: () => cancelLoads(dsId), delayMs: delay ?? 300 }) };
     tracks.set(dsId, t);
@@ -323,6 +376,11 @@ export function rawIntrospect(dsId: string, path: string[], showSystem: boolean)
     raw.set(key, p);
   }
   return p;
+}
+
+/** Forgets the cached listings of a data source (the next `rawIntrospect` asks the server again); the tree stays as it is. */
+export function forgetListings(dsId: string): void {
+  for (const k of [...raw.keys()]) if (k.startsWith(dsId + "\u0000")) raw.delete(k);
 }
 
 function setBadge(id: string, text: string | undefined): void {
@@ -409,18 +467,22 @@ async function fetchChildren(node: ENode): Promise<ENode[]> {
     // every non-system schema is shown.
     const explicit = ds ? visibleSchemas(ds) : null;
     const all = explicit
-      ? tns.filter((t) => t.kind !== "schema" || isSchemaVisible(ds!, t.path))
+      ? tns.filter((t) => t.kind !== "schema" || isSchemaVisible(ds!, t.path, { isDefault: !!t.extra.default }))
       : showSystemObjects()
         ? tns
         : tns.filter((t) => !t.extra.system);
     list = all;
-    const hidden = tns.length - all.length;
-    setBadge(node.id, hidden > 0 ? `${all.length} of ${tns.length}` : d.kind === "dataSource" ? String(all.length) : undefined);
+    // the badge counts the schemas, not `Server Objects` / `Database Objects`
+    const total = tns.filter((t) => t.kind === "schema").length;
+    const shown = all.filter((t) => t.kind === "schema").length;
+    setBadge(node.id, total > shown ? `${shown} of ${total}` : d.kind === "dataSource" ? String(shown) : undefined);
   } else if (d.kind === "dataSource") {
     // PostgreSQL: only the database of the connection is shown (DataGrip's default).
     list = tns.filter((t) => t.hasChildren || t.extra.current);
-    setBadge(node.id, String(list.length));
+    setBadge(node.id, String(list.filter((t) => t.kind === "database").length));
   }
+  // Data Sources > Schemas > Object filter: only the tables / views whose name passes it
+  if (ds && d.kind === "folder" && ["tables", "views", "materialized_views"].includes(d.extra.folder)) list = list.filter((t) => isObjectVisible(ds, t.name));
   const ctx = d.kind === "folder" && d.extra.folder === "columns" ? await columnContext(node) : undefined;
   // Numbering of unnamed constraints is per folder, not per type, so index = position in the list.
   return list.map((tn, i) => mkNode(node, tn, i, ctx));
@@ -658,7 +720,7 @@ export async function expandAllLoaded(): Promise<void> {
         } else walk(n.children);
       }
     };
-    walk(roots());
+    walk(treeRoots());
     if (!changed) break;
     await tick();
   }
@@ -671,7 +733,8 @@ export async function revealObject(dsId: string, ref: ObjectRef | null | undefin
   if (!ctrl) return false;
   const ds = roots().find((r) => r.id === dsId);
   if (!ds) return false;
-  const chain: ENode[] = [ds];
+  const inFolder = dsGroupOf(dsId);
+  const chain: ENode[] = inFolder && folderNodes.get("dsfolder:" + inFolder) ? [folderNodes.get("dsfolder:" + inFolder)!, ds] : [ds];
   let found = !ref;
   try {
     await ensureConnected(dsId);

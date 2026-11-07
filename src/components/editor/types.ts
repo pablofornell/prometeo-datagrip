@@ -57,6 +57,11 @@ export interface ExecuteRequest {
   ranges: Range[];
   /** Why this text was picked. */
   source: "statement" | "selection" | "script";
+  /**
+   * Set when `sql` is not the document text any more (query parameters were substituted): the document offset of an
+   * offset of `sql` (the ranges then describe the original text).
+   */
+  unmap?: (p: number) => number;
 }
 
 /** An execution error to show in the editor. */
@@ -79,6 +84,14 @@ export interface ExecMark {
   to: number;
   status: "ok" | "error" | "running";
   ms?: number;
+}
+
+/** What the intentions popup (Alt+Enter) needs from the host; an entry without its handler is left out. */
+export interface IntentionHost {
+  /** `Refresh schema`: re-introspect the data source. */
+  refreshSchema?: () => void;
+  /** `Choose schema`: open the schema chooser at `at` (the caret, in screen coordinates). */
+  chooseSchema?: (at: { left: number; bottom: number }) => void;
 }
 
 export interface SqlEditorHandle {
@@ -113,8 +126,8 @@ export interface SqlEditorProps {
   execMarks?: ExecMark[];
   /** Ctrl+Enter (selection or statement). The statement chooser may be shown first. */
   onExecute?: (req: ExecuteRequest) => void;
-  /** 1-based line and column of the main caret, for the status bar. */
-  onCaretChange?: (line: number, col: number) => void;
+  /** 1-based line and column of the main caret, for the status bar; `selChars` / `selBreaks`: size of the selection (0 when none). */
+  onCaretChange?: (line: number, col: number, selChars?: number, selBreaks?: number) => void;
   /** Shows the `Customize` link of the Statements chooser and handles its click (open execution settings). */
   onCustomizeExecution?: () => void;
   /** Ctrl+F2 and other host-level keys are not handled here; this is called for `Escape` with no popup open. */
@@ -143,6 +156,8 @@ export interface SqlEditorProps {
   class?: string;
   /** Ctrl+B / Ctrl+Click, Ctrl+Q and Alt+Shift+B on the identifier at the caret (the host opens tabs and popups). */
   navigate?: NavHandlers;
+  /** Alt+Enter: host actions of the intentions popup. */
+  intentions?: IntentionHost;
   /** Receives the imperative handle once the editor is mounted. */
   ref?: (handle: SqlEditorHandle) => void;
 }

@@ -96,6 +96,23 @@ describe("tableFromNodes", () => {
   });
 });
 
+describe("tableFromNodes (SQLite indexes)", () => {
+  it("keeps an expression index with all its terms and locks it", () => {
+    const t = tableFromNodes("sqlite", "main", "x", {}, {
+      columns: [node("column", "d", "text", {}), node("column", "b", "text", {})],
+      keys: [],
+      fks: [],
+      indexes: [
+        node("index", "x_u", "(d, lower(b))", { unique: true, columns: "d, lower(b)", partial: false, expression: true }),
+        node("index", "x_plain", "(d)", { unique: false, columns: "d", partial: false, expression: false }),
+      ],
+      checks: [],
+    });
+    expect(t.indexes[0]).toMatchObject({ name: "x_u", unique: true, columns: ["d", "lower(b)"], locked: true });
+    expect(t.indexes[1]).toMatchObject({ name: "x_plain", columns: ["d"], locked: false });
+  });
+});
+
 describe("objects", () => {
   it("creates a view, a sequence, a schema and a database", () => {
     const view = { ...newObject("view", "shop", "postgres"), query: "select 1;", comment: "v" };

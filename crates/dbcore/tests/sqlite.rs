@@ -278,6 +278,29 @@ async fn introspection_and_ddl() {
 }
 
 #[tokio::test]
+async fn expression_indexes_keep_their_terms() {
+    let (_dir, _cfg, mgr) = setup().await;
+    let s = mgr.open_session("lite").await.unwrap();
+    let ev = run(
+        &mgr,
+        &s,
+        "create table ex (d text, b text, c integer);\n\
+         create unique index ex_u on ex (d, lower(b) collate nocase desc, c);\n\
+         create index ex_plain on ex (c, d);",
+    )
+    .await;
+    assert_ok(&ev);
+    mgr.close_session(&s).await;
+    let idx = children(&mgr, "lite", &["main", "tables", "ex", "indexes"]).await;
+    assert_eq!(names(&idx), ["ex_plain", "ex_u"]);
+    assert_eq!(idx[0].extra["expression"], json!(false));
+    assert_eq!(idx[0].extra["columns"], "c, d");
+    assert_eq!(idx[1].extra["expression"], json!(true));
+    assert_eq!(idx[1].extra["columns"], "d, lower(b), c");
+    assert_eq!(idx[1].hint.as_deref(), Some("(d, lower(b), c)"));
+}
+
+#[tokio::test]
 async fn execute_types_errors_and_state() {
     let (_d, _cfg, mgr) = setup().await;
     let s = mgr.open_session("lite").await.unwrap();
@@ -799,6 +822,75 @@ async fn table_data_edit_export() {
 }
 
 #[tokio::test]
+async fn sql_expression_values_are_stored_as_expressions() {
+    let (_d, _c, mgr) = setup().await;
+    let t = ObjectRef::table(Some("main"), "products");
+    // insert with an expression for a column, update another one with an expression
+    let r = mgr
+        .apply_changes(
+            "lite",
+            &t,
+            &[change(
+                ChangeKind::Insert,
+                json!({}),
+                json!({"sku": "E1", "name": {"$expr": "upper('expr')"}, "category_id": 1, "price": 1.5}),
+            )],
+        )
+        .await
+        .unwrap();
+    assert!(r.committed, "{r:?}");
+    let r = mgr
+        .apply_changes(
+            "lite",
+            &t,
+            &[change(
+                ChangeKind::Update,
+                json!({"id": 1}),
+                json!({"created_at": {"$expr": "date('2001-02-03')"}}),
+            )],
+        )
+        .await
+        .unwrap();
+    assert!(r.committed, "{r:?}");
+    let s = mgr.open_session("lite").await.unwrap();
+    let ev = run(
+        &mgr,
+        &s,
+        "select name from products where sku = 'E1' union all select created_at from products where id = 1",
+    )
+    .await;
+    assert_ok(&ev);
+    mgr.close_session(&s).await;
+    let rs = mgr
+        .table_data(
+            "lite",
+            &t,
+            &TableDataRequest {
+                where_clause: Some("sku = 'E1' or id = 1".into()),
+                order_by: Some("id".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(rs.rows[0][6], json!("2001-02-03"));
+    assert_eq!(rs.rows[1][2], json!("EXPR"));
+    // a second statement is refused, nothing is applied
+    let bad = mgr
+        .apply_changes(
+            "lite",
+            &t,
+            &[change(
+                ChangeKind::Update,
+                json!({"id": 1}),
+                json!({"name": {"$expr": "'x'; drop table products"}}),
+            )],
+        )
+        .await;
+    assert!(bad.is_err(), "{bad:?}");
+}
+
+#[tokio::test]
 async fn read_only_and_reconnect() {
     let (dir, cfg, mgr) = setup().await;
     let ro = DataSourceConfig {
@@ -1296,4 +1388,61 @@ async fn transaction_status_events_and_init_sql() {
         .open_session_with("lite", &["select * from nope_nope".to_string()])
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn explain_query_plan() {
+    let (_dir, _cfg, mgr) = setup().await;
+    let s = mgr.open_session("lite").await.unwrap();
+    let plan = mgr
+        .explain(
+            &s,
+            "select * from products where category_id = 1 order by name;",
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(plan.root.operation, "Select");
+    let first = &plan.root.children[0];
+    assert_eq!(first.operation, "Index Search (SEARCH)");
+    assert!(first.params.contains("table: products;"), "{first:?}");
+    assert!(plan
+        .root
+        .children
+        .iter()
+        .any(|n| n.operation.contains("ORDER BY")));
+    // no ANALYZE in SQLite
+    assert!(mgr.explain(&s, "select 1", true).await.is_err());
+    assert!(mgr.explain(&s, "  ;", false).await.is_err());
+    mgr.close_session(&s).await;
+}
+
+/// Driver properties of the Advanced tab: journal mode, synchronous, foreign keys and busy timeout are applied.
+#[tokio::test]
+async fn advanced_properties_are_honoured() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = lite_cfg(&dir.path().join("adv.db"));
+    cfg.options.insert("journal_mode".into(), "wal".into());
+    cfg.options.insert("synchronous".into(), "full".into());
+    cfg.options.insert("foreign_keys".into(), "false".into());
+    cfg.options.insert("busy_timeout".into(), "1234".into());
+    let mgr = ConnectionManager::new();
+    mgr.connect(&cfg).await.unwrap();
+    let s = mgr.open_session("lite").await.unwrap();
+    for (sql, want) in [
+        ("pragma journal_mode", json!("wal")),
+        ("pragma synchronous", json!(2)),
+        ("pragma foreign_keys", json!(0)),
+        ("pragma busy_timeout", json!(1234)),
+    ] {
+        assert_eq!(scalar(&run(&mgr, &s, sql).await), want, "{sql}");
+    }
+    mgr.close_session(&s).await;
+
+    cfg.options.insert("foreign_keys".into(), "maybe".into());
+    assert!(mgr
+        .test_connection(&cfg)
+        .await
+        .message
+        .contains("foreign_keys: expected true or false"));
 }

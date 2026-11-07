@@ -9,10 +9,12 @@ import {
   type ExecHandle,
   type ExecHandlers,
   applyChanges,
+  cancelSession,
   closeSession,
   type TxStatus,
   execute,
   executeCollect,
+  explainPlan,
   introspect,
   openSession,
   sessionTxStatus,
@@ -25,7 +27,7 @@ import { type MenuItem, notify, openMenu } from "../../components/ui";
 import { showToolWindow } from "../../state/layout";
 import { settings } from "../../state/settings";
 import { activateTab, activeTab } from "../../state/tabs";
-import { ensureConnected } from "../explorer";
+import { autoSyncAfter, ensureConnected } from "../explorer";
 import {
   INTERNAL_MARK,
   completedIn,
@@ -58,14 +60,19 @@ import {
 } from "../table/session";
 import { previewSql, toRowChanges } from "../table/sql";
 import { confirmEndTransactions } from "./txguard";
+import { findParams, loadValues, paramList, saveValues, substitute } from "./params";
+import { askParams } from "./paramsDialog";
 
 export type TxMode = "auto" | "manual";
-export type Isolation = "read uncommitted" | "read committed" | "repeatable read" | "serializable";
+/** `default`: the server's own level (nothing is set on the session). */
+export type Isolation = "default" | "read uncommitted" | "read committed" | "repeatable read" | "serializable";
 
-const ISOLATIONS: Isolation[] = ["read uncommitted", "read committed", "repeatable read", "serializable"];
+/** The isolation levels of the Tx menu; Read Uncommitted only exists on MySQL (PostgreSQL runs it as Read Committed). */
+export const isolationLevels = (driver: DataSource["driver"]): Isolation[] =>
+  driver === "mysql" ? ["default", "read uncommitted", "read committed", "repeatable read", "serializable"] : ["default", "read committed", "repeatable read", "serializable"];
+const isolationLabel = (i: Isolation): string => (i === "default" ? "Database Default" : cap(i));
 const cap = (s: string): string => s.replace(/\b\w/g, (c) => c.toUpperCase());
 const errText = (e: unknown): string => String((e as Error)?.message ?? e).replace(/^Error:\s*/, "");
-const DEFAULT_ISOLATION = (driver: DataSource["driver"]): Isolation => (driver === "mysql" ? "repeatable read" : "read committed");
 
 /** What the user changed in the session with their own statements; a new session does not have it. */
 interface SessionSettings {
@@ -179,7 +186,7 @@ export class ConsoleSession implements OutputHost {
       return [g, (x: T) => void s(() => x)];
     };
     [this.txMode, this.setTx] = sig<TxMode>(settings.defaultTxMode);
-    [this.isolation, this.setIso] = sig<Isolation>(DEFAULT_ISOLATION(ds.driver));
+    [this.isolation, this.setIso] = sig<Isolation>("default");
     [this.txStatus, this.setTxStatus] = sig<TxStatus>("idle");
     this.inTx = () => this.txStatus() !== "idle";
     // the schema chosen last time shows at once; it is applied to the session when that opens (`ensureSession`)
@@ -230,11 +237,12 @@ export class ConsoleSession implements OutputHost {
     const path = withSchema && this.driver === "postgres" ? savedSearchPath(this.ds.id, this.consoleName) : null;
     if (path) sql.push(`SET search_path TO ${path}`);
     else if (want) sql.push(this.useSchemaSql(want));
-    if (this.isolation() !== DEFAULT_ISOLATION(this.driver)) sql.push(this.isolationSql(this.isolation()));
+    if (this.isolation() !== "default") sql.push(this.isolationSql(this.isolation()));
     return sql;
   }
 
   private isolationSql(i: Isolation): string {
+    if (i === "default") return this.driver === "postgres" ? "RESET default_transaction_isolation" : "SET SESSION transaction_isolation = DEFAULT";
     const lvl = i.toUpperCase();
     return this.driver === "postgres" ? `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ${lvl}` : `SET SESSION TRANSACTION ISOLATION LEVEL ${lvl}`;
   }
@@ -412,12 +420,82 @@ export class ConsoleSession implements OutputHost {
   }
 
   cancel(): void {
+    if (this.explaining && this.sessionId) void cancelSession(this.sessionId).catch(() => {});
     void this.curHandle?.then((h) => h.cancel()).catch(() => {});
+  }
+
+  /** An Explain runs on the session (it has no execution handle: `cancel` stops it through the session). */
+  private explaining = false;
+
+  /**
+   * Explain Plan / Explain Analyse (which runs the statement) of the selection or the statement at the caret; the plan
+   * opens in the `Query Plan` tab of the Database Output.
+   */
+  async explain(analyze: boolean): Promise<void> {
+    const out = this.out;
+    if (out.running()) {
+      notify({ kind: "info", title: "The console is busy", body: "Wait for the running statement or cancel it (Ctrl+F2)." });
+      return;
+    }
+    const req = this.editor?.getSelectionOrStatement();
+    if (!req?.sql.trim()) {
+      notify({ kind: "info", title: "Nothing to explain", body: "Put the caret in a statement." });
+      return;
+    }
+    if (analyze && this.driver === "sqlite") return;
+    out.setRunning(true);
+    this.explaining = true;
+    this.setExecError(null);
+    showToolWindow("output", false);
+    let sid: string | undefined;
+    try {
+      sid = await this.ensureSession();
+      this.releaseResults("an Explain ran on the same connection");
+      const plan = await explainPlan(sid, req.sql, analyze);
+      out.setLastMs(plan.elapsedMs);
+      out.showPlan(plan);
+    } catch (e) {
+      const msg = errText(e);
+      if (isSessionLost(e)) this.sessionLost({ tx: this.inTx() });
+      else if (sid) await this.syncTxStatus(sid); // a failing EXPLAIN aborts a PostgreSQL transaction
+      out.log("error", msg);
+      this.setExecError(msg);
+      notify({ kind: "error", title: analyze ? "Explain Analyse failed" : "Explain Plan failed", body: msg });
+    } finally {
+      this.explaining = false;
+      out.setRunning(false);
+    }
   }
 
   rerun(tab: ResultTab, pageSize?: PageSize): void {
     if (pageSize !== undefined) this.setPageSize(pageSize);
     void this.run({ sql: tab.sql, ranges: [], source: "statement" }, { replace: tab, pageSize: pageSize ?? this.pageSize() });
+  }
+
+  /**
+   * Asks for the values of the `?`, `:name`, `$1` ... of the script and substitutes them (null: cancelled). The values
+   * are remembered per console and parameter.
+   */
+  private async resolveParams(req: ExecuteRequest): Promise<ExecuteRequest | null> {
+    const refs = findParams(req.sql, this.driver);
+    if (!refs.length) return req;
+    const values = await askParams(paramList(refs), loadValues(this.ds.id, this.consoleName), true);
+    if (!values) return null;
+    saveValues(this.ds.id, this.consoleName, { ...loadValues(this.ds.id, this.consoleName), ...values });
+    const sub = substitute(req.sql, refs, values);
+    return { ...req, sql: sub.sql, unmap: sub.unmap };
+  }
+
+  /** `View Parameters`: the parameters of the selection / statement (else the script), without running anything. */
+  async viewParameters(): Promise<void> {
+    const req = this.editor?.getSelectionOrStatement() ?? this.editor?.getScript();
+    const keys = req ? paramList(findParams(req.sql, this.driver)) : [];
+    if (!keys.length) {
+      notify({ kind: "info", title: "No parameters", body: "The statement has no ?, :name or $1 parameters." });
+      return;
+    }
+    const values = await askParams(keys, loadValues(this.ds.id, this.consoleName), false);
+    if (values) saveValues(this.ds.id, this.consoleName, { ...loadValues(this.ds.id, this.consoleName), ...values });
   }
 
   /** The editor's own Ctrl+Enter path (statement chooser included). */
@@ -432,6 +510,7 @@ export class ConsoleSession implements OutputHost {
 
   /** Document offset of position `p` of the text that was sent. */
   private docOffset(req: ExecuteRequest, p: number): number {
+    if (req.unmap) p = req.unmap(p);
     let acc = 0;
     for (const r of req.ranges) {
       const len = r.to - r.from;
@@ -499,6 +578,9 @@ export class ConsoleSession implements OutputHost {
       if (a !== "run") return;
       if (out.running()) return;
     }
+    const withParams = await this.resolveParams(req);
+    if (!withParams || out.running()) return;
+    req = withParams;
     out.setRunning(true);
     this.setExecError(null);
     showToolWindow("output", false);
@@ -709,6 +791,8 @@ export class ConsoleSession implements OutputHost {
       }
       resolveHandle(handle);
       await handle.done;
+      // Data Sources > Options > Auto sync: DDL that ran here shows up in the explorer
+      autoSyncAfter(this.ds.id, req.sql);
     };
 
     let launchFailed = false;
@@ -945,20 +1029,20 @@ export class ConsoleSession implements OutputHost {
     ];
     if (this.driver !== "sqlite") {
       items.push({ type: "separator" }, { type: "header", label: "Transaction Isolation" });
-      for (const i of ISOLATIONS) items.push({ label: cap(i), checked: this.isolation() === i, run: () => void this.setIsolation(i) });
+      for (const i of isolationLevels(this.driver)) items.push({ label: isolationLabel(i), checked: this.isolation() === i, run: () => void this.setIsolation(i) });
     }
     items.push({ type: "separator" }, {
       type: "hint",
       label: manual ? "Manually commit changes submitted to the database" : "Changes submitted to the database are auto-committed",
     });
-    if (anchor instanceof HTMLElement) openMenu(items, { anchor, minWidth: 190 });
-    else openMenu(items, { x: anchor.left, y: anchor.bottom + 2, minWidth: 190 });
+    if (anchor instanceof HTMLElement) openMenu(items, { anchor, minWidth: 210 });
+    else openMenu(items, { x: anchor.left, y: anchor.bottom + 2, minWidth: 210 });
   }
 
   // ------------------------------------------------------------ schema switcher
 
   /** Popup of the toolbar's `postgres.public` button. */
-  async openSchemaMenu(anchor: HTMLElement): Promise<void> {
+  async openSchemaMenu(anchor: HTMLElement | { left: number; bottom: number }): Promise<void> {
     try {
       await ensureConnected(this.ds.id);
       const cur = this.schema();
@@ -970,16 +1054,17 @@ export class ConsoleSession implements OutputHost {
           d.name === this.ds.database
             ? {
                 label: d.name,
-                icon: "dg/database",
                 children: schemas.map<MenuItem>((s) => ({ label: s.name, icon: "dg/schema", checked: s.name === cur, run: () => void this.switchSchema(s.name) })),
               }
-            : { label: d.name, icon: "dg/database", enabled: false },
+            : { label: d.name, enabled: false },
         );
+        items.push({ type: "separator" }, { type: "hint", label: "Connect to database (Enter)" });
       } else {
         const list = await introspect(this.ds.id, []);
         items = list.map<MenuItem>((s) => ({ label: s.name, icon: "dg/schema", checked: s.name === cur, run: () => void this.switchSchema(s.name) }));
       }
-      openMenu(items, { anchor, minWidth: 200 });
+      if (anchor instanceof HTMLElement) openMenu(items, { anchor, minWidth: 230 });
+      else openMenu(items, { x: anchor.left, y: anchor.bottom + 2, minWidth: 230 });
     } catch (e) {
       notify({ kind: "error", title: "Cannot list the schemas", body: errText(e) });
     }
@@ -988,6 +1073,10 @@ export class ConsoleSession implements OutputHost {
   async switchSchema(name: string): Promise<void> {
     if (this.driver === "sqlite") return;
     if (this.out.running()) return;
+    if (this.ds.options?.switchSchema === "disabled") {
+      notify({ kind: "info", title: "Switch schema is disabled", body: "Enable it in Data Sources > Options > Switch schema." });
+      return;
+    }
     try {
       const sid = await this.ensureSession();
       this.releaseResults("the schema was switched on the same connection");

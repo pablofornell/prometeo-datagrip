@@ -4,15 +4,10 @@ import { notify } from "../../components/ui";
 import { type ExportSource, openExportDialog } from "../table/exportData";
 import { type OutputHost, type ResultTab, currentOutput } from "./model";
 
-export const FORMATS: { id: ExportFormat; label: string; ext: string }[] = [
-  { id: "csv", label: "CSV", ext: "csv" },
-  { id: "tsv", label: "TSV", ext: "tsv" },
-  { id: "json", label: "JSON", ext: "json" },
-  { id: "sqlInsert", label: "SQL Inserts", ext: "sql" },
-  { id: "markdown", label: "Markdown", ext: "md" },
-];
+import { extractorLabel } from "./extractors";
 
-export const formatLabel = (f: ExportFormat): string => (f === "sqlInsert" ? "SQL" : (FORMATS.find((x) => x.id === f)?.label ?? "CSV"));
+export { EXTRACTORS, extractorLabel, extractorMenuItems } from "./extractors";
+export const formatLabel = extractorLabel;
 
 const errText = (e: unknown): string => String((e as Error)?.message ?? e).replace(/^Error:\s*/, "");
 

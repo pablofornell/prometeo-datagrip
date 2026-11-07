@@ -159,6 +159,16 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
         const nm = parseName(j);
         if (!nm) return;
         const end = nm.end;
+        if (nm.parts.length === 1 && nm.parts[0] === "dual" && introWord === "from" && !idx.findTable(nm.parts)) {
+          // MySQL / Oracle `FROM dual`: a pseudo table without columns
+          refs.push({ parts: nm.parts, opaque: true });
+          j = end;
+          if (multi && isP(j, ",")) {
+            j++;
+            continue;
+          }
+          return;
+        }
         if (firstTokDot(end) && !joinDot(end)) {
           // `FROM sales.|` being typed: the name is a qualifier, not a table
           for (const q of nm.idxs) roles[q] = "sch";
@@ -186,7 +196,7 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
           }
           let a = end;
           if (isWordAt(a) && lw[a] === "as") a++;
-          if (isNameAt(a) && !roles[a] && !(isWordAt(a) && kws.has(lw[a]))) {
+          if (isNameAt(a) && !roles[a] && !(isWordAt(a) && (kws.has(lw[a]) || (lw[a] === "indexed" && isWordAt(a + 1) && lw[a + 1] === "by")))) {
             ref.alias = lw[a];
             ref.aliasText = raw[a];
             roles[a] = "alias";
@@ -220,6 +230,10 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
         break;
       case "join":
         parseTableList(i + 1, false, "join");
+        break;
+      case "using":
+        // PostgreSQL / MySQL `DELETE FROM t USING u`: u is a table (`JOIN .. USING (col)` and `CONVERT(a USING cs)` are not)
+        if (first === "delete" && owners[i] === undefined && !isP(i + 1, "(")) parseTableList(i + 1, true, "using");
         break;
       case "update":
         if (i === 0 || isP(i - 1, ")")) parseTableList(i + 1, first === "update", "update");
@@ -316,12 +330,14 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
   }
   const BARE_PREV = new Set(["select", "where", "and", "or", "on", "by", "having", "set", "when", "then", "else", "not", "in", "like", "ilike", "between", "is", "case", "distinct", "returning", "using", "limit", "offset"]);
   const BARE_PUNCT = new Set([",", "(", "=", "<", ">", "+", "-", "*", "/", "%", "|", "&", "!"]);
-  const NOT_COLUMNS = new Set(["current_date", "current_time", "current_timestamp", "localtime", "localtimestamp", "current_user", "session_user", "user", "current_schema", "current_catalog", "sysdate", "true", "false", "null", "unknown", "default", "excluded", "rowid", "_rowid_", "oid", "ctid", "xmin", "xmax", "cmin", "cmax", "tableoid", "all", "any", "some", "value"]);
+  const NOT_COLUMNS = new Set(["current_date", "current_time", "current_timestamp", "localtime", "localtimestamp", "current_user", "session_user", "user", "current_schema", "current_catalog", "sysdate", "true", "false", "null", "unknown", "default", "excluded", "rowid", "_rowid_", "oid", "ctid", "xmin", "xmax", "cmin", "cmax", "tableoid", "all", "any", "some", "value", "utc_timestamp", "utc_date", "utc_time", "current_role", "systimestamp"]);
   const bareJudged = (i: number): boolean => {
     if (!judgeBare || !isNameAt(i) || NOT_COLUMNS.has(lw[i]) || aliasNames.has(lw[i]) || isP(i + 1, "(") || joinDot(i + 1)) return false;
     if (sig[i].kind === "word" && (kws.has(lw[i]) || TYPE_NAMES.has(lw[i]))) return false;
-    if (["extract", "substring", "trim", "overlay", "position", "interval", "cast"].includes(owners[i] ?? "")) return false;
+    if (["extract", "substring", "trim", "overlay", "position", "interval", "cast", "convert", "xmlelement"].includes(owners[i] ?? "")) return false;
     if (i === 0) return false;
+    // `LOCK IN SHARE MODE`, SQLite `INDEXED BY ix`
+    if ((lw[i] === "share" && lw[i + 1] === "mode" && lw[i - 1] === "in") || (lw[i - 1] === "by" && lw[i - 2] === "indexed")) return false;
     const pv = sig[i - 1];
     if (pv.kind === "punct") return BARE_PUNCT.has(raw[i - 1]);
     return pv.kind === "word" && BARE_PREV.has(lw[i - 1]);

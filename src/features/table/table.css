@@ -198,3 +198,6 @@
 }
 .dgt-choice { font: 13px / 18px var(--dg-font-ui, "Inter", sans-serif); white-space: pre-wrap; }
 
+
+/* funnel / sort icon of the filter bar: opens the history of applied texts */
+.dgt-fb-half .dgt-fb-icon { cursor: default; }

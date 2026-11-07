@@ -151,4 +151,17 @@ describe("the running clock", () => {
       vi.useRealTimers();
     }
   });
+  it("dispose stops the clock of a console removed while a statement runs", async () => {
+    vi.useFakeTimers();
+    try {
+      const out = new ConsoleOutput("c3", "sqlite");
+      out.setRunning(true);
+      expect(vi.getTimerCount()).toBe(1);
+      out.dispose();
+      expect(vi.getTimerCount()).toBe(0);
+      expect(out.running()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

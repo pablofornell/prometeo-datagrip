@@ -80,6 +80,10 @@ const NODE_ICON: Partial<Record<ExplorerKind, string>> = {
   function: "dg/function",
   procedure: "dg/procedure",
   sequence: "dg/sequence",
+  role: "dg/role",
+  tablespace: "dg/database",
+  extension: "dg/package",
+  user: "dg/user",
   error: "error",
 };
 
@@ -105,6 +109,8 @@ export function columnIcon(tn: TreeNode, ctx?: ColumnContext): string {
 export function iconOf(kind: ExplorerKind, tn?: TreeNode, ctx?: ColumnContext): string | undefined {
   if (kind === "column") return tn ? columnIcon(tn, ctx) : LOCAL + "col";
   if (kind === "index" && tn?.extra.unique && !tn.extra.primary) return "dg/index-unique";
+  // `Server Objects` / `Database Objects`
+  if (kind === "folder" && tn?.extra.group) return tn.extra.folder === "$server" ? "dg/server-objects-group" : "dg/database-objects-group";
   return NODE_ICON[kind];
 }
 

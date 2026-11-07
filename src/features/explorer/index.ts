@@ -35,8 +35,9 @@ export {
   ensureConnected,
 } from "./core";
 export { schemaSnapshotFor, loadSchemaSnapshot } from "./schema";
-export { openTable as openTableTab, openDdl as openDdlTab, openDdlRef, openTableRef, newConsole, jumpToConsole } from "./commands";
+export { openTable as openTableTab, openDdl as openDdlTab, openDdlRef, openTableRef, newConsole, jumpToConsole, openConsoleTab } from "./commands";
 export { showQuickDocRef, type QuickDocTarget } from "./QuickDoc";
+export { autoSyncAfter } from "./autosync";
 
 /** The selected explorer node, or undefined when nothing (or a placeholder row) is selected. */
 export function getSelectedNode(): import("./model").ExplorerNodeInfo | undefined {

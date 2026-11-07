@@ -19,10 +19,16 @@ import {
   isTableLike,
   isTableRelated,
   jumpToConsole,
+  moveDataSource,
   newConsole,
   newDataSource,
+  newDataSourceFromUrl,
+  newFolder,
   openDdl,
+  openDrivers,
   openTable,
+  removeFolder,
+  renameFolder,
   requestDrop,
   startRename,
   updateDataSource,
@@ -35,6 +41,7 @@ import {
   controller,
   dataSources,
   expandAllLoaded,
+  isDsFolder,
   refreshSelected,
   revealObject,
   selectedNode,
@@ -43,6 +50,7 @@ import {
 } from "./core";
 import { type ENode, ddlRefOf, tableRefOf } from "./model";
 import { LOCAL, localIconUrl, providerIcon } from "./icons";
+import { dsFolders, dsGroupOf } from "../../state/ds-folders";
 import { activeTab } from "../../state/tabs";
 import { theme } from "../../state/theme";
 
@@ -52,7 +60,7 @@ const sep: MenuItem = { type: "separator" };
 export const explorerFocused = (): boolean => !!(document.activeElement as HTMLElement | null)?.closest?.(".dg-explorer-tree");
 
 const sel = (): ENode | undefined => selectedNode();
-const real = (n: ENode | undefined): n is ENode => !!n && n.data.kind !== "loading" && n.data.kind !== "error";
+const real = (n: ENode | undefined): n is ENode => !!n && n.data.kind !== "loading" && n.data.kind !== "error" && !isDsFolder(n);
 
 export const DRIVERS = [
   { driver: "mariadb", label: "MariaDB" },
@@ -136,8 +144,8 @@ export function registerExplorerActions(): () => void {
       title: "Drop…",
       shortcut: "Delete",
       when: explorerFocused,
-      enabled: () => canDrop(sel()),
-      run: () => requestDrop(sel()),
+      enabled: () => canDrop(sel()) || isDsFolder(sel()),
+      run: () => (isDsFolder(sel()) ? removeFolder(sel()!.data.name) : requestDrop(sel())),
     },
     {
       id: "db.copyReference",
@@ -153,8 +161,8 @@ export function registerExplorerActions(): () => void {
       title: "Rename…",
       shortcut: "Shift+F6",
       when: explorerFocused,
-      enabled: () => canRename(sel()),
-      run: () => startRename(sel()),
+      enabled: () => canRename(sel()) || isDsFolder(sel()),
+      run: () => (isDsFolder(sel()) ? renameFolder(sel()!.data.name) : startRename(sel())),
     },
     {
       id: "db.quickDoc",
@@ -168,6 +176,8 @@ export function registerExplorerActions(): () => void {
     {
       id: "db.copyDdl",
       title: "Generate DDL to Clipboard",
+      shortcut: ["Ctrl+Alt+Shift+G", "Ctrl+Shift+C"],
+      when: explorerFocused,
       enabled: () => {
         const n = sel();
         return real(n) && !!ddlRefOf(n.data);
@@ -177,6 +187,8 @@ export function registerExplorerActions(): () => void {
     {
       id: "db.ddlToConsole",
       title: "Generate DDL to Query Console",
+      shortcut: "Ctrl+Alt+Shift+B",
+      when: explorerFocused,
       enabled: () => {
         const n = sel();
         return real(n) && !!ddlRefOf(n.data);
@@ -205,7 +217,7 @@ export function registerExplorerActions(): () => void {
       enabled: () => !!sel(),
       run: () => openNewPopup(sel()),
     },
-    { id: "explorer.locate", title: "Select Opened Object", icon: "locate", run: () => locateOpened() },
+    { id: "explorer.locate", title: "Select Opened Object", shortcut: "Alt+Shift+B", icon: "locate", run: () => locateOpened() },
     { id: "explorer.expandAll", title: "Expand All", icon: "expand-all", run: () => expandAllLoaded() },
     { id: "explorer.collapseAll", title: "Collapse All", icon: "collapse-all", run: () => controller()?.collapseAll() },
   ];
@@ -229,7 +241,15 @@ const dataSourceItem = (): MenuItem => ({ label: "Data Source", icon: "dg/dbms",
 
 /** Items of the toolbar "+" popup. */
 export function newMenuItems(): MenuItem[] {
-  return [dataSourceItem(), sep, { action: "db.newConsole", label: "Query Console" }];
+  return [
+    dataSourceItem(),
+    { label: "Data Source from URL", icon: "dg/dbms", run: newDataSourceFromUrl },
+    sep,
+    { label: "Folder", icon: "folder", run: () => newFolder() },
+    { label: "Driver", icon: "dg/dbms", run: openDrivers },
+    sep,
+    { action: "db.newConsole", label: "Query Console" },
+  ];
 }
 
 /** Table / View / Sequence / Schema ... of the New submenu: each opens its create dialog. */
@@ -301,7 +321,33 @@ function setColorItem(n: ENode): MenuItem {
 
 const colorable = (n: ENode) => n.data.kind === "dataSource" || n.data.kind === "schema" || n.data.kind === "database" || isTableLike(n);
 
+/** `Move ›` of a data source: the top level, the folders and `New Folder…`. */
+function moveItem(n: ENode): MenuItem {
+  const here = dsGroupOf(n.id);
+  return {
+    label: "Move",
+    children: [
+      { label: "(root)", checked: () => !here, run: () => moveDataSource(n.id, null) },
+      ...dsFolders().map<MenuItem>((f) => ({ label: f, icon: "folder", checked: () => here === f, run: () => moveDataSource(n.id, f) })),
+      sep,
+      { label: "New Folder…", run: () => newFolder(n.id) },
+    ],
+  };
+}
+
+/** Context menu of a data source folder. */
+function folderMenu(n: ENode): MenuItem[] {
+  return [
+    { label: "New", icon: "add", children: [{ label: "Folder", icon: "folder", run: () => newFolder() }, sep, dataSourceItem()] },
+    sep,
+    { label: "Rename…", mnemonic: "R", shortcut: "Shift+F6", run: () => renameFolder(n.data.name) },
+    sep,
+    { label: "Remove Folder", run: () => removeFolder(n.data.name) },
+  ];
+}
+
 export function contextMenuItems(n: ENode | undefined): MenuItem[] {
+  if (n && isDsFolder(n)) return folderMenu(n);
   if (!real(n)) return [newSub()];
   const d = n.data;
   const navigation = (): MenuItem => ({
@@ -313,6 +359,13 @@ export function contextMenuItems(n: ENode | undefined): MenuItem[] {
     action: "grid.export",
     icon: "export",
     run: () => void runAction("grid.export", { dsId: d.dsId, objectRef: tableRefOf(d) }),
+  });
+
+  /** SQL Scripts > Run SQL Script… (run configurations module): files are picked, the data source / schema is the target. */
+  const runScript = (): MenuItem => ({
+    label: "Run SQL Script…",
+    icon: "run",
+    run: () => void runAction("run.sqlScript", { dsId: d.dsId, schema: d.kind === "schema" ? d.name : undefined }),
   });
 
   if (d.kind === "dataSource") {
@@ -330,11 +383,13 @@ export function contextMenuItems(n: ENode | undefined): MenuItem[] {
       { action: "db.refresh" },
       { action: "db.disconnect" },
       sep,
-      { action: "db.rename" },
+      { action: "db.rename", mnemonic: "R" },
+      moveItem(n),
       setColorItem(n),
       sep,
-      { action: "db.quickDoc" },
+      { action: "db.quickDoc", mnemonic: "D" },
       { label: "Navigation", children: [{ action: "db.jumpToConsole" }] },
+      { label: "SQL Scripts", children: [runScript()] },
       sep,
       { label: "Remove Data Source…", shortcut: "Delete", run: () => requestDrop(n) },
     ];
@@ -343,14 +398,16 @@ export function contextMenuItems(n: ENode | undefined): MenuItem[] {
   const items: MenuItem[] = [newSub(n), ...modifyItem(n), { label: "Copy/Paste", children: [{ action: "db.copyReference" }, { action: "db.copyName" }] }];
   if (isTableLike(n)) items.push({ action: "db.editData" });
   items.push({ action: "db.refresh" });
-  if (canRename(n)) items.push(sep, { action: "db.rename" });
+  if (canRename(n)) items.push(sep, { action: "db.rename", mnemonic: "R" });
   if (colorable(n)) items.push(...(canRename(n) ? [] : [sep]), setColorItem(n));
-  items.push(sep, { action: "db.quickDoc" }, navigation());
+  items.push(sep, { action: "db.quickDoc", mnemonic: "D" }, navigation());
   if (ddlRefOf(d)) {
     items.push(sep, {
       label: "SQL Scripts",
-      children: [{ action: "db.copyDdl" }, { action: "db.ddlToConsole" }],
+      children: [{ action: "db.copyDdl" }, { action: "db.ddlToConsole" }, ...(d.kind === "schema" ? [runScript()] : [])],
     });
+  } else if (d.kind === "schema") {
+    items.push(sep, { label: "SQL Scripts", children: [runScript()] });
   }
   const importTarget = importTargetOf(d);
   if (importTarget || isTableLike(n)) {
@@ -365,5 +422,8 @@ export function contextMenuItems(n: ENode | undefined): MenuItem[] {
 
 export function showContextMenu(n: ENode | undefined, e: MouseEvent): void {
   // DataGrip's context menu is about 340px wide
-  openMenu(contextMenuItems(n), { x: e.clientX, y: e.clientY, minWidth: 340 });
+  // while the menu is open the right-clicked row shows the unfocused selection color (the tree keeps the focus)
+  const tree = document.querySelector(".dg-explorer-tree");
+  tree?.classList.add("dg-menu-open");
+  openMenu(contextMenuItems(n), { x: e.clientX, y: e.clientY, minWidth: 340, mnemonics: true, onClose: () => tree?.classList.remove("dg-menu-open") });
 }

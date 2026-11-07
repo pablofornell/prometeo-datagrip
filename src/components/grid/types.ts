@@ -19,6 +19,11 @@ export interface DefaultCell {
   $default: true;
 }
 
+/** `{ "$expr": "now()" }` stores a raw SQL expression instead of a value (dbcore RowChange). */
+export interface SqlExprCell {
+  $expr: string;
+}
+
 export interface GridColumn {
   name: string;
   /** Database type name, e.g. `int4`, `varchar(255)`, `timestamp`, `jsonb`. */
@@ -70,6 +75,25 @@ export interface GridChange {
   values: Record<string, Cell | DefaultCell>;
 }
 
+/** Where "Go To" of a cell leads: one foreign key target, shown as `table (column)`. */
+export interface GridNavTarget {
+  label: string;
+  /** Opens the target; `row` holds the values of the active record by column name. */
+  open: (row: Record<string, Cell>) => void;
+  /** Disabled when the record lacks a value for it (a NULL foreign key). */
+  enabled?: (row: Record<string, Cell>) => boolean;
+}
+
+/** Foreign key navigation supplied by the host (the grid itself knows no metadata). Reads may be reactive. */
+export interface GridNavigation {
+  /** Outgoing keys of the column: where its value points to. */
+  referenced(column: string): GridNavTarget[];
+  /** Incoming keys: the tables whose foreign key references the column. */
+  related(column: string): GridNavTarget[];
+  /** The incoming keys are still being looked up. */
+  loading?(): boolean;
+}
+
 export type CopyFormat = "tsv" | "csv" | "json" | "sql" | "markdown";
 
 export type ViewMode = "table" | "text";
@@ -104,6 +128,8 @@ export interface GridViewState {
   localFilterEnabled: boolean;
   /** Number of hidden columns (Manage Columns). */
   hiddenColumns: number;
+  /** Number of pinned (frozen) columns. */
+  pinnedColumns: number;
 }
 
 /** Imperative handle handed out through `apiRef`. */

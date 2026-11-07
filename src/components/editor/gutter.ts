@@ -1,5 +1,6 @@
 import { RangeSetBuilder, type Extension } from "@codemirror/state";
 import { Decoration, type DecorationSet, EditorView, GutterMarker, WidgetType, gutter } from "@codemirror/view";
+import { bulbField, type BulbKind } from "./intentions";
 import { errorsField, execMarksField } from "./state";
 
 const SVG_OK =
@@ -7,14 +8,23 @@ const SVG_OK =
 const SVG_ERR =
   '<svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="currentColor"/><rect x="7.1" y="3.6" width="1.8" height="5.4" rx=".9" fill="#fff"/><circle cx="8" cy="11.4" r="1" fill="#fff"/></svg>';
 
+const SVG_BULB =
+  '<svg width="16" height="16" viewBox="0 0 16 16"><path d="M8 1.8a4.4 4.4 0 0 0-2.6 7.9c.4.3.6.7.6 1.2v.4h4v-.4c0-.5.2-.9.6-1.2A4.4 4.4 0 0 0 8 1.8z" fill="currentColor"/><rect x="6" y="12" width="4" height="1.2" rx=".6" fill="currentColor"/><rect x="6.6" y="13.7" width="2.8" height="1" rx=".5" fill="currentColor"/></svg>';
+
+type Kind = "ok" | "error" | "running" | null;
+
+/** The execution icon of a line and / or the intention bulb of the caret line. */
 class StatusMarker extends GutterMarker {
-  constructor(readonly kind: "ok" | "error" | "running") {
+  constructor(
+    readonly kind: Kind,
+    readonly bulb: BulbKind = "none",
+  ) {
     super();
   }
   eq(o: StatusMarker): boolean {
-    return o.kind === this.kind;
+    return o.kind === this.kind && o.bulb === this.bulb;
   }
-  toDOM(): HTMLElement {
+  private icon(): HTMLElement {
     const d = document.createElement("div");
     if (this.kind === "running") {
       d.className = "cm-exec-icon cm-exec-running";
@@ -26,26 +36,58 @@ class StatusMarker extends GutterMarker {
     d.innerHTML = ok ? SVG_OK : SVG_ERR;
     return d;
   }
+  toDOM(): HTMLElement {
+    if (this.bulb === "none") return this.icon();
+    const cell = document.createElement("div");
+    cell.className = "cm-status-cell";
+    if (this.kind) cell.append(this.icon());
+    const b = document.createElement("div");
+    b.className = `cm-bulb cm-bulb-${this.bulb === "error" ? "err" : "on"}${this.kind ? "" : " cm-bulb-first"}`;
+    b.title = "Show Context Actions (Alt+Enter)";
+    b.innerHTML = SVG_BULB;
+    cell.append(b);
+    return cell;
+  }
 }
 
 const OK = new StatusMarker("ok");
 const ERR = new StatusMarker("error");
 const RUNNING = new StatusMarker("running");
+const marker = (kind: Kind, bulb: BulbKind): StatusMarker | null => {
+  if (bulb === "none") return kind === "ok" ? OK : kind === "error" ? ERR : kind === "running" ? RUNNING : null;
+  return new StatusMarker(kind, bulb);
+};
 
 /** Gutter column after the line numbers: green check / red `!` for executed statements. */
 const statusGutter = gutter({
   class: "cm-status-gutter",
   lineMarker(view, line) {
+    const head = view.state.selection.main.head;
+    const bulb = head >= line.from && head <= line.to ? view.state.field(bulbField) : "none";
     for (const m of view.state.field(execMarksField)) {
-      if (m.from >= line.from && m.from <= line.to) return m.status === "ok" ? OK : m.status === "running" ? RUNNING : ERR;
+      if (m.from >= line.from && m.from <= line.to) return marker(m.status, bulb);
     }
     for (const e of view.state.field(errorsField)) {
-      if (e.statementFrom >= line.from && e.statementFrom <= line.to) return ERR;
+      if (e.statementFrom >= line.from && e.statementFrom <= line.to) return marker("error", bulb);
     }
-    return null;
+    return marker(null, bulb);
   },
-  lineMarkerChange: (u) => u.docChanged || u.startState.field(execMarksField) !== u.state.field(execMarksField) || u.startState.field(errorsField) !== u.state.field(errorsField),
+  lineMarkerChange: (u) =>
+    u.docChanged ||
+    u.selectionSet ||
+    u.startState.field(bulbField) !== u.state.field(bulbField) ||
+    u.startState.field(execMarksField) !== u.state.field(execMarksField) ||
+    u.startState.field(errorsField) !== u.state.field(errorsField),
   initialSpacer: () => OK,
+  domEventHandlers: {
+    mousedown(view, _line, e) {
+      if (!(e.target as HTMLElement).closest(".cm-bulb")) return false;
+      e.preventDefault();
+      view.focus();
+      void import("./intentionsPopup").then((m) => m.showIntentions(view));
+      return true;
+    },
+  },
 });
 
 class HintWidget extends WidgetType {
@@ -100,5 +142,5 @@ export function formatMs(ms: number): string {
 }
 
 export function statusGutterExtension(): Extension {
-  return [statusGutter, hints];
+  return [bulbField, statusGutter, hints];
 }

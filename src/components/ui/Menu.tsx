@@ -55,6 +55,8 @@ export interface OpenMenuOptions {
   /** List-popup look: 24px rows (combo boxes, "New" popup). Default: 26px menu rows. */
   compact?: boolean;
   minWidth?: number;
+  /** Underline the `mnemonic` letters and let them activate their item (context menus; the bar variant always does). */
+  mnemonics?: boolean;
   /** "bar": dropdown of the main menu bar (narrower insets, full-width separators, like Swing menus). */
   variant?: "bar";
   /** Gap in px between the anchor and the menu (default 2). */
@@ -305,7 +307,7 @@ export function MenuHost(): JSX.Element {
           break;
         }
         // Main menu bar dropdowns: the mnemonic letter activates its item.
-        if (plain && s.opts.variant === "bar") {
+        if (plain && (s.opts.variant === "bar" || s.opts.mnemonics)) {
           const ch = e.key.toLowerCase();
           const i = items.findIndex((it) => {
             const r = resolve(it);
@@ -520,7 +522,7 @@ function MenuPanel(props: {
                   <span class="dg-menu-number">{numberOf(props.level().items, i)}</span>
                 </Show>
                 <span class="dg-menu-label">
-                  <Show when={props.opts.variant === "bar" && r().mnemonic} fallback={r().label}>
+                  <Show when={(props.opts.variant === "bar" || props.opts.mnemonics) && r().mnemonic} fallback={r().label}>
                     <Mnemonic label={r().label} letter={r().mnemonic!} />
                   </Show>
                 </span>

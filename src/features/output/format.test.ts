@@ -14,6 +14,7 @@ describe("output log wording", () => {
   it("rows retrieved", () => {
     expect(rowsRetrieved(18, 902, 21, 881)).toBe("18 rows retrieved starting from 1 in 902 ms (execution: 21 ms, fetching: 881 ms)");
     expect(rowsRetrieved(1, 5)).toBe("1 row retrieved starting from 1 in 5 ms");
+    expect(rowsRetrieved(18, 1, 1, 0)).toBe("18 rows retrieved starting from 1 in 1 ms (execution: 1 ms, fetching: < 1 ms)");
     expect(rowsRetrieved(0, 5, 3, 2)).toBe("0 rows retrieved in 5 ms (execution: 3 ms, fetching: 2 ms)");
   });
   it("affected / completed / summary", () => {

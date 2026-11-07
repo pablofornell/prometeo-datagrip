@@ -51,6 +51,8 @@ import {
   txLabel,
 } from "./session";
 import { FilterBar } from "./FilterBar";
+import { createFkNavigation } from "./fkNav";
+import { extractorMenuItems } from "../output/extractors";
 import { ChoiceDialog, ColumnFilterPopup, EXPORT_FORMATS, ExportDialog, SqlPopup, exportFileBase, type ExportPath, type ExportTarget } from "./Popups";
 import { type PageSize, type Query, type QueryReport, createTableSource } from "./source";
 import { appendCondition, buildCondition, orderByToSort, previewSql, qualifiedName, selectSql, sortToOrderBy, tableQuerySql, toRowChanges } from "./sql";
@@ -69,10 +71,10 @@ const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
 export function TableView(props: { tab: EditorTab; active: boolean }): JSX.Element {
   const data = props.tab.data as ObjectTabData | undefined;
   if (!data?.dsId || !data.objectRef) return <div class="dgt-message">This table editor has no object to show.</div>;
-  return <TableEditor tab={props.tab} active={props.active} dsId={data.dsId} objectRef={data.objectRef} />;
+  return <TableEditor tab={props.tab} active={props.active} dsId={data.dsId} objectRef={data.objectRef} where={data.where} />;
 }
 
-function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; objectRef: ObjectRef }): JSX.Element {
+function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; objectRef: ObjectRef; where?: string }): JSX.Element {
   const { dsId } = props;
   const ref = props.objectRef;
   // Tx: Manual works on a session of its own; its id makes the source read through it (it sees the open transaction)
@@ -95,7 +97,7 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
     else out?.log("text", rowsRetrieved(r.rows, r.ms, undefined, undefined, q.pageSize === "all" ? 1 : q.page * q.pageSize + 1));
     out?.setLastMs(r.ms);
   };
-  const src = createTableSource(dsId, ref, {}, sid, {
+  const src = createTableSource(dsId, ref, props.where ? { where: props.where } : {}, sid, {
     onQuery,
     onSessionLost: () => recoverSession(),
     // Tx: Manual reads go through the transaction session, reopened here when it was lost
@@ -104,7 +106,7 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
   let root!: HTMLDivElement;
   let api: DataGridApi | undefined;
 
-  const [whereText, setWhereText] = createSignal("");
+  const [whereText, setWhereText] = createSignal(props.where ?? "");
   const [orderText, setOrderText] = createSignal("");
   const [pending, setPending] = createSignal(0);
   const [error, setError] = createSignal<string | null>(null);
@@ -529,11 +531,13 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
       { x: r.left, y: r.bottom + 2 },
     );
 
+  // foreign keys of the table: `Go To` / F4 of the cells and the key icon of their columns
+  const fk = createFkNavigation(() => dsId, () => (ref.kind === "table" ? ref : null));
+  /** `Export Table to Clipboard` of the cell menu: every row of the filtered table in the current extractor. */
+  const exportToClipboard = () => void doExport(exportOptions(), "clipboard", { path: "", chosen: false });
+
   const extractorMenu = (r: DOMRect) =>
-    openMenu(
-      EXPORT_FORMATS.map((f) => ({ label: f.label, checked: extractor() === f.value, run: () => setExtractor(f.value) })),
-      { x: r.left, y: r.bottom + 2, compact: true },
-    );
+    openMenu(extractorMenuItems(extractor(), setExtractor), { x: r.right - 230, y: r.bottom + 2, minWidth: 230, title: "Data Extractors" });
 
   const exportOptions = (): ExportOptions => ({ ...defaultExportOptions(driver()), format: extractor(), tableName: tableName() });
 
@@ -653,6 +657,12 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
               onSortChange={sortChange}
               onReload={reload}
               onColumnFilter={(col, anchor) => setColFilter({ col, anchor })}
+              navigation={fk.navigation}
+              fkColumns={fk.fkColumns}
+              dialect={driver()}
+              extractorLabel={EXPORT_FORMATS.find((f) => f.value === extractor())?.label ?? "CSV"}
+              onChangeExtractor={(at) => openMenu(extractorMenuItems(extractor(), setExtractor), { x: at.x, y: at.y, minWidth: 230, title: "Data Extractors" })}
+              onExportToClipboard={exportToClipboard}
               onSelectionChange={onSelection}
               onViewChange={setView}
               apiRef={(a) => (api = a)}

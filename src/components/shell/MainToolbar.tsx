@@ -3,7 +3,7 @@ import { isTauri } from "../../api/tauri";
 import { minimizeWindow, toggleMaximizeWindow, closeWindow } from "../../api/window";
 import { ACTION_IDS } from "../../state/core-actions";
 import { TOOL_WINDOWS, isPinned, isToolWindowVisible, setToolWindowPinned, toggleToolWindow, toolbarWindows } from "../../state/layout";
-import { menuBarOpen, setMenuBarOpen } from "../../state/ui";
+import { isModalOpen, menuBarOpen, setMenuBarOpen } from "../../state/ui";
 import { ActionButton } from "../ui/ActionButton";
 import { Icon } from "../ui/Icon";
 import { type MenuItem, Mnemonic, closeMenu, openMenu } from "../ui/Menu";
@@ -49,7 +49,9 @@ export function MainToolbar(): JSX.Element {
     on(
       menuBarOpen,
       (open) => {
-        if (open) {
+        if (open && isModalOpen()) {
+          setMenuBarOpen(false);
+        } else if (open) {
           if (openIdx() < 0) {
             const i = pendingIdx;
             pendingIdx = 0;
@@ -85,6 +87,7 @@ export function MainToolbar(): JSX.Element {
       const idx = m ? MAIN_MENU.findIndex((x) => x.mnemonic === m) : -1;
       if (idx < 0) return;
       e.preventDefault();
+      if (isModalOpen()) return; // the menu (z 2100) would open above the dialog overlay (z 2000)
       if (menuBarOpen()) showMenu(idx, true);
       else {
         pendingIdx = idx;

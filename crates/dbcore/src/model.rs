@@ -66,6 +66,13 @@ pub enum NodeKind {
     Function,
     Procedure,
     Sequence,
+    /// PostgreSQL role (under `Server Objects`).
+    Role,
+    Tablespace,
+    /// PostgreSQL extension (under `Database Objects`).
+    Extension,
+    /// MySQL account (under `Server Objects`).
+    User,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +171,9 @@ pub struct TestResult {
     pub server_version: Option<String>,
     pub message: String,
     pub elapsed_ms: u64,
+    /// Whether the test session was encrypted (as negotiated); `None` when the server does not tell (SQLite).
+    #[serde(default)]
+    pub ssl: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

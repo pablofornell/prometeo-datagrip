@@ -251,6 +251,63 @@
   flex: 1;
   min-height: 0;
 }
+/* split editor: a tree of panes inside the one island, divided by 1px lines */
+.dg-editor-area {
+  flex-direction: row;
+}
+.dg-split {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+.dg-split-down {
+  flex-direction: column;
+}
+.dg-split-child {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+.dg-pane {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+.dg-pane-splitter {
+  position: relative;
+  background: var(--dg-tabs-border);
+}
+.dg-pane-splitter.dg-splitter-vertical {
+  width: 1px;
+}
+.dg-pane-splitter.dg-splitter-horizontal {
+  height: 1px;
+}
+.dg-pane-splitter::after {
+  content: "";
+  position: absolute;
+}
+.dg-splitter-vertical.dg-pane-splitter::after {
+  inset: 0 -3px;
+}
+.dg-splitter-horizontal.dg-pane-splitter::after {
+  inset: -3px 0;
+}
+/* only the focused pane's selected tab gets the blue pill */
+.dg-editor-area .dg-pane:not(.dg-pane-focused) .dg-tab.dg-selected {
+  background: var(--dg-tab-selected-inactive-bg);
+  border-color: var(--dg-tab-selected-inactive-border);
+}
+.dg-editor-area .dg-pane:not(.dg-pane-focused) .dg-tab.dg-tab-tinted.dg-selected {
+  background: color-mix(in srgb, var(--dg-tab-tint) var(--dg-ds-tint-mix), var(--dg-tab-selected-inactive-bg));
+}
+.dg-tabs-overflow {
+  flex: none;
+  margin-left: 4px;
+}
 .dg-editor-view {
   display: flex;
   flex-direction: column;
@@ -278,6 +335,26 @@
 }
 .dg-empty-hints .dg-key {
   color: var(--dg-text-secondary);
+}
+.dg-empty-editor {
+  flex-direction: column;
+  gap: 20px;
+}
+.dg-empty-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--dg-layer-1-bg);
+  color: var(--dg-text);
+  font: inherit;
+  cursor: default;
+}
+.dg-empty-btn:hover {
+  background: var(--dg-layer-2-bg);
 }
 
 /* ---------------------------------------------------------------- Status bar */

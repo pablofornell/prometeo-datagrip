@@ -122,6 +122,29 @@ describe("maximize and pins", () => {
     expect(layout.maximizedToolWindow()).toBeNull();
   });
 
+  it("showing or focusing another window leaves the maximized state (the maximized one hides the rest)", () => {
+    layout.showToolWindow("explorer", false);
+    layout.showToolWindow("output", false);
+    layout.toggleMaximizeToolWindow("output");
+    expect(layout.maximizedToolWindow()).toBe("output");
+    layout.showToolWindow("explorer", false);
+    expect(layout.maximizedToolWindow()).toBeNull();
+    layout.toggleMaximizeToolWindow("output");
+    layout.focusToolWindow("explorer");
+    expect(layout.maximizedToolWindow()).toBeNull();
+    // the maximized window itself keeps its state when it is shown / focused again
+    layout.toggleMaximizeToolWindow("output");
+    layout.showToolWindow("output", false);
+    layout.focusToolWindow("output");
+    expect(layout.maximizedToolWindow()).toBe("output");
+  });
+
+  it("maximizing moves the focus into the window", () => {
+    layout.showToolWindow("output", false);
+    layout.toggleMaximizeToolWindow("output");
+    expect(layout.activeToolWindow()).toBe("output");
+  });
+
   it("pinned windows make the toolbar, in DataGrip's order", () => {
     expect(layout.toolbarWindows().map((t) => t.id)).toEqual(["explorer", "output", "files"]);
     layout.setToolWindowPinned("services", true);
@@ -134,7 +157,9 @@ describe("maximize and pins", () => {
       "toolwindow.explorer",
       "toolwindow.files",
       "toolwindow.output",
+      "toolwindow.notifications",
       "toolwindow.services",
+      "toolwindow.run",
     ]);
   });
 });

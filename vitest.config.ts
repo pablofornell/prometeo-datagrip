@@ -6,6 +6,6 @@ import viteConfig from "./vite.config";
 export default mergeConfig(
   viteConfig,
   defineConfig({
-    test: { environment: "node" },
+    test: { environment: "node", css: { include: [/\.css\?raw/] } }, // the colour scheme code and the token tests read CSS files with ?raw
   }),
 );

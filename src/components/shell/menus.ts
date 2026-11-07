@@ -16,7 +16,7 @@ const sep: MenuItem = { type: "separator" };
 const a = (action: string, mnemonic?: string, extra: Partial<Extract<MenuItem, { action?: string }>> = {}): MenuItem => ({ action, mnemonic, ...extra });
 /** Same, but only present once the action is registered. */
 const opt = (action: string, mnemonic?: string, extra: Partial<Extract<MenuItem, { action?: string }>> = {}): MenuItem => ({ action, mnemonic, optional: true, ...extra });
-const sub = (label: string, mnemonic: string, children: MenuItem[], extra: Partial<Extract<MenuItem, { action?: string }>> = {}): MenuItem => ({ label, mnemonic, children, ...extra });
+const sub = (label: string, mnemonic: string | undefined, children: MenuItem[], extra: Partial<Extract<MenuItem, { action?: string }>> = {}): MenuItem => ({ label, mnemonic, children, ...extra });
 
 /** Import Data from File(s)…: runs `import.file` on the table / schema selected in the explorer. */
 const importTarget = () => {
@@ -82,7 +82,7 @@ export const MAIN_MENU: MenuBarEntry[] = [
       a("code.comment", "L"),
       a("code.commentBlock", "B"),
       sep,
-      sub("Refactor", "f", [a("db.rename", "R"), opt("db.modifyObject", "M")]),
+      sub("Refactor", undefined, [a("db.rename", "R"), opt("db.modifyObject", "M")]),
       sep,
       a("edit.toggleCase", "g"),
       a("edit.joinLines", "J"),
@@ -129,6 +129,8 @@ export const MAIN_MENU: MenuBarEntry[] = [
     items: [
       a("sql.execute", "E"),
       a("sql.executeScript", "S"),
+      a("sql.explainPlan", "P"),
+      a("sql.explainAnalyse", "A"),
       a("sql.cancel", "C"),
       a("grid.export", "x", { label: "Export Data to File" }),
       sep,
@@ -137,6 +139,9 @@ export const MAIN_MENU: MenuBarEntry[] = [
       sep,
       a("sql.history", "H"),
       a("db.jumpToConsole", "J"),
+      opt("run.file", "F", { label: "Run File" }),
+      opt("run.chooseConfiguration", "u"),
+      opt("run.sqlScript", "q"),
       opt("run.editConfigurations", "g"),
       sep,
       importItem(),
@@ -172,7 +177,7 @@ export const MAIN_MENU: MenuBarEntry[] = [
         a("tab.next", "N"),
         a("tab.prev", "P"),
       ]),
-      opt("notifications.menu", "N"),
+      sub("Notifications", "N", [opt("notifications.menu", "S", { label: "Show All" }), opt("notifications.expireAll", "E", { label: "Expire All" })]),
     ],
   },
   {

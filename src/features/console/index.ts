@@ -22,12 +22,13 @@ import "./console.css";
 export { activeSession, sessionOf } from "./registry";
 export type { ConsoleSession } from "./session";
 export { confirmEndTransactions } from "./txguard";
+export { ConsoleInner as ConsoleEditor, type ConsoleBacking } from "./ConsoleView";
 
 registerConsoleActions();
 registerSlot("editor.view.console", ConsoleView);
 
 // closing a console tab (x, middle click, Ctrl+F4, close others / all) with an open transaction asks Commit / Roll Back
-registerBeforeClose((tab) => (tab.kind === "console" ? confirmEndTransactions({ tabId: tab.id, reason: "closing the console" }) : true));
+registerBeforeClose((tab) => (tab.kind === "console" || tab.kind === "file" ? confirmEndTransactions({ tabId: tab.id, reason: "closing the console" }) : true));
 
 /**
  * Quitting the app (window close button, Alt+F4) ends every session: ask about open transactions first.
@@ -97,7 +98,7 @@ void appInfo()
 createRoot(() => {
   createEffect(
     on(activeTab, (t, prev) => {
-      if (prev?.kind === "console" && t?.kind !== "console") setStatus({ caret: null, txMode: null });
+      if ((prev?.kind === "console" || prev?.kind === "file") && t?.kind !== "console" && t?.kind !== "file") setStatus({ caret: null, txMode: null });
     }),
   );
 });

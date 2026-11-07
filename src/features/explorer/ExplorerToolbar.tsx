@@ -1,8 +1,10 @@
 import { Show, type JSX } from "solid-js";
-import { ActionButton, SpeedSearchField, ToolbarSeparator, matchRanges, openMenu } from "../../components/ui";
+import { ActionButton, type MenuItem, SpeedSearchField, ToolbarSeparator, matchRanges, openMenu } from "../../components/ui";
 import { newMenuItems } from "./actions";
 import { dataSourceDialogAvailable, dataSourceProperties } from "./commands";
-import { controller, searchQuery, selectedNode, setShowSystemObjects, showSystemObjects } from "./core";
+import { controller, searchQuery, selectedNode, setShowSystemObjects, setSortAlphabetically, showSystemObjects, sortAlphabetically } from "./core";
+
+const sep: MenuItem = { type: "separator" };
 
 /** The 34px toolbar under the header: New, Data Source Properties | Refresh, Deactivate | Console, Edit Data, DDL | View Options. */
 export function ExplorerToolbar(): JSX.Element {
@@ -20,7 +22,7 @@ export function ExplorerToolbar(): JSX.Element {
       />
       <ActionButton
         icon="dg/manage-data-sources"
-        title="Data Source Properties"
+        title="Data Sources…"
         shortcut="Ctrl+Alt+Shift+S"
         disabled={!dataSourceDialogAvailable()}
         onClick={() => dataSourceProperties(selectedNode()?.data.dsId)}
@@ -42,7 +44,11 @@ export function ExplorerToolbar(): JSX.Element {
         ref={(el) => (viewBtn = el)}
         onClick={() =>
           openMenu(
-            [{ label: "Show System Schemas", checked: () => showSystemObjects(), run: () => setShowSystemObjects(!showSystemObjects()) }],
+            [
+              { label: "Show System Schemas", checked: () => showSystemObjects(), run: () => setShowSystemObjects(!showSystemObjects()) },
+              sep,
+              { label: "Sort Alphabetically", checked: () => sortAlphabetically(), run: () => setSortAlphabetically(!sortAlphabetically()) },
+            ],
             { anchor: viewBtn },
           )
         }

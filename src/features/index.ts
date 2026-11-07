@@ -10,3 +10,7 @@ import "./navigate";
 import "./settings";
 import "./import";
 import "./services";
+import "./notifications";
+import "./editor-tabs";
+import "./files";
+import "./runconfig";

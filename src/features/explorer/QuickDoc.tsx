@@ -30,6 +30,10 @@ const KIND_TITLE: Record<string, string> = {
   function: "Function",
   procedure: "Procedure",
   routine: "Routine",
+  role: "Role",
+  tablespace: "Tablespace",
+  extension: "Extension",
+  user: "User",
 };
 
 interface Doc {
@@ -95,6 +99,25 @@ export async function docOf(n: ENode): Promise<Doc> {
       break;
     case "sequence":
       add("Type", n.hint);
+      break;
+    case "role":
+      doc.comment = str(ex.comment);
+      add("Superuser", ex.superuser ? "yes" : "no");
+      add("Can log in", ex.login ? "yes" : "no");
+      break;
+    case "tablespace":
+      add("Owner", ex.owner);
+      add("Location", ex.location);
+      break;
+    case "extension":
+      doc.comment = str(ex.comment);
+      add("Version", ex.version);
+      add("Schema", ex.schema);
+      add("Owner", ex.owner);
+      break;
+    case "user":
+      add("User", ex.user);
+      add("Host", ex.host);
       break;
     default:
       add("Definition", ex.definition ?? n.hint);

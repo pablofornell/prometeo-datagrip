@@ -9,7 +9,8 @@ import {
   startCompletion,
 } from "@codemirror/autocomplete";
 import { type Extension, Prec } from "@codemirror/state";
-import { type EditorView, keymap } from "@codemirror/view";
+import { type EditorView, ViewPlugin, keymap } from "@codemirror/view";
+import type { MenuItem } from "../ui/Menu";
 import { docAnalysis } from "./highlight";
 import { KEYWORD_HINTS, functionsFor, keywordsFor } from "./keywords";
 import { type Token } from "./lexer";
@@ -17,6 +18,7 @@ import type { TableIdx } from "./schemaIndex";
 import { analyzeStatement, identName, type Scope } from "./semantic";
 import { configField } from "./state";
 import { type Dialect, statementIndexAt } from "./split";
+import { expandTemplate, insertLiveTemplate, nextTemplateField, templateDescriptions, templateListField, templateListWatcher, templateOptions } from "./templates";
 
 const hints = new WeakMap<Completion, string>();
 
@@ -24,6 +26,27 @@ function mkOpt(c: Completion, hint?: string): Completion {
   if (hint) hints.set(c, hint);
   return c;
 }
+
+/** The popup's `⋮` menu: `Sort by name` and `Show types`, kept across sessions. */
+const PREFS_KEY = "prometeo.completion";
+export const completionPrefs = (() => {
+  let saved: { sortByName?: boolean; showTypes?: boolean } = {};
+  try {
+    saved = JSON.parse(localStorage.getItem(PREFS_KEY) ?? "{}");
+  } catch {
+    /* no storage: defaults */
+  }
+  return { sortByName: !!saved.sortByName, showTypes: saved.showTypes !== false };
+})();
+function savePrefs(): void {
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify(completionPrefs));
+  } catch {
+    /* no storage */
+  }
+  document.body.classList.toggle("dg-comp-no-types", !completionPrefs.showTypes);
+}
+if (typeof document !== "undefined") document.body.classList.toggle("dg-comp-no-types", !completionPrefs.showTypes);
 
 /** Quote an identifier when it is not a plain lower-case name. */
 export function quoteIdent(name: string, d: Dialect): string {
@@ -64,6 +87,22 @@ function tableOption(t: TableIdx, cfg: { sourceLabel?: string; defaultSchema?: s
       boost: t.kind === "sequence" ? 28 : 30,
     },
     cfg.sourceLabel ?? t.kind,
+  );
+}
+
+function functionOption(f: { name: string; args: string; ret?: string }): Completion {
+  return mkOpt(
+    {
+      label: f.name,
+      type: "function",
+      detail: `(${f.args})`,
+      boost: 5,
+      apply: (view, _c, fr, to) => {
+        const insert = `${f.name}()`;
+        view.dispatch({ changes: { from: fr, to, insert }, selection: { anchor: fr + f.name.length + 1 }, userEvent: "input.complete" });
+      },
+    },
+    f.ret,
   );
 }
 
@@ -117,6 +156,9 @@ function completionSource(ctx: CompletionContext): CompletionResult | null {
     if (!closed || ctx.pos < inTok.to) return null;
   }
 
+  // Ctrl+J: only the live templates, typing filters them
+  if (state.field(templateListField)) return { from, options: templateOptions(), validFor: /^[\p{L}\p{N}_$]*$/u };
+
   const dotBefore = from > 0 && a.text[from - 1] === ".";
   if (!dotBefore && prefix === "" && !ctx.explicit) return null;
   if (!dotBefore && /^\d/.test(prefix)) return null;
@@ -150,9 +192,13 @@ function completionSource(ctx: CompletionContext): CompletionResult | null {
       const ref = scope?.byName.get(q);
       if (ref?.table) {
         options.push(...columnOptions(ref.table, ref.alias ?? ref.table.name));
+        // the functions follow the columns, and `cast` is offered everywhere an expression may start
+        for (const f of functionsFor(cfg.dialect)) options.push(functionOption(f));
+        options.push(mkOpt({ label: "cast", type: "keyword", boost: 8 }, KEYWORD_HINTS.cast));
       } else if (!ref && idx.hasSchema(q)) {
         for (const t of idx.schemas.get(q)?.list ?? []) options.push(tableOption(t, o, false));
         for (const r of idx.schemas.get(q)?.routines ?? []) options.push(routineOption(r));
+        options.push(mkOpt({ label: "cast", type: "keyword", boost: 8 }, KEYWORD_HINTS.cast));
       } else if (!ref) {
         const t = idx.findTable([q]);
         if (t) options.push(...columnOptions(t, t.name));
@@ -233,33 +279,19 @@ function completionSource(ctx: CompletionContext): CompletionResult | null {
       }
     }
     for (const s of idx.list) for (const r of s.routines) options.push(routineOption(r));
-    for (const f of functionsFor(cfg.dialect)) {
-      options.push(
-        mkOpt(
-          {
-            label: f.name,
-            type: "function",
-            detail: `(${f.args})`,
-            boost: 5,
-            apply: (view, _c, fr, to) => {
-              const insert = `${f.name}()`;
-              view.dispatch({ changes: { from: fr, to, insert }, selection: { anchor: fr + f.name.length + 1 }, userEvent: "input.complete" });
-            },
-          },
-          f.ret,
-        ),
-      );
-    }
+    for (const f of functionsFor(cfg.dialect)) options.push(functionOption(f));
     const first = si === null ? true : a.statements[si].start >= from - 0;
     for (const k of keywordList(cfg.dialect)) {
       const text = upper ? k.toUpperCase() : k;
       options.push(mkOpt({ label: text, type: "keyword", boost: first ? 8 : -5 }, KEYWORD_HINTS[k]));
     }
+    // the live templates: only for a typed prefix (Tab expands the exact abbreviation)
+    if (prefix !== "" && !cfg.noTemplates) options.push(...templateOptions());
   }
   if (!options.length) return null;
-  // keep the listing order for equal matches (CM would sort alphabetically)
+  // keep the listing order for equal matches (CM would sort alphabetically); `Sort by name` drops the ranking
   options.forEach((opt, i) => {
-    opt.boost = (opt.boost ?? 0) - i * 0.0001;
+    opt.boost = completionPrefs.sortByName ? 0 : (opt.boost ?? 0) - i * 0.0001;
   });
   return { from, options, validFor: /^[\p{L}\p{N}_$]*$/u };
 }
@@ -282,10 +314,52 @@ function tabReplace(view: EditorView): boolean {
   return acceptCompletion(view);
 }
 
+/** `⋮` in the footer of the popup: `Sort by name` / `Show types`. Added to the popup's DOM once it is open. */
+const footerMenu = ViewPlugin.fromClass(
+  class {
+    raf = 0;
+    constructor(readonly view: EditorView) {}
+    update(u: { startState: EditorView["state"]; state: EditorView["state"] }): void {
+      if (completionStatus(u.state) !== "active") return;
+      cancelAnimationFrame(this.raf);
+      this.raf = requestAnimationFrame(() => this.attach());
+    }
+    attach(): void {
+      const tip = document.querySelector<HTMLElement>(".cm-tooltip.cm-tooltip-autocomplete");
+      if (!tip || tip.querySelector(".cm-comp-more")) return;
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "cm-comp-more";
+      b.title = "More options";
+      b.tabIndex = -1;
+      b.innerHTML = '<svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="3.5" r="1.2" fill="currentColor"/><circle cx="8" cy="8" r="1.2" fill="currentColor"/><circle cx="8" cy="12.5" r="1.2" fill="currentColor"/></svg>';
+      b.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const view = this.view;
+        const items: MenuItem[] = [
+          { label: "Sort by name", checked: completionPrefs.sortByName, run: () => { completionPrefs.sortByName = !completionPrefs.sortByName; savePrefs(); startCompletion(view); } },
+          { label: "Show types", checked: completionPrefs.showTypes, run: () => { completionPrefs.showTypes = !completionPrefs.showTypes; savePrefs(); } },
+        ];
+        const r = b.getBoundingClientRect();
+        void import("../ui/Menu").then((m) => m.openMenu(items, { x: r.left, y: r.bottom + 2, compact: true, minWidth: 160, onClose: () => view.focus() }));
+      });
+      tip.append(b);
+    }
+    destroy(): void {
+      cancelAnimationFrame(this.raf);
+    }
+  },
+);
+
 export function sqlCompletion(): Extension {
   return [
+    templateListField,
+    templateListWatcher(),
+    footerMenu,
     autocompletion({
       override: [completionSource],
+      tooltipClass: (state) => (state.field(templateListField) ? "cm-comp-templates" : ""),
       icons: false,
       defaultKeymap: false,
       maxRenderedOptions: 200,
@@ -302,7 +376,7 @@ export function sqlCompletion(): Extension {
         {
           position: 90,
           render: (c) => {
-            const h = hints.get(c);
+            const h = hints.get(c) ?? templateDescriptions.get(c);
             return el("span", "cm-completionHint", h ?? "");
           },
         },
@@ -311,7 +385,10 @@ export function sqlCompletion(): Extension {
     Prec.highest(
       keymap.of([
         { key: "Ctrl-Space", run: startCompletion },
+        { key: "Mod-j", run: insertLiveTemplate, preventDefault: true },
+        { key: "Tab", run: expandTemplate },
         { key: "Tab", run: tabReplace },
+        { key: "Tab", run: nextTemplateField },
         ...completionKeymap.filter((k) => k.key !== "Ctrl-Space" && k.key !== "Alt-`"),
       ]),
     ),

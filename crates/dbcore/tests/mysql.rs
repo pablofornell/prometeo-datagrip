@@ -79,7 +79,24 @@ async fn introspection_tree() {
         .await
         .unwrap();
     assert!(names(&all).contains(&"information_schema".to_string()));
-    assert!(all.iter().all(|n| n.kind == NodeKind::Schema));
+    // the schemas, alphabetical, then `Server Objects` (accounts) when the user may read them
+    let (schemas, rest): (Vec<_>, Vec<_>) = all.iter().partition(|n| n.kind == NodeKind::Schema);
+    assert!(
+        rest.iter()
+            .all(|n| n.kind == NodeKind::Folder && n.name == "Server Objects"),
+        "{rest:?}"
+    );
+    let lowered: Vec<String> = schemas.iter().map(|n| n.name.to_lowercase()).collect();
+    assert!(lowered.windows(2).all(|w| w[0] <= w[1]), "{lowered:?}");
+    let server = children(&mgr, "my", &["$server"]).await;
+    assert_eq!(names(&server), ["users"]);
+    let users = children(&mgr, "my", &["$server", "users"]).await;
+    assert!(
+        users
+            .iter()
+            .any(|u| u.kind == NodeKind::User && u.name.starts_with("root@")),
+        "{users:?}"
+    );
 
     let folders = children(&mgr, "my", &["demo"]).await;
     // other tests / users may add objects to `demo`: check the folders exist, not exact counts
@@ -1515,4 +1532,46 @@ async fn password_field_completes_a_url_without_password() {
     cfg.password = Some(pass.to_string());
     let r = mgr.test_connection(&cfg).await;
     assert!(r.ok, "{r:?}");
+}
+
+#[tokio::test]
+async fn explain_plan_and_analyse() {
+    let (_cfg, mgr) = setup!();
+    let s = mgr.open_session("my").await.unwrap();
+    let sql = "select * from orders o join customers c on c.id = o.customer_id";
+    let plan = mgr.explain(&s, sql, false).await.unwrap();
+    assert_eq!(plan.root.operation, "Select");
+    assert!(!plan.root.children.is_empty(), "{plan:#?}");
+    let a = mgr.explain(&s, sql, true).await.unwrap();
+    assert!(a.analyze);
+    assert!(!a.root.children.is_empty(), "{a:#?}");
+    assert!(a.root.children[0].rows.is_some(), "{a:#?}");
+    mgr.close_session(&s).await;
+}
+
+/// Driver properties of the Advanced tab: `charset`, `collation` and `timezone` reach the session.
+#[tokio::test]
+async fn advanced_properties_are_honoured() {
+    let Some(mut cfg) = mysql_cfg() else { return };
+    cfg.id = "my-adv".into();
+    cfg.options.insert("charset".into(), "latin1".into());
+    cfg.options
+        .insert("collation".into(), "latin1_general_ci".into());
+    cfg.options.insert("timezone".into(), "+05:00".into());
+    let mgr = ConnectionManager::new();
+    mgr.connect(&cfg).await.unwrap();
+    let s = mgr.open_session("my-adv").await.unwrap();
+    assert_eq!(
+        scalar(&run(&mgr, &s, "select @@character_set_client").await),
+        json!("latin1")
+    );
+    assert_eq!(
+        scalar(&run(&mgr, &s, "select @@collation_connection").await),
+        json!("latin1_general_ci")
+    );
+    assert_eq!(
+        scalar(&run(&mgr, &s, "select @@time_zone").await),
+        json!("+05:00")
+    );
+    mgr.close_session(&s).await;
 }

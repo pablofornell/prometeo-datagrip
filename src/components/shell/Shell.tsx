@@ -76,6 +76,8 @@ export function Shell(): JSX.Element {
       <ToolWindowPanel id="files" fallbackBody={FilesToolWindow} />
       <ToolWindowPanel id="output" fallbackBody={OutputBodyPlaceholder} />
       <ToolWindowPanel id="services" />
+      <ToolWindowPanel id="run" />
+      <ToolWindowPanel id="notifications" />
       <Show when={splitter("left")}>
         <Splitter
           class="dg-split-left"

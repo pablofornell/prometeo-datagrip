@@ -6,6 +6,8 @@ import { Show, createMemo, type JSX } from "solid-js";
 import type { ColumnMeta, Driver, ObjectRef } from "../../api/types";
 import { SqlEditor } from "../../components/editor";
 import type { SchemaSnapshot } from "../../components/editor";
+import { type MenuItem, openMenu } from "../../components/ui";
+import { type FilterKind, filterHistory, rememberFilter } from "./filterHistory";
 
 export interface FilterBarProps {
   driver: Driver;
@@ -38,9 +40,55 @@ export function FilterBar(props: FilterBarProps): JSX.Element {
     ],
   }));
 
-  const half = (kind: "where" | "order", label: string, value: () => string, set: (v: string) => void): JSX.Element => (
-    <div class="dgg-fb-half dgt-fb-half" data-fb={kind}>
-      <i class={"dgg-i " + (kind === "where" ? "i-filter" : "i-sortBy")} />
+  const tableKey = () => `${props.sourceLabel ?? ""}\u0000${props.objectRef.schema ?? ""}\u0000${props.objectRef.name}`;
+
+  /** Applies and remembers what is in the fields. */
+  const apply = () => {
+    rememberFilter(tableKey(), "where", props.where);
+    rememberFilter(tableKey(), "order", props.orderBy);
+    props.onApply();
+  };
+
+  /** History popup of the funnel / sort icon: the last applied texts of this table, newest first. */
+  const openHistory = (kind: FilterKind, anchor: HTMLElement, set: (v: string) => void) => {
+    const list = filterHistory(tableKey(), kind);
+    const items: MenuItem[] = list.length
+      ? list.map((t) => ({
+          label: t.length > 80 ? t.slice(0, 79) + "…" : t,
+          run: () => {
+            set(t);
+            apply();
+          },
+        }))
+      : [{ type: "hint", label: kind === "where" ? "No filters applied yet" : "No sort orders applied yet" }];
+    openMenu(items, { anchor, compact: true, minWidth: 260, selected: list.length ? 0 : undefined });
+  };
+
+  const half = (kind: FilterKind, label: string, value: () => string, set: (v: string) => void): JSX.Element => (
+    <div
+      class="dgg-fb-half dgt-fb-half"
+      data-fb={kind}
+      ref={(el) =>
+        // Alt+Down in an empty field opens the history (captured: the editor would use the key for the caret)
+        el.addEventListener(
+          "keydown",
+          (e) => {
+            if (e.key === "ArrowDown" && e.altKey && !e.ctrlKey && !e.shiftKey && value() === "") {
+              e.preventDefault();
+              e.stopPropagation();
+              openHistory(kind, el.querySelector<HTMLElement>("i.dgg-i") ?? el, set);
+            }
+          },
+          true,
+        )
+      }
+    >
+      <i
+        class={"dgg-i dgt-fb-icon " + (kind === "where" ? "i-filter" : "i-sortBy")}
+        title={kind === "where" ? "Filter history (Alt+Down)" : "Sort history (Alt+Down)"}
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={(e) => openHistory(kind, e.currentTarget, set)}
+      />
       <span class="dgg-fb-label" classList={{ filled: value().length > 0 }}>
         {label}
       </span>
@@ -49,7 +97,7 @@ export function FilterBar(props: FilterBarProps): JSX.Element {
         singleLine
         value={value()}
         onChange={set}
-        onSubmit={props.onApply}
+        onSubmit={apply}
         dialect={props.driver}
         schema={schema()}
         defaultSchema={schemaName()}
@@ -63,7 +111,7 @@ export function FilterBar(props: FilterBarProps): JSX.Element {
           tabIndex={-1}
           onClick={() => {
             set("");
-            props.onApply();
+            apply();
           }}
         >
           {"×"}

@@ -10,7 +10,8 @@ use sqlx::mysql::{
 };
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions, PgRow, PgSslMode};
 use sqlx::sqlite::{
-    SqliteConnectOptions, SqliteConnection, SqlitePool, SqlitePoolOptions, SqliteRow,
+    SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePool, SqlitePoolOptions,
+    SqliteRow, SqliteSynchronous,
 };
 use sqlx::{ConnectOptions, Connection, Row};
 
@@ -109,6 +110,49 @@ fn bad(msg: impl std::fmt::Display) -> DbError {
     DbError::Connection(msg.to_string())
 }
 
+/// A file option (`sslrootcert`, `sslcert`, `sslkey`): the path as typed, checked so the error names the file instead
+/// of surfacing as a bare TLS failure.
+fn file_opt<'a>(cfg: &'a DataSourceConfig, key: &str, what: &str) -> Result<Option<&'a str>> {
+    match opt(cfg, &[key]) {
+        Some(p) if !std::path::Path::new(p).is_file() => {
+            Err(bad(format!("{what} file not found: {p}")))
+        }
+        v => Ok(v),
+    }
+}
+
+/// `-c key=value` pairs of a PostgreSQL `options` property (`-c search_path=a -c statement_timeout=5000`,
+/// also `-ckey=value` and `--key=value`). Words that do not set a parameter are ignored.
+pub(crate) fn pg_option_pairs(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut words = text.split_whitespace();
+    while let Some(w) = words.next() {
+        let assignment = if w == "-c" {
+            words.next().map(str::to_string)
+        } else if let Some(rest) = w.strip_prefix("-c") {
+            Some(rest.to_string())
+        } else {
+            w.strip_prefix("--").map(str::to_string)
+        };
+        if let Some((k, v)) = assignment.as_deref().and_then(|a| a.split_once('=')) {
+            if !k.is_empty() {
+                out.push((k.replace('-', "_"), v.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// SQLite boolean option: `true`/`on`/`1`/`yes` and `false`/`off`/`0`/`no`.
+fn bool_opt(cfg: &DataSourceConfig, key: &str) -> Result<Option<bool>> {
+    match opt(cfg, &[key]).map(str::to_ascii_lowercase).as_deref() {
+        None => Ok(None),
+        Some("true" | "on" | "1" | "yes") => Ok(Some(true)),
+        Some("false" | "off" | "0" | "no") => Ok(Some(false)),
+        Some(v) => Err(bad(format!("{key}: expected true or false, got '{v}'"))),
+    }
+}
+
 /// Does this SQLite data source point at an in-memory database?
 pub(crate) fn is_memory(cfg: &DataSourceConfig) -> bool {
     if cfg.driver != Driver::Sqlite {
@@ -179,8 +223,28 @@ pub(crate) fn build_opts(cfg: &DataSourceConfig) -> Result<ConnOpts> {
             o = o.application_name(
                 opt(cfg, &["application_name", "applicationName"]).unwrap_or("Prometeo DataGrip"),
             );
+            if let Some(p) = file_opt(cfg, "sslrootcert", "SSL CA")? {
+                o = o.ssl_root_cert(p);
+            }
+            if let Some(p) = file_opt(cfg, "sslcert", "SSL client certificate")? {
+                o = o.ssl_client_cert(p);
+            }
+            if let Some(p) = file_opt(cfg, "sslkey", "SSL client key")? {
+                o = o.ssl_client_key(p);
+            }
+            // startup parameters: the `options` property, `statement_timeout` (ms) and the read-only flag
+            let mut params: Vec<(String, String)> = Vec::new();
+            if let Some(t) = opt(cfg, &["options"]) {
+                params.extend(pg_option_pairs(t));
+            }
+            if let Some(t) = opt(cfg, &["statement_timeout"]) {
+                params.push(("statement_timeout".into(), t.into()));
+            }
             if cfg.read_only {
-                o = o.options([("default_transaction_read_only", "on")]);
+                params.push(("default_transaction_read_only".into(), "on".into()));
+            }
+            if !params.is_empty() {
+                o = o.options(params);
             }
             Ok(ConnOpts::Pg(o.disable_statement_logging()))
         }
@@ -216,8 +280,23 @@ pub(crate) fn build_opts(cfg: &DataSourceConfig) -> Result<ConnOpts> {
             if let Some(m) = opt(cfg, &["sslmode", "ssl-mode"]) {
                 o = o.ssl_mode(MySqlSslMode::from_str(m).map_err(bad)?);
             }
-            // do not force the session time zone: show values as the server stores them
-            o = o.timezone(None);
+            if let Some(p) = file_opt(cfg, "sslrootcert", "SSL CA")? {
+                o = o.ssl_ca(p);
+            }
+            if let Some(p) = file_opt(cfg, "sslcert", "SSL client certificate")? {
+                o = o.ssl_client_cert(p);
+            }
+            if let Some(p) = file_opt(cfg, "sslkey", "SSL client key")? {
+                o = o.ssl_client_key(p);
+            }
+            if let Some(c) = opt(cfg, &["charset"]) {
+                o = o.charset(c);
+            }
+            if let Some(c) = opt(cfg, &["collation"]) {
+                o = o.collation(c);
+            }
+            // by default the session time zone is not forced: values show as the server stores them
+            o = o.timezone(opt(cfg, &["timezone"]).map(str::to_string));
             Ok(ConnOpts::My(o.disable_statement_logging()))
         }
         Driver::Sqlite => {
@@ -245,10 +324,27 @@ pub(crate) fn build_opts(cfg: &DataSourceConfig) -> Result<ConnOpts> {
             let create = opt(cfg, &["create", "createIfMissing"])
                 .map(|v| v == "true")
                 .unwrap_or(false);
+            // `busy_timeout` is in milliseconds, like the PRAGMA
+            let busy =
+                match opt(cfg, &["busy_timeout"]) {
+                    Some(v) => Duration::from_millis(v.parse::<u64>().map_err(|_| {
+                        bad(format!("busy_timeout: expected milliseconds, got '{v}'"))
+                    })?),
+                    None => Duration::from_secs(5),
+                };
             o = o
                 .create_if_missing(create)
                 .read_only(cfg.read_only)
-                .busy_timeout(Duration::from_secs(5));
+                .busy_timeout(busy);
+            if let Some(m) = opt(cfg, &["journal_mode"]) {
+                o = o.journal_mode(SqliteJournalMode::from_str(m).map_err(bad)?);
+            }
+            if let Some(m) = opt(cfg, &["synchronous"]) {
+                o = o.synchronous(SqliteSynchronous::from_str(m).map_err(bad)?);
+            }
+            if let Some(on) = bool_opt(cfg, "foreign_keys")? {
+                o = o.foreign_keys(on);
+            }
             if is_memory(cfg) {
                 // shared-cache table locks would otherwise make readers block writers
                 o = o.pragma("read_uncommitted", "1");
@@ -419,4 +515,22 @@ pub(crate) fn lite_strings(r: &SqliteRow) -> Vec<Option<String>> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pg_option_pairs;
+
+    #[test]
+    fn pg_options_text_becomes_startup_parameters() {
+        assert_eq!(
+            pg_option_pairs("-c search_path=a,b -ctimezone=UTC --lock-timeout=5 -c nonsense -x"),
+            vec![
+                ("search_path".to_string(), "a,b".to_string()),
+                ("timezone".to_string(), "UTC".to_string()),
+                ("lock_timeout".to_string(), "5".to_string()),
+            ]
+        );
+        assert!(pg_option_pairs("").is_empty());
+    }
 }

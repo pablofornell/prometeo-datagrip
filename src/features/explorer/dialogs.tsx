@@ -1,8 +1,38 @@
-import { Match, Switch, type JSX } from "solid-js";
-import { Dialog } from "../../components/ui";
+import { Match, Show, Switch, createSignal, type JSX } from "solid-js";
+import { Dialog, TextField } from "../../components/ui";
 import { confirmDrop, confirmRemoveDs, confirmRename, dialog, setDialog } from "./commands";
 
-/** Confirmation dialogs (Drop, Remove Data Source). Mounted once by the explorer body. */
+/** One-field dialog (New Folder, Rename Folder). */
+function Prompt(props: { state: Extract<NonNullable<ReturnType<typeof dialog>>, { kind: "prompt" }>; close: () => void }): JSX.Element {
+  const [value, setValue] = createSignal(props.state.value);
+  const [error, setError] = createSignal<string | null>(null);
+  const ok = () => {
+    const err = props.state.accept(value());
+    if (err) setError(err);
+    else props.close();
+  };
+  return (
+    <Dialog
+      title={props.state.title}
+      width={props.state.width ?? 360}
+      onClose={props.close}
+      buttons={[
+        { label: "OK", primary: true, run: ok },
+        { label: "Cancel", run: props.close },
+      ]}
+    >
+      <div class="dg-explorer-prompt">
+        <span>{props.state.label}</span>
+        <TextField value={value()} onInput={(v) => (setValue(v), setError(null))} error={!!error()} frameClass="dg-explorer-prompt-field" data-autofocus />
+      </div>
+      <Show when={error()}>
+        <div class="dg-explorer-prompt-error">{error()}</div>
+      </Show>
+    </Dialog>
+  );
+}
+
+/** Confirmation dialogs (Drop, Remove Data Source) and prompts. Mounted once by the explorer body. */
 export function DialogHost(): JSX.Element {
   const close = () => setDialog(null);
   return (
@@ -53,6 +83,9 @@ export function DialogHost(): JSX.Element {
             <div>Remove data source '{s().ds.name}'?</div>
           </Dialog>
         )}
+      </Match>
+      <Match when={dialog()?.kind === "prompt" && (dialog() as Extract<ReturnType<typeof dialog>, { kind: "prompt" }>)}>
+        {(s) => <Prompt state={s()} close={close} />}
       </Match>
     </Switch>
   );

@@ -1,0 +1,287 @@
+/**
+ * Intentions and quick-fixes (Alt+Enter, the gutter bulb, the `More actions…` link of the inspection tooltips):
+ * only actions that really change the script or the console. They are computed from the same statement analysis
+ * as the inspections, so what the popup offers follows what the editor underlines.
+ */
+import { type EditorState, EditorSelection, Facet, StateField } from "@codemirror/state";
+import { type EditorView } from "@codemirror/view";
+import { quoteIdent } from "./complete";
+import { docAnalysis, LARGE_DOC } from "./highlight";
+import { keywordsFor } from "./keywords";
+import type { Token } from "./lexer";
+import type { TableIdx } from "./schemaIndex";
+import { analyzeStatement, identName, type Analysis } from "./semantic";
+import { configField, problemsField } from "./state";
+import { type Dialect, type Statement, statementIndexAt } from "./split";
+import type { IntentionHost } from "./types";
+
+export interface Intention {
+  /** Stable id (tests, analytics-free). */
+  id: string;
+  label: string;
+  /** `fix`: resolves a problem under the caret (red icon); `action`: any other intention. */
+  kind: "fix" | "action";
+  apply: (view: EditorView) => void;
+}
+
+export interface IntentionOptions {
+  host?: IntentionHost;
+  /** Adds `Run query in console` (the popup does; the bulb does not count it). */
+  run?: (view: EditorView) => void;
+}
+
+/** The host actions of the editor (a getter-backed object: the props change while the editor lives). */
+export const intentionHostFacet = Facet.define<IntentionHost, IntentionHost>({ combine: (v) => v[0] ?? {} });
+
+/** The editor's Ctrl+Enter, offered as the `Run query in console` intention (not counted for the gutter bulb). */
+export const runQueryFacet = Facet.define<(view: EditorView) => void, ((view: EditorView) => void) | undefined>({ combine: (v) => v[0] });
+
+const LIMIT_SUGGESTIONS = 3;
+
+/** Levenshtein distance, giving up above `max`. */
+export function editDistance(a: string, b: string, max = 2): number {
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    let best = i;
+    for (let j = 1; j <= b.length; j++) {
+      const v = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      cur.push(v);
+      if (v < best) best = v;
+    }
+    if (best > max) return max + 1;
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+/** Candidates within distance 2 of `name` (never the name itself), nearest first. */
+export function closest(name: string, candidates: Iterable<string>): string[] {
+  const n = name.toLowerCase();
+  const seen = new Set<string>();
+  const out: { c: string; d: number }[] = [];
+  for (const c of candidates) {
+    const l = c.toLowerCase();
+    if (l === n || seen.has(l)) continue;
+    seen.add(l);
+    const d = editDistance(n, l);
+    if (d <= 2 && d < Math.max(n.length, 2)) out.push({ c, d });
+  }
+  out.sort((x, y) => x.d - y.d || x.c.localeCompare(y.c));
+  return out.map((x) => x.c).slice(0, LIMIT_SUGGESTIONS);
+}
+
+/** Initials of a table name: `order_items` -> `oi`, `products` -> `p`; made unique against `taken`. */
+export function aliasFor(table: string, taken: Set<string>): string {
+  const parts = table.split(/[^A-Za-z0-9]+/).filter(Boolean);
+  let a = (parts.length > 1 ? parts.map((p) => p[0]).join("") : (parts[0] ?? "t").slice(0, 1)).toLowerCase();
+  if (!/^[a-z_]/.test(a)) a = "t";
+  let alias = a;
+  for (let i = 2; taken.has(alias) || keywordsFor("postgres").has(alias); i++) alias = a + i;
+  return alias;
+}
+
+interface Ctx {
+  st: Statement;
+  sig: Token[];
+  an: Analysis;
+  text: string;
+  dialect: Dialect;
+}
+
+function contextAt(state: EditorState, pos: number): Ctx | null {
+  const cfg = state.field(configField);
+  const a = docAnalysis(state.doc, cfg.dialect);
+  const si = statementIndexAt(a.statements, pos);
+  if (si === null) return null;
+  const st = a.statements[si];
+  const own = a.tokens.filter((t) => t.from >= st.start && t.from < st.fullEnd);
+  const an = analyzeStatement(a.text, own, cfg.index, cfg.dialect, cfg.implicit);
+  return { st, sig: own.filter((t) => t.kind !== "comment"), an, text: a.text, dialect: cfg.dialect };
+}
+
+const quoteChar = (d: Dialect): string => (d === "mysql" ? "`" : '"');
+
+/** Insert `text` as its own statement(s) above the statement at the caret. */
+function insertAbove(view: EditorView, st: Statement, text: string): void {
+  view.dispatch({ changes: { from: st.start, insert: text }, selection: EditorSelection.cursor(st.start + text.length), scrollIntoView: true, userEvent: "input.intention" });
+}
+
+const COLUMN_TYPE: Record<Dialect, string> = { postgres: "text", mysql: "varchar(255)", sqlite: "text" };
+const KEY_COLUMN: Record<Dialect, string> = { postgres: "id serial primary key", mysql: "id int primary key auto_increment", sqlite: "id integer primary key" };
+
+/** The intentions available at `pos`, in popup order (fixes first). Pure: no DOM. */
+export function intentionsAt(state: EditorState, pos: number, o: IntentionOptions = {}): Intention[] {
+  if (state.readOnly || state.doc.length > LARGE_DOC) return [];
+  const ctx = contextAt(state, pos);
+  if (!ctx) return [];
+  const cfg = state.field(configField);
+  const { st, sig, an, text, dialect } = ctx;
+  const idx = cfg.index;
+  const out: Intention[] = [];
+  const tokIdx = (() => {
+    const hit = sig.findIndex((t) => pos >= t.from && pos < t.to);
+    return hit >= 0 ? hit : sig.findIndex((t) => pos === t.to);
+  })();
+  const tok = tokIdx >= 0 ? sig[tokIdx] : undefined;
+  const raw = tok ? text.slice(tok.from, tok.to) : "";
+  const bad = tok ? an.unresolved.find((u) => u.from === tok.from) : undefined;
+  const hit = tok ? an.resolved.find((r) => r.from === tok.from) : undefined;
+  const dotBefore = tokIdx > 0 && sig[tokIdx - 1].kind === "punct" && text[sig[tokIdx - 1].from] === "." && sig[tokIdx - 1].to === tok?.from;
+
+  if (tok && bad) {
+    const name = identName(raw);
+    const change = (to: string): Intention => ({
+      id: `change:${to}`,
+      label: `Change to '${to}'`,
+      kind: "fix",
+      apply: (v) => v.dispatch({ changes: { from: tok.from, to: tok.to, insert: quoteIdent(to, dialect) }, selection: EditorSelection.cursor(tok.from + quoteIdent(to, dialect).length), userEvent: "input.intention" }),
+    });
+    if (bad.kind === "table") {
+      const names: string[] = [];
+      for (const s of idx.list) for (const t of s.list) names.push(t.name);
+      for (const c of closest(name, names)) out.push(change(c));
+      const def = `create table ${quoteIdent(name, dialect)}\n(\n    ${KEY_COLUMN[dialect]}\n);\n\n`;
+      out.push({ id: "create-table", label: `Create table '${name}'`, kind: "fix", apply: (v) => insertAbove(v, st, def) });
+    } else if (bad.kind === "schema") {
+      for (const c of closest(name, idx.list.map((s) => s.name))) out.push(change(c));
+    } else {
+      // an unknown column: the tables the name could belong to (the qualifier's table when written)
+      let owners: TableIdx[] = an.scope.refs.map((r) => r.table).filter((t): t is TableIdx => !!t);
+      if (dotBefore && tokIdx >= 2) {
+        const q = identName(text.slice(sig[tokIdx - 2].from, sig[tokIdx - 2].to));
+        const ref = an.scope.byName.get(q);
+        owners = ref?.table ? [ref.table] : [];
+      }
+      owners = owners.filter((t, i) => owners.indexOf(t) === i);
+      for (const c of closest(name, owners.flatMap((t) => t.columns.map((x) => x.name)))) out.push(change(c));
+      for (const t of owners.slice(0, LIMIT_SUGGESTIONS)) {
+        const stmt = `alter table ${quoteIdent(t.name, dialect)} add ${quoteIdent(name, dialect)} ${COLUMN_TYPE[dialect]};\n\n`;
+        out.push({ id: `add-column:${t.name}`, label: `Add column '${name}' to '${t.name}' table`, kind: "fix", apply: (v) => insertAbove(v, st, stmt) });
+      }
+    }
+    const host = o.host;
+    if (host?.refreshSchema) out.unshift({ id: "refresh-schema", label: "Refresh schema", kind: "fix", apply: () => host.refreshSchema?.() });
+    if (host?.chooseSchema) {
+      out.unshift({
+        id: "choose-schema",
+        label: "Choose schema",
+        kind: "fix",
+        apply: (v) => {
+          const c = v.coordsAtPos(tok.from);
+          host.chooseSchema?.({ left: c?.left ?? 0, bottom: c?.bottom ?? 0 });
+        },
+      });
+    }
+  }
+
+  // ---- fixes that are not tied to a problem
+  const kws = keywordsFor(dialect);
+  if (tok && (tok.kind === "qident" || (tok.kind === "word" && (!!hit || !!bad || !kws.has(raw.toLowerCase()))))) {
+    if (tok.kind === "word") {
+      const q = quoteChar(dialect);
+      out.push({ id: "quote", label: "Quote identifier", kind: "action", apply: (v) => v.dispatch({ changes: { from: tok.from, to: tok.to, insert: q + raw + q }, userEvent: "input.intention" }) });
+    } else {
+      const inner = identName(raw);
+      const plain = raw.slice(1, -1);
+      if (/^[a-z_][a-z0-9_$]*$/.test(plain) && inner === plain && !kws.has(plain)) {
+        out.push({ id: "unquote", label: "Unquote identifier", kind: "action", apply: (v) => v.dispatch({ changes: { from: tok.from, to: tok.to, insert: plain }, userEvent: "input.intention" }) });
+      }
+    }
+  }
+
+  // `select *` -> the column list
+  if (tok && tok.kind === "punct" && raw === "*") {
+    const star = starColumns(ctx, tokIdx);
+    if (star) out.push({ id: "expand-star", label: "Expand column list", kind: "action", apply: (v) => v.dispatch({ changes: { from: star.from ?? tok.from, to: tok.to, insert: star.text }, userEvent: "input.intention" }) });
+  }
+
+  // an unqualified column of a statement with several tables -> `alias.column`
+  if (tok && hit?.column && !dotBefore && an.scope.refs.length > 1) {
+    const ref = an.scope.refs.find((r) => r.table === hit.table);
+    const q = ref ? (ref.aliasText ?? ref.table?.name) : undefined;
+    if (q) out.push({ id: "qualify", label: `Qualify column with '${q}'`, kind: "action", apply: (v) => v.dispatch({ changes: { from: tok.from, insert: `${quoteIdent(q, dialect)}.` }, userEvent: "input.intention" }) });
+  }
+
+  // a table in FROM / JOIN without an alias
+  if (tok && hit && !hit.column && !dotBefore && tokIdx > 0 && tokIdx + 1 <= sig.length) {
+    const prev = text.slice(sig[tokIdx - 1].from, sig[tokIdx - 1].to).toLowerCase();
+    const next = sig[tokIdx + 1];
+    const nextText = next ? text.slice(next.from, next.to).toLowerCase() : "";
+    const hasAlias = !!next && (next.kind === "qident" || (next.kind === "word" && (nextText === "as" || !kws.has(nextText))));
+    const name = hit.table.name.toLowerCase();
+    const qualifiedElsewhere = sig.some((t, i) => i !== tokIdx && t.kind !== "string" && identName(text.slice(t.from, t.to)) === name && sig[i + 1] && text[sig[i + 1].from] === "." && sig[i + 1].from === t.to);
+    if ((prev === "from" || prev === "join" || text[sig[tokIdx - 1].from] === ",") && !hasAlias && !qualifiedElsewhere && !raw.includes(".")) {
+      const taken = new Set(an.scope.refs.map((r) => r.alias).filter((x): x is string => !!x));
+      const alias = aliasFor(hit.table.name, taken);
+      out.push({ id: "add-alias", label: `Add alias '${alias}'`, kind: "action", apply: (v) => v.dispatch({ changes: { from: tok.to, insert: ` ${alias}` }, userEvent: "input.intention" }) });
+    }
+  }
+
+  if (o.run && st.text.trim()) out.push({ id: "run-query", label: "Run query in console", kind: "action", apply: o.run });
+  return out;
+}
+
+/** The text that replaces the `*` at `sig[i]` (from the qualifier of `t.*`), or null when the columns are not all known. */
+function starColumns(ctx: Ctx, i: number): { from?: number; text: string } | null {
+  const { sig, text, an, dialect } = ctx;
+  const prev = i > 0 ? sig[i - 1] : undefined;
+  if (!prev) return null;
+  const pt = text.slice(prev.from, prev.to);
+  const pw = pt.toLowerCase();
+  let refs = an.scope.refs;
+  let qualify = refs.length > 1;
+  let from: number | undefined;
+  if (pt === ".") {
+    const qt = i > 1 ? sig[i - 2] : undefined;
+    const ref = qt ? an.scope.byName.get(identName(text.slice(qt.from, qt.to))) : undefined;
+    if (!ref) return null;
+    refs = [ref];
+    qualify = true;
+    from = qt!.from;
+  } else if (pt === ",") {
+    // only inside a select list: walk back to `select` without meeting a clause word
+    let ok = false;
+    for (let k = i - 1; k >= 0; k--) {
+      if (sig[k].kind !== "word") continue;
+      const w = text.slice(sig[k].from, sig[k].to).toLowerCase();
+      if (w === "select") {
+        ok = true;
+        break;
+      }
+      if (["from", "where", "group", "order", "having", "set", "on", "values", "limit"].includes(w)) break;
+    }
+    if (!ok) return null;
+  } else if (!["select", "distinct", "all"].includes(pw)) return null;
+  if (!refs.length || refs.some((r) => !r.table || r.opaque)) return null;
+  const cols: string[] = [];
+  for (const r of refs) {
+    const q = qualify ? `${quoteIdent(r.aliasText ?? r.table!.name, dialect)}.` : "";
+    for (const c of r.table!.columns) cols.push(q + quoteIdent(c.name, dialect));
+  }
+  return cols.length ? { from, text: cols.join(", ") } : null;
+}
+
+// ---------------------------------------------------------------- bulb
+
+export type BulbKind = "none" | "bulb" | "error";
+
+/** Whether the caret has intentions, and whether it sits on a problem (the gutter bulb is yellow / red). */
+export function bulbAt(state: EditorState): BulbKind {
+  if (state.readOnly) return "none";
+  const head = state.selection.main.head;
+  const host = state.facet(intentionHostFacet);
+  const list = intentionsAt(state, head, { host });
+  if (!list.length) return "none";
+  const onProblem = state.field(problemsField).some((p) => head >= p.from && head <= p.to);
+  return onProblem ? "error" : "bulb";
+}
+
+export const bulbField = StateField.define<BulbKind>({
+  create: (s) => bulbAt(s),
+  update(v, tr) {
+    const same = !tr.docChanged && !tr.selection && tr.startState.field(problemsField) === tr.state.field(problemsField) && tr.startState.field(configField) === tr.state.field(configField);
+    return same ? v : bulbAt(tr.state);
+  },
+});

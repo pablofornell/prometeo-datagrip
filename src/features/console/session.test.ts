@@ -82,6 +82,12 @@ vi.mock("../../api/db", () => ({
     return { executionId: "x", done: p, cancel: async () => {}, close: async () => {}, fetchMore: async () => ({ rows: [], hasMore: false }) };
   }),
   introspect: vi.fn(async () => []),
+  explainPlan: vi.fn(async (sid: string, sql: string, analyze: boolean) => {
+    if (!be.sessions.has(sid)) throw gone(sid);
+    if (/nope/.test(sql)) throw new Error("relation \"nope\" does not exist");
+    return { driver: "postgres", analyze, sql, root: { operation: "Select", params: "", rows: null, totalCost: null, startupCost: null, raw: "", props: [], children: [] }, elapsedMs: 7 };
+  }),
+  cancelSession: vi.fn(async () => {}),
   applyChanges: vi.fn(),
   tableData: vi.fn(),
   listDataSources: vi.fn(async () => []),
@@ -93,7 +99,7 @@ vi.mock("../../components/ui", () => ({ notify: (o: unknown) => notify(o), openM
 vi.mock("../../state/layout", () => ({ showToolWindow: vi.fn() }));
 vi.mock("../../state/settings", () => ({ settings: { defaultTxMode: "manual", gridPageSize: 500 } }));
 vi.mock("../../state/tabs", () => ({ activateTab: vi.fn(), activeTab: () => undefined }));
-vi.mock("../explorer", () => ({ ensureConnected: async () => {} }));
+vi.mock("../explorer", () => ({ ensureConnected: async () => {}, autoSyncAfter: () => {} }));
 vi.mock("../table/dialogs", () => ({ askChoice: async () => "cancel" }));
 const resolveEdit = vi.fn(async () => null);
 vi.mock("./editable", async (orig) => ({ ...(await orig<typeof import("./editable")>()), resolveEdit: (...a: unknown[]) => (resolveEdit as (...x: unknown[]) => unknown)(...a) }));
@@ -109,7 +115,7 @@ vi.mock("./schemaPref", () => {
 });
 
 import { savedSchema, savedSearchPath } from "./schemaPref";
-import { ConsoleSession } from "./session";
+import { ConsoleSession, isolationLevels } from "./session";
 
 const ds = (driver: "postgres" | "mysql" = "postgres") => ({ id: "d1", name: "pg", driver, database: "shop", readOnly: false }) as never;
 const mk = (driver: "postgres" | "mysql" = "postgres") => new ConsoleSession("tab1", ds(driver), "console", () => "console [pg]");
@@ -275,5 +281,58 @@ describe("a failed statement", () => {
     await s.run(req("update t set a = 1"));
     expect(s.out.selected()).toBe("output");
     expect(s.execError()).toBeNull();
+  });
+});
+
+describe("Tx isolation", () => {
+  it("lists Database Default first, and Read Uncommitted only for MySQL", () => {
+    expect(isolationLevels("postgres")).toEqual(["default", "read committed", "repeatable read", "serializable"]);
+    expect(isolationLevels("mysql")[1]).toBe("read uncommitted");
+    expect(isolationLevels("sqlite")).not.toContain("read uncommitted");
+  });
+  it("a new console sets nothing; going back to the default resets the session", async () => {
+    const s = mk();
+    expect(s.isolation()).toBe("default");
+    await s.run(req("select 1"));
+    expect(be.opened.at(-1)!.initSql.filter((q) => /ISOLATION/i.test(q))).toEqual([]);
+    await s.setIsolation("serializable");
+    await s.setIsolation("default");
+    expect(be.ran).toContain("RESET default_transaction_isolation");
+    const m = mk("mysql");
+    await m.run(req("select 1"));
+    await m.setIsolation("default");
+    expect(be.ran).toContain("SET SESSION transaction_isolation = DEFAULT");
+  });
+});
+
+describe("Explain", () => {
+  const withEditor = (s: ConsoleSession, sql: string | null) => {
+    s.editor = { getSelectionOrStatement: () => (sql === null ? null : { sql, ranges: [], source: "statement" }) } as never;
+    return s;
+  };
+  it("shows the plan in the Query Plan tab", async () => {
+    const s = withEditor(mk(), "select 1");
+    await s.explain(true);
+    expect(s.out.plan()?.plan.analyze).toBe(true);
+    expect(s.out.selected()).toBe("plan");
+    expect(s.out.lastMs()).toBe(7);
+    expect(s.out.running()).toBe(false);
+    s.out.closeResult("plan");
+    expect(s.out.plan()).toBeNull();
+    expect(s.out.selected()).toBe("output");
+  });
+  it("reports a failing statement in the log and leaves the console usable", async () => {
+    const s = withEditor(mk(), "select * from nope");
+    await s.explain(false);
+    expect(s.out.plan()).toBeNull();
+    expect(lines(s)).toContain('relation "nope" does not exist');
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ kind: "error", title: "Explain Plan failed" }));
+    expect(s.out.running()).toBe(false);
+  });
+  it("needs a statement", async () => {
+    const s = withEditor(mk(), null);
+    await s.explain(false);
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ title: "Nothing to explain" }));
+    expect(s.out.plan()).toBeNull();
   });
 });

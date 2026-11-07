@@ -1,7 +1,8 @@
 /** Small building blocks of the Settings pages: section titles, rows, number fields, search highlighting. */
 import { type JSX, createSignal } from "solid-js";
 import { Highlighted, TextField } from "../../components/ui";
-import type { ThemePref } from "../../state/theme";
+import { type ThemePref, theme } from "../../state/theme";
+import { type SchemeId, parseColor } from "../../state/colorScheme";
 import type { Settings } from "../../state/settings";
 
 /** What the pages edit: a draft copy of the settings (committed by OK / Apply) and the theme choice. */
@@ -103,4 +104,63 @@ export function NumberField(props: {
       }}
     />
   );
+}
+
+/** Black or white, whichever reads better on the colour. */
+function contrastOn(hex: string): string {
+  const n = parseInt(hex.slice(1, 7), 16);
+  const lum = (0.299 * (n >> 16) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255;
+  return lum > 0.55 ? "#000000" : "#FFFFFF";
+}
+
+/** Colour swatch: the hex text is editable, the box opens the system colour chooser. */
+export function ColorField(props: { value: string | undefined; fallback: string; disabled?: boolean; onChange: (hex: string) => void }): JSX.Element {
+  const shown = () => props.value ?? props.fallback;
+  const [text, setText] = createSignal<string | null>(null);
+  const commit = (raw: string) => {
+    const c = parseColor(raw);
+    setText(null);
+    if (c) props.onChange(c);
+  };
+  return (
+    <span class="st-swatch" classList={{ "st-swatch-off": props.disabled }} style={{ background: shown().slice(0, 7), color: contrastOn(shown()) }}>
+      <input
+        class="st-swatch-input"
+        spellcheck={false}
+        disabled={props.disabled}
+        aria-label="Color"
+        value={text() ?? shown().slice(1, 7)}
+        onInput={(e) => setText(e.currentTarget.value)}
+        onBlur={(e) => commit(e.currentTarget.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.stopPropagation();
+            e.preventDefault();
+            commit(e.currentTarget.value);
+          }
+        }}
+      />
+      <input
+        class="st-swatch-pick"
+        type="color"
+        tabindex={-1}
+        disabled={props.disabled}
+        aria-label="Choose color"
+        value={shown().slice(0, 7).toLowerCase()}
+        onInput={(e) => props.onChange(e.currentTarget.value.toUpperCase())}
+      />
+    </span>
+  );
+}
+
+/** The UI theme the draft will have (Sync with OS: the current system theme). */
+export function draftTheme(d: Draft): SchemeId {
+  const t = d.theme();
+  return t === "system" ? theme() : t;
+}
+
+/** The editor color scheme the draft will use: the explicit choice, else the one of the theme. */
+export function draftScheme(d: Draft): SchemeId {
+  const s = d.values.editorScheme;
+  return s === "auto" ? draftTheme(d) : s;
 }

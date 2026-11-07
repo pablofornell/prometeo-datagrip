@@ -1,4 +1,5 @@
 mod commands;
+pub mod files;
 pub mod state;
 pub mod store;
 
@@ -45,6 +46,8 @@ pub fn run() {
             commands::fetch_more,
             commands::cancel,
             commands::close_execution,
+            commands::explain_plan,
+            commands::cancel_session,
             commands::table_data,
             commands::apply_changes,
             commands::table_data_in_session,
@@ -74,6 +77,17 @@ pub fn run() {
             commands::create_console,
             commands::delete_console,
             commands::rename_console,
+            commands::choose_open_files,
+            commands::choose_attach_folder,
+            commands::detach_file_root,
+            commands::file_roots,
+            commands::read_file,
+            commands::write_file,
+            commands::list_dir,
+            commands::list_scratches,
+            commands::create_scratch,
+            commands::delete_scratch,
+            commands::rename_scratch,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Prometeo DataGrip");

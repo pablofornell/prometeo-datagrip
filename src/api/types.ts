@@ -66,6 +66,8 @@ export interface TestResult {
   serverVersion: string | null;
   message: string;
   elapsedMs: number;
+  /** Whether the test session was encrypted (negotiated); null when unknown (SQLite). */
+  ssl?: boolean | null;
 }
 
 export interface ConnectInfo {
@@ -92,7 +94,11 @@ export type NodeKind =
   | "routine"
   | "function"
   | "procedure"
-  | "sequence";
+  | "sequence"
+  | "role"
+  | "tablespace"
+  | "extension"
+  | "user";
 
 export interface TreeNode {
   id: string;
@@ -308,7 +314,20 @@ export interface SessionState {
 
 // ---------------------------------------------------------------- export
 
-export type ExportFormat = "csv" | "tsv" | "json" | "sqlInsert" | "markdown";
+export type ExportFormat =
+  | "csv"
+  | "tsv"
+  | "json"
+  | "sqlInsert"
+  | "markdown"
+  | "csvPipe"
+  | "csvSemicolon"
+  | "jsonLines"
+  | "sqlUpdate"
+  | "whereClause"
+  | "html"
+  | "xml"
+  | "pretty";
 
 export interface ExportOptions {
   format: ExportFormat;
@@ -329,6 +348,37 @@ export interface ExportOptions {
   transpose?: boolean;
   /** First column with the row number (CSV / TSV / Markdown only). */
   rowHeader?: boolean;
+}
+
+// ---------------------------------------------------------------- explain
+
+export interface PlanProp {
+  name: string;
+  value: string;
+}
+
+/** One row of a query plan: the columns of the `Query Plan` tab and its `Property | Value` pane. */
+export interface PlanNode {
+  operation: string;
+  /** `table: orders; index: orders_pkey;` */
+  params: string;
+  rows: number | null;
+  totalCost: number | null;
+  startupCost: number | null;
+  /** `Parallel Aware = false;Async Capable = false;...` */
+  raw: string;
+  props: PlanProp[];
+  children: PlanNode[];
+}
+
+export interface ExplainPlan {
+  driver: Driver;
+  analyze: boolean;
+  /** The statement that was explained. */
+  sql: string;
+  /** `Select` (or the statement kind); its child is the top of the plan. */
+  root: PlanNode;
+  elapsedMs: number;
 }
 
 // ---------------------------------------------------------------- history

@@ -192,7 +192,7 @@ export function tableFromNodes(driver: Driver, schema: string, name: string, tab
     .filter((i) => !i.extra.primary && !keyNames.has(i.name))
     .map((i) => {
       const def = str(i.extra.definition);
-      const locked = driver === "postgres" ? /\b(where|include)\b/i.test(def.replace(/'[^']*'/g, "")) : !!i.extra.partial;
+      const locked = driver === "postgres" ? /\b(where|include)\b/i.test(def.replace(/'[^']*'/g, "")) : !!i.extra.partial || !!i.extra.expression;
       return newIndex({
         name: i.name,
         unique: !!i.extra.unique,
@@ -259,9 +259,10 @@ async function mysqlExtras(ctx: EditorCtx, t: TableDef): Promise<void> {
   const [sc, tn] = [literal("mysql", ctx.schema), literal("mysql", t.name)];
   const [cols, tbl] = await queryRows(ctx.dsId, [
     `select column_name, generation_expression, collation_name from information_schema.columns where table_schema = ${sc} and table_name = ${tn}`,
-    `select table_collation from information_schema.tables where table_schema = ${sc} and table_name = ${tn}`,
+    `select table_collation, table_comment from information_schema.tables where table_schema = ${sc} and table_name = ${tn}`,
   ]);
   t.tableCollation = str(tbl[0]?.[0]);
+  if (tbl[0]) t.comment = str(tbl[0][1]);
   for (const r of cols) {
     const c = t.columns.find((x) => x.name === str(r[0]));
     if (!c) continue;

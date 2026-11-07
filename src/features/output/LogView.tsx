@@ -21,6 +21,28 @@ const Svg = (props: { d: string }): JSX.Element => (
   <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" innerHTML={props.d} />
 );
 
+/** The log as plain text (what Print puts on paper). */
+export function logText(lines: readonly LogLine[]): string {
+  return lines.map((l) => `${logTimestamp(l.ts)} ${l.kind === "sql" ? `${l.prompt ?? ""}> ` : ""}${l.text}`).join("\n");
+}
+
+/** The browser's print of the log text: a hidden frame holding it is printed, so the app around it is not. */
+function printLog(text: string): void {
+  const frame = document.createElement("iframe");
+  frame.style.cssText = "position:fixed;width:0;height:0;border:0;visibility:hidden";
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument;
+  const win = frame.contentWindow;
+  if (!doc || !win) return frame.remove();
+  doc.open();
+  doc.write(`<!doctype html><title>Database Output</title><pre style="font:12px monospace;white-space:pre-wrap">${escapeHtml(text)}</pre>`);
+  doc.close();
+  win.onafterprint = () => frame.remove();
+  win.focus();
+  win.print();
+  setTimeout(() => frame.remove(), 60_000);
+}
+
 export function LogView(props: { out: ConsoleOutput }): JSX.Element {
   let sc!: HTMLDivElement;
   const out = () => props.out;
@@ -43,6 +65,9 @@ export function LogView(props: { out: ConsoleOutput }): JSX.Element {
         </ActionButton>
         <ActionButton title="Scroll to the End" selected={out().scrollToEnd()} onClick={() => (out().setScrollToEnd(!out().scrollToEnd()), sc.scrollTo({ top: sc.scrollHeight }))}>
           <Svg d='<path d="M2 3h12M2 6.5h12M2 10h6"/><path d="M12 9v5M9.5 12l2.5 2.5L14.5 12"/>' />
+        </ActionButton>
+        <ActionButton title="Print" disabled={!out().lines.length} onClick={() => printLog(logText(out().lines))}>
+          <Svg d='<path d="M4.5 6V2.5h7V6"/><rect x="2.5" y="6" width="11" height="5.5" rx="1"/><path d="M4.5 9.5h7v4h-7z"/>' />
         </ActionButton>
         <ActionButton title="Clear All" icon="delete" onClick={() => out().clearLog()} />
       </div>

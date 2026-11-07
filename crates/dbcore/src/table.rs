@@ -555,6 +555,25 @@ pub(crate) fn to_bind(d: Driver, v: &Value, col: &ColInfo) -> Result<Bind> {
     })
 }
 
+/// `{"$expr": "now()"}`: a raw SQL expression the grid asks to store instead of a value (single expression only).
+fn sql_expr(d: Driver, v: &Value) -> Result<Option<String>> {
+    let Some(e) = v
+        .as_object()
+        .and_then(|m| m.get("$expr"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let e = e.trim();
+    if e.is_empty() {
+        return Err(DbError::InvalidArgument(
+            "The SQL expression is empty".into(),
+        ));
+    }
+    reject_separator("SQL expression", Some(e), d)?;
+    Ok(Some(e.to_string()))
+}
+
 /// A binary preview that was cut off: useless (and wrong) as part of a row key.
 fn is_truncated_bin(v: &Value) -> bool {
     v.as_object().is_some_and(|m| {
@@ -772,6 +791,10 @@ pub(crate) fn build_stmt(
             let mut sets = Vec::new();
             for (k, v) in &ch.values {
                 let c = find(k)?;
+                if let Some(e) = sql_expr(d, v)? {
+                    sets.push(format!("{} = ({e})", ident(k)));
+                    continue;
+                }
                 let p = ph(&mut binds, c, v)?;
                 sets.push(format!("{} = {p}", ident(k)));
             }
@@ -799,7 +822,10 @@ pub(crate) fn build_stmt(
                     .as_object()
                     .map(|m| m.contains_key("$default"))
                     .unwrap_or(false);
-                if is_default {
+                if let Some(e) = sql_expr(d, v)? {
+                    names.push(ident(k));
+                    vals.push(format!("({e})"));
+                } else if is_default {
                     if d == Driver::Sqlite {
                         continue; // SQLite has no DEFAULT keyword in VALUES: omit the column
                     }
@@ -1108,6 +1134,38 @@ mod tests {
             stmt(Driver::Postgres, "\"t\"", &info, &RowAddr::None, &empty).sql,
             "insert into \"t\" default values"
         );
+    }
+
+    #[test]
+    fn sql_expression_values_are_inlined_without_binds() {
+        let info = vec![col("id", "int", true), col("at", "timestamp", false)];
+        let ch = change(
+            ChangeKind::Update,
+            &[("id", json!(1))],
+            &[("at", json!({"$expr": "now()"}))],
+        );
+        let st = stmt(Driver::Postgres, "\"t\"", &info, &RowAddr::None, &ch);
+        assert_eq!(
+            st.sql,
+            "update \"t\" set \"at\" = (now()) where \"id\" = cast($1 as int)"
+        );
+        let ins = change(
+            ChangeKind::Insert,
+            &[],
+            &[("at", json!({"$expr": "current_timestamp"}))],
+        );
+        let st = stmt(Driver::Sqlite, "\"t\"", &info, &RowAddr::None, &ins);
+        assert_eq!(
+            st.sql,
+            "insert into \"t\" (\"at\") values ((current_timestamp))"
+        );
+        assert!(st.binds.is_empty());
+        let bad = change(
+            ChangeKind::Insert,
+            &[],
+            &[("at", json!({"$expr": "now(); drop table t"}))],
+        );
+        assert!(build_stmt(Driver::Postgres, "\"t\"", &info, &RowAddr::None, &bad).is_err());
     }
 
     #[test]
