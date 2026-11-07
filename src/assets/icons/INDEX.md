@@ -185,3 +185,4 @@ Naming: `<name>.svg` = light theme variant, `<name>_dark.svg` = dark theme varia
 | `dg/editor-output` | `DataGrip 2026.3 intellij.database.jar!/icons/expui/editorOutput` | light+dark | Output in editor |
 | `dg/dbms-output` | `DataGrip 2026.3 intellij.database.jar!/icons/expui/dbmsOutput` | light+dark | DBMS output |
 | `dg/locked` | `DataGrip 2026.3 intellij.database.jar!/icons/expui/locked` | light+dark | Read-only / locked |
+| `explain-plan` | original artwork (Prometeo DataGrip) | light+dark | Query Plan result tab (Explain Plan) |

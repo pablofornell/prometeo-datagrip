@@ -1,6 +1,8 @@
+import type { NavHandlers } from "./navigate";
 import type { Dialect } from "./split";
 
 export type { Dialect } from "./split";
+export type { NavHandlers, NavTarget } from "./navigate";
 
 /** Column of a table in the schema snapshot used for highlighting and completion. */
 export interface SchemaColumn {
@@ -55,6 +57,11 @@ export interface ExecuteRequest {
   ranges: Range[];
   /** Why this text was picked. */
   source: "statement" | "selection" | "script";
+  /**
+   * Set when `sql` is not the document text any more (query parameters were substituted): the document offset of an
+   * offset of `sql` (the ranges then describe the original text).
+   */
+  unmap?: (p: number) => number;
 }
 
 /** An execution error to show in the editor. */
@@ -68,12 +75,23 @@ export interface EditorError {
   message: string;
 }
 
-/** Result of an executed statement: gutter check / red `!` and the gray inline `994 ms` hint. */
+/**
+ * Result of an executed statement: gutter check / red `!` and the gray inline `994 ms` hint. `running`: a spinner
+ * instead of the icon, and `ms` is the elapsed time (shown as `4 s` once it reached a second).
+ */
 export interface ExecMark {
   from: number;
   to: number;
-  status: "ok" | "error";
+  status: "ok" | "error" | "running";
   ms?: number;
+}
+
+/** What the intentions popup (Alt+Enter) needs from the host; an entry without its handler is left out. */
+export interface IntentionHost {
+  /** `Refresh schema`: re-introspect the data source. */
+  refreshSchema?: () => void;
+  /** `Choose schema`: open the schema chooser at `at` (the caret, in screen coordinates). */
+  chooseSchema?: (at: { left: number; bottom: number }) => void;
 }
 
 export interface SqlEditorHandle {
@@ -108,8 +126,8 @@ export interface SqlEditorProps {
   execMarks?: ExecMark[];
   /** Ctrl+Enter (selection or statement). The statement chooser may be shown first. */
   onExecute?: (req: ExecuteRequest) => void;
-  /** 1-based line and column of the main caret, for the status bar. */
-  onCaretChange?: (line: number, col: number) => void;
+  /** 1-based line and column of the main caret, for the status bar; `selChars` / `selBreaks`: size of the selection (0 when none). */
+  onCaretChange?: (line: number, col: number, selChars?: number, selBreaks?: number) => void;
   /** Shows the `Customize` link of the Statements chooser and handles its click (open execution settings). */
   onCustomizeExecution?: () => void;
   /** Ctrl+F2 and other host-level keys are not handled here; this is called for `Escape` with no popup open. */
@@ -136,6 +154,10 @@ export interface SqlEditorProps {
   scopeTable?: { schema?: string; name: string };
   autofocus?: boolean;
   class?: string;
+  /** Ctrl+B / Ctrl+Click, Ctrl+Q and Alt+Shift+B on the identifier at the caret (the host opens tabs and popups). */
+  navigate?: NavHandlers;
+  /** Alt+Enter: host actions of the intentions popup. */
+  intentions?: IntentionHost;
   /** Receives the imperative handle once the editor is mounted. */
   ref?: (handle: SqlEditorHandle) => void;
 }

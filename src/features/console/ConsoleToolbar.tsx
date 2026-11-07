@@ -1,14 +1,15 @@
-/** The 34px toolbar of a query console (operative items of DataGrip's: run, history, Tx, commit / rollback, stop, schema). */
+/** The 34px toolbar of a query console (operative items of DataGrip's: run, explain, history, Tx, commit / rollback, stop, schema). */
 import { Show, type JSX } from "solid-js";
 import { ActionButton, Icon, ToolbarSeparator, openMenu } from "../../components/ui";
 import { StopButton } from "../output/OutputToolbar";
 import { openSettings } from "../settings";
 import type { ConsoleSession } from "./session";
 
-export function ConsoleToolbar(props: { session: ConsoleSession }): JSX.Element {
+export function ConsoleToolbar(props: { session: ConsoleSession; /** Shown left of the schema switcher (the data source chooser of a file). */ trailing?: JSX.Element }): JSX.Element {
   const s = () => props.session;
   let txBtn!: HTMLButtonElement;
   let schemaBtn!: HTMLButtonElement;
+  let explainBtn!: HTMLButtonElement;
   return (
     <div class="dg-toolbar dgc-toolbar">
       <span
@@ -20,14 +21,24 @@ export function ConsoleToolbar(props: { session: ConsoleSession }): JSX.Element 
       >
         <ActionButton action="sql.execute" icon="run" />
       </span>
+      <ActionButton
+        ref={(el) => (explainBtn = el)}
+        icon="explain-plan"
+        title="Explain Plan"
+        dropdown
+        disabled={s().out.running()}
+        onClick={() => openMenu([{ action: "sql.explainPlan" }, ...(s().driver === "sqlite" ? [] : [{ action: "sql.explainAnalyse" }])], { anchor: explainBtn })}
+      />
       <ToolbarSeparator />
       <ActionButton action="sql.history" icon="history" title="Browse Query History" />
+      <ActionButton icon="view-parameters" title="View Parameters" onClick={() => void s().viewParameters()} />
       <ActionButton icon="settings" title="Open Query Execution Settings…" onClick={() => openSettings("database.query-execution")} />
       <ToolbarSeparator />
       <button
         ref={txBtn}
         type="button"
         class="dgc-text-btn"
+        disabled={s().out.running()}
         title={s().txStatus() === "failed" ? "The transaction has failed: an earlier statement raised an error. Roll it back to continue." : undefined}
         tabindex={-1}
         onMouseDown={(e) => e.preventDefault()}
@@ -45,6 +56,7 @@ export function ConsoleToolbar(props: { session: ConsoleSession }): JSX.Element 
       </Show>
       <StopButton running={s().out.running()} class="dgc-stop" />
       <span class="dgc-spacer" />
+      {props.trailing}
       <button
         ref={schemaBtn}
         type="button"

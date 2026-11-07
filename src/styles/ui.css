@@ -384,6 +384,16 @@
 .dg-menu-label {
   flex: 1;
 }
+/* numbered list popups (Theme…, Quick Switch Scheme): grey digit instead of the icon */
+.dg-menu-number {
+  flex: none;
+  width: 16px;
+  margin-right: 5px;
+  color: var(--dg-menu-accelerator-fg);
+}
+.dg-menu-row.dg-active:not(.dg-disabled) .dg-menu-number {
+  color: inherit;
+}
 .dg-menu-badge {
   margin-left: 6px;
   padding: 0 5px;
@@ -399,6 +409,15 @@
 }
 .dg-menu-row.dg-disabled .dg-menu-shortcut {
   color: var(--dg-text-disabled);
+}
+.dg-menu-trailing {
+  display: flex;
+  flex: none;
+  margin-left: 14px;
+  border-radius: 4px;
+}
+.dg-menu-trailing:hover {
+  background: var(--dg-toolbar-button-hover-bg);
 }
 .dg-menu-arrow {
   display: flex;
@@ -429,7 +448,10 @@
 }
 .dg-menu-hint {
   flex: none;
-  max-width: 260px;
+  /* wraps within the width the items give the menu (it never widens it) */
+  width: 0;
+  min-width: 100%;
+  box-sizing: border-box;
   padding: 6px 17px 8px;
   color: var(--dg-popup-separator-fg);
   font-size: var(--dg-font-size-medium);
@@ -471,6 +493,13 @@
 }
 .dg-tooltip-desc {
   color: var(--dg-tooltip-info-fg);
+}
+.dg-tooltip-mono {
+  font-family: var(--dg-font-mono);
+  font-size: var(--dg-editor-font-size);
+}
+.dg-tooltip-mono .dg-tooltip-desc {
+  color: inherit;
 }
 
 /* ---------------------------------------------------------------- Notifications */
@@ -520,9 +549,16 @@
 .dg-notification-close {
   display: flex;
   flex: none;
+  gap: 2px;
   height: 16px;
-  opacity: 0.7;
   visibility: hidden;
+}
+.dg-notification-close > span {
+  display: flex;
+  opacity: 0.7;
+}
+.dg-notification-close > span:hover {
+  opacity: 1;
 }
 .dg-notification:hover .dg-notification-close {
   visibility: visible;
@@ -736,7 +772,33 @@ mark.dg-search-match {
 .dg-menu-bar-menu .dg-menu-icon {
   margin-right: 4px;
 }
+.dg-menu-bar-menu .dg-menu-sep {
+  height: 3px; /* Swing bar menus: 29px pitch across a separator versus 26px between rows */
+}
 .dg-menu-bar-menu .dg-menu-sep::after {
   left: -6px;
   right: -6px;
+  top: 1px;
+}
+.dg-menu-bar-menu .dg-menu-label u,
+.dg-menubar-item u {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* 12-spoke busy spinner (DataGrip's AnimatedIcon): size it with width/height, color with `color` */
+.dg-spokes {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  background-color: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%280 8 8%29' opacity='1.0'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%2830 8 8%29' opacity='0.93'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%2860 8 8%29' opacity='0.86'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%2890 8 8%29' opacity='0.79'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%28120 8 8%29' opacity='0.72'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%28150 8 8%29' opacity='0.65'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%28180 8 8%29' opacity='0.58'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%28210 8 8%29' opacity='0.51'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%28240 8 8%29' opacity='0.44'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%28270 8 8%29' opacity='0.37'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%28300 8 8%29' opacity='0.3'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%28330 8 8%29' opacity='0.23'/%3E%3C/svg%3E") center / 100% 100% no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%280 8 8%29' opacity='1.0'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%2830 8 8%29' opacity='0.93'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%2860 8 8%29' opacity='0.86'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%2890 8 8%29' opacity='0.79'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%28120 8 8%29' opacity='0.72'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%28150 8 8%29' opacity='0.65'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%28180 8 8%29' opacity='0.58'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%28210 8 8%29' opacity='0.51'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%28240 8 8%29' opacity='0.44'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%28270 8 8%29' opacity='0.37'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%28300 8 8%29' opacity='0.3'/%3E%3Crect x='7.3' y='0.9' width='1.4' height='3.8' rx='.7' transform='rotate%28330 8 8%29' opacity='0.23'/%3E%3C/svg%3E") center / 100% 100% no-repeat;
+  animation: dg-spokes-spin 1s steps(12) infinite;
+}
+@keyframes dg-spokes-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }

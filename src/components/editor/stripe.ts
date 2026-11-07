@@ -1,9 +1,11 @@
 import type { Extension } from "@codemirror/state";
-import { EditorSelection } from "@codemirror/state";
+import { completionStatus } from "@codemirror/autocomplete";
 import { EditorView, ViewPlugin, type ViewUpdate } from "@codemirror/view";
 import { identifierAtCaret } from "./highlight";
 import { previewField } from "./frame";
-import { errorsField } from "./state";
+import { templateActive } from "./templates";
+import { jumpProblem } from "./inspect";
+import { errorsField, problemsField } from "./state";
 
 const CHECK =
   '<svg width="16" height="16" viewBox="0 0 16 16"><path d="M3.5 8.6l3 3 6-6.6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
@@ -37,7 +39,18 @@ class StripeView {
   }
 
   update(u: ViewUpdate): void {
-    if (u.docChanged || u.selectionSet || u.geometryChanged || u.viewportChanged || u.startState.field(errorsField) !== u.state.field(errorsField) || u.startState.field(previewField) !== u.state.field(previewField)) this.schedule();
+    if (
+      u.docChanged ||
+      u.selectionSet ||
+      u.geometryChanged ||
+      u.viewportChanged ||
+      u.startState.field(errorsField) !== u.state.field(errorsField) ||
+      u.startState.field(problemsField) !== u.state.field(problemsField) ||
+      u.startState.field(previewField) !== u.state.field(previewField) ||
+      completionStatus(u.startState) !== completionStatus(u.state) ||
+      templateActive(u.startState) !== templateActive(u.state)
+    )
+      this.schedule();
   }
 
   destroy(): void {
@@ -68,7 +81,9 @@ class StripeView {
     const id = identifierAtCaret(v);
     if (id && id.tokens.length > 1) for (const t of id.tokens) put(t.from, "id");
     const errors = v.state.field(errorsField);
+    const problems = v.state.field(problemsField);
     for (const e of errors) put(errorPos(v, e.statementFrom, e.position), "err");
+    for (const p of problems) put(p.from, "err");
     const frag = document.createDocumentFragment();
     const pv = v.state.field(previewField);
     if (pv) {
@@ -88,35 +103,31 @@ class StripeView {
     }
     this.marksEl.replaceChildren(frag);
     this.layoutThumb();
-    this.drawWidget(errors.length);
+    this.drawWidget(errors.length + problems.length);
   }
 
   private drawWidget(count: number): void {
     const w = this.widget;
+    if (completionStatus(this.view.state) === "active" || templateActive(this.view.state)) {
+      // DataGrip pauses the analysis while the completion popup is open or a live template is being filled in
+      w.className = "cm-inspect cm-inspect-paused";
+      w.textContent = "Paused…";
+      return;
+    }
     if (count === 0) {
       w.className = "cm-inspect cm-inspect-ok";
       w.innerHTML = `<span class="cm-inspect-icon">${CHECK}</span>`;
       return;
     }
     w.className = "cm-inspect cm-inspect-err";
-    w.innerHTML = `<span class="cm-inspect-icon">${ERRDOT}</span><span class="cm-inspect-count">${count}</span><button class="cm-inspect-nav" data-dir="-1" title="Previous Error">${UP}</button><button class="cm-inspect-nav" data-dir="1" title="Next Error">${DOWN}</button>`;
+    w.innerHTML = `<span class="cm-inspect-icon">${ERRDOT}</span><span class="cm-inspect-count">${count}</span><button class="cm-inspect-nav" data-dir="-1" title="Previous Problem (Shift+F2)">${UP}</button><button class="cm-inspect-nav" data-dir="1" title="Next Problem (F2)">${DOWN}</button>`;
     w.querySelectorAll("button").forEach((b) =>
       b.addEventListener("mousedown", (ev) => {
         ev.preventDefault();
-        this.jump(Number((b as HTMLElement).dataset.dir));
+        jumpProblem(this.view, Number((b as HTMLElement).dataset.dir) > 0 ? 1 : -1);
+        this.view.focus();
       }),
     );
-  }
-
-  private jump(dir: number): void {
-    const v = this.view;
-    const errs = v.state.field(errorsField).map((e) => errorPos(v, e.statementFrom, e.position)).sort((a, b) => a - b);
-    if (!errs.length) return;
-    const head = v.state.selection.main.head;
-    let target = dir > 0 ? errs.find((p) => p > head) : [...errs].reverse().find((p) => p < head);
-    if (target === undefined) target = dir > 0 ? errs[0] : errs[errs.length - 1];
-    v.dispatch({ selection: EditorSelection.cursor(target), effects: EditorView.scrollIntoView(target, { y: "center" }) });
-    v.focus();
   }
 
   layoutThumb(): void {

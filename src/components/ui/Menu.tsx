@@ -12,6 +12,7 @@ import { Index, Show, createEffect, createSignal, on, onCleanup, type JSX } from
 import { Portal } from "solid-js/web";
 import { actionShortcut, getAction, isActionEnabled } from "../../state/actions";
 import { Icon } from "./Icon";
+import { mnemonicIndex, pruneItems } from "./menu-util";
 
 export type MenuItem =
   | {
@@ -23,10 +24,19 @@ export type MenuItem =
       shortcut?: string;
       /** Small pill after the label, e.g. "New". */
       badge?: string;
+      /**
+       * Mnemonic letter (underlined in the main menu bar's dropdowns; pressing it while that menu is open
+       * activates the item).
+       */
+      mnemonic?: string;
+      /** Registry-backed item that is left out entirely while its action is not registered (feature not built yet). */
+      optional?: boolean;
       enabled?: boolean | (() => boolean);
       checked?: boolean | (() => boolean);
       run?: () => void;
       children?: MenuItem[];
+      /** Small toggle button at the row's end (pin in the "More tool windows" list); clicking it keeps the menu open. */
+      trailing?: { icon: string; selectedIcon?: string; selected?: boolean | (() => boolean); title?: string; run: () => void };
     }
   | { type: "separator" }
   /** Gray section header ("Transaction Mode"). */
@@ -45,6 +55,8 @@ export interface OpenMenuOptions {
   /** List-popup look: 24px rows (combo boxes, "New" popup). Default: 26px menu rows. */
   compact?: boolean;
   minWidth?: number;
+  /** Underline the `mnemonic` letters and let them activate their item (context menus; the bar variant always does). */
+  mnemonics?: boolean;
   /** "bar": dropdown of the main menu bar (narrower insets, full-width separators, like Swing menus). */
   variant?: "bar";
   /** Gap in px between the anchor and the menu (default 2). */
@@ -53,8 +65,14 @@ export interface OpenMenuOptions {
   onClose?: () => void;
   /** Left/Right pressed on the top level without a submenu (menu bar navigation). */
   onHorizontal?: (dir: -1 | 1) => void;
-  /** Index (into `items`) preselected when opening from the keyboard / combo box. */
-  selected?: number;
+  /** Index (into `items`) preselected when opening from the keyboard / combo box; "first" = first enabled item. */
+  selected?: number | "first";
+  /** List popup with a grey number before every item; the digit keys 1-9 pick the item directly. */
+  numbered?: boolean;
+  /** Center the menu in the window (quick-switch popups). */
+  center?: boolean;
+  /** The highlighted row of the top level changed (hover or arrow keys): used for live previews. */
+  onHighlight?: (index: number) => void;
 }
 
 interface Level {
@@ -80,7 +98,8 @@ export function closeMenu(): void {
 
 export const isMenuOpen = () => state() !== null;
 
-export function openMenu(items: MenuItem[], opts: OpenMenuOptions = {}): void {
+export function openMenu(rawItems: MenuItem[], opts: OpenMenuOptions = {}): void {
+  const items = pruneItems(rawItems);
   const prev = state();
   if (prev) {
     setState(null);
@@ -97,7 +116,7 @@ export function openMenu(items: MenuItem[], opts: OpenMenuOptions = {}): void {
     const y = opts.y ?? 0;
     rect = { left: x, right: x, top: y, bottom: y };
   }
-  const idx = opts.selected ?? -1;
+  const idx = opts.selected === "first" ? Math.max(-1, items.findIndex(selectable)) : (opts.selected ?? -1);
   setState({ levels: [{ items, index: idx, rect, anchored: !!opts.anchor, gap: opts.gap ?? 2 }], opts });
 }
 
@@ -109,11 +128,13 @@ interface Resolved {
   icon?: string;
   shortcut?: string;
   badge?: string;
+  mnemonic?: string;
   enabled: boolean;
   checked: boolean;
   hasChildren: boolean;
   children?: MenuItem[];
   run?: () => void;
+  trailing?: { icon: string; title?: string; run: () => void };
 }
 
 function val(v: boolean | (() => boolean) | undefined, dflt: boolean): boolean {
@@ -135,11 +156,17 @@ function resolve(it: MenuItem): Resolved {
     icon: it.icon ?? a?.icon,
     shortcut: it.shortcut ?? actionShortcut(a),
     badge: it.badge,
+    mnemonic: it.mnemonic,
     enabled,
     checked: it.checked !== undefined ? val(it.checked, false) : (a?.checked?.() ?? false),
     hasChildren,
     children: it.children,
     run: it.run ?? (it.action ? () => void a?.run?.() : undefined),
+    trailing: it.trailing && {
+      icon: val(it.trailing.selected, false) ? (it.trailing.selectedIcon ?? it.trailing.icon) : it.trailing.icon,
+      title: it.trailing.title,
+      run: it.trailing.run,
+    },
   };
 }
 
@@ -150,6 +177,13 @@ const selectable = (it: MenuItem) => {
 
 // ---------------------------------------------------------------- host
 
+let hoveredBarItem: HTMLElement | null = null;
+
+/** The element under the pointer, ignoring the menu backdrop. */
+function elementBelow(e: MouseEvent): HTMLElement | undefined {
+  return document.elementsFromPoint(e.clientX, e.clientY).find((el) => !el.classList.contains("dg-menu-backdrop")) as HTMLElement | undefined;
+}
+
 export function MenuHost(): JSX.Element {
   const setLevelIndex = (l: number, i: number) => {
     const s = state();
@@ -157,6 +191,7 @@ export function MenuHost(): JSX.Element {
     const levels = s.levels.slice(0, l + 1);
     levels[l] = { ...levels[l], index: i };
     setState({ ...s, levels });
+    if (l === 0 && s.levels[0].index !== i) s.opts.onHighlight?.(i);
   };
 
   const openSub = (l: number, i: number, rowRect: DOMRect, selectFirst: boolean) => {
@@ -168,7 +203,7 @@ export function MenuHost(): JSX.Element {
     const levels = s.levels.slice(0, l + 1);
     levels[l] = { ...levels[l], index: i };
     if (r && r.hasChildren && r.enabled) {
-      const sub = r.children!;
+      const sub = pruneItems(r.children!);
       // Anchor to the parent *menu* edges (submenus overlap the parent's border by 1px), the row's top.
       const pr = document.querySelectorAll(".dg-menu")[l]?.getBoundingClientRect() ?? rowRect;
       rowRect = new DOMRect(pr.left, rowRect.top, pr.width, rowRect.height);
@@ -260,8 +295,32 @@ export function MenuHost(): JSX.Element {
         else closeMenu();
         break;
       default: {
+        const plain = e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey;
+        // Numbered list popups: 1-9 pick the item directly.
+        if (plain && s.opts.numbered && l === 0 && /^[1-9]$/.test(e.key)) {
+          const real = items.map((it, i) => ({ it, i })).filter((x) => resolve(x.it).kind === "item");
+          const hit = real[Number(e.key) - 1];
+          if (hit && resolve(hit.it).enabled) {
+            setLevelIndex(l, hit.i);
+            activate(l, hit.i);
+          }
+          break;
+        }
+        // Main menu bar dropdowns: the mnemonic letter activates its item.
+        if (plain && (s.opts.variant === "bar" || s.opts.mnemonics)) {
+          const ch = e.key.toLowerCase();
+          const i = items.findIndex((it) => {
+            const r = resolve(it);
+            return r.kind === "item" && r.enabled && r.mnemonic?.toLowerCase() === ch;
+          });
+          if (i >= 0) {
+            setLevelIndex(l, i);
+            activate(l, i);
+            break;
+          }
+        }
         // Type-to-jump to the next item starting with the typed letter.
-        if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        if (plain) {
           const ch = e.key.toLowerCase();
           const n = items.length;
           for (let k = 1; k <= n; k++) {
@@ -294,13 +353,37 @@ export function MenuHost(): JSX.Element {
         <Portal>
           <div
             class="dg-menu-backdrop"
+            onMouseMove={(e) => {
+              // The main menu bar stays live under the backdrop: hovering another title switches the menu.
+              if (s().opts.variant !== "bar") return;
+              const item = elementBelow(e)?.closest<HTMLElement>(".dg-menubar-item");
+              if (item && item !== hoveredBarItem) item.dispatchEvent(new MouseEvent("mouseenter"));
+              hoveredBarItem = item ?? null;
+            }}
             onMouseDown={(e) => {
               e.preventDefault();
+              if (s().opts.variant === "bar") {
+                const item = elementBelow(e)?.closest<HTMLElement>(".dg-menubar-item");
+                if (item) {
+                  // a click on a title: the bar toggles / switches menus itself
+                  item.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 }));
+                  return;
+                }
+              }
               closeMenu();
             }}
             onContextMenu={(e) => {
               e.preventDefault();
+              const { clientX, clientY } = e;
+              const below = elementBelow(e);
               closeMenu();
+              // Like DataGrip: a right click elsewhere closes the menu and opens the context menu of what is under the pointer.
+              if (below && !below.closest(".dg-menubar"))
+                queueMicrotask(() =>
+                  (document.elementFromPoint(clientX, clientY) ?? below).dispatchEvent(
+                    new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX, clientY, button: 2 }),
+                  ),
+                );
             }}
           />
           <Index each={s().levels}>
@@ -346,7 +429,10 @@ function MenuPanel(props: {
     const vh = window.innerHeight;
     let left: number;
     let top: number;
-    if (props.depth > 0) {
+    if (props.depth === 0 && props.opts.center) {
+      left = Math.round((vw - w) / 2);
+      top = Math.round((vh - h) / 2);
+    } else if (props.depth > 0) {
       left = lv.rect.right - 1;
       if (left + w > vw - 4) left = Math.max(4, lv.rect.left - w + 1);
       top = lv.rect.top - 7;
@@ -383,7 +469,11 @@ function MenuPanel(props: {
         "min-width": (props.opts.minWidth ?? 0) + "px",
       }}
       onContextMenu={(e) => e.preventDefault()}
-      onMouseDown={(e) => e.stopPropagation()}
+      onMouseDown={(e) => {
+        // Menus never take the keyboard focus: focus-dependent actions (Edit > Copy) must still see the component the user was in.
+        e.preventDefault();
+        e.stopPropagation();
+      }}
     >
       <Show when={props.opts.title && props.depth === 0}>
         <div class="dg-menu-title">{props.opts.title}</div>
@@ -419,17 +509,42 @@ function MenuPanel(props: {
                 }}
                 onClick={(e) => props.onActivate(i, e.currentTarget)}
               >
-                <span class="dg-menu-icon">
-                  <Show when={r().icon} fallback={<Show when={r().checked}><Icon name="checkmark" /></Show>}>
-                    <Icon name={r().icon} />
+                <Show
+                  when={props.opts.numbered && props.depth === 0}
+                  fallback={
+                    <span class="dg-menu-icon">
+                      <Show when={r().icon} fallback={<Show when={r().checked}><Icon name="checkmark" /></Show>}>
+                        <Icon name={r().icon} />
+                      </Show>
+                    </span>
+                  }
+                >
+                  <span class="dg-menu-number">{numberOf(props.level().items, i)}</span>
+                </Show>
+                <span class="dg-menu-label">
+                  <Show when={(props.opts.variant === "bar" || props.opts.mnemonics) && r().mnemonic} fallback={r().label}>
+                    <Mnemonic label={r().label} letter={r().mnemonic!} />
                   </Show>
                 </span>
-                <span class="dg-menu-label">{r().label}</span>
                 <Show when={r().badge}>
                   <span class="dg-menu-badge">{r().badge}</span>
                 </Show>
                 <Show when={r().shortcut}>
                   <span class="dg-menu-shortcut">{r().shortcut}</span>
+                </Show>
+                <Show when={r().trailing}>
+                  {(t) => (
+                    <span
+                      class="dg-menu-trailing"
+                      title={t().title}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        t().run();
+                      }}
+                    >
+                      <Icon name={t().icon} />
+                    </span>
+                  )}
                 </Show>
                 <Show when={r().hasChildren}>
                   <span class="dg-menu-arrow">
@@ -442,5 +557,24 @@ function MenuPanel(props: {
         }}
       </Index>
     </div>
+  );
+}
+
+/** 1-based position of `items[i]` among the real (non-separator) rows of a numbered popup. */
+function numberOf(items: MenuItem[], i: number): number {
+  let n = 0;
+  for (let k = 0; k <= i; k++) if (resolve(items[k]).kind === "item") n++;
+  return n;
+}
+
+/** Label with the mnemonic letter underlined. */
+export function Mnemonic(props: { label: string; letter: string }): JSX.Element {
+  const at = () => mnemonicIndex(props.label, props.letter);
+  return (
+    <Show when={at() >= 0} fallback={props.label}>
+      {props.label.slice(0, at())}
+      <u>{props.label[at()]}</u>
+      {props.label.slice(at() + 1)}
+    </Show>
   );
 }

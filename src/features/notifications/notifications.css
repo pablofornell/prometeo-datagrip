@@ -1,0 +1,85 @@
+/* Notifications tool window and the status bar bell. */
+.dg-ntf-head {
+  display: flex;
+  flex: 1;
+  justify-content: flex-end;
+  gap: 12px;
+  padding-right: 4px;
+}
+.dg-ntf-btn {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--dg-link);
+  font: inherit;
+  cursor: default;
+}
+.dg-ntf-btn:hover:not(:disabled) {
+  text-decoration: underline;
+}
+.dg-ntf-btn:disabled {
+  color: var(--dg-text-disabled);
+}
+
+.dg-ntf {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+  outline: none;
+}
+.dg-ntf-row {
+  display: flex;
+  gap: 8px;
+  padding: 8px 12px 9px 12px;
+  line-height: 17px;
+  border-bottom: 1px solid var(--dg-separator);
+}
+.dg-ntf-row.dg-ntf-error {
+  background: var(--dg-notification-error-bg);
+}
+.dg-ntf-row.dg-ntf-warning {
+  background: var(--dg-notification-warning-bg);
+}
+.dg-ntf-icon {
+  flex: none;
+  margin-top: 1px;
+}
+.dg-ntf-main {
+  flex: 1;
+  min-width: 0;
+}
+.dg-ntf-title {
+  font-weight: var(--dg-font-ui-weight-title);
+}
+.dg-ntf-row:not(.dg-ntf-unread) .dg-ntf-title {
+  font-weight: normal;
+}
+.dg-ntf-text {
+  overflow-wrap: anywhere;
+}
+.dg-ntf-links {
+  display: flex;
+  gap: 12px;
+  margin-top: 2px;
+}
+.dg-ntf-time {
+  flex: none;
+  color: var(--dg-text-secondary);
+}
+
+/* bell at the far right of the status bar */
+.dg-status-bell {
+  position: relative;
+  cursor: default;
+}
+.dg-status-bell .dg-status-dot {
+  position: absolute;
+  top: 1px;
+  right: 3px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--dg-accent);
+}

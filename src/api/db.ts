@@ -13,10 +13,17 @@ import type {
   Driver,
   ExecEvent,
   ExecOptions,
+  ExplainPlan,
   ExportFormat,
   ExportOptions,
   FetchedRows,
   HistoryEntry,
+  ImportFormat,
+  ImportPreview,
+  ImportProgress,
+  ImportRequest,
+  ImportResult,
+  ImportSource,
   ObjectRef,
   ResultSet,
   RowChange,
@@ -98,7 +105,8 @@ export const sessionState = (sessionId: string): Promise<SessionState> =>
 export const introspect = (dsId: string, path: string[], showSystem = false): Promise<TreeNode[]> =>
   invoke("introspect", { dsId, path, showSystem });
 
-export const getDdl = (dsId: string, object: ObjectRef): Promise<string> => invoke("get_ddl", { dsId, object });
+/** `unqualified`: names of the object's own schema without the schema (the DDL view); scripts keep them qualified. */
+export const getDdl = (dsId: string, object: ObjectRef, unqualified = false): Promise<string> => invoke("get_ddl", { dsId, object, unqualified });
 
 /** Flat tables/views with columns, for completion. `schema` omitted = every non-system schema. */
 export const schemaSnapshot = (dsId: string, schema?: string | null): Promise<SnapshotObject[]> =>
@@ -208,6 +216,16 @@ export const cancelExecution = (executionId: string): Promise<void> => invoke("c
 
 export const closeExecution = (executionId: string): Promise<void> => invoke("close_execution", { executionId });
 
+/**
+ * Explain Plan (`analyze: false`) / Explain Analyse (`analyze: true`, runs the statement) of the first statement of `sql`
+ * on a console session, as a tree. Not recorded in the query history. SQLite has no analyse.
+ */
+export const explainPlan = (sessionId: string, sql: string, analyze: boolean): Promise<ExplainPlan> =>
+  invoke("explain_plan", { sessionId, sql, analyze });
+
+/** Stops the statement running on a session (what an `explainPlan` runs has no execution id). */
+export const cancelSession = (sessionId: string): Promise<void> => invoke("cancel_session", { sessionId });
+
 // ---------------------------------------------------------------- table data / editing
 
 export const tableData = (dsId: string, table: ObjectRef, request: TableDataRequest = {}): Promise<ResultSet> =>
@@ -231,6 +249,8 @@ export const defaultExportOptions = (driver: Driver = "postgres"): ExportOptions
   tableName: null,
   dialect: driver,
   rowsPerInsert: 1,
+  transpose: false,
+  rowHeader: false,
 });
 
 /**
@@ -241,6 +261,26 @@ export const defaultExportOptions = (driver: Driver = "postgres"): ExportOptions
  */
 export const chooseExportPath = (suggestedName?: string, format?: ExportFormat): Promise<string | null> =>
   invoke("choose_export_path", { suggestedName: suggestedName ?? null, format: format ?? null });
+
+/** `<home>/<file name>`: the default "Output file" of the Export Data dialog (`null`: the home folder is unknown). */
+export const defaultExportPath = (fileName: string): Promise<string | null> => invoke("default_export_path", { fileName });
+
+/**
+ * Lets the backend write the typed `path` without the save dialog. Granted only for a NEW file under the home
+ * folder (no hidden folders, symlinks resolved) named with the extension of `format`: resolves `false` otherwise, and the export has to go through `chooseExportPath`.
+ */
+export const approveExportPath = (path: string, format?: ExportFormat): Promise<boolean> =>
+  invoke("approve_export_path", { path, format: format ?? null });
+
+/**
+ * The target of the Export Data dialog: `path` is exported straight away when the backend approves it, else
+ * (an existing file, outside the home folder) the save dialog opens with its file name and decides.
+ * Resolves the path written, or `null` when the user cancels that dialog.
+ */
+export async function resolveExportPath(path: string, format: ExportFormat): Promise<string | null> {
+  if (await approveExportPath(path, format)) return path;
+  return chooseExportPath(path.split("/").pop() || undefined, format);
+}
 
 /** `chooseExportPath` + `exportQuery`. Resolves `null` when the user cancels the dialog. */
 export async function exportQueryToFile(
@@ -284,6 +324,47 @@ export const exportResult = (result: Pick<ResultSet, "columns" | "rows">, option
 /** Format an in-memory result set as text (for the clipboard). */
 export const exportToString = (result: Pick<ResultSet, "columns" | "rows">, options: ExportOptions): Promise<string> =>
   invoke("export_to_string", { result: { hasMore: false, totalHint: null, ...result }, options });
+
+// ---------------------------------------------------------------- import
+
+export const defaultImportFormat = (): ImportFormat => ({
+  encoding: "UTF-8",
+  delimiter: ",",
+  quote: '"',
+  header: true,
+  firstColumnHeader: false,
+  trim: false,
+  nullText: "",
+});
+
+/**
+ * Open the native Open dialog FROM THE BACKEND and resolve with the chosen file (`null` = cancelled). Only a file
+ * returned here is read by `importPreview` / `importFile`.
+ */
+export const chooseImportFile = (): Promise<ImportSource | null> => invoke("choose_import_file");
+
+/** Column names, the first `limit` rows and an inferred type per column. `path` comes from `chooseImportFile`. */
+export const importPreview = (path: string, format: ImportFormat, limit = 10): Promise<ImportPreview> =>
+  invoke("import_preview", { path, format, limit });
+
+/**
+ * Stream the file into the table in ONE transaction. `importId` (any unique string) lets `cancelImport` roll it
+ * back; `onProgress` is called after every batch. Resolves with the outcome (rows that failed are in the result,
+ * not a rejection); rejects when the import could not run at all.
+ */
+export function importFile(
+  dsId: string,
+  importId: string,
+  request: ImportRequest,
+  onProgress?: (p: ImportProgress) => void,
+): Promise<ImportResult> {
+  const sink: { onmessage: (p: ImportProgress) => void } = isTauri() ? new Channel<ImportProgress>() : { onmessage: () => {} };
+  sink.onmessage = (p) => onProgress?.(p);
+  return invoke("import_file", { dsId, importId, request, onProgress: sink });
+}
+
+/** Roll a running import back. No-op when it already ended. */
+export const cancelImport = (importId: string): Promise<void> => invoke("cancel_import", { importId });
 
 // ---------------------------------------------------------------- SQL splitter (same as the backend)
 
@@ -334,3 +415,42 @@ export const deleteConsole = (dsId: string, name: string): Promise<void> => invo
 
 export const renameConsole = (dsId: string, from: string, to: string): Promise<void> =>
   invoke("rename_console", { dsId, from, to });
+
+// ---------------------------------------------------------------- files (scratches, opened .sql files, attached folders)
+// The backend only reads / writes scratch files, files the user picked in `chooseOpenFiles` and files below a
+// folder picked in `chooseAttachFolder`.
+
+export interface FileInfo {
+  path: string;
+  name: string;
+  isDir: boolean;
+  size: number;
+  /** Milliseconds since the epoch. */
+  mtimeMs: number;
+}
+export interface FileContent {
+  text: string;
+  mtimeMs: number;
+}
+export interface FileRoots {
+  files: FileInfo[];
+  folders: FileInfo[];
+}
+
+/** Native "Open" dialog (multi-select); resolves to the chosen files (empty when cancelled). */
+export const chooseOpenFiles = (): Promise<FileInfo[]> => invoke("choose_open_files");
+/** Native folder dialog; the folder is attached to the Files window. `null` when cancelled. */
+export const chooseAttachFolder = (): Promise<FileInfo | null> => invoke("choose_attach_folder");
+/** Forgets an opened file / attached folder (the file on disk stays). */
+export const detachFileRoot = (path: string): Promise<void> => invoke("detach_file_root", { path });
+export const fileRoots = (): Promise<FileRoots> => invoke("file_roots");
+export const readFile = (path: string): Promise<FileContent> => invoke("read_file", { path });
+/** Returns the new mtime. With `expectedMtimeMs` the write is refused when the file changed on disk since. */
+export const writeFile = (path: string, text: string, expectedMtimeMs?: number | null): Promise<number> =>
+  invoke("write_file", { path, text, expectedMtimeMs: expectedMtimeMs ?? null });
+export const listDir = (path: string): Promise<FileInfo[]> => invoke("list_dir", { path });
+export const listScratches = (): Promise<FileInfo[]> => invoke("list_scratches");
+/** Creates an empty `scratch.sql` (then `scratch_1.sql`, ...). */
+export const createScratch = (): Promise<FileInfo> => invoke("create_scratch");
+export const deleteScratch = (path: string): Promise<void> => invoke("delete_scratch", { path });
+export const renameScratch = (path: string, to: string): Promise<FileInfo> => invoke("rename_scratch", { path, to });

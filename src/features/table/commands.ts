@@ -6,6 +6,8 @@ import { dsInfo, loadDataSources } from "./ds";
 export interface ObjectTabData {
   dsId: string;
   objectRef: ObjectRef;
+  /** Initial WHERE of a table tab (opened by `Go To` on a foreign key). */
+  where?: string;
 }
 
 const suffix = (ref: ObjectRef) => `${ref.schema ?? ""}.${ref.name}${ref.signature != null ? `(${ref.signature})` : ""}`;
@@ -23,14 +25,16 @@ export function iconOfKind(kind: NodeKind): string {
 export const tableTabId = (dsId: string, ref: ObjectRef) => `table:${dsId}:${suffix(ref)}`;
 export const ddlTabId = (dsId: string, ref: ObjectRef) => `ddl:${dsId}:${suffix(ref)}`;
 
-export async function openTableTab(dsId: string, ref: ObjectRef): Promise<void> {
+export async function openTableTab(dsId: string, ref: ObjectRef, opts: { where?: string } = {}): Promise<void> {
   await loadDataSources();
+  const where = opts.where?.trim() || undefined;
   openTab({
-    id: tableTabId(dsId, ref),
+    // a filtered tab is its own tab: the plain one of the table stays as it is
+    id: where ? `${tableTabId(dsId, ref)}?${where}` : tableTabId(dsId, ref),
     kind: "table",
     title: `${ref.name} [${dsInfo(dsId)?.name ?? dsId}]`,
     icon: iconOfKind(ref.kind),
-    data: { dsId, objectRef: ref } satisfies ObjectTabData,
+    data: { dsId, objectRef: ref, ...(where ? { where } : {}) } satisfies ObjectTabData,
   });
 }
 

@@ -182,3 +182,7 @@
 
 /* the shared match mark is white-on-yellow: unreadable on the light popup */
 :root[data-theme="light"] .dgn-popup mark.dg-search-match { color: inherit; }
+
+/* ---- "Include non-project items" checkbox and the "Type / to see commands" hint */
+.dgn-include { display: flex; align-items: center; margin-right: 4px; white-space: nowrap; }
+.dgn-hint { flex: none; margin-left: 8px; color: var(--dg-text-secondary); pointer-events: none; }

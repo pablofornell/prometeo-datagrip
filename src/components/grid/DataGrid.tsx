@@ -21,9 +21,11 @@ import {
   untrack,
   type JSX,
 } from "solid-js";
+import { Portal } from "solid-js/web";
 import { settings } from "../../state/settings";
-import { computeAggregates, type Aggregates } from "./aggregates";
+import { computeAggregates, formatStat, type Aggregates } from "./aggregates";
 import { COPY_FORMAT_LABELS, formatRows, type CopyColumn } from "./copy";
+import { DateEditor } from "./DateEditor";
 import { DEFAULT_FIND_OPTIONS, compileQuery, findNextMatch, type FindOptions } from "./find";
 import { FindBar } from "./FindBar";
 import { LocalFilterPopup } from "./LocalFilterPopup";
@@ -42,6 +44,7 @@ import {
   editText,
   isBinaryCell,
   isEditableKind,
+  isExprCell,
   isRightAligned,
   parseEdit,
   sortKey,
@@ -57,6 +60,7 @@ import type {
   DataGridApi,
   GridChange,
   GridColumn,
+  GridNavigation,
   GridViewState,
   SelRange,
   SideTab,
@@ -94,6 +98,8 @@ export interface ColumnsState {
   order: number[];
   hidden: number[];
   widths: number[];
+  /** Pinned (frozen) column indexes. */
+  pinned?: number[];
 }
 
 export interface DataGridProps {
@@ -131,6 +137,21 @@ export interface DataGridProps {
   onColumnFilter?: (column: number, anchor: DOMRect) => void;
   onSelectionChange?: (info: SelectionInfo) => void;
   onColumnsChange?: (state: ColumnsState) => void;
+  /** Order / hidden / widths / pinned to restore when the columns are (re)loaded (kept per result tab by the host). */
+  initialColumns?: ColumnsState;
+  /** Foreign key navigation (`Go To`, F4). */
+  navigation?: GridNavigation;
+  /** Name of the data extractor for the cell menu entry `Change Data Extractor (CSV)`; omit both to hide it. */
+  extractorLabel?: string;
+  onChangeExtractor?: (at: { x: number; y: number }) => void;
+  /** `Export Table to Clipboard` of the cell menu; omitted = no entry. */
+  onExportToClipboard?: () => void;
+  /** SQL dialect, for the expressions offered by `Set SQL Expression`. */
+  dialect?: "postgres" | "mysql" | "sqlite";
+  /** Extra scroll room below the last row (the floating paging pill). */
+  bottomPad?: number;
+  /** Names of the columns that hold a foreign key (their icon shows the key); read reactively, no grid reset. */
+  fkColumns?: () => ReadonlySet<string>;
   /** Gutter / header numbers start after this many rows (paged table editor: `offset + index + 1`). */
   rowNumberOffset?: number;
   /** Reports transpose / find / record view / local filter / hidden columns, to keep toolbar toggles in sync. */
@@ -216,10 +237,12 @@ export function DataGrid(props: DataGridProps): JSX.Element {
   });
 
   // ---- columns ----
+  const iconOf = (c: GridColumn | undefined) => iconClass(c && !c.isFk && props.fkColumns?.().has(c.name) ? { ...c, isFk: true } : c);
   const kinds = createMemo<ColumnKind[]>(() => props.columns.map((c) => classifyType(c.typeName)));
   const [widths, setWidths] = createSignal<number[]>([]);
   const [order, setOrder] = createSignal<number[]>([]);
   const [hidden, setHidden] = createSignal<Set<number>>(new Set());
+  const [pinned, setPinned] = createSignal<Set<number>>(new Set());
   const [internalSort, setInternalSort] = createSignal<SortSpec[]>([]);
   const sortState = () => props.sort ?? internalSort();
 
@@ -248,8 +271,17 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     const h = hidden();
     const o = order();
     const base = o.length === n ? o : props.columns.map((_, i) => i);
-    return base.filter((c) => !h.has(c));
+    const list = base.filter((c) => !h.has(c));
+    const p = pinned();
+    return p.size ? [...list.filter((c) => p.has(c)), ...list.filter((c) => !p.has(c))] : list;
   });
+  /** Pinned (frozen) columns lead the visible ones; the transposed layout has none. */
+  const nPinned = createMemo(() => {
+    if (T()) return 0;
+    const p = pinned();
+    return p.size ? vis().filter((c) => p.has(c)).length : 0;
+  });
+  const pinW = () => colX()[nPinned()] ?? 0;
   const widthOf = (ci: number) => widths()[ci] ?? 100;
   const colX = createMemo(() => {
     const v = vis();
@@ -430,7 +462,7 @@ export function DataGrid(props: DataGridProps): JSX.Element {
       for (let r = a; r <= b; r++) out.push(r);
       return out;
     }
-    return vis().slice(a, b + 1);
+    return vis().slice(Math.max(a, nPinned()), b + 1);
   });
 
   /** Value shown in a display cell (pending edits applied). */
@@ -455,14 +487,16 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     }
     return `<div class="c${right ? " r" : ""}${cls}" style="left:${x}px;width:${w}px">${esc(text)}</div>`;
   }
-  function rowHtml(r: number): string {
+  /** `pin`: the pinned columns only (drawn in the sticky layer); otherwise the windowed, unpinned ones. */
+  function rowHtml(r: number, pin = false): string {
     pending.version();
     touch(props.version);
     const nt = settings.gridNullText;
     const fm = matcher();
     const X = colX();
     const v = vis();
-    const [c0, c1] = colWin();
+    const np = nPinned();
+    const [c0, c1] = pin ? [0, np - 1] : [Math.max(colWin()[0], np), colWin()[1]];
     const k = kinds();
     const ni = pending.insertedCount;
     let html = "";
@@ -541,8 +575,12 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     vi: number;
     ci: number;
     text: string;
+    /** The text is a raw SQL expression (`Edit as SQL Expression`), stored as `{ $expr }`. */
+    expr?: boolean;
   }
   const [edit, setEdit] = createSignal<EditState | null>(null);
+  /** The true / false / default list under a boolean cell. */
+  const [boolPick, setBoolPick] = createSignal<{ r: number; vi: number; ci: number } | null>(null);
   const [valueEd, setValueEd] = createSignal<{ r: number; vi: number; ci: number; text: string; readOnly: boolean } | null>(null);
 
 
@@ -557,15 +595,19 @@ export function DataGrid(props: DataGridProps): JSX.Element {
       () => props.columns,
       () => {
         batch(() => {
-          setWidths(untrack(initialWidths));
-          setOrder(props.columns.map((_, i) => i));
-          setHidden(new Set<number>());
+          const keep = untrack(() => props.initialColumns);
+          const fits = !!keep && keep.order.length === props.columns.length && keep.widths.length === props.columns.length;
+          setWidths(fits ? keep!.widths.slice() : untrack(initialWidths));
+          setOrder(fits ? keep!.order.slice() : props.columns.map((_, i) => i));
+          setHidden(new Set<number>(fits ? keep!.hidden : []));
+          setPinned(new Set<number>(fits ? (keep!.pinned ?? []) : []));
           setInternalSort([]);
           setColFilters(new Map());
           setLfPopup(null);
           setManage(null);
           setSelection([], null);
           setEdit(null);
+          setBoolPick(null);
           setValueEd(null);
           pending.revertAll();
         });
@@ -640,8 +682,11 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     const left = X[sp.h] ?? 0;
     const right = X[sp.h + 1] ?? left;
     const viewLeft = logicalLeft();
-    if (left < viewLeft) scroller.scrollLeft = scrollPos(left, totalW(), dataW);
-    else if (right > viewLeft + dataW) scroller.scrollLeft = scrollPos(Math.min(left, right - dataW), totalW(), dataW);
+    // pinned columns are always in view; the others scroll clear of the pinned block
+    const pw = !T() && sp.h >= nPinned() ? pinW() : 0;
+    if (!T() && sp.h < nPinned()) return;
+    if (left - pw < viewLeft) scroller.scrollLeft = scrollPos(left - pw, totalW(), dataW);
+    else if (right > viewLeft + dataW) scroller.scrollLeft = scrollPos(Math.min(left - pw, right - dataW), totalW(), dataW);
   }
 
   // underlay rectangles (logical blocks mapped through the active layout)
@@ -767,8 +812,11 @@ export function DataGrid(props: DataGridProps): JSX.Element {
 
   function toData(e: { clientX: number; clientY: number }) {
     const rect = scroller.getBoundingClientRect();
+    // the pinned block does not scroll: a pointer over it hits those columns whatever the scroll offset
+    const vx = e.clientX - rect.left - gutterW();
+    const onPin = nPinned() > 0 && vx >= 0 && vx < pinW();
     return {
-      x: e.clientX - rect.left + logicalLeft() - gutterW(),
+      x: onPin ? vx : vx + logicalLeft(),
       y: e.clientY - rect.top + logicalTop() - HEADER_H,
       inGutter: e.clientX - rect.left < gutterW(),
       inHeader: e.clientY - rect.top < HEADER_H,
@@ -835,7 +883,7 @@ export function DataGrid(props: DataGridProps): JSX.Element {
 
   function onBodyMouseDown(e: MouseEvent) {
     if (e.button !== 0 && e.button !== 2) return;
-    if ((e.target as Element).closest(".dgg-header, .dgg-editor")) return;
+    if ((e.target as Element).closest(".dgg-header, .dgg-ew, .dgg-bool")) return;
     if (isScrollbar(e) || total() === 0 || nCols() === 0) return;
     const p = toData(e);
     if (p.inHeader) return;
@@ -885,7 +933,7 @@ export function DataGrid(props: DataGridProps): JSX.Element {
   }
 
   function onBodyDblClick(e: MouseEvent) {
-    if ((e.target as Element).closest(".dgg-header, .dgg-editor") || isScrollbar(e)) return;
+    if ((e.target as Element).closest(".dgg-header, .dgg-ew, .dgg-bool") || isScrollbar(e)) return;
     const p = toData(e);
     if (p.inHeader || p.inGutter) return;
     const cell = cellAtPoint(p);
@@ -905,10 +953,8 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     root.focus({ preventScroll: true });
     const vi = visPos().get(ci)!;
     const mod = e.ctrlKey || e.metaKey;
-    if (e.button === 2) {
-      if (!colSelectedFully(vi)) selectCols(vi, vi, false);
-      return;
-    }
+    // right-click only opens the menu: the selection stays as it is
+    if (e.button === 2) return;
     if (e.shiftKey && active()) selectCols(active()!.c, vi, false, { r: active()!.r, c: vi });
     else if (mod) selectCols(vi, vi, true);
     else selectCols(vi, vi, false);
@@ -961,7 +1007,51 @@ export function DataGrid(props: DataGridProps): JSX.Element {
   }
 
   function emitColumns() {
-    props.onColumnsChange?.({ order: order(), hidden: [...hidden()], widths: widths() });
+    props.onColumnsChange?.({ order: order(), hidden: [...hidden()], widths: widths(), pinned: [...pinned()] });
+  }
+  function pinColumns(cis: number[]) {
+    batch(() => {
+      setPinned((p) => new Set([...p, ...cis]));
+      setSelection([], null);
+    });
+    if (scroller) scroller.scrollLeft = 0;
+    emitColumns();
+  }
+  function unpinColumn(ci: number) {
+    batch(() => {
+      setPinned((p) => {
+        const n = new Set(p);
+        n.delete(ci);
+        return n;
+      });
+      setSelection([], null);
+    });
+    emitColumns();
+  }
+  /** `Hide Other Columns`. */
+  function hideOthers(ci: number) {
+    const keep = new Set<number>([ci]);
+    setHiddenSet(new Set(props.columns.map((_, i) => i).filter((c) => !keep.has(c))));
+  }
+  /** `Fit Columns to Window`: the visible columns share the data width in proportion to their widths. */
+  function fitToWindow() {
+    const v = vis();
+    const w = widths();
+    const sum = v.reduce((a, c) => a + (w[c] ?? 100), 0);
+    const avail = scroller ? scroller.clientWidth - gutterW() : 0;
+    if (!sum || avail <= 0) return;
+    const k = avail / sum;
+    setWidths((arr) => {
+      const a = arr.slice();
+      for (const c of v) a[c] = Math.max(MIN_COL_W, Math.floor((arr[c] ?? 100) * k));
+      return a;
+    });
+    emitColumns();
+  }
+  /** `Reset Columns Width`: back to the widths computed from header and content. */
+  function resetWidths() {
+    setWidths(untrack(initialWidths));
+    emitColumns();
   }
   function moveColumn(ci: number, toBoundary: number) {
     const v = vis();
@@ -1047,6 +1137,12 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     else applySort(cur.filter((_, j) => j !== i));
   }
   const clearSort = () => applySort([]);
+  /** `Add to ORDER BY`: the column joins the sort (or changes direction in it). */
+  function addSort(ci: number, dir: "asc" | "desc") {
+    const cur = sortState();
+    if (cur.some((x) => x.col === ci)) applySort(cur.map((x) => (x.col === ci ? { col: ci, dir } : x)));
+    else applySort([...cur, { col: ci, dir }]);
+  }
 
   // ---- editing ----
   function canEditCell(r: number, ci: number): boolean {
@@ -1057,14 +1153,34 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     return true;
   }
 
-  function startEdit(initial?: string) {
+  function startEdit(initial?: string, expr = false) {
     const a = active();
-    if (!a || edit()) return;
+    if (!a || edit() || boolPick()) return;
     const ci = vis()[a.c];
     if (!canEditCell(a.r, ci)) return;
-    const text = initial !== undefined ? initial : editText(cellValue(a.r, ci));
-    setEdit({ r: a.r, vi: a.c, ci, text });
     ensureVisible(a.r, a.c);
+    // a boolean is picked from a list (typing still opens the text field)
+    if (kinds()[ci] === "bool" && initial === undefined && !expr) {
+      setBoolPick({ r: a.r, vi: a.c, ci });
+      return;
+    }
+    const cur = cellValue(a.r, ci);
+    const text = initial !== undefined ? initial : expr ? (isExprCell(cur) ? cur.$expr : "") : editText(cur);
+    setEdit({ r: a.r, vi: a.c, ci, text, expr });
+  }
+  function pickBool(b: { r: number; ci: number }, v: boolean | "default") {
+    setBoolPick(null);
+    root.focus({ preventScroll: true });
+    applyValue(b.r, b.ci, v === "default" ? DEFAULT_VALUE : v);
+  }
+  /** Space on a boolean cell flips it (NULL becomes true). */
+  function toggleBool(): boolean {
+    const a = active();
+    if (!a || ranges().length !== 1) return false;
+    const ci = vis()[a.c];
+    if (kinds()[ci] !== "bool" || !canEditCell(a.r, ci)) return false;
+    applyValue(a.r, ci, cellValue(a.r, ci) !== true);
+    return true;
   }
 
   function applyValue(r: number, ci: number, v: Cell) {
@@ -1083,6 +1199,11 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     if (refocus) root.focus({ preventScroll: true });
     const kind = kinds()[ed.ci];
     const cur = cellValue(ed.r, ed.ci);
+    if (ed.expr) {
+      const e = text.trim();
+      if (e && !(isExprCell(cur) && cur.$expr === e)) applyValue(ed.r, ed.ci, { $expr: e });
+      return;
+    }
     if (text === editText(cur)) return; // unchanged
     applyValue(ed.r, ed.ci, parseEdit(text, kind));
   }
@@ -1179,6 +1300,25 @@ export function DataGrid(props: DataGridProps): JSX.Element {
   }
   const setNull = () => setSelectedCells(null);
   const setDefault = () => setSelectedCells(DEFAULT_VALUE);
+  const setExpression = (e: string) => setSelectedCells({ $expr: e });
+  /** `Load File…`: the text of a chosen file goes into the active cell. */
+  function loadFile() {
+    const a = active();
+    if (!a) return;
+    const { r } = a;
+    const ci = vis()[a.c];
+    const input = document.createElement("input");
+    input.type = "file";
+    input.style.display = "none";
+    input.onchange = () => {
+      const f = input.files?.[0];
+      input.remove();
+      if (f) void f.text().then((t) => applyValue(r, ci, t));
+    };
+    input.oncancel = () => input.remove();
+    document.body.appendChild(input);
+    input.click();
+  }
 
   async function submit() {
     if (pending.isEmpty() || !props.onSubmit) return;
@@ -1320,7 +1460,7 @@ export function DataGrid(props: DataGridProps): JSX.Element {
   }
 
   function onKeyDown(e: KeyboardEvent) {
-    if ((e.target as HTMLElement).closest?.(".dgg-editor, .dgg-ve, .dgg-menu, .dgg-find, .dgg-side")) return;
+    if ((e.target as HTMLElement).closest?.(".dgg-ew, .dgg-bool, .dgg-ve, .dgg-menu, .dgg-find, .dgg-side")) return;
     const mod = e.ctrlKey || e.metaKey;
     const k = e.key;
     const alt = e.altKey;
@@ -1342,6 +1482,18 @@ export function DataGrid(props: DataGridProps): JSX.Element {
         const t = tabTarget(a.r, a.c, shift);
         if (t) selectCell(t.r, t.c);
       }
+    } else if ((k === "ArrowUp" || k === "ArrowDown") && alt && shift && !mod) {
+      const ci = activeCi();
+      if (ci !== null) applySort([{ col: ci, dir: k === "ArrowUp" ? "asc" : "desc" }]);
+    } else if (k === "Backspace" && mod && alt && shift) clearSort();
+    else if (k === "ArrowUp" && mod && alt && shift) resetWidths();
+    else if (k === "F4" && !mod && !alt && !shift) {
+      if (!gotoReferenced()) handled = false;
+    } else if (k.toLowerCase() === "c" && mod && shift && !alt) copyAggregation();
+    else if (k.toLowerCase() === "q" && mod && !alt && !shift) openDoc();
+    else if (k.toLowerCase() === "w" && mod && !alt && !shift) {
+      const a = active();
+      if (a) selectCols(a.c, a.c, false);
     } else if (k === "Enter" && mod && shift && !alt) toggleRecordView();
     else if (k === "F12" && mod) openManageColumns();
     else if (k.toLowerCase() === "f" && mod && !alt && !shift) openFind();
@@ -1368,6 +1520,8 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     } else if (k === " " && shift) {
       const a = active();
       if (a) selectRows(a.r, a.r, false);
+    } else if (k === " " && !mod && !alt && toggleBool()) {
+      /* flipped */
     } else if (k === "F5" && mod) props.onReload?.();
     else if (k.length === 1 && !mod && !alt && props.editable) {
       startEdit(k);
@@ -1380,7 +1534,11 @@ export function DataGrid(props: DataGridProps): JSX.Element {
   }
 
   // ---- context menu ----
-  const [menu, setMenu] = createSignal<{ x: number; y: number; items: MenuItem[] } | null>(null);
+  const [menu, setMenu] = createSignal<{ x: number; y: number; items: () => MenuItem[]; preselect?: boolean } | null>(null);
+  /** Where the menu was opened (menu entries that open a popup anchor it there; the menu is closed by then). */
+  let menuPt = { x: 0, y: 0 };
+  /** Quick Documentation of the column of the active cell. */
+  const [doc, setDoc] = createSignal<{ x: number; y: number; ci: number } | null>(null);
 
   function copyAsItems(): MenuItem[] {
     return (["tsv", "csv", "json", "sql", "markdown"] as CopyFormat[]).map((f) => ({
@@ -1389,83 +1547,186 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     }));
   }
 
+  /** Values of the record of display row `r` by column name (what the host builds the target's WHERE from). */
+  function recordOf(r: number): Record<string, Cell> {
+    const rec: Record<string, Cell> = {};
+    props.columns.forEach((c, ci) => (rec[c.name] = cellValue(r, ci)));
+    return rec;
+  }
+  /** F4 / `Go To > Referenced Row`: opens the row the active cell's foreign key points to. False when it has none. */
+  function gotoReferenced(): boolean {
+    const a = active();
+    const nav = props.navigation;
+    if (!a || !nav || a.r >= total()) return false;
+    const rec = recordOf(a.r);
+    const t = nav.referenced(props.columns[vis()[a.c]].name).find((x) => !x.enabled || x.enabled(rec));
+    if (!t) return false;
+    t.open(rec);
+    return true;
+  }
+  /** `Go To` submenu of the active cell, null when the host gives no navigation. */
+  function goToItem(): MenuItem | null {
+    const nav = props.navigation;
+    const a = active();
+    if (!nav) return null;
+    if (!a || a.r >= total()) return { label: "Go To", disabled: true };
+    const col = props.columns[vis()[a.c]].name;
+    const rec = recordOf(a.r);
+    const target = (t: { label: string; open: (r: Record<string, Cell>) => void; enabled?: (r: Record<string, Cell>) => boolean }, prefix = ""): MenuItem => ({
+      label: prefix + t.label,
+      disabled: t.enabled ? !t.enabled(rec) : false,
+      onSelect: () => t.open(rec),
+    });
+    const refs = nav.referenced(col);
+    const rels = nav.related(col);
+    const items: MenuItem[] = [];
+    if (refs.length === 1) items.push({ ...target(refs[0], "Referenced Row: "), shortcut: "F4" });
+    else if (refs.length > 1) items.push({ label: "Referenced Row", submenu: refs.map((t) => target(t)) });
+    items.push(
+      rels.length
+        ? { label: "Related Rows", submenu: rels.map((t) => target(t)) }
+        : { label: nav.loading?.() ? "Related Rows (loading...)" : "Related Rows", disabled: true },
+    );
+    return { label: "Go To", submenu: items };
+  }
+
+  /** Sum of the selected numbers to the clipboard (`Copy Aggregation Result (SUM)`). */
+  function copyAggregation() {
+    const g = aggregates();
+    if (g.countNums > 0) writeClipboard(formatStat(g.sum), "tsv");
+  }
+  function openDoc() {
+    const a = active();
+    if (!a) return;
+    const r = scroller.getBoundingClientRect();
+    const X = hX();
+    const { v, h } = toScreen(T(), a.r, a.c);
+    setDoc({ x: Math.min(window.innerWidth - 320, r.left + gutterW() + (X[h] ?? 0) - logicalLeft()), y: r.top + HEADER_H + (v + 1) * ROW_H - logicalTop() + 2, ci: vis()[a.c] });
+  }
+
+  /** Expressions `Set SQL Expression` offers for the column of the active cell. */
+  function expressionChoices(ci: number): string[] {
+    const k = kinds()[ci];
+    const lite = props.dialect === "sqlite";
+    if (k === "datetime") return lite ? ["current_timestamp"] : ["now()", "current_timestamp"];
+    if (k === "date") return lite ? ["current_date"] : ["current_date", "now()"];
+    if (k === "time") return ["current_time"];
+    return [];
+  }
+
   function bodyMenu(): MenuItem[] {
+    pending.version();
     const a = active();
     const has = !!a;
     const ed = !!props.editable;
-    const cellEditable = has && canEditCell(a!.r, vis()[a!.c]);
+    const ci = has ? vis()[a!.c] : -1;
+    const cellEditable = has && canEditCell(a!.r, ci);
+    const kind = ci >= 0 ? kinds()[ci] : "other";
+    const agg = has ? aggregates() : null;
+    const exprs = ci >= 0 ? expressionChoices(ci) : [];
+    const goTo = goToItem();
+    const x = (list: (MenuItem | null | false | undefined)[]) => list.filter((i): i is MenuItem => !!i);
     return [
-      { label: "Edit Cell", shortcut: "Enter", disabled: !cellEditable, onSelect: () => startEdit() },
-      { label: "Show Value Editor", shortcut: "Shift+Enter", disabled: !has, onSelect: openValueEditor },
-      { label: "Set NULL", shortcut: "Ctrl+Alt+N", disabled: !ed || !has, onSelect: setNull },
-      { label: "Set DEFAULT", shortcut: "Ctrl+Alt+D", disabled: !ed || !has, onSelect: setDefault },
+      { label: "Edit", shortcut: "Enter", disabled: !cellEditable, onSelect: () => startEdit() },
       { separator: true },
-      { label: "Add Row", shortcut: "Alt+Insert", disabled: !ed, onSelect: addRow },
-      { label: "Clone Row", shortcut: "Ctrl+D", disabled: !ed || !has, onSelect: cloneRow },
-      { label: "Delete Rows", shortcut: "Ctrl+Y", disabled: !ed || !has, onSelect: deleteRows },
-      { label: "Revert Selected", shortcut: "Ctrl+Alt+Z", disabled: !ed || pending.isEmpty(), onSelect: revertSelected },
+      { label: "Show Record View", shortcut: "Ctrl+Shift+Enter", icon: "record", onSelect: toggleRecordView },
+      { label: "Open in Value Editor", shortcut: "Shift+Enter", disabled: !has, onSelect: openValueEditor },
+      { label: "Show Aggregate View", disabled: !has, onSelect: () => showSidePanel("aggregates") },
       { separator: true },
-      { label: "Copy", shortcut: "Ctrl+C", disabled: !has, onSelect: () => copy("tsv") },
+      { label: "Revert Selected", shortcut: "Ctrl+Alt+Z", icon: "revert", disabled: !ed || pending.isEmpty(), onSelect: revertSelected },
+      { separator: true },
+      { label: "Edit as SQL Expression", icon: "fx", disabled: !cellEditable, onSelect: () => startEdit(undefined, true) },
+      {
+        label: "Set SQL Expression",
+        icon: "fx",
+        disabled: !ed || !has,
+        submenu: [
+          { label: "NULL", shortcut: "Ctrl+Alt+N", onSelect: setNull },
+          { label: "DEFAULT", shortcut: "Ctrl+Alt+D", onSelect: setDefault },
+          ...exprs.map((e) => ({ label: e, onSelect: () => setExpression(e) })),
+        ],
+      },
+      ...x([kind === "text" && { label: "Load File...", disabled: !cellEditable, onSelect: loadFile }]),
+      { separator: true },
+      { label: "Copy", shortcut: "Ctrl+C", icon: "copy", disabled: !has, onSelect: () => copy("tsv") },
       { label: "Copy As", disabled: !has, submenu: copyAsItems() },
       { label: "Paste", shortcut: "Ctrl+V", disabled: !ed || !has, onSelect: pasteFromClipboard },
-      { separator: true },
       { label: "Select All", shortcut: "Ctrl+A", onSelect: selectAll },
+      ...x([
+        props.onChangeExtractor && {
+          label: `Change Data Extractor (${props.extractorLabel ?? "CSV"})`,
+          onSelect: () => props.onChangeExtractor?.(menuPt),
+        },
+      ]),
+      { label: "Copy Aggregation Result (SUM)", shortcut: "Ctrl+Shift+C", icon: "copy", disabled: !agg || agg.countNums === 0, onSelect: copyAggregation },
       { separator: true },
-      { label: "Transpose", checked: T(), onSelect: () => toggleTranspose() },
-      { label: "Show Record View", shortcut: "Ctrl+Shift+Enter", checked: sideTab() !== null, onSelect: toggleRecordView },
-      { label: "Manage Columns…", shortcut: "Ctrl+F12", onSelect: () => openManageColumns() },
-      { label: "Reload Page", shortcut: "Ctrl+F5", disabled: !props.onReload, onSelect: () => props.onReload?.() },
+      { label: "Add Row", shortcut: "Alt+Insert", icon: "add", disabled: !ed, onSelect: addRow },
+      { label: "Delete Row", shortcut: "Ctrl+Y", icon: "remove", disabled: !ed || !has, onSelect: deleteRows },
+      { label: "Clone Row", shortcut: "Ctrl+D", icon: "copy", disabled: !ed || !has, onSelect: cloneRow },
+      ...(goTo || props.onExportToClipboard
+        ? x([{ separator: true }, goTo, props.onExportToClipboard && { label: "Export Table to Clipboard", icon: "export", onSelect: () => props.onExportToClipboard?.() }])
+        : []),
+      { separator: true },
+      {
+        label: "Set Local Filter",
+        disabled: !has,
+        onSelect: () => has && openColumnFilter(ci, new DOMRect(menuPt.x, menuPt.y, 0, 0)),
+      },
+      { label: "Local Filter By Cell Value", disabled: !has, onSelect: filterByCellValue },
+      { separator: true },
+      { label: "Quick Documentation", shortcut: "Ctrl+Q", disabled: !has, onSelect: openDoc },
     ];
   }
   function headerMenu(ci: number): MenuItem[] {
     const s = sortState();
-    const cur = s.find((x) => x.col === ci);
-    const hiddenList = [...hidden()].sort((a, b) => a - b);
+    const isPinned = pinned().has(ci);
+    const vi = visPos().get(ci) ?? 0;
+    const asc = (add: boolean) => () => (add ? addSort(ci, "asc") : applySort([{ col: ci, dir: "asc" }]));
+    const desc = (add: boolean) => () => (add ? addSort(ci, "desc") : applySort([{ col: ci, dir: "desc" }]));
     return [
-      { label: "Sort Ascending", checked: cur?.dir === "asc", onSelect: () => applySort([{ col: ci, dir: "asc" }]) },
-      { label: "Sort Descending", checked: cur?.dir === "desc", onSelect: () => applySort([{ col: ci, dir: "desc" }]) },
-      { label: "Clear Sorting", shortcut: "Ctrl+Alt+Shift+Backspace", disabled: s.length === 0, onSelect: clearSort },
-      { separator: true },
       { label: "Copy Column Name", onSelect: () => writeClipboard(props.columns[ci].name, "tsv") },
-      { label: "Copy", shortcut: "Ctrl+C", onSelect: () => copy("tsv") },
-      { label: "Copy As", submenu: copyAsItems() },
+      { label: "Select Column", shortcut: "Ctrl+W", onSelect: () => selectCols(vi, vi, false) },
       { separator: true },
-      { label: "Fit Column Width", onSelect: () => fitColumn(ci) },
+      isPinned ? { label: "Unpin Column", icon: "pinOn", onSelect: () => unpinColumn(ci) } : { label: "Pin Column", icon: "pin", onSelect: () => pinColumns([ci]) },
+      { label: "Pin Columns Up to Here", icon: "pin", onSelect: () => pinColumns(vis().slice(0, vi + 1)) },
+      { separator: true },
       { label: "Hide Column", disabled: vis().length < 2, onSelect: () => hideColumn(ci) },
+      { label: "Hide Other Columns", disabled: vis().length < 2, onSelect: () => hideOthers(ci) },
+      { label: "Manage Columns...", shortcut: "Ctrl+F12", icon: "columns", onSelect: () => openManageColumns() },
+      { separator: true },
+      { label: "Fit Columns to Window", onSelect: fitToWindow },
+      { label: "Reset Columns Width", shortcut: "Ctrl+Alt+Shift+Up", onSelect: resetWidths },
+      { separator: true },
+      { label: "ORDER BY", header: true },
+      { label: "Ascending", shortcut: "Alt+Shift+Up", onSelect: asc(false) },
+      { label: "Descending", shortcut: "Alt+Shift+Down", onSelect: desc(false) },
+      { separator: true },
+      { label: "Add to ORDER BY", header: true },
+      { label: "Ascending", shortcut: "Alt+Click", disabled: s.length === 0, onSelect: asc(true) },
+      { label: "Descending", shortcut: "Alt+Double Click", disabled: s.length === 0, onSelect: desc(true) },
+      { separator: true },
       {
-        label: "Show Hidden Columns",
-        disabled: hiddenList.length === 0,
-        submenu: [
-          { label: "Show All", onSelect: showAllColumns },
-          { separator: true },
-          ...hiddenList.map((h) => ({
-            label: props.columns[h]?.name ?? String(h),
-            onSelect: () => {
-              setHidden((x) => {
-                const n = new Set(x);
-                n.delete(h);
-                return n;
-              });
-              emitColumns();
-            },
-          })),
-        ],
+        label: "Set Local Filter",
+        onSelect: () => openColumnFilter(ci, new DOMRect(menuPt.x, menuPt.y, 0, 0)),
       },
+      { label: "Clear Sorting", shortcut: "Ctrl+Alt+Shift+Backspace", disabled: s.length === 0, onSelect: clearSort },
     ];
   }
   function onContextMenu(e: MouseEvent) {
     e.preventDefault();
-    if ((e.target as Element).closest(".dgg-editor, .dgg-ve, .dgg-overlay")) return;
+    if ((e.target as Element).closest(".dgg-ew, .dgg-bool, .dgg-ve, .dgg-overlay")) return;
     const p = toData(e);
     if (isScrollbar(e)) return;
+    menuPt = { x: e.clientX, y: e.clientY };
     if (p.inHeader && !T()) {
       const vi = colAt(p.x);
       if (vi < 0) return;
-      setMenu({ x: e.clientX, y: e.clientY, items: headerMenu(vis()[vi]) });
+      const ci = vis()[vi];
+      setMenu({ x: e.clientX, y: e.clientY, items: () => headerMenu(ci), preselect: true });
       return;
     }
     if (p.inHeader || p.inGutter || (p.y >= 0 && p.y < bodyH() && colAt(p.x) >= 0)) {
-      setMenu({ x: e.clientX, y: e.clientY, items: bodyMenu() });
+      setMenu({ x: e.clientX, y: e.clientY, items: bodyMenu });
     }
   }
 
@@ -1596,6 +1857,24 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     const row = props.getRow(i);
     return row ? keyOf(row[ci] ?? null, kinds()[ci]) : undefined;
   };
+  /** The funnel of a column: the host's popup when it has one, else the local filter popup. */
+  function openColumnFilter(ci: number, anchor: DOMRect) {
+    if (props.onColumnFilter) props.onColumnFilter(ci, anchor);
+    else openLocalFilter(ci, anchor);
+  }
+  /** `Local Filter By Cell Value`: only the rows equal to the active cell's value. */
+  function filterByCellValue() {
+    const a = active();
+    if (!a) return;
+    const ci = vis()[a.c];
+    const key = keyOf(cellValue(a.r, ci), kinds()[ci]);
+    const m = new Map(colFilters());
+    m.set(ci, new Set([key]));
+    batch(() => {
+      setLfEnabled(true);
+      setColFilters(m);
+    });
+  }
   function openLocalFilter(ci: number, anchor: DOMRect) {
     const { values, truncated } = countValues(props.rowCount, (i) => sourceKey(i, ci));
     setLfPopup({ ci, anchor, values, truncated });
@@ -1716,6 +1995,7 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     localFilterActive: lfEnabled() && colFilters().size > 0,
     localFilterEnabled: lfEnabled(),
     hiddenColumns: hidden().size,
+    pinnedColumns: pinned().size,
   }));
   createEffect(() => props.onViewChange?.(viewState()));
 
@@ -1764,15 +2044,121 @@ export function DataGrid(props: DataGridProps): JSX.Element {
   };
 
   // ---- value editor placement ----
-  const editorStyle = (ed: EditState): JSX.CSSProperties => {
+  const editorStyle = (ed: { r: number; vi: number }, pin = false): JSX.CSSProperties => {
     const X = hX();
     const { v, h } = toScreen(T(), ed.r, ed.vi);
     return {
-      left: X[h] - shiftH() + "px",
+      left: X[h] - (pin ? 0 : shiftH()) + "px",
       top: v * ROW_H - shiftV() + "px",
       width: X[h + 1] - X[h] + "px",
       height: ROW_H + "px",
     };
+  };
+
+  /** One column header; `pin`: inside the sticky pinned block (positions relative to it, no scroll offset). */
+  const headerCell = (ci: number, pin: boolean): JSX.Element => {
+    const vi = () => visPos().get(ci) ?? 0;
+    const sortIdx = () => sortState().findIndex((s) => s.col === ci);
+    const dir = () => sortState()[sortIdx()]?.dir;
+    return (
+      <div
+        class="dgg-hc"
+        classList={{ sel: colHasSel(vi()), dragging: dragCol() === ci }}
+        style={{ left: (pin ? 0 : gutterW()) + (colX()[vi()] ?? 0) + "px", width: widthOf(ci) + "px" }}
+        onMouseDown={(e) => onHeaderMouseDown(e, ci)}
+      >
+        <i class={"dgg-ico " + iconOf(props.columns[ci])} />
+        <span class="dgg-hname" title={`${props.columns[ci].name}: ${props.columns[ci].typeName.toUpperCase()}`}>
+          {props.columns[ci].name}
+        </span>
+        <button
+          class="dgg-hbtn funnel"
+          classList={{ on: lfEnabled() && colFilters().has(ci) }}
+          title="Column filter"
+          tabIndex={-1}
+          onClick={(e) => openColumnFilter(ci, (e.currentTarget as HTMLElement).getBoundingClientRect())}
+        />
+        <button
+          class="dgg-hbtn sort"
+          classList={{ on: sortIdx() >= 0 }}
+          title={sortIdx() < 0 ? "Sort (Alt+click: add to sort)" : dir() === "asc" ? "Ascending" : "Descending"}
+          tabIndex={-1}
+          onClick={(e) => toggleSort(ci, e.altKey)}
+        >
+          <Show
+            when={sortIdx() >= 0}
+            fallback={
+              <svg width="16" height="16" viewBox="0 0 16 16">
+                <path d="M6 6.5L8 4.5L10 6.5ZM6 9.5L8 11.5L10 9.5Z" fill="currentColor" />
+              </svg>
+            }
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d={dir() === "asc" ? "M4.5 9.5L8 6L11.5 9.5" : "M4.5 6.5L8 10L11.5 6.5"} />
+            </svg>
+            <Show when={sortState().length > 1}>
+              <span class="dgg-snum">{sortIdx() + 1}</span>
+            </Show>
+          </Show>
+        </button>
+        <div class="dgg-resize" onMouseDown={(e) => onResizeDown(e, ci)} onDblClick={(e) => (e.stopPropagation(), fitColumn(ci))} />
+      </div>
+    );
+  };
+
+  /** Selection / current row / pending-change fills. `pin`: for the pinned layer (no horizontal scroll shift). */
+  const underlay = (pin: boolean): JSX.Element => {
+    const dx = () => (pin ? shiftH() : 0);
+    return (
+      <>
+        <Show when={curRect()}>
+          {(q) => <div class="dgg-u cur" style={{ left: q().x + dx() + "px", top: q().y + "px", width: q().w + "px", height: q().h + "px" }} />}
+        </Show>
+        <For each={changeRects()}>
+          {(q) => <div class={"dgg-u " + q.k} style={{ left: q.x + dx() + "px", top: q.y + "px", width: q.w + "px", height: q.h + "px" }} />}
+        </For>
+        <For each={selRects()}>
+          {(q) => <div class="dgg-u sel" style={{ left: q.x + dx() + "px", top: q.y + "px", width: q.w + "px", height: q.h + "px" }} />}
+        </For>
+      </>
+    );
+  };
+  const cellEditor = (pin: boolean): JSX.Element => {
+    const ed = untrack(edit)!;
+    return (
+      <CellEditor
+        state={ed}
+        style={editorStyle(ed, pin)}
+        kind={kinds()[ed.ci]}
+        right={!T() && isRightAligned(kinds()[ed.ci], cellValue(ed.r, ed.ci))}
+        onCommit={commitEdit}
+        onCancel={cancelEdit}
+        onValueEditor={(t) => {
+          const s = edit();
+          if (!s) return;
+          setEdit(null);
+          setValueEd({ r: s.r, vi: s.vi, ci: s.ci, text: t, readOnly: false });
+        }}
+        onTab={(back, t) => {
+          const s = edit();
+          if (!s) return;
+          commitEdit(t, true);
+          const nx = tabTarget(s.r, s.vi, back);
+          if (nx) selectCell(nx.r, nx.c);
+          root.focus({ preventScroll: true });
+        }}
+      />
+    );
+  };
+  const boolList = (pin: boolean): JSX.Element => {
+    const b = untrack(boolPick)!;
+    return (
+      <BoolList
+        style={{ left: parseFloat(String(editorStyle(b, pin).left)) - 14 + "px", top: parseFloat(String(editorStyle(b, pin).top)) + ROW_H + "px" }}
+        onPick={(v) => pickBool(b, v)}
+        onCancel={() => (setBoolPick(null), root.focus({ preventScroll: true }))}
+      />
+    );
   };
 
   const tableView = (
@@ -1783,7 +2169,7 @@ export function DataGrid(props: DataGridProps): JSX.Element {
       onMouseDown={onBodyMouseDown}
       onDblClick={onBodyDblClick}
     >
-      <div class="dgg-sizer" style={{ width: gutterW() + extentW() + "px", height: HEADER_H + extentH() + "px" }}>
+      <div class="dgg-sizer" style={{ width: gutterW() + extentW() + "px", height: HEADER_H + extentH() + (props.bottomPad ?? 0) + "px" }}>
         <div class="dgg-header">
           <div class="dgg-corner" style={{ width: gutterW() + "px" }} />
           <Show when={T()}>
@@ -1800,61 +2186,12 @@ export function DataGrid(props: DataGridProps): JSX.Element {
               )}
             </For>
           </Show>
-          <For each={T() ? [] : hdrCols()}>
-            {(ci) => {
-              const vi = () => visPos().get(ci) ?? 0;
-              const sortIdx = () => sortState().findIndex((s) => s.col === ci);
-              const dir = () => sortState()[sortIdx()]?.dir;
-              return (
-                <div
-                  class="dgg-hc"
-                  classList={{ sel: colHasSel(vi()), dragging: dragCol() === ci }}
-                  style={{ left: gutterW() + (colX()[vi()] ?? 0) + "px", width: widthOf(ci) + "px" }}
-                  onMouseDown={(e) => onHeaderMouseDown(e, ci)}
-                >
-                  <i class={"dgg-ico " + iconClass(props.columns[ci])} />
-                  <span class="dgg-hname" title={`${props.columns[ci].name}  ${props.columns[ci].typeName}`}>
-                    {props.columns[ci].name}
-                  </span>
-                  <button
-                    class="dgg-hbtn funnel"
-                    classList={{ on: lfEnabled() && colFilters().has(ci) }}
-                    title="Column filter"
-                    tabIndex={-1}
-                    onClick={(e) => {
-                      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                      if (props.onColumnFilter) props.onColumnFilter(ci, rect);
-                      else openLocalFilter(ci, rect);
-                    }}
-                  />
-                  <button
-                    class="dgg-hbtn sort"
-                    classList={{ on: sortIdx() >= 0 }}
-                    title={sortIdx() < 0 ? "Sort (Ctrl+click: add to sort)" : dir() === "asc" ? "Ascending" : "Descending"}
-                    tabIndex={-1}
-                    onClick={(e) => toggleSort(ci, e.ctrlKey || e.shiftKey || e.metaKey)}
-                  >
-                    <Show
-                      when={sortIdx() >= 0}
-                      fallback={
-                        <svg width="16" height="16" viewBox="0 0 16 16">
-                          <path d="M6 6.5L8 4.5L10 6.5ZM6 9.5L8 11.5L10 9.5Z" fill="currentColor" />
-                        </svg>
-                      }
-                    >
-                      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
-                        <path d={dir() === "asc" ? "M4.5 9.5L8 6L11.5 9.5" : "M4.5 6.5L8 10L11.5 6.5"} />
-                      </svg>
-                      <Show when={sortState().length > 1}>
-                        <span class="dgg-snum">{sortIdx() + 1}</span>
-                      </Show>
-                    </Show>
-                  </button>
-                  <div class="dgg-resize" onMouseDown={(e) => onResizeDown(e, ci)} onDblClick={(e) => (e.stopPropagation(), fitColumn(ci))} />
-                </div>
-              );
-            }}
-          </For>
+          <Show when={nPinned() > 0}>
+            <div class="dgg-hpin" style={{ left: gutterW() + "px", width: pinW() + "px" }}>
+              <For each={vis().slice(0, nPinned())}>{(ci) => headerCell(ci, true)}</For>
+            </div>
+          </Show>
+          <For each={T() ? [] : hdrCols()}>{(ci) => headerCell(ci, false)}</For>
           <Show when={!T() && dropAt() !== null}>
             <div class="dgg-drop" style={{ left: gutterW() + (colX()[dropAt()!] ?? 0) + "px" }} />
           </Show>
@@ -1883,7 +2220,7 @@ export function DataGrid(props: DataGridProps): JSX.Element {
                   }
                 >
                   <div class="dgg-gr nm" classList={{ sel: colSelectedFully(r) }} style={{ top: r * ROW_H - shiftV() + "px" }}>
-                    <i class={"dgg-ico " + iconClass(props.columns[vis()[r]])} />
+                    <i class={"dgg-ico " + iconOf(props.columns[vis()[r]])} />
                     <span>{props.columns[vis()[r]]?.name}</span>
                   </div>
                 </Show>
@@ -1891,42 +2228,28 @@ export function DataGrid(props: DataGridProps): JSX.Element {
             </For>
           </div>
           <div class="dgg-data" style={{ left: gutterW() + "px", width: extentW() + "px", height: extentH() + "px" }}>
-            <div class="dgg-underlay">
-              <Show when={curRect()}>
-                {(q) => <div class="dgg-u cur" style={{ left: q().x + "px", top: q().y + "px", width: q().w + "px", height: q().h + "px" }} />}
-              </Show>
-              <For each={changeRects()}>
-                {(q) => <div class={"dgg-u " + q.k} style={{ left: q.x + "px", top: q.y + "px", width: q.w + "px", height: q.h + "px" }} />}
-              </For>
-              <For each={selRects()}>
-                {(q) => <div class="dgg-u sel" style={{ left: q.x + "px", top: q.y + "px", width: q.w + "px", height: q.h + "px" }} />}
-              </For>
-            </div>
+            <div class="dgg-underlay">{underlay(false)}</div>
             <For each={rowList()}>
               {(r) => <div class="dgg-row" style={{ top: r * ROW_H - shiftV() + "px", width: extentW() + "px" }} innerHTML={T() ? rowHtmlT(r) : rowHtml(r)} />}
             </For>
-            <Show when={edit()}>
-              {(ed) => <CellEditor state={ed()} style={editorStyle(ed())} right={!T() && isRightAligned(kinds()[ed().ci], cellValue(ed().r, ed().ci))} onCommit={commitEdit} onCancel={cancelEdit} onValueEditor={(t) => {
-                const s = edit();
-                if (!s) return;
-                setEdit(null);
-                setValueEd({ r: s.r, vi: s.vi, ci: s.ci, text: t, readOnly: false });
-              }} onTab={(back, t) => {
-                const s = edit();
-                if (!s) return;
-                commitEdit(t, true);
-                const nx = tabTarget(s.r, s.vi, back);
-                if (nx) selectCell(nx.r, nx.c);
-                root.focus({ preventScroll: true });
-              }} />}
+            <Show when={nPinned() > 0}>
+              <div class="dgg-pinlayer" style={{ left: gutterW() + "px", width: pinW() + "px", height: extentH() + "px" }}>
+                <div class="dgg-underlay">{underlay(true)}</div>
+                <For each={rowList()}>
+                  {(r) => <div class="dgg-row" style={{ top: r * ROW_H - shiftV() + "px", width: pinW() + "px" }} innerHTML={rowHtml(r, true)} />}
+                </For>
+                <Show when={edit() && edit()!.vi < nPinned()}>{cellEditor(true)}</Show>
+                <Show when={boolPick() && boolPick()!.vi < nPinned()}>{boolList(true)}</Show>
+              </div>
             </Show>
+            <Show when={edit() && (T() || edit()!.vi >= nPinned())}>{cellEditor(false)}</Show>
+            <Show when={boolPick() && (T() || boolPick()!.vi >= nPinned())}>{boolList(false)}</Show>
           </div>
         </div>
       </div>
     </div>
   );
 
-  const empty = () => props.rowCount === 0 && pending.insertedCount === 0;
   const textMode = () => (props.viewMode ?? "table") === "text";
   const sideStyleSize = () => sideSize() || 476;
 
@@ -1934,6 +2257,7 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     <div
       ref={root}
       class="dgg"
+      data-editable={props.editable ? "" : undefined}
       classList={{ pop: !!(manage() || lfPopup()) }}
       style={{ "letter-spacing": ls() ? ls() + "px" : undefined }}
       tabIndex={0}
@@ -1968,11 +2292,6 @@ export function DataGrid(props: DataGridProps): JSX.Element {
             <Show when={!textMode()} fallback={<TextView columns={props.columns} rowCount={props.rowCount} getRow={props.getRow} version={props.version} />}>
               {tableView}
             </Show>
-            <Show when={empty() && !textMode()}>
-              <div class="dgg-empty" style={{ top: HEADER_H + 1 + "px" }}>
-                No rows
-              </div>
-            </Show>
             <div class="dgg-overlay">{props.children}</div>
           </div>
         </div>
@@ -1999,7 +2318,7 @@ export function DataGrid(props: DataGridProps): JSX.Element {
                 return !!a && canEditCell(a.r, ci);
               }}
               nullText={settings.gridNullText}
-              iconClass={iconClass}
+              iconClass={iconOf}
               onFocusField={focusField}
               onCommitField={commitField}
               onExpandField={(ci) => {
@@ -2022,7 +2341,10 @@ export function DataGrid(props: DataGridProps): JSX.Element {
           )}
         </Show>
       </div>
-      <Show when={menu()}>{(m) => <GridMenu x={m().x} y={m().y} items={m().items} onClose={() => (setMenu(null), root.focus({ preventScroll: true }))} />}</Show>
+      <Show when={menu()}>
+        {(m) => <GridMenu x={m().x} y={m().y} items={m().items()} preselect={m().preselect} onClose={() => (setMenu(null), root.focus({ preventScroll: true }))} />}
+      </Show>
+      <Show when={doc()}>{(d) => <ColumnDoc x={d().x} y={d().y} col={props.columns[d().ci]} table={props.tableName} onClose={() => (setDoc(null), root.focus({ preventScroll: true }))} />}</Show>
       <Show when={manage()}>
         {(m) => (
           <ManageColumns
@@ -2037,6 +2359,8 @@ export function DataGrid(props: DataGridProps): JSX.Element {
               else n.add(ci);
               setHiddenSet(n);
             }}
+            pinned={pinned()}
+            onTogglePin={(ci) => (pinned().has(ci) ? unpinColumn(ci) : pinColumns([ci]))}
             onShowAll={() => setHiddenSet(new Set())}
             onHideAll={() => setHiddenSet(new Set(props.columns.map((_, i) => i)))}
             onMove={moveColumnTo}
@@ -2084,8 +2408,9 @@ export function DataGrid(props: DataGridProps): JSX.Element {
 }
 
 interface CellEditorProps {
-  state: { r: number; vi: number; ci: number; text: string };
+  state: { r: number; vi: number; ci: number; text: string; expr?: boolean };
   style: JSX.CSSProperties;
+  kind: ColumnKind;
   right: boolean;
   onCommit: (text: string, refocus?: boolean) => void;
   onCancel: () => void;
@@ -2093,48 +2418,163 @@ interface CellEditorProps {
   onTab: (back: boolean, text: string) => void;
 }
 
+/**
+ * In-cell text editor. Date / timestamp / time columns get a `...` button (value editor) and the picker panel
+ * under the cell; the wrapper commits when the focus leaves it as a whole (the picker's fields are inside it).
+ */
 function CellEditor(props: CellEditorProps): JSX.Element {
   let input!: HTMLInputElement;
+  let wrap!: HTMLDivElement;
   let done = false;
+  let refocus = false;
+  const [text, setText] = createSignal(props.state.text);
+  const isDate = () => !props.state.expr && (props.kind === "date" || props.kind === "datetime" || props.kind === "time");
   onMount(() => {
     input.focus();
     input.setSelectionRange(input.value.length, input.value.length);
   });
+  const finish = (fn: () => void) => {
+    if (done) return;
+    done = true;
+    fn();
+  };
   return (
-    <input
-      ref={input}
-      class="dgg-editor"
-      classList={{ r: props.right }}
+    <div
+      ref={wrap}
+      class="dgg-ew"
+      classList={{ expr: !!props.state.expr, dt: isDate() }}
       style={props.style}
-      value={props.state.text}
-      spellcheck={false}
       onMouseDown={(e) => e.stopPropagation()}
       onDblClick={(e) => e.stopPropagation()}
-      onBlur={() => {
-        if (done) return;
-        done = true;
-        props.onCommit(input.value);
+      onFocusOut={(e) => {
+        if (!wrap.contains(e.relatedTarget as Node | null)) finish(() => props.onCommit(text(), refocus));
       }}
       onKeyDown={(e) => {
         e.stopPropagation();
-        if (e.key === "Enter" && e.shiftKey) {
+        const inInput = e.target === input;
+        if (e.key === "Enter" && e.shiftKey && inInput) {
           e.preventDefault();
-          done = true;
-          props.onValueEditor(input.value);
+          finish(() => props.onValueEditor(text()));
         } else if (e.key === "Enter") {
           e.preventDefault();
-          done = true;
-          props.onCommit(input.value, true);
+          if (inInput) finish(() => props.onCommit(text(), true));
+          else {
+            // a picker field: its pending change event fires on blur, then the focus-out commits
+            refocus = true;
+            (e.target as HTMLElement).blur();
+          }
         } else if (e.key === "Escape") {
           e.preventDefault();
-          done = true;
-          props.onCancel();
-        } else if (e.key === "Tab") {
+          finish(() => props.onCancel());
+        } else if (e.key === "Tab" && inInput) {
           e.preventDefault();
-          done = true;
-          props.onTab(e.shiftKey, input.value);
+          finish(() => props.onTab(e.shiftKey, text()));
         }
       }}
-    />
+    >
+      <input
+        ref={input}
+        class="dgg-editor"
+        classList={{ r: props.right }}
+        value={text()}
+        spellcheck={false}
+        onInput={(e) => setText(e.currentTarget.value)}
+      />
+      <Show when={isDate()}>
+        <button class="dgg-ew-more" tabIndex={-1} title="Open value editor" onMouseDown={(e) => e.preventDefault()} onClick={() => finish(() => props.onValueEditor(text()))}>
+          ...
+        </button>
+        <DateEditor kind={props.kind} text={text()} onChange={setText} />
+      </Show>
+    </div>
+  );
+}
+
+const BOOL_CHOICES: { label: string; value: boolean | "default" }[] = [
+  { label: "true", value: true },
+  { label: "false", value: false },
+  { label: "default", value: "default" },
+];
+
+/** The list under a boolean cell: true / false / default (Up / Down / Enter, Esc cancels). */
+function BoolList(props: { style: JSX.CSSProperties; onPick: (v: boolean | "default") => void; onCancel: () => void }): JSX.Element {
+  let el!: HTMLDivElement;
+  const [hi, setHi] = createSignal(0);
+  onMount(() => el.focus());
+  return (
+    <div
+      ref={el}
+      class="dgg-bool"
+      tabIndex={-1}
+      style={props.style}
+      onMouseDown={(e) => e.stopPropagation()}
+      onDblClick={(e) => e.stopPropagation()}
+      onBlur={() => props.onCancel()}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+          e.preventDefault();
+          setHi((i) => (i + (e.key === "ArrowDown" ? 1 : -1) + BOOL_CHOICES.length) % BOOL_CHOICES.length);
+        } else if (e.key === "Enter") {
+          e.preventDefault();
+          props.onPick(BOOL_CHOICES[hi()].value);
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          props.onCancel();
+        }
+      }}
+    >
+      <For each={BOOL_CHOICES}>
+        {(c, i) => (
+          <div class="dgg-bool-item" classList={{ hi: hi() === i() }} onMouseEnter={() => setHi(i())} onClick={() => props.onPick(c.value)}>
+            {c.label}
+          </div>
+        )}
+      </For>
+    </div>
+  );
+}
+
+/** Quick Documentation of a column (Ctrl+Q on a cell): name, type and keys. Closes on any click or key. */
+function ColumnDoc(props: { x: number; y: number; col: GridColumn; table?: string; onClose: () => void }): JSX.Element {
+  let el!: HTMLDivElement;
+  onMount(() => {
+    const down = (e: MouseEvent) => !el.contains(e.target as Node) && props.onClose();
+    const key = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      props.onClose();
+    };
+    window.addEventListener("mousedown", down, true);
+    window.addEventListener("keydown", key, true);
+    onCleanup(() => {
+      window.removeEventListener("mousedown", down, true);
+      window.removeEventListener("keydown", key, true);
+    });
+  });
+  const c = () => props.col;
+  const flags = () => [c().isPk && "primary key", c().isFk && "foreign key", c().isIndexed && "indexed", c().nullable === false ? "not null" : "nullable"].filter(Boolean).join(", ");
+  return (
+    <Portal>
+      <div ref={el} class="dgg-doc" style={{ left: Math.max(4, props.x) + "px", top: Math.max(4, props.y) + "px" }}>
+        <div class="dgg-doc-title">
+          <i class={"dgg-ico " + iconClass(c())} /> {c().name}
+        </div>
+        <div class="dgg-doc-row">
+          <span>Type</span>
+          {c().typeName}
+        </div>
+        <div class="dgg-doc-row">
+          <span>Flags</span>
+          {flags()}
+        </div>
+        <Show when={props.table}>
+          <div class="dgg-doc-row">
+            <span>Table</span>
+            {props.table}
+          </div>
+        </Show>
+      </div>
+    </Portal>
   );
 }

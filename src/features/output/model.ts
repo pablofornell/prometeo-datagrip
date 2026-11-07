@@ -3,9 +3,9 @@
  * The console feature (src/features/console) writes it; the output UI only reads it and calls back into
  * the owning console through `OutputHost`.
  */
-import { type Accessor, createMemo, createSignal } from "solid-js";
+import { type Accessor, batch, createMemo, createSignal } from "solid-js";
 import { createStore, produce } from "solid-js/store";
-import type { Cell, ColumnMeta, Driver, ExecHandle, ExportFormat, TxStatus } from "../../api/db";
+import type { Cell, ColumnMeta, Driver, ExecHandle, ExplainPlan, ExportFormat, TxStatus } from "../../api/db";
 import type { DataGridApi, GridChange, GridColumn, GridViewState, ViewMode } from "../../components/grid";
 import type { PageSize } from "../../components/grid";
 import { isConnectionLost } from "../../state/connection-errors";
@@ -50,6 +50,10 @@ export interface OutputHost {
   previewEdits(tab: ResultTab, changes: GridChange[]): string;
   /** Bring the console editor tab to the front. */
   focusEditor(): void;
+  /** Current schema of the console's session (the schema of a result's table when the statement does not say). */
+  readonly schema?: Accessor<string | null>;
+  /** Inserts text at the caret of the console's editor (SQL popup `Open in Console`). */
+  insertSql?(text: string): void;
 }
 
 /** The page size of Settings (`gridPageSize`, 0 = all). Read it when needed, never cache it. */
@@ -85,6 +89,11 @@ export class ResultTab {
   readonly setExtractor: (f: ExportFormat) => void;
   readonly pageSize: Accessor<PageSize>;
   readonly setPageSize: (p: PageSize) => void;
+  /** Index of the first row of the page the grid shows (numeric page sizes; the rows of earlier pages stay loaded). */
+  readonly pageStart: Accessor<number>;
+  private readonly setPageStart: (n: number) => void;
+  /** Column order / hidden / widths / pinned of the grid, kept while the tab lives (a reload keeps the layout). */
+  columnsState?: import("../../components/grid").ColumnsState;
   /** Table and key of an editable result (null: read-only); set once the metadata is resolved. */
   readonly edit: Accessor<EditTarget | null>;
   readonly setEdit: (e: EditTarget | null) => void;
@@ -97,11 +106,17 @@ export class ResultTab {
   /** The "Preview Pending Changes" popup is open. */
   readonly preview: Accessor<boolean>;
   readonly setPreview: (b: boolean) => void;
+  /** The `SQL` popup (the statement that produced the result) is open. */
+  readonly showQuery: Accessor<boolean>;
+  readonly setShowQuery: (b: boolean) => void;
   /** Transpose / record view / find state of the mounted grid (for the toolbar toggles). */
   readonly view: Accessor<GridViewState | null>;
   readonly setView: (v: GridViewState) => void;
   /** Handle of the mounted grid (set by the result view). */
   gridApi?: DataGridApi;
+  /** The statement still runs: a tab without columns and rows (spinner in the grid) that the result replaces. */
+  readonly loading: Accessor<boolean>;
+  readonly setLoading: (b: boolean) => void;
   /** Duration of the execution that produced it (header `648 ms`). */
   ms = 0;
   closed = false;
@@ -141,12 +156,15 @@ export class ResultTab {
     [this.viewMode, this.setViewMode] = sig<ViewMode>("table");
     [this.extractor, this.setExtractor] = sig<ExportFormat>("csv");
     [this.pageSize, this.setPageSize] = sig<PageSize>(pageSize);
+    [this.pageStart, this.setPageStart] = sig(0);
     [this.edit, this.setEdit] = sig<EditTarget | null>(null);
     [this.pending, this.setPending] = sig(0);
     [this.applying, this.setApplying] = sig(false);
     [this.preview, this.setPreview] = sig(false);
+    [this.showQuery, this.setShowQuery] = sig(false);
     [this.partial, this.setPartial] = sig<string | null>(null);
     [this.view, this.setView] = sig<GridViewState | null>(null);
+    [this.loading, this.setLoading] = sig(false);
   }
 
   /** `fetch_more` of the next rows (scroll). No-op while loading or when everything is loaded. */
@@ -170,6 +188,44 @@ export class ResultTab {
     } finally {
       this.setLoadingMore(false);
     }
+  }
+
+  /** Rows per page; 0 = "All" (one list that loads more while scrolling). */
+  pageRows(): number {
+    const s = this.pageSize();
+    return typeof s === "number" ? s : 0;
+  }
+  /** The loaded rows end before the page that follows, or the server has more. */
+  canNextPage(): boolean {
+    const n = this.pageRows();
+    return n > 0 && (this.pageStart() + n < this.rowCount() || this.hasMore());
+  }
+  canPrevPage(): boolean {
+    return this.pageRows() > 0 && this.pageStart() > 0;
+  }
+  /** Next page: more rows are fetched on the open cursor when the loaded ones end. False when there is none. */
+  async nextPage(): Promise<boolean> {
+    const n = this.pageRows();
+    if (!n || !this.canNextPage()) return false;
+    const next = this.pageStart() + n;
+    if (next >= this.rows.length) await this.loadMore(next + n - this.rows.length);
+    if (next >= this.rows.length) return false;
+    this.setPageStart(next);
+    return true;
+  }
+  prevPage(): void {
+    const n = this.pageRows();
+    if (n && this.pageStart() > 0) this.setPageStart(Math.max(0, this.pageStart() - n));
+  }
+  firstPage(): void {
+    this.setPageStart(0);
+  }
+  /** Last page: reads the rest of the result first. */
+  async lastPage(): Promise<void> {
+    const n = this.pageRows();
+    if (!n) return;
+    await this.loadAll();
+    this.setPageStart(Math.floor(Math.max(0, this.rows.length - 1) / n) * n);
   }
 
   /** "All" / "Count Rows": pull every remaining row. */
@@ -245,6 +301,16 @@ export function partialMessage(error: string, loaded: number): string {
   return `could not load more rows (${error}). Only the first ${n} rows are shown, not the complete result.`;
 }
 
+/** The `Query Plan` tab of Explain Plan / Explain Analyse (one per console; a new explain replaces it). */
+export const PLAN_TAB = "plan";
+
+export interface PlanTab {
+  readonly plan: ExplainPlan;
+  /** Path of the selected row in the tree (`0.1`: second child of the first child of the root); `""` = the root. */
+  readonly selected: Accessor<string>;
+  readonly select: (path: string) => void;
+}
+
 const MAX_LINES = 3000;
 let lineSeq = 0;
 
@@ -262,7 +328,10 @@ export class ConsoleOutput {
   readonly selected: Accessor<string>;
   readonly select: (id: string) => void;
   readonly running: Accessor<boolean>;
+  /** Starts / stops the clock of `elapsed`. */
   readonly setRunning: (b: boolean) => void;
+  /** Milliseconds since the run started, refreshed every 100 ms while `running`. */
+  readonly elapsed: Accessor<number>;
   /** Duration of the last execution, `null` until something ran. */
   readonly lastMs: Accessor<number | null>;
   readonly setLastMs: (n: number | null) => void;
@@ -271,6 +340,12 @@ export class ConsoleOutput {
   readonly scrollToEnd: Accessor<boolean>;
   readonly setScrollToEnd: (b: boolean) => void;
   readonly current: Accessor<ResultTab | undefined>;
+  /** The Output log is shown next to the selected result instead of only in its own tab (the layout toggle of the log toolbar). */
+  readonly logAside: Accessor<boolean>;
+  readonly setLogAside: (b: boolean) => void;
+  /** The Explain Plan result (tab id `PLAN_TAB`), if any. */
+  readonly plan: Accessor<PlanTab | null>;
+  private readonly setPlan: (p: PlanTab | null) => void;
 
   constructor(
     readonly tabId: string,
@@ -285,10 +360,28 @@ export class ConsoleOutput {
     };
     [this.results, this.setResults] = sig<ResultTab[]>([]);
     [this.selected, this.select] = sig("output");
-    [this.running, this.setRunning] = sig(false);
+    const [running, setRun] = createSignal(false);
+    const [elapsed, setElapsed] = createSignal(0);
+    this.running = running;
+    this.elapsed = elapsed;
+    let clock: ReturnType<typeof setInterval> | undefined;
+    this.setRunning = (b) => {
+      if (b === running()) return;
+      clearInterval(clock);
+      clock = undefined;
+      if (b) {
+        const t0 = performance.now();
+        setElapsed(0);
+        clock = setInterval(() => setElapsed(performance.now() - t0), 100);
+        (clock as { unref?: () => void }).unref?.();
+      }
+      setRun(b);
+    };
     [this.lastMs, this.setLastMs] = sig<number | null>(null);
     [this.wrap, this.setWrap] = sig(false);
     [this.scrollToEnd, this.setScrollToEnd] = sig(true);
+    [this.logAside, this.setLogAside] = sig(false);
+    [this.plan, this.setPlan] = sig<PlanTab | null>(null);
     this.current = createMemo(() => this.results().find((r) => r.id === this.selected()));
   }
 
@@ -334,7 +427,63 @@ export class ConsoleOutput {
     this.setResults(list);
   }
 
+  /** The result tab that stands in for a statement that is still running, and what it stands in for. */
+  private pendingTab: ResultTab | null = null;
+  private stash: { list: ResultTab[]; selected: string } | null = null;
+
+  /**
+   * The statement runs: its (empty, spinning) result tab replaces the unpinned ones at once. Nothing is closed, so
+   * `clearPending` brings the earlier results back when the statement fails or returns no rows.
+   */
+  showPending(tab: ResultTab, replace?: ResultTab): void {
+    this.clearPending();
+    const list = this.results();
+    const i = replace ? list.findIndex((r) => r.id === replace.id) : -1;
+    tab.setLoading(true);
+    tab.log = (kind, text) => void this.log(kind, text);
+    if (replace) tab.setPinned(replace.pinned());
+    this.stash = { list, selected: this.selected() };
+    this.pendingTab = tab;
+    batch(() => {
+      this.setResults(replace ? (i >= 0 ? [...list.slice(0, i), tab, ...list.slice(i + 1)] : [...list, tab]) : [...list.filter((r) => r.pinned()), tab]);
+      this.select(tab.id);
+    });
+  }
+
+  /** Takes the pending tab away (the result arrived, the statement failed or returned no rows). */
+  clearPending(): void {
+    const tab = this.pendingTab;
+    const st = this.stash;
+    this.pendingTab = null;
+    this.stash = null;
+    if (!tab || !st) return;
+    tab.closed = true;
+    batch(() => {
+      const keep = st.list.filter((r) => !r.closed);
+      this.setResults(keep);
+      this.select(keep.some((r) => r.id === st.selected) ? st.selected : "output");
+    });
+  }
+
+  /** Shows the plan of an Explain in its own tab and selects it. */
+  showPlan(plan: ExplainPlan): void {
+    const [selected, select] = createSignal("");
+    batch(() => {
+      this.setPlan({ plan, selected, select: (p) => void select(p) });
+      this.select(PLAN_TAB);
+    });
+  }
+
+  closePlan(): void {
+    batch(() => {
+      this.setPlan(null);
+      if (this.selected() === PLAN_TAB) this.select("output");
+    });
+  }
+
   closeResult(id: string): void {
+    if (id === PLAN_TAB) return this.closePlan();
+    if (id === this.pendingTab?.id) return this.clearPending(); // the statement keeps running; its earlier results return
     const list = this.results();
     const i = list.findIndex((r) => r.id === id);
     if (i < 0) return;
@@ -352,6 +501,7 @@ export class ConsoleOutput {
   }
 
   dispose(): void {
+    this.setRunning(false); // stops the clock of `elapsed` (a console removed while a statement runs)
     for (const r of this.results()) r.close();
     this.setResults([]);
   }
@@ -385,7 +535,7 @@ export const outputOf = (tabId: string): ConsoleOutput | undefined => outputs().
  */
 export function currentOutput(): ConsoleOutput | undefined {
   const t = activeTab();
-  if (t?.kind === "console") return outputs().get(t.id);
+  if (t?.kind === "console" || t?.kind === "file") return outputs().get(t.id);
   if (t?.kind === "table" && outputs().has(t.id)) return outputs().get(t.id);
   const last = lastConsoleId();
   return last ? outputs().get(last) : undefined;

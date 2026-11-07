@@ -1,0 +1,225 @@
+/* Modify Table / New Table dialog (features/schema-editor) */
+.dgse {
+  width: 775px;
+  height: 760px;
+  max-height: calc(100vh - 32px);
+  background: var(--dg-panel-bg);
+  outline: none;
+  /* DataGrip's dialog sits about 20px above the centre */
+  position: relative;
+  top: -20px;
+}
+.dgse-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 220px;
+}
+.dgse-toolbar {
+  display: flex;
+  align-items: center;
+  flex: none;
+  gap: 2px;
+  height: 38px;
+  padding: 0 12px 0 8px;
+}
+.dgse-tb {
+  width: 24px;
+  height: 24px;
+}
+.dgse-tb-spacer {
+  flex: 1;
+}
+.dgse-title {
+  padding-left: 4px;
+  font-weight: var(--dg-font-ui-weight-title);
+}
+.dgse-split {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.dgse-left {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  width: 282px;
+  min-height: 0;
+}
+.dgse-tree.dg-tree {
+  padding: 2px 6px 4px 8px;
+}
+.dgse-tree .dg-tree-label {
+  flex: none;
+  max-width: 100%;
+}
+.dgse-tree .dg-tree-hint {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.dgse-right {
+  flex: 1;
+  min-width: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+.dgse-sheet {
+  padding: 2px 14px 10px 12px;
+}
+.dgse-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 108px;
+  height: 24px;
+  margin: 0 0 10px 0;
+  padding: 0 12px 0 8px;
+  box-sizing: border-box;
+  border: 1px solid var(--dg-input-border);
+  border-radius: 12px;
+  background: var(--dg-combo-bg);
+}
+.dgse-row {
+  display: flex;
+  align-items: center;
+  min-height: 28px;
+  margin: 0 0 8px;
+}
+.dgse-row-top {
+  align-items: flex-start;
+}
+.dgse-row-top .dgse-label {
+  padding-top: 5px;
+}
+.dgse-label {
+  flex: none;
+  width: 135px;
+  padding-right: 4px;
+  box-sizing: border-box;
+  white-space: nowrap;
+}
+.dgse-control {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+}
+.dgse-control > .dgse-typecombo,
+.dgse-control > .dg-textfield {
+  width: 100%;
+}
+.dgse-mono,
+.dgse-typecombo .dg-textfield input {
+  font-family: var(--dg-font-mono);
+}
+input.dgse-mono {
+  font-family: var(--dg-font-mono);
+}
+.dgse-chevron {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  opacity: 0.9;
+}
+.dgse-collist {
+  max-height: 150px;
+  overflow-y: auto;
+  padding: 4px 8px;
+  box-sizing: border-box;
+  border: 1px solid var(--dg-input-border);
+  border-radius: var(--dg-input-radius);
+  background: var(--dg-input-bg);
+}
+.dgse-collist.dgse-disabled {
+  color: var(--dg-text-disabled);
+}
+.dgse-colrow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 24px;
+}
+.dgse-colorder {
+  color: var(--dg-text-secondary);
+  font-size: var(--dg-font-size-small);
+}
+.dgse-empty,
+.dgse-note {
+  padding: 6px 2px;
+  color: var(--dg-text-secondary);
+}
+.dgse-query {
+  display: flex;
+  height: 150px;
+  overflow: hidden;
+  border: 1px solid var(--dg-input-border);
+  border-radius: var(--dg-input-radius);
+}
+.dgse-query > .sql-editor {
+  flex: 1;
+  min-width: 0;
+}
+
+.dgse-preview-head {
+  display: flex;
+  align-items: center;
+  flex: none;
+  gap: 4px;
+  height: 28px;
+  padding: 0 12px 0 8px;
+}
+.dgse-preview-title {
+  color: var(--dg-text-secondary);
+}
+.dgse-preview-line {
+  flex: 1;
+  height: 1px;
+  margin: 0 6px;
+  background: var(--dg-border);
+}
+.dgse-preview-btn {
+  display: flex;
+  border-radius: 4px;
+}
+.dgse-preview-btn:hover {
+  background: var(--dg-action-button-hover-bg);
+}
+.dgse-preview {
+  position: relative;
+  display: flex;
+  flex: none;
+  height: 226px;
+  margin: 0 8px 8px 8px;
+  border: 1px solid var(--dg-border);
+  border-radius: var(--dg-input-radius);
+  overflow: hidden;
+}
+.dgse-preview > .sql-editor {
+  flex: 1;
+  min-width: 0;
+}
+.dgse-preview-ok {
+  position: absolute;
+  top: 6px;
+  right: 10px;
+  display: flex;
+  z-index: 3;
+}
+.dgse-notes {
+  flex: none;
+  max-height: 88px;
+  overflow-y: auto;
+  padding: 0 16px 6px;
+  font-size: var(--dg-font-size-medium);
+  white-space: pre-wrap;
+  user-select: text;
+}
+.dgse-error {
+  color: var(--dg-text-error);
+}
+.dgse-warning {
+  color: var(--dg-text-warning);
+}
+.dgse-tree .dg-tree-label.dgse-new {
+  color: var(--dg-text-success);
+}

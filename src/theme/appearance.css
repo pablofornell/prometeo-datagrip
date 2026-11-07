@@ -1,0 +1,46 @@
+/*
+ * Switches of Settings > Appearance and Editor that need nothing but a CSS rule. src/state/settings.ts puts the
+ * attributes on <html> (`data-compact`, `data-project-colors="off"`, ...); the colours are tokens of dark.css / light.css.
+ */
+
+/* Compact mode: 22px tree rows and menu rows instead of 24px */
+:root[data-compact] .dg-tree-row {
+  height: 22px;
+}
+:root[data-compact] .dg-menu-row {
+  height: 22px;
+}
+
+/* Use project colors in main toolbar */
+:root[data-project-colors="off"] .dg-toolbar {
+  background: var(--dg-toolbar-bg);
+}
+
+/* Display icons in menu items (the check mark of toggle items stays) */
+:root[data-menu-icons="off"] .dg-menu-icon .dg-icon:not([src*="checkmark"]) {
+  display: none;
+}
+
+/* Tree views: indent guides, one hairline under each chevron of the parents (see Tree.tsx for the --dg-tree-* vars) */
+:root[data-tree-guides] .dg-tree-row {
+  background-image: repeating-linear-gradient(
+    to right,
+    transparent 0,
+    transparent calc(var(--dg-tree-indent-w) - 1px),
+    var(--dg-tree-indent-guide) calc(var(--dg-tree-indent-w) - 1px),
+    var(--dg-tree-indent-guide) var(--dg-tree-indent-w)
+  );
+  background-size: var(--dg-tree-guide-w, 0) 100%;
+  background-position: 8px 0;
+  background-repeat: no-repeat;
+}
+
+/* Editor > General > Appearance */
+:root[data-editor-indent-guides="off"] .sql-editor .cm-line {
+  background-image: none !important; /* the guides are an inline background-image on the line */
+}
+
+/* Data Editor and Viewer > Alternate row colors */
+:root[data-grid-alt] .dgg-row.alt {
+  background: var(--dg-grid-alt-row-bg);
+}

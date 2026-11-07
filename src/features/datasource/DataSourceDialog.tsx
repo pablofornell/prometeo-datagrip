@@ -9,17 +9,25 @@ import { SchemasTab } from "./SchemasTab";
 import { SshSslTab } from "./SshSslTab";
 import { TestBar } from "./TestBar";
 import { DBMS, DBMS_ORDER, type Dbms, dbmsIcon, driversRailIcon } from "./drivers";
+import { dsFolders, dsGroupOf } from "../../state/ds-folders";
 import { type Session, createSession } from "./session";
+import type { UrlPrefill } from "./urlParse";
 import { ColorSelect, LinkButton } from "./widgets";
 
 export interface DialogApi {
   select(id: string): void;
-  addNew(dbms: Dbms): void;
+  addNew(dbms: Dbms, prefill?: UrlPrefill): void;
+  /** Shows the Drivers page. */
+  showDrivers(): void;
 }
 
 export interface DialogProps {
   selectId?: string;
   newDbms?: Dbms;
+  /** Fields of the new data source ("Data Source from URL"). */
+  newPrefill?: UrlPrefill;
+  /** Start on the Drivers page. */
+  drivers?: boolean;
   onClose: () => void;
   register: (api: DialogApi | null) => void;
 }
@@ -41,14 +49,16 @@ const Arrow = (props: { dir: "left" | "right" }) => (
 
 export function DataSourceDialog(props: DialogProps) {
   const s = createSession();
-  const [page, setPage] = createSignal<"sources" | "drivers">("sources");
+  const [page, setPage] = createSignal<"sources" | "drivers">(props.drivers ? "drivers" : "sources");
   const [tab, setTab] = createSignal<TabId>("general");
   const [commentOpen, setCommentOpen] = createSignal(false);
   const [renaming, setRenaming] = createSignal<string | null>(null);
+  /** The driver the Drivers page selects when it opens (the one of the data source whose gear button was pressed). */
+  const [driverFocus, setDriverFocus] = createSignal<Dbms | undefined>(undefined);
 
   onMount(async () => {
     await s.load(props.selectId);
-    if (props.newDbms) s.addNew(props.newDbms);
+    if (props.newDbms) s.addNew(props.newDbms, props.newPrefill);
     focusName();
     props.register({
       select: (id) => {
@@ -56,11 +66,12 @@ export function DataSourceDialog(props: DialogProps) {
         const d = s.drafts.find((x) => x.id === id);
         if (d) s.select(d.key);
       },
-      addNew: (dbms) => {
+      addNew: (dbms, prefill) => {
         setPage("sources");
-        s.addNew(dbms);
+        s.addNew(dbms, prefill);
         focusName();
       },
+      showDrivers: () => (setDriverFocus(undefined), setPage("drivers")),
     });
   });
 
@@ -123,6 +134,16 @@ export function DataSourceDialog(props: DialogProps) {
     e.preventDefault();
     e.stopPropagation();
   };
+  /** The list: the data sources outside any folder under "Project Data Sources", then one group per folder. */
+  const groups = createMemo(() => {
+    const folder = (x: (typeof s.drafts)[number]) => (x.id ? dsGroupOf(x.id) : undefined);
+    const out = [{ title: "Project Data Sources", drafts: s.drafts.filter((x) => !folder(x)) }];
+    for (const f of dsFolders()) {
+      const drafts = s.drafts.filter((x) => folder(x) === f);
+      if (drafts.length) out.push({ title: f, drafts });
+    }
+    return out;
+  });
   const modifiedTab = createMemo(() => (page() === "sources" ? tab() : "general"));
 
   return (
@@ -151,7 +172,19 @@ export function DataSourceDialog(props: DialogProps) {
           </button>
         </div>
 
-        <Show when={page() === "sources"} fallback={<DriversPage />}>
+        <Show
+          when={page() === "sources"}
+          fallback={
+            <DriversPage
+              initial={driverFocus()}
+              onCreate={(dbms) => {
+                setPage("sources");
+                s.addNew(dbms);
+                focusName();
+              }}
+            />
+          }
+        >
           {/* ---- left: list */}
           <div class="ds-left">
             <div class="ds-left-head">
@@ -176,43 +209,62 @@ export function DataSourceDialog(props: DialogProps) {
               <button type="button" class="dg-action-button ds-tb" classList={{ "dg-disabled": !d() }} {...tip("Duplicate")} disabled={!d()} onClick={() => s.duplicateSelected()}>
                 <Icon name="copy" />
               </button>
+              <button
+                type="button"
+                class="dg-action-button ds-tb"
+                classList={{ "dg-disabled": !d() }}
+                {...tip("Go to Driver")}
+                disabled={!d()}
+                onClick={() => {
+                  setDriverFocus(d()!.form.dbms);
+                  setPage("drivers");
+                }}
+              >
+                <Icon name="settings" />
+              </button>
             </div>
             <div class="ds-list" tabindex={0} onKeyDown={onListKey}>
-              <div class="ds-list-group">Project Data Sources</div>
-              <For each={s.drafts}>
-                {(x) => (
-                  <div
-                    class="ds-list-row"
-                    classList={{ "ds-selected": s.selectedKey() === x.key, "ds-new": s.isNew(x), "ds-modified": s.isModified(x) }}
-                    onClick={() => s.select(x.key)}
-                    onDblClick={() => setRenaming(x.key)}
-                  >
-                    <Icon src={dbmsIcon(x.form.dbms)} />
-                    <Show when={renaming() === x.key} fallback={<span class="ds-list-name">{x.form.name || "<unnamed>"}</span>}>
-                      <input
-                        class="ds-rename"
-                        spellcheck={false}
-                        value={x.form.name}
-                        ref={(el) => setTimeout(() => (el.focus(), el.select()), 0)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") {
-                            e.stopPropagation();
-                            e.preventDefault();
-                            s.rename(x.key, e.currentTarget.value);
-                            setRenaming(null);
-                          } else if (e.key === "Escape") {
-                            e.stopPropagation();
-                            e.preventDefault();
-                            setRenaming(null);
-                          }
-                        }}
-                        onBlur={(e) => {
-                          if (renaming() === x.key) s.rename(x.key, e.currentTarget.value);
-                          setRenaming(null);
-                        }}
-                      />
-                    </Show>
-                  </div>
+              <For each={groups()}>
+                {(g) => (
+                  <>
+                    <div class="ds-list-group">{g.title}</div>
+                    <For each={g.drafts}>
+                      {(x) => (
+                        <div
+                          class="ds-list-row"
+                          classList={{ "ds-selected": s.selectedKey() === x.key, "ds-new": s.isNew(x), "ds-modified": s.isModified(x) }}
+                          onClick={() => s.select(x.key)}
+                          onDblClick={() => setRenaming(x.key)}
+                        >
+                          <Icon src={dbmsIcon(x.form.dbms)} />
+                          <Show when={renaming() === x.key} fallback={<span class="ds-list-name">{x.form.name || "<unnamed>"}</span>}>
+                            <input
+                              class="ds-rename"
+                              spellcheck={false}
+                              value={x.form.name}
+                              ref={(el) => setTimeout(() => (el.focus(), el.select()), 0)}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") {
+                                  e.stopPropagation();
+                                  e.preventDefault();
+                                  s.rename(x.key, e.currentTarget.value);
+                                  setRenaming(null);
+                                } else if (e.key === "Escape") {
+                                  e.stopPropagation();
+                                  e.preventDefault();
+                                  setRenaming(null);
+                                }
+                              }}
+                              onBlur={(e) => {
+                                if (renaming() === x.key) s.rename(x.key, e.currentTarget.value);
+                                setRenaming(null);
+                              }}
+                            />
+                          </Show>
+                        </div>
+                      )}
+                    </For>
+                  </>
                 )}
               </For>
               <hr class="ds-list-sep" />

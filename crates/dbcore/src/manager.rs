@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::conn::{build_opts, connect_one, is_memory, open_pool, Conn, ConnOpts, Live};
+use crate::conn::{build_opts, connect_one, is_memory, open_pool, Conn, ConnOpts, Live, Pool};
 use crate::error::{ConnectionLost, DbError, Result};
 use crate::exec::conn_scalar;
 use crate::model::*;
@@ -100,18 +100,15 @@ pub(crate) struct Opened {
     pub server_ver: ServerVer,
 }
 
-/// Open a connection for a session: its cancel handle (backend pid / connection id / `sqlite3*`) and, for
-/// MySQL, `@@autocommit` and `@@version` (read once here, before any user statement: the tracker follows
-/// autocommit from then on and needs the version to read `/*!NNNNN ... */` comments).
-pub(crate) async fn open_conn(live: &Live) -> Result<Opened> {
-    let mut conn = live.new_conn().await?;
-    let cancel = match &mut conn {
+/// How to interrupt the statements of `conn` (backend pid / connection id / `sqlite3*`).
+pub(crate) async fn cancel_target_of(conn: &mut Conn) -> Result<CancelTarget> {
+    Ok(match conn {
         Conn::Pg(_) => {
-            let pid = conn_scalar(&mut conn, "select pg_backend_pid()::text").await?;
+            let pid = conn_scalar(conn, "select pg_backend_pid()::text").await?;
             CancelTarget::Pg(pid.and_then(|p| p.parse().ok()).unwrap_or(0))
         }
         Conn::My(_) => {
-            let id = conn_scalar(&mut conn, "select connection_id()").await?;
+            let id = conn_scalar(conn, "select connection_id()").await?;
             CancelTarget::My(id.and_then(|p| p.parse().ok()).unwrap_or(0))
         }
         Conn::Lite(c) => {
@@ -119,7 +116,36 @@ pub(crate) async fn open_conn(live: &Live) -> Result<Opened> {
             let ptr = h.as_raw_handle().as_ptr() as usize;
             CancelTarget::Lite(Arc::new(Mutex::new(Some(ptr))))
         }
-    };
+    })
+}
+
+/// Ask the server (through `pool`, another connection) to stop what `target` is running.
+pub(crate) async fn interrupt(pool: &Pool, target: &CancelTarget) {
+    match target {
+        CancelTarget::None => {}
+        CancelTarget::Pg(pid) => {
+            let _ = pool.exec(&format!("select pg_cancel_backend({pid})")).await;
+        }
+        CancelTarget::My(id) => {
+            let _ = pool.exec(&format!("KILL QUERY {id}")).await;
+        }
+        CancelTarget::Lite(h) => {
+            let g = h.lock().unwrap();
+            if let Some(ptr) = *g {
+                // SAFETY: the pointer is cleared (under this lock) before the connection
+                // is dropped, and sqlite3_interrupt is documented as thread-safe.
+                unsafe { libsqlite3_sys::sqlite3_interrupt(ptr as *mut libsqlite3_sys::sqlite3) };
+            }
+        }
+    }
+}
+
+/// Open a connection for a session: its cancel handle (backend pid / connection id / `sqlite3*`) and, for
+/// MySQL, `@@autocommit` and `@@version` (read once here, before any user statement: the tracker follows
+/// autocommit from then on and needs the version to read `/*!NNNNN ... */` comments).
+pub(crate) async fn open_conn(live: &Live) -> Result<Opened> {
+    let mut conn = live.new_conn().await?;
+    let cancel = cancel_target_of(&mut conn).await?;
     let autocommit_on = match &mut conn {
         Conn::My(_) => conn_scalar(&mut conn, "select @@autocommit")
             .await?
@@ -252,29 +278,7 @@ impl Session {
 
     /// Ask the server to stop the statement currently running on this session.
     pub async fn cancel_running(&self) {
-        match &self.cancel_target() {
-            CancelTarget::None => {}
-            CancelTarget::Pg(pid) => {
-                let _ = self
-                    .live
-                    .pool
-                    .exec(&format!("select pg_cancel_backend({pid})"))
-                    .await;
-            }
-            CancelTarget::My(id) => {
-                let _ = self.live.pool.exec(&format!("KILL QUERY {id}")).await;
-            }
-            CancelTarget::Lite(h) => {
-                let g = h.lock().unwrap();
-                if let Some(ptr) = *g {
-                    // SAFETY: the pointer is cleared (under this lock) before the connection
-                    // is dropped, and sqlite3_interrupt is documented as thread-safe.
-                    unsafe {
-                        libsqlite3_sys::sqlite3_interrupt(ptr as *mut libsqlite3_sys::sqlite3)
-                    };
-                }
-            }
-        }
+        interrupt(&self.live.pool, &self.cancel_target()).await;
     }
 }
 
@@ -298,8 +302,8 @@ pub struct ConnectionManager {
     pub(crate) inner: Arc<Inner>,
 }
 
-/// Connect once (fail fast, real error) and read the server version.
-async fn probe(cfg: &DataSourceConfig, opts: &ConnOpts) -> Result<String> {
+/// Connect once (fail fast, real error); reads the server version and whether the session is encrypted.
+async fn probe(cfg: &DataSourceConfig, opts: &ConnOpts) -> Result<(String, Option<bool>)> {
     let mut conn = connect_one(opts, cfg).await?;
     let q = match conn.driver() {
         Driver::Postgres => "show server_version",
@@ -308,14 +312,33 @@ async fn probe(cfg: &DataSourceConfig, opts: &ConnOpts) -> Result<String> {
     };
     let v = conn_scalar(&mut conn, q).await;
     let driver = conn.driver();
+    // what the connection negotiated, not what was asked for (`sslmode=prefer` may end up unencrypted)
+    let ssl_sql = match driver {
+        Driver::Postgres => Some("select coalesce((select ssl from pg_stat_ssl where pid = pg_backend_pid()), false)::text"),
+        Driver::MySql => Some(
+            "select if(coalesce((select variable_value from performance_schema.session_status where variable_name = 'Ssl_cipher'), '') = '', 'false', 'true')",
+        ),
+        Driver::Sqlite => None,
+    };
+    let ssl = match ssl_sql {
+        Some(sql) => conn_scalar(&mut conn, sql)
+            .await
+            .ok()
+            .flatten()
+            .map(|t| t == "true"),
+        None => None,
+    };
     conn.close().await;
     let v = v?.unwrap_or_default();
-    Ok(match driver {
-        Driver::Postgres => format!("PostgreSQL {v}"),
-        Driver::MySql if v.to_lowercase().contains("mariadb") => format!("MariaDB {v}"),
-        Driver::MySql => format!("MySQL {v}"),
-        Driver::Sqlite => format!("SQLite {v}"),
-    })
+    Ok((
+        match driver {
+            Driver::Postgres => format!("PostgreSQL {v}"),
+            Driver::MySql if v.to_lowercase().contains("mariadb") => format!("MariaDB {v}"),
+            Driver::MySql => format!("MySQL {v}"),
+            Driver::Sqlite => format!("SQLite {v}"),
+        },
+        ssl,
+    ))
 }
 
 impl ConnectionManager {
@@ -326,24 +349,26 @@ impl ConnectionManager {
     /// Try to connect with a throw-away pool and report server version / error.
     pub async fn test_connection(&self, cfg: &DataSourceConfig) -> TestResult {
         let t0 = Instant::now();
-        let res: Result<String> = async {
+        let res: Result<(String, Option<bool>)> = async {
             let opts = build_opts(cfg)?;
             probe(cfg, &opts).await
         }
         .await;
         let elapsed_ms = t0.elapsed().as_millis() as u64;
         match res {
-            Ok(v) => TestResult {
+            Ok((v, ssl)) => TestResult {
                 ok: true,
                 message: format!("Succeeded. {v}"),
                 server_version: Some(v),
                 elapsed_ms,
+                ssl,
             },
             Err(e) => TestResult {
                 ok: false,
                 server_version: None,
                 message: e.to_string(),
                 elapsed_ms,
+                ssl: None,
             },
         }
     }
@@ -356,7 +381,7 @@ impl ConnectionManager {
             });
         }
         let opts = build_opts(cfg)?;
-        let version = probe(cfg, &opts).await?;
+        let (version, _) = probe(cfg, &opts).await?;
         let pool = open_pool(cfg, &opts).await?;
         let keepalive = if is_memory(cfg) {
             Some(connect_one(&opts, cfg).await?)

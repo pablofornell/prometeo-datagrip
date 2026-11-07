@@ -29,3 +29,19 @@
   font: 13px / 18px var(--dg-font-ui, "Inter", sans-serif);
 }
 .dgd-error { color: var(--dg-error-fg, #f75464); white-space: pre-wrap; }
+.dgd-banner {
+  display: flex;
+  align-items: center;
+  flex: none;
+  gap: 10px;
+  height: 28px;
+  box-sizing: border-box;
+  padding: 0 12px;
+  background: var(--dg-editor-notification-bg);
+  border-bottom: 1px solid var(--dg-banner-info-border);
+  color: var(--dg-text);
+  font: 13px / 18px var(--dg-font-ui, "Inter", sans-serif);
+}
+.dgd-banner-link { color: var(--dg-link, #548af7); cursor: pointer; }
+.dgd-banner-link:hover { text-decoration: underline; }
+.dgd-banner-sep { width: 1px; height: 14px; background: var(--dg-separator, #43454a); }

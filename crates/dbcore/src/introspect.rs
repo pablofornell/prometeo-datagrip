@@ -87,6 +87,24 @@ fn folder_label(key: &str) -> String {
     key.replace('_', " ")
 }
 
+/// Path element of the `Server Objects` node (PostgreSQL / MySQL: roles, tablespaces, users). Never a real name.
+const SERVER_OBJECTS: &str = "$server";
+/// Path element of PostgreSQL's `Database Objects` node under a database (extensions).
+const DATABASE_OBJECTS: &str = "$objects";
+
+/// A folder node of the object groups (`Server Objects`, `Database Objects`).
+fn group(ds: &str, base: &[String], name: &str, key: &str) -> TreeNode {
+    mk(
+        ds,
+        NodeKind::Folder,
+        name,
+        None,
+        child_path(base, key),
+        true,
+        json!({ "folder": key, "group": true }),
+    )
+}
+
 fn folder(
     ds: &str,
     base: &[String],
@@ -195,15 +213,22 @@ async fn pg_children(
 ) -> Result<Vec<TreeNode>> {
     let pool = &live.pool;
     let lit = |v: &str| quote_literal(Driver::Postgres, v);
+    if path.first().map(String::as_str) == Some(SERVER_OBJECTS) {
+        return pg_server_objects(pool, ds, path).await;
+    }
+    if path.len() >= 2 && path[1] == DATABASE_OBJECTS {
+        return pg_database_objects(pool, ds, path).await;
+    }
     match path.len() {
         0 => {
             let rows = pool
                 .query_strings(
-                    "select datname, (datname = current_database())::text, pg_encoding_to_char(encoding) \
+                    "select datname, (datname = current_database())::text, pg_encoding_to_char(encoding), \
+                     coalesce(shobj_description(oid, 'pg_database'), '') \
                      from pg_database where not datistemplate and datallowconn order by (datname = current_database()) desc, datname",
                 )
                 .await?;
-            Ok(rows
+            let mut out: Vec<TreeNode> = rows
                 .iter()
                 .map(|r| {
                     let current = b(r, 1);
@@ -214,13 +239,21 @@ async fn pg_children(
                         None,
                         vec![s(r, 0)],
                         current,
-                        json!({ "current": current, "encoding": s(r, 2) }),
+                        json!({ "current": current, "encoding": s(r, 2), "comment": s(r, 3) }),
                     )
                 })
-                .collect())
+                .collect();
+            out.push(group(ds, &[], "Server Objects", SERVER_OBJECTS));
+            Ok(out)
         }
         1 => {
             pg_check_db(pool, &path[0]).await?;
+            let default_schema = pool
+                .query_strings("select coalesce((select s from unnest(current_schemas(false)) as s limit 1), 'public')")
+                .await?
+                .first()
+                .map(|r| s(r, 0))
+                .unwrap_or_default();
             let sys = if opts.show_system {
                 ""
             } else {
@@ -230,10 +263,10 @@ async fn pg_children(
                 .query_strings(&format!(
                     "select nspname, coalesce(obj_description(oid, 'pg_namespace'), ''), pg_get_userbyid(nspowner) \
                      from pg_namespace where nspname !~ '^pg_toast' and nspname !~ '^pg_temp' and nspname !~ '^pg_toast_temp'{sys} \
-                     order by (nspname = 'public') desc, nspname"
+                     order by lower(nspname), nspname"
                 ))
                 .await?;
-            Ok(rows
+            let mut out: Vec<TreeNode> = rows
                 .iter()
                 .map(|r| {
                     mk(
@@ -243,10 +276,12 @@ async fn pg_children(
                         nonempty(s(r, 1)),
                         child_path(path, &s(r, 0)),
                         true,
-                        json!({ "schema": s(r, 0), "owner": s(r, 2), "system": matches!(s(r, 0).as_str(), "pg_catalog" | "information_schema") }),
+                        json!({ "schema": s(r, 0), "owner": s(r, 2), "system": matches!(s(r, 0).as_str(), "pg_catalog" | "information_schema"), "default": s(r, 0) == default_schema }),
                     )
                 })
-                .collect())
+                .collect();
+            out.push(group(ds, path, "Database Objects", DATABASE_OBJECTS));
+            Ok(out)
         }
         2 => {
             let sc = &path[1];
@@ -298,6 +333,119 @@ async fn pg_check_db(pool: &Pool, db: &str) -> Result<()> {
     Ok(())
 }
 
+/// `Server Objects` of PostgreSQL: `roles`, `tablespaces`.
+async fn pg_server_objects(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec<TreeNode>> {
+    match path.len() {
+        1 => {
+            let rows = pool
+                .query_strings(
+                    "select (select count(*) from pg_roles where rolname !~ '^pg_'), (select count(*) from pg_tablespace)",
+                )
+                .await?;
+            let r = rows.first().cloned().unwrap_or_default();
+            Ok(["roles", "tablespaces"]
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| n(&r, *i) > 0)
+                .map(|(i, k)| folder(ds, path, k, n(&r, i), None, None))
+                .collect())
+        }
+        2 if path[1] == "roles" => {
+            let rows = pool
+                .query_strings(
+                    "select rolname, rolsuper::text, rolcanlogin::text, coalesce(shobj_description(oid, 'pg_authid'), '') \
+                     from pg_roles where rolname !~ '^pg_' order by lower(rolname), rolname",
+                )
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    let hint = if b(r, 1) {
+                        Some("superuser".to_string())
+                    } else if b(r, 2) {
+                        Some("login".to_string())
+                    } else {
+                        None
+                    };
+                    mk(
+                        ds,
+                        NodeKind::Role,
+                        &s(r, 0),
+                        hint,
+                        child_path(path, &s(r, 0)),
+                        false,
+                        json!({ "superuser": b(r, 1), "login": b(r, 2), "comment": s(r, 3) }),
+                    )
+                })
+                .collect())
+        }
+        2 if path[1] == "tablespaces" => {
+            let rows = pool
+                .query_strings(
+                    "select spcname, pg_get_userbyid(spcowner), coalesce(pg_tablespace_location(oid), '') \
+                     from pg_tablespace order by spcname",
+                )
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    mk(
+                        ds,
+                        NodeKind::Tablespace,
+                        &s(r, 0),
+                        nonempty(s(r, 2)),
+                        child_path(path, &s(r, 0)),
+                        false,
+                        json!({ "owner": s(r, 1), "location": s(r, 2) }),
+                    )
+                })
+                .collect())
+        }
+        _ => Err(bad_path(path)),
+    }
+}
+
+/// `Database Objects` of PostgreSQL: `extensions` (name and version).
+async fn pg_database_objects(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec<TreeNode>> {
+    pg_check_db(pool, &path[0]).await?;
+    match path.len() {
+        2 => {
+            let rows = pool
+                .query_strings("select count(*) from pg_extension")
+                .await?;
+            let c = rows.first().map(|r| n(r, 0)).unwrap_or(0);
+            Ok(if c > 0 {
+                vec![folder(ds, path, "extensions", c, None, None)]
+            } else {
+                vec![]
+            })
+        }
+        3 if path[2] == "extensions" => {
+            let rows = pool
+                .query_strings(
+                    "select e.extname, e.extversion, pg_get_userbyid(e.extowner), n.nspname, coalesce(obj_description(e.oid, 'pg_extension'), '') \
+                     from pg_extension e join pg_namespace n on n.oid = e.extnamespace order by lower(e.extname), e.extname",
+                )
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    mk(
+                        ds,
+                        NodeKind::Extension,
+                        &s(r, 0),
+                        nonempty(s(r, 1)),
+                        child_path(path, &s(r, 0)),
+                        false,
+                        json!({ "version": s(r, 1), "owner": s(r, 2), "schema": s(r, 3), "comment": s(r, 4) }),
+                    )
+                })
+                .collect())
+        }
+        _ => Err(bad_path(path)),
+    }
+}
+
 async fn pg_objects(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec<TreeNode>> {
     let sc = &path[1];
     let lit = |v: &str| quote_literal(Driver::Postgres, v);
@@ -312,7 +460,8 @@ async fn pg_objects(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec<TreeNo
             };
             let rows = pool
                 .query_strings(&format!(
-                    "select c.relname, c.relkind::text, c.reltuples::bigint::text, coalesce(obj_description(c.oid, 'pg_class'), ''), c.oid::text \
+                    "select c.relname, c.relkind::text, c.reltuples::bigint::text, coalesce(obj_description(c.oid, 'pg_class'), ''), c.oid::text, \
+                     coalesce((select format_type(q.seqtypid, null) from pg_sequence q where q.seqrelid = c.oid), '') \
                      from pg_class c join pg_namespace n on n.oid = c.relnamespace \
                      where n.nspname = {} and c.relkind in ({kinds}) order by c.relname",
                     lit(sc)
@@ -322,11 +471,13 @@ async fn pg_objects(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec<TreeNo
                 .iter()
                 .map(|r| {
                     let est = n(r, 2);
+                    // a sequence shows its data type (`integer`, `bigint`) like DataGrip, the others their comment
+                    let hint = if kind == NodeKind::Sequence { nonempty(s(r, 5)) } else { nonempty(s(r, 3)) };
                     mk(
                         ds,
                         kind,
                         &s(r, 0),
-                        nonempty(s(r, 3)),
+                        hint,
                         child_path(path, &s(r, 0)),
                         kind != NodeKind::Sequence,
                         json!({ "schema": sc, "relkind": s(r, 1), "rowEstimate": if est >= 0 { Some(est) } else { None }, "oid": s(r, 4), "comment": s(r, 3) }),
@@ -596,6 +747,44 @@ fn my_lit(v: &str) -> String {
 
 const MY_SYSTEM: [&str; 4] = ["information_schema", "mysql", "performance_schema", "sys"];
 
+/// `Server Objects` of MySQL: `users`.
+async fn my_server_objects(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec<TreeNode>> {
+    match path.len() {
+        1 => {
+            let rows = pool
+                .query_strings("select count(*) from mysql.user")
+                .await?;
+            let c = rows.first().map(|r| n(r, 0)).unwrap_or(0);
+            Ok(if c > 0 {
+                vec![folder(ds, path, "users", c, None, None)]
+            } else {
+                vec![]
+            })
+        }
+        2 if path[1] == "users" => {
+            let rows = pool
+                .query_strings("select user, host from mysql.user order by lower(user), user, host")
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    let name = format!("{}@{}", s(r, 0), s(r, 1));
+                    mk(
+                        ds,
+                        NodeKind::User,
+                        &name,
+                        None,
+                        child_path(path, &name),
+                        false,
+                        json!({ "user": s(r, 0), "host": s(r, 1) }),
+                    )
+                })
+                .collect())
+        }
+        _ => Err(bad_path(path)),
+    }
+}
+
 async fn my_children(
     live: &Live,
     ds: &str,
@@ -603,12 +792,16 @@ async fn my_children(
     opts: &IntrospectOptions,
 ) -> Result<Vec<TreeNode>> {
     let pool = &live.pool;
+    if path.first().map(String::as_str) == Some(SERVER_OBJECTS) {
+        return my_server_objects(pool, ds, path).await;
+    }
     match path.len() {
         0 => {
             let rows = pool
-                .query_strings("select schema_name, default_character_set_name from information_schema.schemata order by schema_name")
+                .query_strings("select schema_name, default_character_set_name from information_schema.schemata order by lower(schema_name), schema_name")
                 .await?;
-            Ok(rows
+            let users = pool.query_strings("select count(*) from mysql.user").await;
+            let mut out: Vec<TreeNode> = rows
                 .iter()
                 .filter(|r| opts.show_system || !MY_SYSTEM.contains(&s(r, 0).to_lowercase().as_str()))
                 .map(|r| {
@@ -622,7 +815,12 @@ async fn my_children(
                         json!({ "schema": s(r, 0), "charset": s(r, 1), "system": MY_SYSTEM.contains(&s(r, 0).to_lowercase().as_str()) }),
                     )
                 })
-                .collect())
+                .collect();
+            // the account list needs the privilege to read `mysql.user`; without it there is no node
+            if users.is_ok() {
+                out.push(group(ds, &[], "Server Objects", SERVER_OBJECTS));
+            }
+            Ok(out)
         }
         1 => {
             let sc = &path[0];
@@ -1126,7 +1324,7 @@ async fn lite_children(
                         ));
                     }
                     for i in lite_index_list(pool, sc, t).await?.into_iter().filter(|i| i.origin == "u") {
-                        let names = lite_index_columns(pool, sc, &i.name).await?;
+                        let (names, _) = lite_index_columns(pool, sc, &i.name).await?;
                         out.push(mk(
                             ds,
                             NodeKind::UniqueKey,
@@ -1158,7 +1356,7 @@ async fn lite_children(
                 "indexes" => {
                     let mut out = Vec::new();
                     for i in lite_index_list(pool, sc, t).await?.into_iter().filter(|i| i.origin == "c") {
-                        let names = lite_index_columns(pool, sc, &i.name).await?;
+                        let (names, expression) = lite_index_columns(pool, sc, &i.name).await?;
                         out.push(mk(
                             ds,
                             NodeKind::Index,
@@ -1166,7 +1364,7 @@ async fn lite_children(
                             Some(format!("({})", names.join(", "))),
                             child_path(path, &i.name),
                             false,
-                            ex(json!({ "unique": i.unique, "columns": names.join(", "), "partial": i.partial })),
+                            ex(json!({ "unique": i.unique, "columns": names.join(", "), "partial": i.partial, "expression": expression })),
                         ));
                     }
                     Ok(out)
@@ -1242,11 +1440,116 @@ async fn lite_index_list(pool: &Pool, schema: &str, table: &str) -> Result<Vec<L
         .collect())
 }
 
-async fn lite_index_columns(pool: &Pool, schema: &str, index: &str) -> Result<Vec<String>> {
+/// Key columns of an index; an expression of the index (`lower(b)`) comes as its source text (from the `create index`
+/// statement, `index_info` has no name for it). The flag tells that there is at least one expression.
+async fn lite_index_columns(pool: &Pool, schema: &str, index: &str) -> Result<(Vec<String>, bool)> {
     let rows = pool
         .query_strings(&format!("pragma {}.index_info({})", lq(schema), ll(index)))
         .await?;
-    Ok(rows.iter().map(|r| s(r, 2)).collect())
+    // columns: seqno, cid (-2 = expression), name
+    let has_expr = rows.iter().any(|r| s(r, 1) == "-2");
+    let mut names: Vec<String> = rows.iter().map(|r| s(r, 2)).collect();
+    if has_expr {
+        let sql = pool
+            .query_strings(&format!(
+                "select sql from {}.sqlite_master where type = 'index' and name = {}",
+                lq(schema),
+                ll(index)
+            ))
+            .await?
+            .first()
+            .map(|r| s(r, 0))
+            .unwrap_or_default();
+        let parts = lite_index_terms(&sql);
+        for (i, r) in rows.iter().enumerate() {
+            if s(r, 1) == "-2" {
+                names[i] = match parts.get(i) {
+                    Some(p) if parts.len() == rows.len() => p.clone(),
+                    _ => "<expression>".to_string(),
+                };
+            }
+        }
+    }
+    Ok((names, has_expr))
+}
+
+/// The terms of `create index ... on t (a, lower(b) collate nocase, c desc) where ...` without `collate` / `asc` / `desc`.
+fn lite_index_terms(sql: &str) -> Vec<String> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut i = 0;
+    let mut quote: Option<char> = None;
+    let mut depth = 0;
+    let mut seen_on = false;
+    let mut start = None;
+    let mut cur = String::new();
+    let mut terms: Vec<String> = Vec::new();
+    while i < chars.len() {
+        let ch = chars[i];
+        if let Some(q) = quote {
+            if start.is_some() {
+                cur.push(ch);
+            }
+            if ch == q {
+                quote = None;
+            }
+        } else if ch == '\'' || ch == '"' || ch == '`' || ch == '[' {
+            quote = Some(if ch == '[' { ']' } else { ch });
+            if start.is_some() {
+                cur.push(ch);
+            }
+        } else if start.is_none() {
+            if ch.is_alphabetic()
+                && (i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_'))
+            {
+                let w: String = chars[i..]
+                    .iter()
+                    .take_while(|c| c.is_alphanumeric() || **c == '_')
+                    .collect();
+                if w.eq_ignore_ascii_case("on") {
+                    seen_on = true;
+                }
+                i += w.chars().count();
+                continue;
+            }
+            if ch == '(' && seen_on {
+                start = Some(i);
+                depth = 1;
+            }
+        } else if ch == '(' {
+            depth += 1;
+            cur.push(ch);
+        } else if ch == ')' {
+            depth -= 1;
+            if depth == 0 {
+                terms.push(std::mem::take(&mut cur));
+                break;
+            }
+            cur.push(ch);
+        } else if ch == ',' && depth == 1 {
+            terms.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(ch);
+        }
+        i += 1;
+    }
+    terms.iter().map(|t| strip_index_term(t.trim())).collect()
+}
+
+/// `lower(b) collate nocase desc` -> `lower(b)`.
+fn strip_index_term(t: &str) -> String {
+    let mut t = t.trim().to_string();
+    loop {
+        let low = t.to_ascii_lowercase();
+        let cut = if low.ends_with(" asc") || low.ends_with(" desc") {
+            low.rfind(' ')
+        } else {
+            low.rfind(" collate ")
+        };
+        match cut {
+            Some(at) if !low[at..].contains(')') => t.truncate(at),
+            _ => return t.trim().to_string(),
+        }
+    }
 }
 
 async fn lite_fks(pool: &Pool, schema: &str, table: &str) -> Result<Vec<LiteFk>> {

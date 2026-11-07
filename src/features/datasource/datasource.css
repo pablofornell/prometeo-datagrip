@@ -645,6 +645,35 @@ body.dg-modal-open .dg-notifications {
   color: var(--dg-input-fg);
   font: inherit;
 }
+.ds-textarea-wrap {
+  position: relative;
+  flex: 1;
+  display: flex;
+}
+.ds-textarea-wrap .ds-textarea {
+  padding-right: 28px;
+}
+.ds-expand {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: flex;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--dg-text-secondary);
+}
+.ds-expand:hover {
+  color: var(--dg-text);
+}
+.ds-script-editor {
+  width: 100%;
+  height: 260px;
+  font-family: var(--dg-font-mono);
+}
+.ds-opt-combo-short {
+  width: 110px;
+}
 .ds-textarea:focus {
   border-color: var(--dg-input-focus-border);
   box-shadow: inset 0 0 0 1px var(--dg-input-focus-border);
@@ -885,4 +914,120 @@ body.dg-modal-open .dg-notifications {
 }
 .ds-tree-row .dg-checkbox {
   gap: 6px;
+}
+
+/* ------------------------------------------------------------ Drivers page */
+.ds-drivers-list {
+  position: relative;
+}
+.ds-drivers-list .ds-list-group {
+  margin-top: 0;
+}
+.ds-drivers-searchbar {
+  flex: none;
+  padding: 6px 4px 0;
+}
+.ds-drivers-searchbar .dg-speedsearch {
+  width: 100%;
+  box-sizing: border-box;
+}
+.ds-driver-form {
+  flex: 1;
+  min-height: 0;
+}
+.ds-driver-tabs {
+  margin: 12px 0 4px;
+}
+.ds-driver-options {
+  margin-top: 8px;
+}
+.ds-driver-options .ds-opt-row {
+  margin-left: 0;
+}
+.ds-driver-foot {
+  flex: none;
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
+  height: 34px;
+  padding: 0 12px;
+  border-top: 1px solid var(--dg-border);
+}
+
+/* ------------------------------------------------------------ schema filter tree (popup and Schemas tab) */
+.dg-sft {
+  --sft-indent: 6px;
+}
+.dg-sft-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 24px;
+  padding-left: var(--sft-indent);
+}
+.dg-sft-row .dg-checkbox {
+  gap: 6px;
+}
+.dg-sft-child {
+  padding-left: calc(var(--sft-indent) + 22px);
+}
+.dg-sft-db {
+  gap: 0;
+}
+.dg-sft-chevron {
+  display: flex;
+  flex: none;
+  width: 16px;
+  margin-right: 4px;
+  color: var(--dg-text-secondary);
+}
+.dg-sft-dbname {
+  font-weight: 600;
+}
+.dg-sft-note {
+  color: var(--dg-text-secondary);
+}
+.dg-sft-pattern {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--dg-text-secondary);
+  font: inherit;
+  font-size: var(--dg-font-size-small);
+  cursor: default;
+}
+.dg-sft-pattern:hover {
+  color: var(--dg-link);
+}
+.dg-sft-pattern.dg-sft-has {
+  color: var(--dg-text);
+}
+.dg-sft-pattern-field {
+  width: 150px;
+  height: 22px;
+}
+.ds-schemas-tree .dg-sft {
+  --sft-indent: 25px;
+}
+
+.ds-schemas-fields {
+  flex: none;
+  padding: 10px 12px 12px;
+  border-top: 1px solid var(--dg-border);
+}
+.ds-schemas-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.ds-schemas-field:first-child {
+  margin-top: 0;
+}
+.ds-schemas-field .dg-textfield {
+  flex: 1;
+}
+.ds-schemas-field .ds-label {
+  flex: none;
+  width: 104px;
 }

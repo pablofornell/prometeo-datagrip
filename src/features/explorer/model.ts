@@ -80,6 +80,10 @@ const NODE_ICON: Partial<Record<ExplorerKind, string>> = {
   function: "dg/function",
   procedure: "dg/procedure",
   sequence: "dg/sequence",
+  role: "dg/role",
+  tablespace: "dg/database",
+  extension: "dg/package",
+  user: "dg/user",
   error: "error",
 };
 
@@ -105,6 +109,8 @@ export function columnIcon(tn: TreeNode, ctx?: ColumnContext): string {
 export function iconOf(kind: ExplorerKind, tn?: TreeNode, ctx?: ColumnContext): string | undefined {
   if (kind === "column") return tn ? columnIcon(tn, ctx) : LOCAL + "col";
   if (kind === "index" && tn?.extra.unique && !tn.extra.primary) return "dg/index-unique";
+  // `Server Objects` / `Database Objects`
+  if (kind === "folder" && tn?.extra.group) return tn.extra.folder === "$server" ? "dg/server-objects-group" : "dg/database-objects-group";
   return NODE_ICON[kind];
 }
 
@@ -165,13 +171,22 @@ function routineHint(hint: string): string {
   return `(${out.join(", ")})${m[2]}`;
 }
 
+/** Objects whose comment is shown as a hover tooltip (never as an inline hint, like DataGrip). */
+const COMMENTED: ReadonlySet<NodeKind> = new Set(["database", "schema", "table", "view", "materializedView"]);
+
+export function commentOf(tn: TreeNode): string | undefined {
+  if (!COMMENTED.has(tn.kind)) return undefined;
+  // SQLite reports the database file as the "comment" of a schema; MySQL reports "VIEW" for views
+  const c = typeof tn.extra.comment === "string" ? tn.extra.comment : tn.extra.file || tn.kind === "database" ? undefined : tn.hint;
+  const t = c?.trim();
+  return !t || (tn.kind === "view" && t === "VIEW") ? undefined : t;
+}
+
 export function hintOf(tn: TreeNode): string | undefined {
+  if (COMMENTED.has(tn.kind)) return undefined;
   switch (tn.kind) {
     case "column":
       return columnHint(tn) || undefined;
-    case "schema":
-      // SQLite reports the database file as the "comment" of a schema: DataGrip shows just `main`.
-      return tn.extra.file ? undefined : (tn.hint ?? undefined);
     case "foreignKey":
       return tn.hint ? fkHint(tn.hint) : undefined;
     case "check":

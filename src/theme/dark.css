@@ -235,6 +235,7 @@
   --dg-counter-fg: #000000;
   --dg-progress-fg: #3871E1;            /* ProgressBar.progressColor */
   --dg-progress-track: #40434A;         /* ProgressBar.trackColor */
+  --dg-ds-tint-mix: 18%;                   /* data source color tint (tree rows, tabs, console) */
 
   /* ---- Swing tables (dialogs, e.g. driver properties) ---- */
   --dg-table-bg: #191A1C;
@@ -262,6 +263,7 @@
   --dg-grid-modified-bg: #385570;       /* pending UPDATE cell: CellColors.REPLACE -> DIFF_MODIFIED */
   --dg-grid-inserted-bg: #294436;       /* pending INSERT row: DIFF_INSERTED */
   --dg-grid-deleted-bg: #484A4A;        /* pending DELETE row: DIFF_DELETED */
+  --dg-grid-pinned-line: #393B40;          /* pinned columns: right border of the frozen block */
   --dg-grid-error-underline: #FA6675;   /* GRID_ERROR_VALUE -> ERRORS_ATTRIBUTES */
 
   /* ---- Editor (scheme "Islands Dark") ---- */
@@ -316,6 +318,8 @@
   --dg-editor-warning-wave: #F2C55C;    /* WARNING_ATTRIBUTES effect (wave) */
   --dg-editor-warning-bg: transparent;
   --dg-editor-warning-stripe: #C29E4A;
+  --dg-editor-bulb: #F2C55C;               /* intention bulb (Alt+Enter available) */
+  --dg-editor-bulb-error: #F75464;         /* intention bulb on a problem */
   --dg-editor-weak-warning-wave: #857042; /* INFO_ATTRIBUTES (weak warning) */
   --dg-editor-typo-wave: #7EC482;       /* TYPO */
   --dg-editor-unused: #6F737A;          /* NOT_USED_ELEMENT_ATTRIBUTES fg */
@@ -352,4 +356,19 @@
   /* icons */
   --dg-icon: #C3C5CB;                   /* icon-default-stroke (dark SVGs already recolored) */
   --dg-icon-disabled: #5F6269;
+
+  /* tool windows */
+  --dg-services-connected-dot: #1FD11F;      /* green "connected" dot on data source / session icons (Services) */
+
+  /* hard-coded colours moved out of component CSS (SHELL-24) */
+  --dg-icon-success: #5FB865;                /* gutter / inspection widget check mark (Green4 dark) */
+  --dg-icon-idle: #595959;                   /* idle "Cancel Running Statements" square */
+  --dg-stripe-change: #42BD77;               /* editor scrollbar stripe: changed statement range */
+  --dg-stripe-id: #5B786A;                   /* editor scrollbar stripe: identifier under caret */
+  --dg-editor-stmt-frame-fg: var(--dg-editor-statement-to-execute); /* statement frame (dark: same as the token) */
+  --dg-editor-search-fg: inherit;            /* text colour of a search match */
+  --dg-ds-connected-dot-ring: #191A1C8C;     /* thin ring around the connected dot in the explorer */
+  --dg-pill-border: #404040;                 /* grid paging pill border */
+  --dg-pill-bg: var(--dg-layer-1-bg);
+  --dg-grid-alt-row-bg: #1F2024;            /* Data Editor and Viewer > Alternate row colors */
 }

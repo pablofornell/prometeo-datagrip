@@ -20,19 +20,25 @@ import { type Component, createEffect, on, onCleanup, onMount } from "solid-js";
 import { getAction, isActionEnabled, runAction } from "../../state/actions";
 import { editorMetrics, settings } from "../../state/settings";
 import "./editor.css";
-import { duplicate, extendSelection, goToLine, moveLine, moveStatement, shiftTab, shrinkSelection, tabIndent, toggleBlock } from "./commands";
+import { clipRecorder, completeStatement, duplicate, extendSelection, goToLine, moveLine, moveStatement, parameterInfo, parameterInfoExtension, pasteFromHistory, shiftTab, shrinkSelection, tabIndent, toggleBlock } from "./commands";
 import { sqlCompletion } from "./complete";
 import { completionExtras, withExtras } from "./extras";
 import { errorExtension } from "./errors";
+import { openEditorMenu, placeCaretAt, writeText } from "./contextMenu";
 import { closeChooser, isChooserOpen, scriptRequest, selectionOrStatement, showChooser } from "./execute";
 import { formatScript } from "./format";
+import { applyKeywordCase } from "./keywordCase";
 import { previewField, previewFill, statementFrame } from "./frame";
 import { statusGutterExtension } from "./gutter";
 import { docAnalysis, indentGuides, sqlHighlighting } from "./highlight";
+import { inspectExtension, jumpProblem } from "./inspect";
+import { intentionHostFacet, runQueryFacet } from "./intentions";
+import { applyFirstIntention, intentionsCommand } from "./intentionsPopup";
 import { editorLayers } from "./layers";
+import { goToDeclaration, navigationExtension, quickDocAtCaret, referenceAtCaret, selectInExplorerAtCaret } from "./navigate";
 import { schemaIndexFor } from "./schemaIndex";
 import { sqlSearch } from "./search";
-import { configField, errorsField, execMarksField, setConfig, setErrors, setExecMarks } from "./state";
+import { configField, errorsField, execMarksField, problemsField, setConfig, setErrors, setExecMarks } from "./state";
 import { stripeExtension } from "./stripe";
 import type { ExecuteRequest, Range, SqlEditorHandle, SqlEditorProps } from "./types";
 
@@ -100,7 +106,13 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
     if (isChooserOpen(v)) return true;
     const r = selectionOrStatement(v.state);
     if (!r) return true;
-    if (r.candidates.length > 1) {
+    // Settings > Database > Query Execution: "When caret inside statement execute" (the candidates are the statement, then
+    // the statement with its attached comment)
+    const mode = settings.execCaretInside;
+    if (r.candidates.length > 1 && mode !== "ask") {
+      const c = mode === "smallest" ? r.candidates[0] : r.candidates[r.candidates.length - 1];
+      emit({ sql: v.state.sliceDoc(c.range.from, c.range.to), ranges: [c.range], source: "statement" });
+    } else if (r.candidates.length > 1) {
       showChooser(
         v,
         r.candidates,
@@ -117,19 +129,28 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
     const sel = v.state.selection.main;
     if (!sel.empty) {
       const text = v.state.sliceDoc(sel.from, sel.to);
-      const out = formatScript(text, dialect);
+      const out = applyKeywordCase(formatScript(text, dialect), dialect, settings.sqlKeywordCase);
       const ch = diffChange(text, out);
       if (ch) v.dispatch({ changes: { from: sel.from + ch.from, to: sel.from + ch.to, insert: ch.insert }, userEvent: "input.format" });
       return true;
     }
     const text = v.state.doc.toString();
-    const out = formatScript(text, dialect);
+    const out = applyKeywordCase(formatScript(text, dialect), dialect, settings.sqlKeywordCase);
     const ch = diffChange(text, out);
     if (ch) {
       const head = v.state.selection.main.head;
       const mapped = head <= ch.from ? head : head >= ch.to ? head - (ch.to - ch.from) + ch.insert.length : ch.from + ch.insert.length;
       v.dispatch({ changes: ch, selection: EditorSelection.cursor(Math.min(mapped, out.length)), userEvent: "input.format" });
     }
+    return true;
+  };
+
+  const nav = () => props.navigate ?? {};
+  const goTo = goToDeclaration(nav);
+  const copyReference: Command = (v) => {
+    const ref = nav().goTo ? referenceAtCaret(v) : null;
+    if (!ref) return false;
+    void writeText(ref);
     return true;
   };
 
@@ -170,6 +191,7 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
       index,
       sourceLabel: props.sourceLabel,
       statementFrame: props.statementFrame !== false && !props.singleLine,
+      noTemplates: !!props.singleLine,
       implicit: table ? [{ parts: [table.name.toLowerCase()], table, opaque: false }] : undefined,
     });
   };
@@ -182,7 +204,8 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
       if (u.docChanged || u.selectionSet) {
         const head = u.state.selection.main.head;
         const line = u.state.doc.lineAt(head);
-        props.onCaretChange?.(line.number, head - line.from + 1);
+        const sel = u.state.selection.main;
+        props.onCaretChange?.(line.number, head - line.from + 1, sel.to - sel.from, sel.empty ? 0 : u.state.doc.lineAt(sel.to).number - u.state.doc.lineAt(sel.from).number);
       }
     });
 
@@ -199,9 +222,18 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
         { key: "Alt-Shift-ArrowUp", run: moveLine(-1), preventDefault: true },
         { key: "Alt-Shift-ArrowDown", run: moveLine(1), preventDefault: true },
         { key: "Mod-Alt-l", run: reformat, preventDefault: true },
+        { key: "Mod-Shift-v", run: pasteFromHistory, preventDefault: true },
+        ...(single ? [] : [{ key: "Mod-Shift-Enter", run: completeStatement, preventDefault: true }]),
+        { key: "Mod-p", run: parameterInfo, preventDefault: true },
         { key: "Mod-w", run: extendSelection, preventDefault: true },
         { key: "Mod-Shift-w", run: shrinkSelection, preventDefault: true },
         { key: "Mod-g", run: goToLine, preventDefault: true },
+        { key: "Mod-b", run: goTo, preventDefault: true },
+        { key: "Mod-q", run: quickDocAtCaret(nav), preventDefault: true },
+        { key: "Alt-Shift-b", run: selectInExplorerAtCaret(nav), preventDefault: true },
+        { key: "Mod-Alt-Shift-c", run: copyReference, preventDefault: true },
+        ...(single ? [] : [{ key: "F2", run: (v: EditorView) => jumpProblem(v, 1), preventDefault: true }, { key: "Shift-F2", run: (v: EditorView) => jumpProblem(v, -1), preventDefault: true }]),
+        ...(single || props.readOnly ? [] : [{ key: "Alt-Enter", run: intentionsCommand, preventDefault: true }, { key: "Alt-Shift-Enter", run: applyFirstIntention, preventDefault: true }]),
         { key: "Alt-j", run: selectNextOccurrence, preventDefault: true },
         { key: "Mod-Alt-Shift-j", run: selectSelectionMatches, preventDefault: true },
         { key: "Mod-Shift-l", run: selectLine },
@@ -226,8 +258,20 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
       extensions: [
         configField,
         errorsField,
+        problemsField,
         execMarksField,
         previewField,
+        parameterInfoExtension,
+        clipRecorder,
+        intentionHostFacet.of({
+          get refreshSchema() {
+            return props.intentions?.refreshSchema;
+          },
+          get chooseSchema() {
+            return props.intentions?.chooseSchema;
+          },
+        }),
+        ...(props.onExecute && !single ? [runQueryFacet.of(execute)] : []),
         EditorState.allowMultipleSelections.of(true),
         EditorView.clickAddsSelectionRange.of((e) => e.altKey && !e.shiftKey),
         rectangularSelection({ eventFilter: (e) => e.altKey && e.shiftKey && e.button === 0 }),
@@ -251,6 +295,17 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
         closeBrackets(),
         sqlHighlighting(),
         errorExtension(),
+        ...(props.stripe !== false && !single ? [inspectExtension()] : []),
+        navigationExtension(nav),
+        EditorView.domEventHandlers({
+          contextmenu(e, v) {
+            e.preventDefault();
+            v.focus();
+            placeCaretAt(v, e);
+            openEditorMenu(v, e, { single, nav: nav(), canExecute: !!props.onExecute, reformat, goToDeclaration: goTo });
+            return true;
+          },
+        }),
         statementFrame,
         ...(props.stripe !== false && !single ? [stripeExtension()] : []),
         sqlCompletion(),

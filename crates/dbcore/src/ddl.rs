@@ -41,9 +41,31 @@ impl ConnectionManager {
     /// DDL text of an object (`CREATE TABLE ...`). For indexes, constraints and columns
     /// it returns the corresponding `CREATE INDEX` / `ALTER TABLE ... ADD ...` statement.
     pub async fn ddl(&self, ds_id: &str, obj: &ObjectRef) -> Result<String> {
+        self.ddl_with(ds_id, obj, false).await
+    }
+
+    /// Like [`ddl`](Self::ddl); with `unqualified` the names in the object's own schema are written without the
+    /// schema (`create table invoices`, `references clients`), as DataGrip's DDL view does. The text then no longer
+    /// says where the object lives: use it for display, not for scripts that run elsewhere.
+    pub async fn ddl_with(
+        &self,
+        ds_id: &str,
+        obj: &ObjectRef,
+        unqualified: bool,
+    ) -> Result<String> {
         let live = self.live(ds_id)?;
         match live.driver() {
-            Driver::Postgres => pg_ddl(&live, obj).await,
+            Driver::Postgres => {
+                let text = pg_ddl(&live, obj).await?;
+                let routine = matches!(
+                    obj.kind,
+                    NodeKind::Function | NodeKind::Procedure | NodeKind::Routine
+                );
+                Ok(match (&obj.schema, unqualified && !routine) {
+                    (Some(sc), true) => unqualify_schema(&text, sc),
+                    _ => text,
+                })
+            }
             Driver::MySql => my_ddl(&live, obj).await,
             Driver::Sqlite => lite_ddl(&live, obj).await,
         }
@@ -51,6 +73,57 @@ impl ConnectionManager {
 }
 
 // ============================================================ PostgreSQL
+
+/// Removes the `schema.` prefix of identifiers outside string literals, quoted identifiers and comments
+/// (`create table sales.invoices` -> `create table invoices`, `"My Schema".t` -> `t`).
+pub fn unqualify_schema(sql: &str, schema: &str) -> String {
+    let plain = format!("{schema}.");
+    let quoted = format!("{}.", quote_ident(Driver::Postgres, schema));
+    let prefixes = [quoted.as_str(), plain.as_str()];
+    let ident_char = |c: char| c.is_alphanumeric() || matches!(c, '_' | '$' | '.' | '"');
+    let mut out = String::with_capacity(sql.len());
+    let mut prev: Option<char> = None;
+    let mut rest = sql;
+    while let Some(c) = rest.chars().next() {
+        // literals / quoted identifiers / comments are copied unchanged
+        let skip_to = match c {
+            '\'' => Some(('\'', 1)),
+            '-' if rest.starts_with("--") => Some(('\n', 2)),
+            _ => None,
+        };
+        if let Some((end, from)) = skip_to {
+            let mut len = from;
+            let body = &rest[from..];
+            let mut it = body.char_indices().peekable();
+            let mut closed = None;
+            while let Some((i, ch)) = it.next() {
+                if ch == end {
+                    if end == '\'' && matches!(it.peek(), Some((_, '\''))) {
+                        it.next();
+                        continue;
+                    }
+                    closed = Some(i + ch.len_utf8());
+                    break;
+                }
+            }
+            len += closed.unwrap_or(body.len());
+            out.push_str(&rest[..len]);
+            prev = rest[..len].chars().last();
+            rest = &rest[len..];
+            continue;
+        }
+        if !prev.is_some_and(ident_char) {
+            if let Some(p) = prefixes.iter().find(|p| rest.starts_with(**p)) {
+                rest = &rest[p.len()..];
+                continue;
+            }
+        }
+        out.push(c);
+        prev = Some(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
 
 fn pl(v: &str) -> String {
     quote_literal(Driver::Postgres, v)
@@ -901,6 +974,15 @@ mod tests {
                 "alter b;".into()
             ]),
             "-- auto-generated definition\ncreate a;\n\nalter b;"
+        );
+    }
+
+    #[test]
+    fn schema_prefix_is_removed_outside_literals_and_comments() {
+        let sql = "create table sales.invoices\n(\n    client_id integer references sales.clients,\n    d text default nextval('sales.invoices_id_seq'::regclass)\n);\n-- sales.x\ncreate index i\n    on \"sales\".invoices (client_id);\nalter table other.t add x int; -- it's sales.y\nselect assales.z;";
+        assert_eq!(
+            unqualify_schema(sql, "sales"),
+            "create table invoices\n(\n    client_id integer references clients,\n    d text default nextval('sales.invoices_id_seq'::regclass)\n);\n-- sales.x\ncreate index i\n    on invoices (client_id);\nalter table other.t add x int; -- it's sales.y\nselect assales.z;"
         );
     }
 }

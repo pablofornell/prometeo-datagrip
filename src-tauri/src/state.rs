@@ -11,15 +11,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use dbcore::import::CancellationToken;
 use dbcore::{
     export_result, export_to_string, ApplyResult, ConnectInfo, ConnectionManager, DataSourceConfig,
-    Driver, ExecEvent, ExecOptions, ExecutionId, ExportOptions, FetchedRows, HistoryEntry,
+    Driver, ExecEvent, ExecOptions, ExecutionId, ExplainPlan, ExportOptions, FetchedRows,
+    HistoryEntry, ImportFormat, ImportPreview, ImportProgress, ImportRequest, ImportResult,
     ObjectRef, QueryHistory, ResultSet, RowChange, SessionId, SessionState, SnapshotObject,
     Statement, TableDataRequest, TestResult, TreeNode, TxStatus,
 };
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::files::FileAccess;
 use crate::store::{
     redact, strip_url_password, ConsoleStore, DataSourceStore, DataSourceView, NoKeyring,
     OsKeyring, PasswordStorage, SecretStore, StartupNotice, UiStateStore,
@@ -42,6 +45,40 @@ pub struct AppInfo {
 /// How long a path chosen in the save dialog stays valid for `export_query` / `export_result`.
 const EXPORT_PATH_TTL: Duration = Duration::from_secs(300);
 
+/// How long a `cancel_import` for an unknown id waits for its `import_file`.
+const EARLY_CANCEL_TTL: Duration = Duration::from_secs(30);
+
+/// Permission to write one export file.
+struct ExportGrant {
+    at: Instant,
+    /// Where to write: the path itself (save dialog), or the path with its folder resolved when the grant was
+    /// given, so a folder swapped for a symlink afterwards is not followed.
+    write_to: PathBuf,
+    /// The user confirmed replacing an existing file (save dialog). A typed path must be a new file.
+    replace: bool,
+}
+
+/// Where an approved export goes and whether an existing file there may be replaced.
+pub struct ExportTarget {
+    pub path: PathBuf,
+    pub replace: bool,
+}
+
+impl ExportTarget {
+    /// Opens the file without following a symlink at the end of the path; a new file unless `replace`.
+    fn create(&self) -> Result<File, String> {
+        let f = if self.replace {
+            dbcore::fsutil::create_or_truncate_nofollow(&self.path)
+        } else {
+            dbcore::fsutil::create_new_nofollow(&self.path)
+        };
+        f.map_err(|e| format!("Cannot create {}: {e}", self.path.display()))
+    }
+}
+
+/// How long a file chosen in the import dialog may be previewed and imported (renewed by every use).
+const IMPORT_PATH_TTL: Duration = Duration::from_secs(3600);
+
 /// A running (or still pageable) execution.
 #[derive(Debug, Clone)]
 pub struct ExecMeta {
@@ -56,6 +93,8 @@ pub struct AppState {
     pub ui: Arc<UiStateStore>,
     pub history: Arc<QueryHistory>,
     pub consoles: Arc<ConsoleStore>,
+    /// Scratch files, opened `.sql` files and attached folders of the Files tool window (`files.rs`).
+    pub files: Arc<FileAccess>,
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
     /// session id -> data source id
@@ -64,7 +103,14 @@ pub struct AppState {
     executions: Arc<Mutex<HashMap<String, ExecMeta>>>,
     /// Export targets the user picked in a save dialog opened by the backend (`choose_export_path`), each
     /// valid once and for [`EXPORT_PATH_TTL`]. `export_query` / `export_result` write nowhere else.
-    export_paths: Mutex<HashMap<PathBuf, Instant>>,
+    export_paths: Mutex<HashMap<PathBuf, ExportGrant>>,
+    /// Files the user picked in the open dialog opened by the backend (`choose_import_file`): the only ones
+    /// `import_preview` / `import_file` read.
+    import_paths: Mutex<HashMap<PathBuf, Instant>>,
+    /// import id -> cancellation token of a running import.
+    imports: Mutex<HashMap<String, CancellationToken>>,
+    /// import id -> when `cancel_import` named it before `import_file` registered it (see [`AppState::cancel_import`]).
+    early_cancels: Mutex<HashMap<String, Instant>>,
 }
 
 /// Run blocking work (file IO, keyring) off the async workers.
@@ -80,10 +126,11 @@ async fn blocking<T: Send + 'static>(
 /// changing or removing them must not drop a live connection: `comment`; `visibleSchemas` (a legacy key the
 /// frontend migrates to its own state); `showSystemSchemas` (introspection takes `show_system` per call, a tree
 /// refresh is enough); `txMode` / `sessionControl` / `keepAliveSec` / `autoDisconnectSec` / `startupScript`
-/// (applied by the frontend when it opens sessions) and `passwordSave` (reserved). The keys dbcore reads
+/// (applied by the frontend when it opens sessions), `switchSchema` / `autoSync` (console and explorer behaviour)
+/// and `passwordSave` (reserved). The keys dbcore reads
 /// (`sslmode`, `application_name`, `connectTimeout`, `create`, ...), `dbms`, `auth` and free driver
 /// properties stay in the fingerprint.
-const VIEW_ONLY_OPTIONS: [&str; 9] = [
+const VIEW_ONLY_OPTIONS: [&str; 11] = [
     "comment",
     "visibleSchemas",
     "showSystemSchemas",
@@ -92,6 +139,8 @@ const VIEW_ONLY_OPTIONS: [&str; 9] = [
     "keepAliveSec",
     "autoDisconnectSec",
     "startupScript",
+    "switchSchema",
+    "autoSync",
     "passwordSave",
 ];
 
@@ -154,11 +203,18 @@ impl AppState {
             )),
             history: Arc::new(QueryHistory::new(data_dir.join("history.jsonl"))),
             consoles: Arc::new(ConsoleStore::new(data_dir.join("consoles"))),
+            files: Arc::new(FileAccess::new(
+                data_dir.join("scratches"),
+                config_dir.join("file-access.json"),
+            )),
             config_dir,
             data_dir,
             sessions: Mutex::new(HashMap::new()),
             executions: Arc::new(Mutex::new(HashMap::new())),
             export_paths: Mutex::new(HashMap::new()),
+            import_paths: Mutex::new(HashMap::new()),
+            imports: Mutex::new(HashMap::new()),
+            early_cancels: Mutex::new(HashMap::new()),
         })
     }
 
@@ -334,7 +390,20 @@ impl AppState {
     }
 
     pub async fn get_ddl(&self, ds_id: &str, object: ObjectRef) -> Result<String, String> {
-        self.mgr.ddl(ds_id, &object).await.map_err(String::from)
+        self.get_ddl_with(ds_id, object, false).await
+    }
+
+    /// `unqualified`: names of the object's own schema without the schema (the DDL view, as in DataGrip).
+    pub async fn get_ddl_with(
+        &self,
+        ds_id: &str,
+        object: ObjectRef,
+        unqualified: bool,
+    ) -> Result<String, String> {
+        self.mgr
+            .ddl_with(ds_id, &object, unqualified)
+            .await
+            .map_err(String::from)
     }
 
     pub async fn schema_snapshot(
@@ -510,18 +579,37 @@ impl AppState {
     /// Remember `path` as chosen by the user in a save dialog: the next `export_query` / `export_result` to
     /// exactly this path is allowed (once, within five minutes).
     pub fn allow_export_path(&self, path: PathBuf) {
+        self.grant_export(path.clone(), path, true);
+    }
+
+    /// Remember the typed `path` (a new file, already checked) to be written at `write_to`, once.
+    pub fn allow_typed_export_path(&self, path: PathBuf, write_to: PathBuf) {
+        self.grant_export(path, write_to, false);
+    }
+
+    fn grant_export(&self, path: PathBuf, write_to: PathBuf, replace: bool) {
         let mut m = self.export_paths.lock().unwrap();
-        m.retain(|_, t| t.elapsed() < EXPORT_PATH_TTL);
-        m.insert(path, Instant::now());
+        m.retain(|_, g| g.at.elapsed() < EXPORT_PATH_TTL);
+        m.insert(
+            path,
+            ExportGrant {
+                at: Instant::now(),
+                write_to,
+                replace,
+            },
+        );
     }
 
     /// Consume the permission for `path`; the frontend cannot make the backend write to a file the user did
     /// not pick.
-    fn take_export_path(&self, path: &Path) -> Result<(), String> {
+    fn take_export_path(&self, path: &Path) -> Result<ExportTarget, String> {
         let mut m = self.export_paths.lock().unwrap();
-        m.retain(|_, t| t.elapsed() < EXPORT_PATH_TTL);
+        m.retain(|_, g| g.at.elapsed() < EXPORT_PATH_TTL);
         match m.remove(path) {
-            Some(_) => Ok(()),
+            Some(g) => Ok(ExportTarget {
+                path: g.write_to,
+                replace: g.replace,
+            }),
             None => Err(format!(
                 "Refusing to write {}: export targets must be chosen in the save dialog (choose_export_path)",
                 path.display()
@@ -538,9 +626,9 @@ impl AppState {
         opts: ExportOptions,
         path: &Path,
     ) -> Result<usize, String> {
-        self.take_export_path(path)?;
-        let file =
-            File::create(path).map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
+        let target = self.take_export_path(path)?;
+        let path = target.path.as_path();
+        let file = target.create()?;
         let mut w = BufWriter::new(file);
         let res = self.mgr.export_query(ds_id, sql, &opts, &mut w).await;
         let res = res
@@ -567,16 +655,36 @@ impl AppState {
         Ok(String::from_utf8_lossy(&buf).into_owned())
     }
 
+    /// Explain Plan / Explain Analyse of the first statement of `sql` on a console session (not recorded in the history).
+    pub async fn explain(
+        &self,
+        session_id: &str,
+        sql: &str,
+        analyze: bool,
+    ) -> Result<ExplainPlan, String> {
+        self.mgr
+            .explain(&SessionId(session_id.to_string()), sql, analyze)
+            .await
+            .map_err(String::from)
+    }
+
+    /// Stops the statement running on the session (an Explain Analyse has no execution id to `cancel`).
+    pub async fn cancel_session(&self, session_id: &str) -> Result<(), String> {
+        self.mgr
+            .cancel_session(&SessionId(session_id.to_string()))
+            .await
+            .map_err(String::from)
+    }
+
     pub async fn export_result(
         &self,
         rs: ResultSet,
         opts: ExportOptions,
         path: PathBuf,
     ) -> Result<usize, String> {
-        self.take_export_path(&path)?;
+        let target = self.take_export_path(&path)?;
         blocking(move || {
-            let file = File::create(&path)
-                .map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
+            let file = target.create()?;
             let mut w = BufWriter::new(file);
             let n = export_result(&rs, &opts, &mut w).map_err(String::from)?;
             w.flush().map_err(|e| format!("I/O error: {e}"))?;
@@ -591,6 +699,115 @@ impl AppState {
         opts: ExportOptions,
     ) -> Result<String, String> {
         export_to_string(&rs, &opts).map_err(String::from)
+    }
+
+    // ------------------------------------------------------------ import
+
+    /// Remember `path` as chosen by the user in the open dialog.
+    pub fn allow_import_path(&self, path: PathBuf) {
+        let mut m = self.import_paths.lock().unwrap();
+        m.retain(|_, t| t.elapsed() < IMPORT_PATH_TTL);
+        m.insert(path, Instant::now());
+    }
+
+    /// The path of a file picked by the user (its permission is renewed), or the reason it is refused.
+    fn check_import_path(&self, path: &str) -> Result<PathBuf, String> {
+        let path = PathBuf::from(path);
+        let mut m = self.import_paths.lock().unwrap();
+        m.retain(|_, t| t.elapsed() < IMPORT_PATH_TTL);
+        match m.get_mut(&path) {
+            Some(t) => {
+                *t = Instant::now();
+                Ok(path)
+            }
+            None => Err(format!(
+                "Refusing to read {}: import files must be chosen in the open dialog (choose_import_file)",
+                path.display()
+            )),
+        }
+    }
+
+    /// `<folder of the file>/<name of the file>_errors.txt`: where the rows that fail are written unless the user
+    /// picks another place.
+    pub fn default_error_file(path: &Path) -> PathBuf {
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "import".into());
+        path.with_file_name(format!("{stem}_errors.txt"))
+    }
+
+    pub async fn import_preview(
+        &self,
+        path: &str,
+        format: ImportFormat,
+        limit: usize,
+    ) -> Result<ImportPreview, String> {
+        let path = self.check_import_path(path)?;
+        blocking(move || dbcore::import::preview(&path, &format, limit).map_err(String::from)).await
+    }
+
+    /// Runs the import; `import_id` (chosen by the caller, unique per import) lets
+    /// [`cancel_import`](Self::cancel_import) stop it. The id is registered before anything else happens, so a
+    /// cancel cannot slip between the call and the start; an id that is running already is refused.
+    pub async fn import_file(
+        &self,
+        ds_id: &str,
+        import_id: &str,
+        mut req: ImportRequest,
+        progress: impl Fn(ImportProgress) + Send + Sync,
+    ) -> Result<ImportResult, String> {
+        let token = CancellationToken::new();
+        {
+            let mut imports = self.imports.lock().unwrap();
+            if imports.contains_key(import_id) {
+                return Err(format!("The import id {import_id} is in use already"));
+            }
+            imports.insert(import_id.to_string(), token.clone());
+            let mut early = self.early_cancels.lock().unwrap();
+            early.retain(|_, t| t.elapsed() < EARLY_CANCEL_TTL);
+            if early.remove(import_id).is_some() {
+                token.cancel();
+            }
+        }
+        // removes the registration however this function ends
+        struct Registered<'a>(&'a Mutex<HashMap<String, CancellationToken>>, &'a str);
+        impl Drop for Registered<'_> {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().remove(self.1);
+            }
+        }
+        let _registered = Registered(&self.imports, import_id);
+
+        req.path = self.check_import_path(&req.path.to_string_lossy())?;
+        if let Some(p) = req.options.error_file.clone() {
+            // the default place (never replaces a file), or a file the user picked in a save dialog
+            if p != Self::default_error_file(&req.path) {
+                let target = self.take_export_path(&p)?;
+                req.options.error_file = Some(target.path);
+                req.options.error_file_replace = target.replace;
+            } else {
+                req.options.error_file_replace = false;
+            }
+        }
+        let res = self.mgr.import_file(ds_id, &req, &token, &progress).await;
+        res.map_err(String::from)
+    }
+
+    /// Rolls a running import back. An id that is not running (yet) is remembered for a few seconds, so a cancel
+    /// that overtakes its `import_file` still stops it; a no-op once the import ended.
+    pub fn cancel_import(&self, import_id: &str) {
+        // the `imports` lock is held while the id is noted, as in `import_file`: no gap to fall into
+        let imports = self.imports.lock().unwrap();
+        if let Some(t) = imports.get(import_id) {
+            t.cancel();
+            return;
+        }
+        let mut early = self.early_cancels.lock().unwrap();
+        early.retain(|_, t| t.elapsed() < EARLY_CANCEL_TTL);
+        if early.len() < 64 {
+            early.insert(import_id.to_string(), Instant::now());
+        }
     }
 
     // ------------------------------------------------------------ splitter
@@ -688,5 +905,65 @@ impl AppState {
             to.to_string(),
         );
         blocking(move || c.rename(&ds, &a, &b)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = AppState::open(dir.path().join("config"), dir.path().join("data")).unwrap();
+        (s, dir)
+    }
+
+    #[test]
+    fn a_cancel_before_the_import_is_remembered_and_applied() {
+        let (s, _dir) = state();
+        s.cancel_import("early");
+        assert!(s.early_cancels.lock().unwrap().contains_key("early"));
+        // `import_file` registers the token first and consumes the early cancel
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let req: ImportRequest = serde_json::from_value(serde_json::json!({
+            "path": "/nonexistent.csv", "table": "t", "createTable": false, "columns": []
+        }))
+        .unwrap();
+        let err = rt
+            .block_on(s.import_file("ds", "early", req, |_| {}))
+            .unwrap_err();
+        assert!(err.contains("Refusing to read"), "{err}");
+        assert!(s.early_cancels.lock().unwrap().is_empty());
+        // the registration is gone again, whatever the outcome
+        assert!(s.imports.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_running_import_id_is_refused_and_cancelled_by_id() {
+        let (s, _dir) = state();
+        let token = CancellationToken::new();
+        s.imports
+            .lock()
+            .unwrap()
+            .insert("run".into(), token.clone());
+        s.cancel_import("run");
+        assert!(token.is_cancelled());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let req: ImportRequest = serde_json::from_value(serde_json::json!({
+            "path": "/x.csv", "table": "t", "createTable": false, "columns": []
+        }))
+        .unwrap();
+        let err = rt
+            .block_on(s.import_file("ds", "run", req, |_| {}))
+            .unwrap_err();
+        assert!(err.contains("in use already"), "{err}");
+        // the refused call did not drop the first import's registration
+        assert!(s.imports.lock().unwrap().contains_key("run"));
     }
 }

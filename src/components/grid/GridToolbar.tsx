@@ -3,9 +3,10 @@
  *   GridToolbar     - the 34px action toolbar (reload, add/remove row, revert, preview, submit, Tx, export...)
  *   GridFilterBar   - the table-editor WHERE | ORDER BY row (30px)
  *   GridPagingPill  - the floating "N rows" pill with the page-size menu
- * TODO: use the shared tooltip / ContextMenu of src/components/ui once available (native `title` for now).
+ * Tooltips are the shared ones of src/components/ui (`tip()`: text + gray shortcut).
  */
 import { Show, createSignal, type JSX } from "solid-js";
+import { tip } from "../ui/Tooltip";
 import { GridMenu, type MenuItem } from "./GridMenu";
 import type { ViewMode } from "./types";
 import "./grid.css";
@@ -52,7 +53,7 @@ function Btn(props: {
       class="dgg-tbtn"
       classList={{ selected: props.selected, green: props.green, dot: props.dot }}
       disabled={props.disabled}
-      title={props.shortcut ? `${props.title}  ${props.shortcut}` : props.title}
+      {...tip(props.title, props.shortcut)}
       onClick={(e) => props.onClick?.(e)}
       tabIndex={-1}
     >
@@ -66,6 +67,8 @@ const Sep = () => <span class="dgg-tsep" />;
 export interface GridToolbarProps {
   /** Result can be edited (table results): enables the edit group. */
   editable?: boolean;
+  /** The result has no rows (and no pending new row): Delete Rows is disabled. */
+  emptyResult?: boolean;
   /** Pending changes exist: enables revert / preview / submit (submit turns green). */
   hasChanges?: boolean;
   /** A statement is running: enables "Cancel Running Statements". */
@@ -167,16 +170,17 @@ export function GridToolbar(props: GridToolbarProps): JSX.Element {
       <Btn icon="reload" title="Reload Page" shortcut="Ctrl+F5" onClick={props.onReload} />
       <Btn icon="stop" title="Cancel Running Statements" shortcut="Ctrl+F2" disabled={!props.running} onClick={props.onCancel} />
       <Sep />
-      <Btn icon="add" title="Add Row" shortcut="Alt+Insert" disabled={!ed()} onClick={props.onAddRow} />
-      <Btn icon="remove" title="Delete Rows" shortcut="Ctrl+Y" disabled={!ed()} onClick={props.onDeleteRows} />
-      <Btn icon="revert" title="Revert Selected" shortcut="Ctrl+Alt+Z" disabled={!ed() || !props.hasChanges} onClick={props.onRevert} />
-      <Btn icon="preview" title="Preview Pending Changes" disabled={!ed() || !props.hasChanges} onClick={props.onPreview} />
-      <Btn icon="submit" title="Submit" shortcut="Ctrl+Enter" disabled={!ed() || !props.hasChanges} green={ed() && !!props.hasChanges} onClick={props.onSubmit} />
+      {/* a read-only result (join, aggregate, view) has no edit group, like DataGrip */}
       <Show when={ed()}>
+        <Btn icon="add" title="Add Row" shortcut="Alt+Insert" onClick={props.onAddRow} />
+        <Btn icon="remove" title="Delete Rows" shortcut="Ctrl+Y" disabled={props.emptyResult} onClick={props.onDeleteRows} />
+        <Btn icon="revert" title="Revert Selected" shortcut="Ctrl+Alt+Z" disabled={!props.hasChanges} onClick={props.onRevert} />
+        <Btn icon="preview" title="Preview Pending Changes" disabled={!props.hasChanges} onClick={props.onPreview} />
+        <Btn icon="submit" title="Submit" shortcut="Ctrl+Enter" disabled={!props.hasChanges} green={!!props.hasChanges} onClick={props.onSubmit} />
         <button
           class="dgg-tbtn text tx"
           classList={{ failed: !!props.txFailed }}
-          title="Transaction Mode"
+          {...tip("Transaction Mode")}
           tabIndex={-1}
           onClick={(e) => props.onTxMenu?.((e.currentTarget as HTMLElement).getBoundingClientRect())}
         >
@@ -188,10 +192,14 @@ export function GridToolbar(props: GridToolbarProps): JSX.Element {
           <Btn icon="rollback" title="Roll Back" disabled={!props.txActive || !props.onRollback} onClick={() => props.onRollback?.()} />
         </Show>
       </Show>
-      <Sep />
-      <button class="dgg-tbtn text" title="Go to DDL" tabIndex={-1} onClick={() => props.onDDL?.()} disabled={!props.onDDL}>
-        DDL
-      </button>
+      <Show when={ed()}>
+        <Sep />
+      </Show>
+      <Show when={props.onDDL}>
+        <button class="dgg-tbtn text" {...tip("Go to DDL")} tabIndex={-1} onClick={() => props.onDDL?.()}>
+          DDL
+        </button>
+      </Show>
       <Show when={props.onPin}>
         <Btn icon={props.pinned ? "pinOn" : "pin"} title={props.pinned ? "Unpin Tab" : "Pin Tab"} selected={props.pinned} onClick={() => props.onPin?.()} />
       </Show>
@@ -208,14 +216,20 @@ export function GridToolbar(props: GridToolbarProps): JSX.Element {
 
       <span class="dgg-tspacer" />
 
-      <button class="dgg-tbtn text" title="Show the query that produced this result set" tabIndex={-1} onClick={() => props.onSql?.()} disabled={!props.onSql}>
-        SQL
-      </button>
-      <Btn icon="openTab" title="Open in Editor Tab" disabled={!props.onOpenInEditor} onClick={props.onOpenInEditor} />
-      <Sep />
+      <Show when={props.onSql}>
+        <button class="dgg-tbtn text" {...tip("Show the query that produced this result set")} tabIndex={-1} onClick={() => props.onSql?.()}>
+          SQL
+        </button>
+      </Show>
+      <Show when={props.onOpenInEditor}>
+        <Btn icon="openTab" title="Open in Editor Tab" onClick={props.onOpenInEditor} />
+      </Show>
+      <Show when={props.onSql || props.onOpenInEditor}>
+        <Sep />
+      </Show>
       <button
         class="dgg-tbtn text fmt"
-        title="Extractor"
+        {...tip("Extractor")}
         tabIndex={-1}
         onClick={(e) => props.onExtractorMenu?.((e.currentTarget as HTMLElement).getBoundingClientRect())}
       >
@@ -284,7 +298,7 @@ export function GridFilterBar(props: GridFilterBarProps): JSX.Element {
       <Show when={value().length > 0}>
         <button
           class="dgg-fb-clear"
-          title="Clear"
+          {...tip("Clear")}
           tabIndex={-1}
           onClick={() => {
             set("");
@@ -317,6 +331,11 @@ export interface GridPagingPillProps {
   defaultPageSize?: number;
   onPageSizeChange?: (size: PageSize) => void;
   onCountRows?: () => void;
+  /** The statement still runs: `of N+` after the count (the total is not known yet). */
+  loading?: boolean;
+  /** Gray `of N` segment: the rows loaded in all pages; `ofMore` makes it `of N+` (the server has more). */
+  ofTotal?: number;
+  ofMore?: boolean;
   onFirstPage?: () => void;
   onPreviousPage?: () => void;
   onNextPage?: () => void;
@@ -334,6 +353,10 @@ export function GridPagingPill(props: GridPagingPillProps): JSX.Element {
     return props.totalRows != null ? `${n} of ${props.totalRows.toLocaleString("en-US")} ${noun}` : `${n} ${noun}`;
   };
   const def = () => props.defaultPageSize ?? 500;
+  const ofText = () => {
+    if (props.ofTotal != null) return `of ${props.ofTotal.toLocaleString("en-US")}${props.ofMore ? "+" : ""}`;
+    return props.loading ? `of ${props.rowCount.toLocaleString("en-US")}+` : null;
+  };
 
   const openSizes = (e: MouseEvent) => {
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
@@ -372,8 +395,16 @@ export function GridPagingPill(props: GridPagingPillProps): JSX.Element {
         <span>{label()}</span>
         <i class="dgg-i i-chevron" />
       </button>
+      <Show when={ofText()}>
+        {(t) => (
+          <>
+            <span class="dgg-pill-sep" />
+            <span class="dgg-pill-of">{t()}</span>
+          </>
+        )}
+      </Show>
       <span class="dgg-pill-sep" />
-      <button class="dgg-pill-more" onClick={openMore} tabIndex={-1} title="More">
+      <button class="dgg-pill-more" onClick={openMore} tabIndex={-1} {...tip("More")}>
         <i class="dgg-i i-more" />
       </button>
       <Show when={menu()}>{(m) => <GridMenu x={m().x} y={m().y} items={m().items} onClose={() => setMenu(null)} />}</Show>

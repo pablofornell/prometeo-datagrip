@@ -879,3 +879,94 @@ async fn open_session_with_init_sql_and_tx_status() {
         .await
         .is_err());
 }
+
+/// Import: only files picked in the open dialog are read; the error file is the default one or a save-dialog pick.
+#[tokio::test]
+async fn import_reads_only_picked_files_and_writes_only_allowed_error_files() {
+    use dbcore::{ImportFormat, ImportRequest};
+
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(&dir);
+    let cfg = DataSourceConfig {
+        name: "lite".into(),
+        driver: Driver::Sqlite,
+        file: dir.path().join("i.sqlite").display().to_string(),
+        options: [("create".to_string(), "true".to_string())].into(),
+        ..Default::default()
+    };
+    let ds = st.save_data_source(cfg).await.unwrap().cfg.id;
+    st.connect(&ds).await.unwrap();
+    let csv = dir.path().join("rows.csv");
+    std::fs::write(&csv, "id,name\n1,a\n2,b\nx,c\n").unwrap();
+    let path = csv.display().to_string();
+
+    // not picked in the dialog: refused
+    let e = st
+        .import_preview(&path, ImportFormat::default(), 10)
+        .await
+        .unwrap_err();
+    assert!(e.contains("choose_import_file"), "{e}");
+
+    st.allow_import_path(csv.clone());
+    let pv = st
+        .import_preview(&path, ImportFormat::default(), 10)
+        .await
+        .unwrap();
+    assert_eq!(pv.rows.len(), 3);
+    assert_eq!(pv.columns[0].name, "id");
+
+    let request = |error_file: &std::path::Path| -> ImportRequest {
+        serde_json::from_value(json!({
+            "path": path,
+            "table": "t",
+            "createTable": true,
+            "columns": [
+                { "name": "id", "source": 0, "type": "integer" },
+                { "name": "name", "source": 1, "type": "text" },
+            ],
+            "options": { "errorFile": error_file },
+        }))
+        .unwrap()
+    };
+
+    // an error file nobody picked: refused, nothing is imported
+    let other = dir.path().join("elsewhere.txt");
+    let e = st
+        .import_file(&ds, "imp1", request(&other), |_| {})
+        .await
+        .unwrap_err();
+    assert!(e.contains("Refusing to write"), "{e}");
+
+    // the default error file next to the source is allowed
+    let default = AppState::default_error_file(&csv);
+    assert_eq!(default, dir.path().join("rows_errors.txt"));
+    let progress = Mutex::new(Vec::new());
+    let res = st
+        .import_file(&ds, "imp2", request(&default), |p| {
+            progress.lock().unwrap().push(p.rows)
+        })
+        .await
+        .unwrap();
+    assert_eq!((res.imported, res.failed), (2, 1), "{res:?}");
+    assert_eq!(res.error_file.as_deref(), default.to_str());
+    assert!(default.exists());
+    assert_eq!(progress.lock().unwrap().last(), Some(&3));
+
+    // a save-dialog pick is allowed, once
+    let picked = dir.path().join("picked.txt");
+    st.allow_export_path(picked.clone());
+    let again = dir.path().join("rows2.csv");
+    std::fs::write(&again, "id,name\n1,a\nx,b\n").unwrap();
+    st.allow_import_path(again.clone());
+    let mut req = request(&picked);
+    req.path = again.clone();
+    req.create_table = false;
+    let res = st.import_file(&ds, "imp3", req, |_| {}).await.unwrap();
+    assert_eq!((res.imported, res.failed), (1, 1), "{res:?}");
+    assert!(std::fs::read_to_string(&picked)
+        .unwrap()
+        .contains("not a valid integer"));
+
+    // cancelling an unknown import is a no-op
+    st.cancel_import("nope");
+}

@@ -22,11 +22,15 @@ export interface ManageColumnsProps {
   /** Visual order of column indexes (hidden ones included). */
   order: number[];
   hidden: ReadonlySet<number>;
+  /** Pinned (frozen) columns. */
+  pinned?: ReadonlySet<number>;
   /** Toolbar button rectangle to open under (right edges aligned); omitted = centred over `bounds`. */
   anchor?: DOMRect;
   /** Grid rectangle used to centre the popup when there is no anchor. */
   bounds?: DOMRect;
   onToggle: (col: number, visible: boolean) => void;
+  /** Pin / unpin a column (the pin icon of a hovered row). */
+  onTogglePin?: (col: number) => void;
   onShowAll: () => void;
   onHideAll: () => void;
   /** Move `col` so it lands at index `toIndex` of the (full) order. */
@@ -151,6 +155,14 @@ export function ManageColumns(props: ManageColumnsProps): JSX.Element {
                 <span class="dgg-mc-name">{props.columns[ci].name}</span>
                 <span class="dgg-mc-type">{props.columns[ci].typeName.toUpperCase()}</span>
                 <span class="dgg-mc-spacer" />
+                <Show when={props.onTogglePin}>
+                  <i
+                    class="dgg-mc-pin dgg-i"
+                    classList={{ on: !!props.pinned?.has(ci), "i-pin": !props.pinned?.has(ci), "i-pinOn": !!props.pinned?.has(ci) }}
+                    title={props.pinned?.has(ci) ? "Unpin column" : "Pin column"}
+                    onClick={(e) => (e.stopPropagation(), props.onTogglePin?.(ci))}
+                  />
+                </Show>
                 <i class="dgg-mc-grip" title="Drag to reorder" onMouseDown={(e) => startDrag(e, ci)} onClick={(e) => e.stopPropagation()} />
               </div>
             )}

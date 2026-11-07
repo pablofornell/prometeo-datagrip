@@ -66,6 +66,8 @@ export interface TestResult {
   serverVersion: string | null;
   message: string;
   elapsedMs: number;
+  /** Whether the test session was encrypted (negotiated); null when unknown (SQLite). */
+  ssl?: boolean | null;
 }
 
 export interface ConnectInfo {
@@ -92,7 +94,11 @@ export type NodeKind =
   | "routine"
   | "function"
   | "procedure"
-  | "sequence";
+  | "sequence"
+  | "role"
+  | "tablespace"
+  | "extension"
+  | "user";
 
 export interface TreeNode {
   id: string;
@@ -308,7 +314,20 @@ export interface SessionState {
 
 // ---------------------------------------------------------------- export
 
-export type ExportFormat = "csv" | "tsv" | "json" | "sqlInsert" | "markdown";
+export type ExportFormat =
+  | "csv"
+  | "tsv"
+  | "json"
+  | "sqlInsert"
+  | "markdown"
+  | "csvPipe"
+  | "csvSemicolon"
+  | "jsonLines"
+  | "sqlUpdate"
+  | "whereClause"
+  | "html"
+  | "xml"
+  | "pretty";
 
 export interface ExportOptions {
   format: ExportFormat;
@@ -325,6 +344,41 @@ export interface ExportOptions {
   dialect: Driver;
   /** Rows per INSERT statement (multi-row VALUES when > 1). */
   rowsPerInsert: number;
+  /** One output row per column (first cell the column name), one output column per result row. */
+  transpose?: boolean;
+  /** First column with the row number (CSV / TSV / Markdown only). */
+  rowHeader?: boolean;
+}
+
+// ---------------------------------------------------------------- explain
+
+export interface PlanProp {
+  name: string;
+  value: string;
+}
+
+/** One row of a query plan: the columns of the `Query Plan` tab and its `Property | Value` pane. */
+export interface PlanNode {
+  operation: string;
+  /** `table: orders; index: orders_pkey;` */
+  params: string;
+  rows: number | null;
+  totalCost: number | null;
+  startupCost: number | null;
+  /** `Parallel Aware = false;Async Capable = false;...` */
+  raw: string;
+  props: PlanProp[];
+  children: PlanNode[];
+}
+
+export interface ExplainPlan {
+  driver: Driver;
+  analyze: boolean;
+  /** The statement that was explained. */
+  sql: string;
+  /** `Select` (or the statement kind); its child is the top of the plan. */
+  root: PlanNode;
+  elapsedMs: number;
 }
 
 // ---------------------------------------------------------------- history
@@ -366,4 +420,96 @@ export interface StartupNotice {
   message: string;
   /** Full path of `<file>.corrupt-<unix seconds>`, when the backup could be made. */
   backup: string | null;
+}
+
+// ---------------------------------------------------------------- import (crates/dbcore/src/import.rs)
+
+export type InferredType = "boolean" | "integer" | "bigint" | "double" | "date" | "timestamp" | "text";
+
+/** How a delimited file is read. */
+export interface ImportFormat {
+  /** `UTF-8` (default) or `ISO-8859-1`. */
+  encoding: string;
+  delimiter: string;
+  /** Quote character; empty = never quoted. */
+  quote: string;
+  /** The first record holds the column names. */
+  header: boolean;
+  /** The first column holds row labels and is dropped. */
+  firstColumnHeader: boolean;
+  trim: boolean;
+  /** An unquoted value equal to this text is NULL (empty: empty cells are NULL). */
+  nullText: string;
+}
+
+/** The file picked in the native open dialog. */
+export interface ImportSource {
+  path: string;
+  name: string;
+  size: number;
+  /** Where the failing rows are written unless the user picks another file. */
+  defaultErrorFile: string;
+}
+
+export interface ImportPreview {
+  columns: { name: string; inferredType: InferredType }[];
+  /** The first rows (`null` = NULL). */
+  rows: (string | null)[][];
+  /** Rows the types were inferred from. */
+  sampled: number;
+  truncated: boolean;
+  fileSize: number;
+}
+
+export interface ImportColumnMap {
+  /** Column of the target table. */
+  name: string;
+  /** Index of the file column; `null` leaves the column to its default. */
+  source: number | null;
+  /** Type of the column (the one to create, or the existing one). */
+  type: string;
+}
+
+export interface ImportOptions {
+  insertInconvertibleAsNull: boolean;
+  abortOnError: boolean;
+  errorFile: string | null;
+  batchSize?: number;
+}
+
+export interface ImportRequest {
+  path: string;
+  format: ImportFormat;
+  schema: string | null;
+  table: string;
+  createTable: boolean;
+  columns: ImportColumnMap[];
+  options: ImportOptions;
+}
+
+export interface ImportRowError {
+  /** Record number in the file (the first line is 1; the header counts). */
+  row: number;
+  message: string;
+}
+
+export interface ImportProgress {
+  rows: number;
+  failed: number;
+  /** Share of the file read, 0..1. */
+  fraction: number;
+}
+
+export interface ImportResult {
+  imported: number;
+  failed: number;
+  /** The first failing rows (the error file has all of them). */
+  errors: ImportRowError[];
+  errorFile: string | null;
+  errorFileError: string | null;
+  cancelled: boolean;
+  /** Nothing was kept: cancelled, or an error with `abortOnError`. */
+  rolledBack: boolean;
+  createdTable: boolean;
+  elapsedMs: number;
 }

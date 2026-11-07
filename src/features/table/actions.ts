@@ -1,6 +1,7 @@
 /** `table.*` actions (focus-guarded shortcuts) and the guard that asks before a tab with pending changes closes. */
 import type { ObjectRef } from "../../api/types";
 import { notify } from "../../components/ui";
+import { EditorView } from "@codemirror/view";
 import { type Action } from "../../state/actions";
 import { exportCurrentResult } from "../output";
 import { openTableExport } from "./exportData";
@@ -12,6 +13,15 @@ const act = (f: (c: TableController) => void) => () => {
   const c = focusedController() ?? activeController();
   if (c) f(c);
 };
+
+/** Focuses the WHERE field of a table editor and selects its text. */
+export function focusWhere(c: TableController | undefined): void {
+  const content = c?.root()?.querySelector<HTMLElement>('[data-fb="where"] .cm-content');
+  const view = content && EditorView.findFromDOM(content);
+  if (!view) return;
+  view.focus();
+  view.dispatch({ selection: { anchor: 0, head: view.state.doc.length } });
+}
 
 export function tableActions(): Action[] {
   return [
@@ -111,6 +121,14 @@ export function tableActions(): Action[] {
         if (c) return c.exportData();
         if (!exportCurrentResult()) notify({ kind: "info", title: "Nothing to export", body: "Open a table or select a result first." });
       },
+    },
+    {
+      // Console.TableResult.EditFilterCriteria: the WHERE field of the active table editor takes the focus, text selected
+      id: "table.editFilter",
+      title: "Edit Filter Criteria",
+      shortcut: "Ctrl+Alt+Shift+F",
+      enabled: () => !!activeController(),
+      run: () => focusWhere(activeController()),
     },
     {
       id: "table.ddl",

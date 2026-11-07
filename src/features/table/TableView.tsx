@@ -28,7 +28,7 @@ import {
 } from "../../components/grid";
 import { notify, openMenu } from "../../components/ui";
 import { settings } from "../../state/settings";
-import { setStatus } from "../../state/status";
+import { setGridSelection, setStatus } from "../../state/status";
 import { type EditorTab, activateTab, updateTab } from "../../state/tabs";
 import { type ObjectTabData, openDdlTab } from "./commands";
 import { registerController } from "./controller";
@@ -38,7 +38,7 @@ import { rowsRetrieved } from "../output/format";
 import { CONNECTION_LOST_LOG, CONNECTION_LOST_TX_LOG } from "../../state/connection-errors";
 import { type ConsoleOutput, createOutput, removeOutput } from "../output/model";
 import { dsInfo, errText, loadDataSources, writeClipboard } from "./ds";
-import { exportTableQuery } from "./exportData";
+import { type ExportSource, exportPreview, exportTableQuery } from "./exportData";
 import {
   SERVER_ROLLBACK_BODY,
   SERVER_ROLLBACK_LOG,
@@ -51,7 +51,9 @@ import {
   txLabel,
 } from "./session";
 import { FilterBar } from "./FilterBar";
-import { ChoiceDialog, ColumnFilterPopup, EXPORT_FORMATS, ExportDialog, SqlPopup, type ExportTarget } from "./Popups";
+import { createFkNavigation } from "./fkNav";
+import { extractorMenuItems } from "../output/extractors";
+import { ChoiceDialog, ColumnFilterPopup, EXPORT_FORMATS, ExportDialog, SqlPopup, exportFileBase, type ExportPath, type ExportTarget } from "./Popups";
 import { type PageSize, type Query, type QueryReport, createTableSource } from "./source";
 import { appendCondition, buildCondition, orderByToSort, previewSql, qualifiedName, selectSql, sortToOrderBy, tableQuerySql, toRowChanges } from "./sql";
 import "./table.css";
@@ -69,10 +71,10 @@ const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
 export function TableView(props: { tab: EditorTab; active: boolean }): JSX.Element {
   const data = props.tab.data as ObjectTabData | undefined;
   if (!data?.dsId || !data.objectRef) return <div class="dgt-message">This table editor has no object to show.</div>;
-  return <TableEditor tab={props.tab} active={props.active} dsId={data.dsId} objectRef={data.objectRef} />;
+  return <TableEditor tab={props.tab} active={props.active} dsId={data.dsId} objectRef={data.objectRef} where={data.where} />;
 }
 
-function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; objectRef: ObjectRef }): JSX.Element {
+function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; objectRef: ObjectRef; where?: string }): JSX.Element {
   const { dsId } = props;
   const ref = props.objectRef;
   // Tx: Manual works on a session of its own; its id makes the source read through it (it sees the open transaction)
@@ -95,7 +97,7 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
     else out?.log("text", rowsRetrieved(r.rows, r.ms, undefined, undefined, q.pageSize === "all" ? 1 : q.page * q.pageSize + 1));
     out?.setLastMs(r.ms);
   };
-  const src = createTableSource(dsId, ref, {}, sid, {
+  const src = createTableSource(dsId, ref, props.where ? { where: props.where } : {}, sid, {
     onQuery,
     onSessionLost: () => recoverSession(),
     // Tx: Manual reads go through the transaction session, reopened here when it was lost
@@ -104,7 +106,7 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
   let root!: HTMLDivElement;
   let api: DataGridApi | undefined;
 
-  const [whereText, setWhereText] = createSignal("");
+  const [whereText, setWhereText] = createSignal(props.where ?? "");
   const [orderText, setOrderText] = createSignal("");
   const [pending, setPending] = createSignal(0);
   const [error, setError] = createSignal<string | null>(null);
@@ -504,11 +506,7 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
   // status bar: row:col and the aggregate of the selection
   const onSelection = (info: SelectionInfo) => {
     if (!props.active) return;
-    const n = info.numeric;
-    setStatus({
-      caret: info.row ? { line: info.row, col: info.col ?? 1 } : null,
-      aggregator: n && n.count > 1 ? `SUM: ${n.sum}` : info.cells > 1 ? "SUM: Not enough values" : "No aggregator selected",
-    });
+    setGridSelection(props.tab.id, info);
   };
 
   // ---------------------------------------------------------------- toolbar bits
@@ -533,20 +531,34 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
       { x: r.left, y: r.bottom + 2 },
     );
 
+  // foreign keys of the table: `Go To` / F4 of the cells and the key icon of their columns
+  const fk = createFkNavigation(() => dsId, () => (ref.kind === "table" ? ref : null));
+  /** `Export Table to Clipboard` of the cell menu: every row of the filtered table in the current extractor. */
+  const exportToClipboard = () => void doExport(exportOptions(), "clipboard", { path: "", chosen: false });
+
   const extractorMenu = (r: DOMRect) =>
-    openMenu(
-      EXPORT_FORMATS.map((f) => ({ label: f.label, checked: extractor() === f.value, run: () => setExtractor(f.value) })),
-      { x: r.left, y: r.bottom + 2, compact: true },
-    );
+    openMenu(extractorMenuItems(extractor(), setExtractor), { x: r.right - 230, y: r.bottom + 2, minWidth: 230, title: "Data Extractors" });
 
   const exportOptions = (): ExportOptions => ({ ...defaultExportOptions(driver()), format: extractor(), tableName: tableName() });
 
-  async function doExport(options: ExportOptions, target: ExportTarget): Promise<void> {
+  /** What the Export Data dialog exports: the rows the editor holds when they are all loaded, else the query again. */
+  const exportSource = (): ExportSource => {
+    const q = src.applied();
+    return {
+      dsId,
+      label: tableName(),
+      sql: selectSql(driver(), ref, q.where, q.orderBy),
+      options: exportOptions(),
+      loaded: () => ({ columns: cols() ?? [], rows: src.pageRows(), complete: !!cols() && src.complete() }),
+    };
+  };
+
+  async function doExport(options: ExportOptions, target: ExportTarget, out: ExportPath): Promise<void> {
     setExportDlg(false);
     setExtractor(options.format);
     const q = src.applied();
     if (target === "file") {
-      await exportTableQuery(dsId, ref, driver(), options, "file", { where: q.where, orderBy: q.orderBy });
+      await exportTableQuery(dsId, ref, driver(), options, "file", out, { where: q.where, orderBy: q.orderBy });
       return;
     }
     const fmt = EXPORT_FORMATS.find((f) => f.value === options.format) ?? EXPORT_FORMATS[0];
@@ -645,6 +657,12 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
               onSortChange={sortChange}
               onReload={reload}
               onColumnFilter={(col, anchor) => setColFilter({ col, anchor })}
+              navigation={fk.navigation}
+              fkColumns={fk.fkColumns}
+              dialect={driver()}
+              extractorLabel={EXPORT_FORMATS.find((f) => f.value === extractor())?.label ?? "CSV"}
+              onChangeExtractor={(at) => openMenu(extractorMenuItems(extractor(), setExtractor), { x: at.x, y: at.y, minWidth: 230, title: "Data Extractors" })}
+              onExportToClipboard={exportToClipboard}
               onSelectionChange={onSelection}
               onViewChange={setView}
               apiRef={(a) => (api = a)}
@@ -688,7 +706,14 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
         )}
       </Show>
       <Show when={exportDlg()}>
-        <ExportDialog options={exportOptions()} target="file" onClose={() => setExportDlg(false)} onExport={(o, t) => void doExport(o, t)} />
+        <ExportDialog
+          options={exportOptions()}
+          source={tableName()}
+          fileBase={exportFileBase(tableName())}
+          preview={(o) => exportPreview(exportSource(), o)}
+          onClose={() => setExportDlg(false)}
+          onExport={(o, t, out) => void doExport(o, t, out)}
+        />
       </Show>
       <Show when={colFilter()}>
         {(f) => (

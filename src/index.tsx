@@ -9,6 +9,7 @@ import "./styles/tokens-extra.css";
 import "./styles/app.css";
 import "./styles/ui.css";
 import "./styles/shell.css";
+import "./theme/appearance.css";
 import { initTheme } from "./state/theme";
 
 initTheme(); // sets <html data-theme> before the first paint

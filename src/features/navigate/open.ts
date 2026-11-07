@@ -6,14 +6,16 @@ import { isToolWindowVisible } from "../../state/layout";
 import { openTab } from "../../state/tabs";
 import { ensureConnected, explorerDataSources, openDdlTab, openTableTab, revealObject } from "../explorer";
 import type { NodeData } from "../explorer/model";
-import type { Entry } from "./sources";
+import { TABLE_CHILD_KINDS, type Entry } from "./sources";
 
 const TABLE_KINDS = ["table", "view", "materializedView"];
+/** Columns, indexes, keys, checks and triggers belong to a table: they open its data / DDL. */
+const isChild = (e: Entry) => TABLE_CHILD_KINDS.includes(e.kind);
 
 function nodeData(e: Entry, driver: Driver): NodeData {
-  // A column opens the data of its table.
-  const kind = (e.kind === "column" ? (e.tableKind ?? "table") : e.kind) as NodeKind;
-  const name = e.kind === "column" ? (e.table ?? e.name) : e.name;
+  // A column (index, key, ...) opens the data of its table.
+  const kind = (isChild(e) ? (e.tableKind ?? "table") : e.kind) as NodeKind;
+  const name = isChild(e) ? (e.table ?? e.name) : e.name;
   return {
     dsId: e.dsId!,
     kind,
@@ -26,24 +28,29 @@ function nodeData(e: Entry, driver: Driver): NodeData {
 
 /** Does Shift+Enter (DDL) apply to this entry? */
 export function hasDdl(e: Entry | undefined): boolean {
-  return !!e && e.group === "db" && ["table", "view", "materializedView", "routine", "function", "procedure", "sequence", "column"].includes(e.kind);
+  return !!e && e.group === "db" && (isChild(e) || ["table", "view", "materializedView", "routine", "function", "procedure", "sequence"].includes(e.kind));
 }
 
 export async function openEntry(e: Entry, mode: "default" | "ddl" = "default"): Promise<void> {
+  if (e.kind === "setting") {
+    await runAction("app.settings", e.pageId);
+    return;
+  }
   if (e.group === "action") {
     if (e.actionId) await runAction(e.actionId);
     return;
   }
   const ds = explorerDataSources().find((d) => d.id === e.dsId);
   if (!ds) return;
-  if (e.group === "console") {
+  if (e.group === "console" || e.group === "text") {
     try {
       await ensureConnected(ds.id);
     } catch (err) {
       notify({ kind: "error", title: `Connection to ${ds.name} failed`, body: String((err as Error)?.message ?? err) });
       return;
     }
-    openTab({ id: `console:${ds.id}:${e.name}`, kind: "console", title: `${e.name} [${ds.name}]`, icon: "dg/console", data: { dsId: ds.id, consoleName: e.name } });
+    const name = e.group === "text" ? (e.file ?? e.name) : e.name;
+    openTab({ id: `console:${ds.id}:${name}`, kind: "console", title: `${name} [${ds.name}]`, icon: "dg/console", data: { dsId: ds.id, consoleName: name } });
     return;
   }
   const explorerShown = isToolWindowVisible("explorer");
@@ -52,7 +59,7 @@ export async function openEntry(e: Entry, mode: "default" | "ddl" = "default"): 
     await revealObject(ds.id, e.kind === "schema" ? { schema: e.name, name: e.name, kind: "schema" } : null);
     return;
   }
-  const isTable = TABLE_KINDS.includes(e.kind) || e.kind === "column";
+  const isTable = TABLE_KINDS.includes(e.kind) || isChild(e);
   // Select it in the explorer first (that focuses the tree), then open the tab so the editor ends up focused.
   if (explorerShown) {
     await revealObject(ds.id, {
@@ -71,21 +78,21 @@ export async function openEntry(e: Entry, mode: "default" | "ddl" = "default"): 
 // ---------------------------------------------------------------- recent
 
 const KEY = "prometeo.nav.recent";
-type Stored = Pick<Entry, "group" | "kind" | "name" | "dsId" | "schema" | "table" | "tableKind" | "signature" | "actionId">;
+type Stored = Pick<Entry, "group" | "kind" | "name" | "dsId" | "schema" | "table" | "tableKind" | "signature" | "actionId" | "unique">;
 
 export function loadRecent(): Entry[] {
   try {
     const raw = JSON.parse(localStorage.getItem(KEY) ?? "[]") as Stored[];
-    return raw.filter((r) => r.group !== "action").map((r) => ({ ...r, lower: r.name.toLowerCase() }));
+    return raw.filter((r) => r.group !== "action" && r.group !== "text").map((r) => ({ ...r, lower: r.name.toLowerCase() }));
   } catch {
     return [];
   }
 }
 
 export function pushRecent(e: Entry): void {
-  if (e.group === "action") return;
+  if (e.group === "action" || e.group === "text") return;
   const same = (a: Stored, b: Stored) => a.kind === b.kind && a.name === b.name && a.dsId === b.dsId && a.schema === b.schema && a.table === b.table && a.signature === b.signature;
-  const mine: Stored = { group: e.group, kind: e.kind, name: e.name, dsId: e.dsId, schema: e.schema, table: e.table, tableKind: e.tableKind, signature: e.signature };
+  const mine: Stored = { group: e.group, kind: e.kind, name: e.name, dsId: e.dsId, schema: e.schema, table: e.table, tableKind: e.tableKind, signature: e.signature, unique: e.unique };
   try {
     const list = (JSON.parse(localStorage.getItem(KEY) ?? "[]") as Stored[]).filter((r) => !same(r, mine));
     localStorage.setItem(KEY, JSON.stringify([mine, ...list].slice(0, 30)));

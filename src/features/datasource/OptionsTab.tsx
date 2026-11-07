@@ -1,5 +1,5 @@
-import type { JSX } from "solid-js";
-import { Checkbox, ComboBox, Icon, TextField, openMenu } from "../../components/ui";
+import { type JSX, Show, createEffect, createSignal } from "solid-js";
+import { Checkbox, ComboBox, Dialog, Icon, TextField, openMenu, tip } from "../../components/ui";
 import type { Session } from "./session";
 
 function Section(props: { title: string; children: JSX.Element }) {
@@ -53,8 +53,32 @@ export function OptionsTab(props: { s: Session }) {
     </div>
   );
 
+  const [scriptOpen, setScriptOpen] = createSignal(false);
+  const [script, setScript] = createSignal("");
+  createEffect(() => scriptOpen() && setScript(o("startupScript") ?? ""));
+
   return (
     <div class="ds-scroll ds-options">
+      <Show when={scriptOpen()}>
+        <Dialog
+          title="Startup Script"
+          width={640}
+          onClose={() => setScriptOpen(false)}
+          buttons={[
+            {
+              label: "OK",
+              primary: true,
+              run: () => {
+                s.setOption("startupScript", script());
+                setScriptOpen(false);
+              },
+            },
+            { label: "Cancel", run: () => setScriptOpen(false) },
+          ]}
+        >
+          <textarea class="ds-textarea ds-script-editor" spellcheck={false} value={script()} onInput={(e) => setScript(e.currentTarget.value)} data-autofocus />
+        </Dialog>
+      </Show>
       <Section title="Connection">
         <div class="ds-opt-row">
           <Checkbox checked={f().readOnly} onChange={(c) => s.setField("readOnly", c)} label="Read-only" />
@@ -70,6 +94,21 @@ export function OptionsTab(props: { s: Session }) {
             onChange={(v) => s.setOption("txMode", v === "auto" ? undefined : v)}
           />
         </div>
+        <Show when={f().dbms !== "sqlite"}>
+          <div class="ds-opt-row">
+            <span class="ds-opt-label">Switch schema:</span>
+            <div class="ds-opt-combo ds-opt-combo-short">
+              <ComboBox
+                value={o("switchSchema") ?? "automatic"}
+                options={[
+                  { value: "automatic", label: "Automatic" },
+                  { value: "disabled", label: "Disabled" },
+                ]}
+                onChange={(v) => s.setOption("switchSchema", v === "automatic" ? undefined : v)}
+              />
+            </div>
+          </div>
+        </Show>
         {numberRow("keepAliveSec", "Run keep-alive query each", "60")}
         {numberRow("autoDisconnectSec", "Auto-disconnect after", "300")}
         <div class="ds-opt-row">
@@ -87,16 +126,26 @@ export function OptionsTab(props: { s: Session }) {
         </div>
         <div class="ds-opt-row ds-opt-top">
           <span class="ds-opt-label">Startup script:</span>
-          <textarea
-            class="ds-textarea"
-            spellcheck={false}
-            rows={1}
-            value={o("startupScript") ?? ""}
-            onInput={(e) => s.setOption("startupScript", e.currentTarget.value)}
-          />
+          <div class="ds-textarea-wrap">
+            <textarea
+              class="ds-textarea"
+              spellcheck={false}
+              rows={1}
+              value={o("startupScript") ?? ""}
+              onInput={(e) => s.setOption("startupScript", e.currentTarget.value)}
+            />
+            <button type="button" class="ds-expand" onMouseDown={(e) => e.preventDefault()} onClick={() => setScriptOpen(true)} {...tip("Expand")}>
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9.5 2.5h4v4M13.5 2.5l-4.5 4.5M6.5 13.5h-4v-4M2.5 13.5L7 9" />
+              </svg>
+            </button>
+          </div>
         </div>
       </Section>
       <Section title="Introspection">
+        <div class="ds-opt-row">
+          <Checkbox checked={o("autoSync") !== "false"} onChange={(c) => s.setOption("autoSync", c ? undefined : "false")} label="Auto sync" />
+        </div>
         <div class="ds-opt-row">
           <Checkbox
             checked={o("showSystemSchemas") === "true"}

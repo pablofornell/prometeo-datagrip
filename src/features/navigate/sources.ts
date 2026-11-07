@@ -4,16 +4,24 @@
  * the registered actions. Entries are built once per snapshot and cached; searching never calls the backend.
  */
 import { createEffect, createMemo, createRoot, createSignal, untrack } from "solid-js";
-import { type DataSource, type NodeKind, type SnapshotObject, type TreeNode, introspect, listConsoles } from "../../api/db";
+import { type DataSource, type NodeKind, type SnapshotObject, type TreeNode, introspect, listConsoles, readConsole } from "../../api/db";
 import { MAIN_MENU, GEAR_MENU } from "../../components/shell/menus";
 import type { MenuItem } from "../../components/ui";
 import * as registry from "../../state/actions";
 import { ACTION_IDS } from "../../state/core-actions";
+import { isSchemaNameVisible } from "../datasource/schemas";
 import { connectedDataSourceIds, explorerDataSources, loadSchemaSnapshot, schemaSnapshotFor } from "../explorer";
+import { PAGES, type PageNode } from "../settings/model";
 import { type PreparedQuery, type Range, matchName, prepareQuery } from "./match";
 
-export type EntryKind = "dataSource" | "schema" | "table" | "view" | "materializedView" | "routine" | "function" | "procedure" | "sequence" | "column" | "console" | "action";
-export type Group = "db" | "console" | "action";
+export type EntryKind =
+  | "dataSource" | "schema" | "table" | "view" | "materializedView" | "routine" | "function" | "procedure" | "sequence" | "column"
+  | "index" | "primaryKey" | "uniqueKey" | "foreignKey" | "check" | "trigger"
+  | "console" | "action" | "setting" | "text";
+export type Group = "db" | "console" | "action" | "text";
+
+/** Kinds that live inside a table (shown as `db.schema.table`), loaded lazily after the snapshot. */
+export const TABLE_CHILD_KINDS: readonly EntryKind[] = ["column", "index", "primaryKey", "uniqueKey", "foreignKey", "check", "trigger"];
 
 export interface Entry {
   group: Group;
@@ -22,13 +30,22 @@ export interface Entry {
   lower: string;
   dsId?: string;
   schema?: string;
-  /** Column: its table. */
+  /** Column / index / key / trigger: its table. */
   table?: string;
-  /** Column: kind of its table. */
+  /** Column / index / key / trigger: kind of its table. */
   tableKind?: NodeKind;
+  /** Indexes: unique ones get the unique-index icon. */
+  unique?: boolean;
   /** Routines: identity arguments as the backend reports them. */
   signature?: string;
   actionId?: string;
+  /** Settings options: the Settings page that holds it. */
+  pageId?: string;
+  /** Slash commands (`/db`): the tab they switch to. */
+  goTab?: string;
+  /** Text matches: console name and 1-based line. */
+  file?: string;
+  line?: number;
   /** Actions: gray text at the right (shortcut or menu group). */
   right?: string;
 }
@@ -41,11 +58,19 @@ const RANK: Record<EntryKind, number> = {
   function: 3,
   procedure: 3,
   sequence: 4,
+  index: 4,
+  primaryKey: 4,
+  uniqueKey: 4,
+  foreignKey: 4,
+  check: 4,
+  trigger: 4,
   schema: 5,
   dataSource: 6,
   column: 8,
   console: 0,
   action: 0,
+  setting: 1,
+  text: 0,
 };
 
 const mk = (group: Group, kind: EntryKind, name: string, rest: Partial<Entry> = {}): Entry => ({ group, kind, name, lower: name.toLowerCase(), ...rest });
@@ -83,9 +108,21 @@ const [extras, setExtras] = createSignal<ReadonlyMap<string, Extras>>(new Map())
 const inFlight = new Map<string, SnapshotObject[]>();
 
 const ROUTINE_KINDS: NodeKind[] = ["routine", "function", "procedure"];
+const TABLE_FOLDERS = ["tables", "views", "materialized_views"];
+const TABLE_KINDS_N: NodeKind[] = ["table", "view", "materializedView"];
+/** Object folders of a table whose children are indexed (columns come with the snapshot). */
+const CHILD_FOLDERS = ["keys", "foreign_keys", "indexes", "checks", "triggers"];
+const CHILD_KINDS: NodeKind[] = ["primaryKey", "uniqueKey", "foreignKey", "index", "check", "trigger"];
+/** Tables whose keys / indexes / triggers are looked up per data source (a few calls each). */
+const MAX_RELATED_TABLES = 300;
 
-/** Routines, sequences and schemas of a data source, through the lazy introspection API (a few calls per schema). */
-async function loadExtras(ds: DataSource): Promise<Entry[]> {
+interface TableRef {
+  node: TreeNode;
+  schema: string;
+}
+
+/** Routines, sequences, schemas and the tables themselves (for `loadRelated`) of a data source, through the lazy introspection API (a few calls per schema). */
+async function loadExtras(ds: DataSource): Promise<{ entries: Entry[]; tables: TableRef[] }> {
   const top = await introspect(ds.id, []);
   let schemas: TreeNode[];
   if (top.some((n) => n.kind === "database")) {
@@ -93,26 +130,61 @@ async function loadExtras(ds: DataSource): Promise<Entry[]> {
     schemas = db ? (await introspect(ds.id, db.path)).filter((n) => n.kind === "schema") : [];
   } else schemas = top.filter((n) => n.kind === "schema");
   const out: Entry[] = [];
+  const tables: TableRef[] = [];
   for (const s of schemas) {
     out.push(mk("db", "schema", s.name, { dsId: ds.id, schema: s.name }));
-    const folders = (await introspect(ds.id, s.path)).filter((f) => f.kind === "folder" && (f.extra.folder === "routines" || f.extra.folder === "sequences"));
+    const folders = (await introspect(ds.id, s.path)).filter((f) => f.kind === "folder" && ["routines", "sequences", ...TABLE_FOLDERS].includes(f.extra.folder));
     for (const f of folders) {
       for (const n of await introspect(ds.id, f.path)) {
         if (n.kind === "sequence") out.push(mk("db", "sequence", n.name, { dsId: ds.id, schema: s.name }));
         else if (ROUTINE_KINDS.includes(n.kind)) out.push(mk("db", n.kind as EntryKind, n.name, { dsId: ds.id, schema: s.name, signature: String(n.extra.signature ?? "") }));
+        else if (TABLE_KINDS_N.includes(n.kind)) tables.push({ node: n, schema: s.name });
       }
     }
   }
+  return { entries: out, tables };
+}
+
+/** Indexes, keys, foreign keys, checks and triggers of the tables, with a few requests running at once. */
+async function loadRelated(ds: DataSource, tables: TableRef[], isCurrent: () => boolean): Promise<Entry[]> {
+  const out: Entry[] = [];
+  const shown = (t: TableRef) => isSchemaNameVisible(ds, t.schema);
+  // schemas the explorer shows first: the cap must not be spent on hidden ones
+  const queue = [...tables.filter(shown), ...tables.filter((t) => !shown(t))].slice(0, MAX_RELATED_TABLES);
+  const one = async (t: TableRef) => {
+    const folders = (await introspect(ds.id, t.node.path)).filter((f) => f.kind === "folder" && CHILD_FOLDERS.includes(f.extra.folder) && Number(f.extra.count ?? f.hint ?? 1) !== 0);
+    for (const f of folders) {
+      for (const n of await introspect(ds.id, f.path)) {
+        if (!CHILD_KINDS.includes(n.kind)) continue;
+        out.push(mk("db", n.kind as EntryKind, n.name, { dsId: ds.id, schema: t.schema, table: t.node.name, tableKind: t.node.kind, unique: n.kind === "index" && !!n.extra.unique && !n.extra.primary }));
+      }
+    }
+  };
+  let next = 0;
+  const worker = async () => {
+    while (isCurrent() && next < queue.length) {
+      try {
+        await one(queue[next++]);
+      } catch {
+        /* a table that cannot be read is skipped */
+      }
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
   return out;
 }
 
 function refreshExtras(ds: DataSource, snap: SnapshotObject[]): void {
   if (extras().get(ds.id)?.snap === snap || inFlight.get(ds.id) === snap) return;
   inFlight.set(ds.id, snap);
+  const current = () => inFlight.get(ds.id) === snap;
   void loadExtras(ds)
-    .then((entries) => {
-      if (inFlight.get(ds.id) !== snap) return;
+    .then(async ({ entries, tables }) => {
+      if (!current()) return;
       setExtras((m) => new Map(m).set(ds.id, { snap, entries }));
+      const related = await loadRelated(ds, tables, current).catch(() => [] as Entry[]);
+      if (!current() || !related.length) return;
+      setExtras((m) => new Map(m).set(ds.id, { snap, entries: [...entries, ...related] }));
     })
     .catch(() => {})
     .finally(() => {
@@ -166,6 +238,12 @@ export function ensureIndex(): void {
 export const databaseEntries = (): Entry[] => dbEntries();
 export const databaseColumnEntries = (): Entry[] => colEntries();
 
+/** Is the entry in a schema the explorer shows (the schema selector of its data source)? Data sources and entries without a schema always are. */
+export function isEntryVisible(e: Entry, ds: DataSource | undefined): boolean {
+  if (e.group !== "db" || !ds || !e.schema || e.kind === "dataSource") return true;
+  return isSchemaNameVisible(ds, e.schema);
+}
+
 // ---------------------------------------------------------------- consoles
 
 const [consoles, setConsoles] = createSignal<Entry[]>([]);
@@ -187,6 +265,80 @@ export async function reloadConsoles(): Promise<void> {
   setConsoles(out);
 }
 
+// ---------------------------------------------------------------- text (contents of the consoles)
+
+const MAX_TEXT_LINES = 20000;
+const [textLines, setTextLines] = createSignal<Entry[]>([]);
+export { textLines as textEntries };
+
+/** Reads every console file (small, local): one entry per non-blank line. */
+export async function reloadTextIndex(): Promise<void> {
+  const per = await Promise.all(
+    explorerDataSources().map(async (ds) => {
+      const out: Entry[] = [];
+      try {
+        for (const name of await listConsoles(ds.id)) {
+          let text = "";
+          try {
+            text = await readConsole(ds.id, name);
+          } catch {
+            continue;
+          }
+          text.split(/\r?\n/).forEach((l, i) => {
+            const t = l.trim();
+            if (t) out.push(mk("text", "text", t, { dsId: ds.id, file: name, line: i + 1, right: `${name}.sql:${i + 1}` }));
+          });
+        }
+      } catch {
+        /* no consoles */
+      }
+      return out;
+    }),
+  );
+  setTextLines(per.flat().slice(0, MAX_TEXT_LINES));
+}
+
+/** Lines that contain the text (case-insensitive), with the matched ranges. */
+export function searchText(entries: Entry[], text: string, limit: number, dsId?: string | null): Hit[] {
+  const q = text.trim().toLowerCase();
+  if (!q) return [];
+  const out: Hit[] = [];
+  for (const e of entries) {
+    if (dsId && e.dsId !== dsId) continue;
+    const ranges: Range[] = [];
+    for (let at = e.lower.indexOf(q); at >= 0; at = e.lower.indexOf(q, at + q.length)) ranges.push([at, at + q.length]);
+    if (!ranges.length) continue;
+    out.push({ entry: e, ranges, score: 0 });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- settings options
+
+function settingEntries(): Entry[] {
+  const out: Entry[] = [];
+  const seen = new Set<string>();
+  const walk = (nodes: PageNode[], trail: string[]) => {
+    for (const n of nodes) {
+      const here = [...trail, n.title];
+      const right = "Settings > " + here.join(" > ");
+      for (const name of [n.title, ...(n.keywords ?? [])]) {
+        const key = n.id + "\u0000" + name.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(mk("action", "setting", name, { pageId: n.id, right }));
+      }
+      if (n.children) walk(n.children, here);
+    }
+  };
+  walk(PAGES, []);
+  return out;
+}
+
+/** Options of the Settings pages (their labels), found by Search Everywhere / Find Action. */
+export const collectSettings = (): Entry[] => settingEntries();
+
 // ---------------------------------------------------------------- actions
 
 function groupsOfActions(): Map<string, string> {
@@ -205,7 +357,8 @@ function groupsOfActions(): Map<string, string> {
 const KNOWN_ACTIONS = [
   ...Object.values(ACTION_IDS),
   "app.exit", "window.minimize", "window.maximize", "window.resetLayout", "help.about", "tab.close", "tab.closeOthers", "tab.closeAll",
-  "tab.next", "tab.prev", "toolwindow.hideActive", "toolwindow.hideAll", "toolwindow.explorer", "toolwindow.output",
+  "tab.next", "tab.prev", "toolwindow.hideActive", "toolwindow.hideAll", "toolwindow.explorer", "toolwindow.output", "toolwindow.files", "toolwindow.services", "toolwindow.notifications",
+  "notifications.menu", "notifications.expireAll", "notifications.clearAll",
   "theme.system", "theme.dark", "theme.light", "db.properties", "db.disconnect", "db.drop", "db.copyReference", "db.copyName",
   "db.copyDdl", "db.ddlToConsole", "db.duplicateDataSource", "explorer.locate", "explorer.expandAll", "explorer.collapseAll",
   "sql.executeScript", "table.addRow", "table.deleteRows", "table.submit", "table.revert", "table.reload", "table.nextPage",
@@ -352,7 +505,7 @@ export function signatureText(sig: string | undefined): string {
 /** Gray location text after the name: `postgres.sales [postgres@localhost]`. */
 export function locationOf(e: Entry, ds: DataSource | undefined): string {
   if (e.group === "console") return `Database Consoles/${ds?.name ?? ""}`;
-  if (e.group === "action" || e.kind === "dataSource") return "";
+  if (e.group === "action" || e.group === "text" || e.kind === "dataSource") return "";
   const segs = pathOf(e, ds).slice(1);
   const dsPart = ds ? `[${ds.name}]` : "";
   return [segs.join("."), dsPart].filter(Boolean).join(" ");
@@ -368,7 +521,8 @@ export function footerPath(e: Entry, ds: DataSource | undefined): string {
   if (ds.driver === "postgres") parts.push(seg("database", ds.database || "postgres"));
   if (e.schema) parts.push(seg("schema", e.schema));
   const folder: Partial<Record<EntryKind, string>> = { table: "table", view: "view", materializedView: "materialized-view", routine: "routine", function: "routine", procedure: "routine", sequence: "sequence" };
-  if (e.kind === "column") parts.push(seg(folder[e.tableKind as EntryKind] ?? "table", e.table ?? ""), seg("column", e.name));
+  const childSeg: Partial<Record<EntryKind, string>> = { column: "column", index: "index", primaryKey: "key", uniqueKey: "key", foreignKey: "foreign-key", check: "check", trigger: "trigger" };
+  if (childSeg[e.kind]) parts.push(seg(folder[e.tableKind as EntryKind] ?? "table", e.table ?? ""), seg(childSeg[e.kind]!, e.name));
   else if (folder[e.kind]) parts.push(seg(folder[e.kind]!, e.name));
   return parts.join("/");
 }

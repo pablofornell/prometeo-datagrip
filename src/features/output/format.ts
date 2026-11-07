@@ -29,11 +29,14 @@ export function formatDuration(ms: number): string {
   return parts.join(" ");
 }
 
+/** A part of a statement's time: whole milliseconds, never `0 ms` (the server reports whole ms, a quick part is `< 1 ms`). */
+const part = (ms: number): string => (Math.round(ms) < 1 ? "< 1 ms" : formatDuration(ms));
+
 const rowsWord = (n: number): string => (n === 1 ? "1 row" : `${n} rows`);
 
 /** `18 rows retrieved starting from 1 in 902 ms (execution: 21 ms, fetching: 881 ms)`. */
 export function rowsRetrieved(rows: number, totalMs: number, execMs?: number, fetchMs?: number, from = 1): string {
-  const timing = execMs !== undefined && fetchMs !== undefined ? ` (execution: ${formatDuration(execMs)}, fetching: ${formatDuration(fetchMs)})` : "";
+  const timing = execMs !== undefined && fetchMs !== undefined ? ` (execution: ${part(execMs)}, fetching: ${part(fetchMs)})` : "";
   if (rows === 0) return `0 rows retrieved in ${formatDuration(totalMs)}${timing}`;
   return `${rowsWord(rows)} retrieved starting from ${from} in ${formatDuration(totalMs)}${timing}`;
 }

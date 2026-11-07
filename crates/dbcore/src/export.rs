@@ -1,4 +1,5 @@
-//! Export of result sets / queries: CSV, TSV, JSON, SQL INSERT, Markdown table.
+//! Export of result sets / queries: CSV (comma, semicolon, pipe), TSV, JSON, JSON lines, SQL INSERT / UPDATE, WHERE clause,
+//! Markdown, HTML table, XML and an aligned text table.
 
 use std::io::{self, Write};
 
@@ -20,6 +21,20 @@ pub enum ExportFormat {
     Json,
     SqlInsert,
     Markdown,
+    /// CSV with `|` as the field delimiter.
+    CsvPipe,
+    /// CSV with `;` as the field delimiter.
+    CsvSemicolon,
+    /// One JSON object per line.
+    JsonLines,
+    /// `update t set ... where <key> = ...;` (the key is the primary key columns, else every column).
+    SqlUpdate,
+    /// `where <key> in (...)` / `where (a = 1 and b = 2) or ...` over the rows (key as in `SqlUpdate`).
+    WhereClause,
+    Html,
+    Xml,
+    /// Aligned plain-text table.
+    Pretty,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +54,11 @@ pub struct ExportOptions {
     pub dialect: Driver,
     /// Rows per INSERT statement (multi-row VALUES when > 1).
     pub rows_per_insert: usize,
+    /// Write the result transposed: one output row per column (first cell: the column name), one output
+    /// column per result row. The whole result is held in memory.
+    pub transpose: bool,
+    /// Add a first column with the row number (CSV / TSV / Markdown only; the header cell is empty).
+    pub row_header: bool,
 }
 
 impl Default for ExportOptions {
@@ -52,6 +72,8 @@ impl Default for ExportOptions {
             table_name: None,
             dialect: Driver::Postgres,
             rows_per_insert: 1,
+            transpose: false,
+            row_header: false,
         }
     }
 }
@@ -124,10 +146,22 @@ fn sql_literal(d: Driver, c: &Cell) -> String {
 pub struct Exporter<W: Write> {
     w: W,
     o: ExportOptions,
+    /// Column names as written (with the row header column).
     cols: Vec<String>,
+    /// Column names of the result being exported.
+    src_cols: Vec<String>,
+    /// Rows of the result seen so far.
     rows: usize,
+    /// Rows written (differs from `rows` when transposed).
+    emitted: usize,
     began: bool,
     batch: Vec<String>,
+    /// Rows held back until `finish` (transposed export).
+    held: Vec<Vec<Cell>>,
+    /// Primary key flag of each column of the result (SQL UPDATE / WHERE key).
+    src_pk: Vec<bool>,
+    /// Text rows of the `Pretty` table (needs every row to align the columns).
+    text_rows: Vec<Vec<String>>,
 }
 
 impl<W: Write> Exporter<W> {
@@ -136,15 +170,22 @@ impl<W: Write> Exporter<W> {
             w,
             o: opts,
             cols: Vec::new(),
+            src_cols: Vec::new(),
             rows: 0,
+            emitted: 0,
             began: false,
             batch: Vec::new(),
+            held: Vec::new(),
+            src_pk: Vec::new(),
+            text_rows: Vec::new(),
         }
     }
 
     fn delim(&self) -> char {
         match self.o.format {
             ExportFormat::Tsv => '\t',
+            ExportFormat::CsvPipe => '|',
+            ExportFormat::CsvSemicolon => ';',
             _ => self.o.delimiter.unwrap_or(','),
         }
     }
@@ -172,6 +213,57 @@ impl<W: Write> Exporter<W> {
             .replace('\n', "<br>")
     }
 
+    fn is_csv(&self) -> bool {
+        matches!(
+            self.o.format,
+            ExportFormat::Csv | ExportFormat::CsvPipe | ExportFormat::CsvSemicolon
+        )
+    }
+
+    /// Indexes (in the result) of the columns that identify a row: the primary key, else every column.
+    fn key_cols(&self) -> Vec<usize> {
+        let pk: Vec<usize> = (0..self.src_cols.len())
+            .filter(|i| self.src_pk.get(*i).copied().unwrap_or(false))
+            .collect();
+        if pk.is_empty() {
+            (0..self.src_cols.len()).collect()
+        } else {
+            pk
+        }
+    }
+
+    /// `"col" = literal` (`is null` for NULL).
+    fn eq_pred(&self, i: usize, row: &[Cell]) -> String {
+        let col = quote_ident(self.o.dialect, &self.src_cols[i]);
+        match row.get(i) {
+            None | Some(Value::Null) => format!("{col} is null"),
+            Some(c) => format!("{col} = {}", sql_literal(self.o.dialect, c)),
+        }
+    }
+
+    fn xml_name(s: &str) -> String {
+        let mut n: String = s
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || matches!(c, '_' | '-' | '.') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if n.is_empty() || !n.starts_with(|c: char| c.is_alphabetic() || c == '_') {
+            n.insert(0, '_');
+        }
+        n
+    }
+
+    fn xml_text(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    }
+
     fn table(&self) -> String {
         let name = self
             .o
@@ -184,11 +276,34 @@ impl<W: Write> Exporter<W> {
             .join(".")
     }
 
+    fn row_header(&self) -> bool {
+        self.o.row_header
+            && (self.is_csv()
+                || matches!(self.o.format, ExportFormat::Tsv | ExportFormat::Markdown))
+    }
+
     pub fn begin(&mut self, columns: &[ColumnMeta]) -> io::Result<()> {
-        self.cols = columns.iter().map(|c| c.name.clone()).collect();
+        self.src_cols = columns.iter().map(|c| c.name.clone()).collect();
+        self.src_pk = columns.iter().map(|c| c.is_pk).collect();
         self.began = true;
+        if self.o.transpose {
+            return Ok(());
+        }
+        let names = self.src_cols.clone();
+        self.start(names)
+    }
+
+    /// Writes the header of the output (`names` are the columns of the output, without the row header).
+    fn start(&mut self, names: Vec<String>) -> io::Result<()> {
+        self.cols = names;
+        if self.row_header() {
+            self.cols.insert(0, String::new());
+        }
         match self.o.format {
-            ExportFormat::Csv | ExportFormat::Tsv => {
+            ExportFormat::Csv
+            | ExportFormat::CsvPipe
+            | ExportFormat::CsvSemicolon
+            | ExportFormat::Tsv => {
                 if self.o.header {
                     let line: Vec<String> = self
                         .cols
@@ -218,14 +333,52 @@ impl<W: Write> Exporter<W> {
                         .join("|")
                 )?;
             }
-            ExportFormat::SqlInsert => {}
+            ExportFormat::Html => {
+                writeln!(self.w, "<table>\n  <thead>\n    <tr>")?;
+                for c in &self.cols {
+                    writeln!(self.w, "      <th>{}</th>", Self::xml_text(c))?;
+                }
+                writeln!(self.w, "    </tr>\n  </thead>\n  <tbody>")?;
+            }
+            ExportFormat::Xml => {
+                writeln!(
+                    self.w,
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<result>"
+                )?;
+            }
+            ExportFormat::Pretty => {
+                let head = self.cols.clone();
+                self.text_rows.push(head);
+            }
+            ExportFormat::JsonLines
+            | ExportFormat::SqlInsert
+            | ExportFormat::SqlUpdate
+            | ExportFormat::WhereClause => {}
         }
         Ok(())
     }
 
     pub fn row(&mut self, row: &[Cell]) -> io::Result<()> {
+        self.rows += 1;
+        if self.o.transpose {
+            self.held.push(row.to_vec());
+            return Ok(());
+        }
+        self.emit(row)
+    }
+
+    fn emit(&mut self, row: &[Cell]) -> io::Result<()> {
+        let with_header;
+        let row = if self.row_header() {
+            with_header = std::iter::once(Value::from(self.emitted + 1))
+                .chain(row.iter().cloned())
+                .collect::<Vec<_>>();
+            &with_header[..]
+        } else {
+            row
+        };
         match self.o.format {
-            ExportFormat::Csv => {
+            ExportFormat::Csv | ExportFormat::CsvPipe | ExportFormat::CsvSemicolon => {
                 let line: Vec<String> = row
                     .iter()
                     .map(|c| self.csv_field(&cell_text(c, &self.o.null_text)))
@@ -252,7 +405,7 @@ impl<W: Write> Exporter<W> {
                     .collect();
                 writeln!(self.w, "| {} |", line.join(" | "))?;
             }
-            ExportFormat::Json => {
+            ExportFormat::Json | ExportFormat::JsonLines => {
                 let mut obj = serde_json::Map::new();
                 for (i, c) in row.iter().enumerate() {
                     let mut key = self
@@ -265,8 +418,106 @@ impl<W: Write> Exporter<W> {
                     }
                     obj.insert(key, cell_json(c));
                 }
-                write!(self.w, "{}\n  ", if self.rows == 0 { "" } else { "," })?;
-                serde_json::to_writer(&mut self.w, &Value::Object(obj))?;
+                if self.o.format == ExportFormat::JsonLines {
+                    serde_json::to_writer(&mut self.w, &Value::Object(obj))?;
+                    writeln!(self.w)?;
+                } else {
+                    write!(self.w, "{}\n  ", if self.emitted == 0 { "" } else { "," })?;
+                    serde_json::to_writer(&mut self.w, &Value::Object(obj))?;
+                }
+            }
+            ExportFormat::SqlUpdate => {
+                let key = self.key_cols();
+                let mut set: Vec<usize> = (0..self.src_cols.len())
+                    .filter(|i| !key.contains(i) || key.len() == self.src_cols.len())
+                    .collect();
+                if set.is_empty() {
+                    set = key.clone();
+                }
+                let sets: Vec<String> = set
+                    .iter()
+                    .map(|&i| {
+                        format!(
+                            "{} = {}",
+                            quote_ident(self.o.dialect, &self.src_cols[i]),
+                            row.get(i)
+                                .map(|c| sql_literal(self.o.dialect, c))
+                                .unwrap_or_else(|| "NULL".into())
+                        )
+                    })
+                    .collect();
+                let wheres: Vec<String> = key.iter().map(|&i| self.eq_pred(i, row)).collect();
+                writeln!(
+                    self.w,
+                    "update {} set {} where {};",
+                    self.table(),
+                    sets.join(", "),
+                    wheres.join(" and ")
+                )?;
+            }
+            ExportFormat::WhereClause => {
+                let key = self.key_cols();
+                if key.len() == 1 {
+                    // one key column: a single `in (...)` list, written by `finish`
+                    let c = row.get(key[0]).cloned().unwrap_or(Value::Null);
+                    self.batch.push(sql_literal(self.o.dialect, &c));
+                } else {
+                    let preds: Vec<String> = key.iter().map(|&i| self.eq_pred(i, row)).collect();
+                    write!(
+                        self.w,
+                        "{}({})",
+                        if self.emitted == 0 {
+                            "where "
+                        } else {
+                            "\n   or "
+                        },
+                        preds.join(" and ")
+                    )?;
+                }
+            }
+            ExportFormat::Html => {
+                writeln!(self.w, "    <tr>")?;
+                for c in row {
+                    writeln!(
+                        self.w,
+                        "      <td>{}</td>",
+                        Self::xml_text(&cell_text(c, &self.o.null_text))
+                    )?;
+                }
+                writeln!(self.w, "    </tr>")?;
+            }
+            ExportFormat::Xml => {
+                writeln!(self.w, "  <row>")?;
+                for (i, c) in row.iter().enumerate() {
+                    let name = Self::xml_name(
+                        &self
+                            .cols
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| format!("column{i}")),
+                    );
+                    if c.is_null() {
+                        writeln!(self.w, "    <{name} null=\"true\"/>")?;
+                    } else {
+                        writeln!(
+                            self.w,
+                            "    <{name}>{}</{name}>",
+                            Self::xml_text(&cell_text(c, ""))
+                        )?;
+                    }
+                }
+                writeln!(self.w, "  </row>")?;
+            }
+            ExportFormat::Pretty => {
+                let line: Vec<String> = row
+                    .iter()
+                    .map(|c| {
+                        cell_text(c, &self.o.null_text)
+                            .replace('\r', "")
+                            .replace('\n', "\\n")
+                    })
+                    .collect();
+                self.text_rows.push(line);
             }
             ExportFormat::SqlInsert => {
                 let vals: Vec<String> =
@@ -277,7 +528,7 @@ impl<W: Write> Exporter<W> {
                 }
             }
         }
-        self.rows += 1;
+        self.emitted += 1;
         Ok(())
     }
 
@@ -301,17 +552,81 @@ impl<W: Write> Exporter<W> {
         Ok(())
     }
 
+    /// The aligned text table: header, a rule, the rows (numbers are not special: every cell is left aligned).
+    fn write_pretty(&mut self) -> io::Result<()> {
+        let rows = std::mem::take(&mut self.text_rows);
+        let n = rows.iter().map(Vec::len).max().unwrap_or(0);
+        let width = |i: usize| {
+            rows.iter()
+                .filter_map(|r| r.get(i))
+                .map(|c| c.chars().count())
+                .max()
+                .unwrap_or(0)
+        };
+        let widths: Vec<usize> = (0..n).map(width).collect();
+        let line = |r: &Vec<String>| {
+            (0..n)
+                .map(|i| {
+                    let c = r.get(i).map(String::as_str).unwrap_or("");
+                    format!("{c}{}", " ".repeat(widths[i] - c.chars().count()))
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+                .trim_end()
+                .to_string()
+        };
+        for (k, r) in rows.iter().enumerate() {
+            writeln!(self.w, "{}", line(r))?;
+            if k == 0 {
+                let rule = widths
+                    .iter()
+                    .map(|w| "-".repeat(*w))
+                    .collect::<Vec<_>>()
+                    .join("-+-");
+                writeln!(self.w, "{rule}")?;
+            }
+        }
+        Ok(())
+    }
+
     /// Flush and return the writer and the number of rows written.
     pub fn finish(mut self) -> io::Result<(W, usize)> {
+        if self.o.transpose && self.began {
+            let held = std::mem::take(&mut self.held);
+            let mut names = vec!["column".to_string()];
+            names.extend((1..=held.len()).map(|i| i.to_string()));
+            self.start(names)?;
+            for (i, name) in self.src_cols.clone().into_iter().enumerate() {
+                let mut row = vec![Value::String(name)];
+                row.extend(
+                    held.iter()
+                        .map(|r| r.get(i).cloned().unwrap_or(Value::Null)),
+                );
+                self.emit(&row)?;
+            }
+        }
         match self.o.format {
             ExportFormat::Json => {
-                if self.rows == 0 {
+                if self.emitted == 0 {
                     writeln!(self.w, "]")?;
                 } else {
                     writeln!(self.w, "\n]")?;
                 }
             }
             ExportFormat::SqlInsert => self.flush_batch()?,
+            ExportFormat::WhereClause => {
+                if !self.batch.is_empty() {
+                    let key = self.key_cols();
+                    let col = quote_ident(self.o.dialect, &self.src_cols[key[0]]);
+                    writeln!(self.w, "where {col} in ({})", self.batch.join(", "))?;
+                    self.batch.clear();
+                } else if self.emitted > 0 {
+                    writeln!(self.w)?;
+                }
+            }
+            ExportFormat::Html => writeln!(self.w, "  </tbody>\n</table>")?,
+            ExportFormat::Xml => writeln!(self.w, "</result>")?,
+            ExportFormat::Pretty => self.write_pretty()?,
             _ => {}
         }
         self.w.flush()?;
@@ -353,7 +668,7 @@ impl ConnectionManager {
         let cols = query_pool(&live, sql, usize::MAX, |cols, row| {
             if !e.began {
                 e.begin(cols)?;
-            } else if !cols.iter().map(|c| &c.name).eq(e.cols.iter()) {
+            } else if !cols.iter().map(|c| &c.name).eq(e.src_cols.iter()) {
                 // a later result set of the same call with other columns: only the first
                 // shape is exported (rows of equally shaped result sets are appended)
                 return Ok(());
@@ -437,6 +752,42 @@ mod tests {
     }
 
     #[test]
+    fn row_header_and_transpose() {
+        let out = run(ExportFormat::Csv, |o| o.row_header = true);
+        assert_eq!(out.lines().next().unwrap(), ",id,name,data");
+        assert!(
+            out.lines().nth(2).unwrap().starts_with("2,2,,true"),
+            "{out}"
+        );
+        let md = run(ExportFormat::Markdown, |o| o.row_header = true);
+        assert!(md.starts_with("|  | id | name | data |\n"), "{md}");
+        // not for formats that have no such column
+        let sql = run(ExportFormat::SqlInsert, |o| o.row_header = true);
+        assert!(
+            sql.starts_with("insert into \"table_name\" (\"id\", \"name\", \"data\") values (1,"),
+            "{sql}"
+        );
+        let t = run(ExportFormat::Csv, |o| o.transpose = true);
+        let lines: Vec<&str> = t.lines().collect();
+        assert_eq!(lines[0], "column,1,2,3");
+        assert_eq!(lines[1], "id,1,2,9007199254740993");
+        assert_eq!(lines[2], "name,\"a,b \"\"q\"\"\",,\"l1");
+        let t = run(ExportFormat::Csv, |o| {
+            o.transpose = true;
+            o.header = false;
+            o.row_header = true;
+        });
+        assert!(t.starts_with("1,id,1,2,9007199254740993\n2,name,"), "{t}");
+        // the row count is the number of result rows
+        let mut buf = Vec::new();
+        let o = ExportOptions {
+            transpose: true,
+            ..Default::default()
+        };
+        assert_eq!(export_result(&rs(), &o, &mut buf).unwrap(), 3);
+    }
+
+    #[test]
     fn json() {
         let out = run(ExportFormat::Json, |_| {});
         let v: Value = serde_json::from_str(&out).unwrap();
@@ -498,5 +849,98 @@ mod tests {
             o.rows_per_insert = 2;
         });
         assert!(out.starts_with("insert into `table_name` (`id`, `name`, `data`) values (1, 'a,b \"q\"', X'ff00'),\n    (2, NULL, 1);"), "{out}");
+    }
+
+    /// A result with a primary key column (`id`), for the key based formats.
+    fn rs_pk() -> ResultSet {
+        let mut r = rs();
+        r.columns[0].is_pk = true;
+        r
+    }
+
+    fn run_pk(f: ExportFormat, tweak: impl FnOnce(&mut ExportOptions)) -> String {
+        let mut o = ExportOptions {
+            format: f,
+            table_name: Some("public.t".into()),
+            ..Default::default()
+        };
+        tweak(&mut o);
+        export_to_string(&rs_pk(), &o).unwrap()
+    }
+
+    #[test]
+    fn csv_variants_and_json_lines() {
+        let pipe = run(ExportFormat::CsvPipe, |_| {});
+        assert_eq!(pipe.lines().next().unwrap(), "id|name|data");
+        assert!(pipe.contains("1|\"a,b \"\"q\"\"\"|0xff00"), "{pipe}");
+        let semi = run(ExportFormat::CsvSemicolon, |_| {});
+        assert_eq!(semi.lines().nth(2).unwrap(), "2;;true");
+        let jl = run(ExportFormat::JsonLines, |_| {});
+        let lines: Vec<&str> = jl.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            serde_json::from_str::<Value>(lines[0]).unwrap(),
+            json!({"id": 1, "name": "a,b \"q\"", "data": "0xff00"})
+        );
+    }
+
+    #[test]
+    fn sql_update_and_where_clause() {
+        let up = run_pk(ExportFormat::SqlUpdate, |_| {});
+        assert_eq!(
+            up.lines().next().unwrap(),
+            "update \"public\".\"t\" set \"name\" = 'a,b \"q\"', \"data\" = '\\xff00'::bytea where \"id\" = 1;"
+        );
+        assert!(
+            up.contains("set \"name\" = NULL, \"data\" = true where \"id\" = 2;"),
+            "{up}"
+        );
+        // without a primary key every column identifies the row (NULL as `is null`)
+        let all = run(ExportFormat::SqlUpdate, |o| o.dialect = Driver::MySql);
+        assert!(
+            all.contains("where `id` = 2 and `name` is null and `data` = 1;"),
+            "{all}"
+        );
+        let w = run_pk(ExportFormat::WhereClause, |_| {});
+        assert_eq!(w, "where \"id\" in (1, 2, '9007199254740993')\n");
+        let w2 = run(ExportFormat::WhereClause, |_| {});
+        assert!(
+            w2.starts_with("where (\"id\" = 1 and \"name\" = 'a,b \"q\"'"),
+            "{w2}"
+        );
+        assert!(
+            w2.contains("\n   or (\"id\" = 2 and \"name\" is null"),
+            "{w2}"
+        );
+    }
+
+    #[test]
+    fn html_xml_and_pretty() {
+        let h = run(ExportFormat::Html, |o| o.null_text = "NULL".into());
+        assert!(
+            h.starts_with("<table>\n  <thead>\n    <tr>\n      <th>id</th>"),
+            "{h}"
+        );
+        assert!(
+            h.contains("<td>NULL</td>") && h.ends_with("  </tbody>\n</table>\n"),
+            "{h}"
+        );
+        let x = run(ExportFormat::Xml, |_| {});
+        assert!(
+            x.starts_with(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<result>\n  <row>\n    <id>1</id>"
+            ),
+            "{x}"
+        );
+        assert!(
+            x.contains("<name null=\"true\"/>") && x.ends_with("</row>\n</result>\n"),
+            "{x}"
+        );
+        assert_eq!(ExportFormat::Xml, ExportFormat::Xml);
+        let p = run(ExportFormat::Pretty, |o| o.null_text = "-".into());
+        let l: Vec<&str> = p.lines().collect();
+        assert_eq!(l[0], "id               | name     | data");
+        assert!(l[1].starts_with("-----------------+-"), "{p}");
+        assert_eq!(l[3], "2                | -        | true");
     }
 }

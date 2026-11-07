@@ -7,6 +7,7 @@
  *   dbms               "mariadb" when the Driver combo says MariaDB (driver stays "mysql")
  *   auth               "none" for "No auth" (user / password are cleared)
  *   passwordSave       reserved, always "forever" (only "Forever" is supported by the backend)
+ *   sslrootcert / sslcert / sslkey   paths of the CA, client certificate and client key files (both drivers; read by dbcore)
  *   sslmode            sqlx ssl mode (PG: disable|allow|prefer|require|verify-ca|verify-full,
  *                      MySQL: disabled|preferred|required|verify_ca|verify_identity); absent = driver default
  *   create             "true": SQLite creates the file when it does not exist (read by dbcore)
@@ -17,6 +18,8 @@
  *   autoDisconnectSec  absent = off, otherwise seconds of inactivity before the connection is closed
  *   startupScript      SQL run when a session opens
  *   showSystemSchemas  "true": the explorer also lists system schemas
+ *   switchSchema       "disabled": the console's schema switcher does not run `SET search_path` / `USE` (absent = automatic)
+ *   autoSync           "false": no re-introspection after DDL that ran in a console (absent = on)
  *   visibleSchemas     NOT a backend option any more: the form carries it (JSON array of introspection paths of the
  *                      schemas to show, e.g. [["postgres","public"]]; absent = all non-system) but Apply stores it in the
  *                      UI state (state/schema-filter), because options are part of the connection fingerprint and a
@@ -24,6 +27,7 @@
  * Any other key is a free driver property edited in the Advanced tab.
  */
 import type { DataSource, DataSourceConfig } from "../../api/db";
+import { defaultOptions } from "./driverDefaults";
 import { visibleSchemasRaw } from "./schemas";
 import { DBMS, type Dbms, buildUrl, dbmsOf, fromSqlxUrl, isMemoryUrl, parseUrl, sqliteFileOfUrl, toSqlxUrl } from "./drivers";
 
@@ -83,7 +87,8 @@ export interface Draft {
 
 export const RESERVED_OPTIONS = new Set([
   "comment", "dbms", "auth", "passwordSave", "sslmode", "create", "txMode", "sessionControl", "keepAliveSec",
-  "autoDisconnectSec", "startupScript", "showSystemSchemas", "visibleSchemas",
+  "autoDisconnectSec", "startupScript", "showSystemSchemas", "visibleSchemas", "switchSchema", "autoSync",
+  "sslrootcert", "sslcert", "sslkey",
 ]);
 
 export function defaultForm(dbms: Dbms): Form {
@@ -101,7 +106,8 @@ export function defaultForm(dbms: Dbms): Form {
     url: "",
     color: null,
     readOnly: false,
-    options: {},
+    // what the driver's Options page says new data sources start with
+    options: defaultOptions(dbms),
   };
   f.url = buildUrl(dbms, f);
   return f;
@@ -174,7 +180,7 @@ export const VIEW_ONLY_OPTION_KEYS: readonly string[] = ["visibleSchemas"];
  */
 export const FINGERPRINT_IGNORED_OPTION_KEYS: readonly string[] = [
   "comment", "visibleSchemas", "showSystemSchemas", "txMode", "sessionControl", "keepAliveSec", "autoDisconnectSec",
-  "startupScript", "passwordSave",
+  "startupScript", "switchSchema", "autoSync", "passwordSave",
 ];
 
 /**

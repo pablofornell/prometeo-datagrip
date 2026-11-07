@@ -1,8 +1,13 @@
-/** Query History popup (Ctrl+Alt+E): search + list of the executed statements of the data source, Enter inserts into the console. */
-import { For, Show, createSignal, onCleanup, onMount, type JSX } from "solid-js";
+/**
+ * Query History (Ctrl+Alt+E): the executed statements of the data source in a two-pane dialog, the list (oldest on
+ * top, the latest preselected) and a read-only preview of the selected statement. Typing filters the list (speed
+ * search), Paste inserts the statement at the caret of the console.
+ */
+import { For, Show, createMemo, createSignal, onCleanup, onMount, type JSX } from "solid-js";
 import { render } from "solid-js/web";
-import { type HistoryEntry, historyList, historySearch } from "../../api/db";
-import { Icon } from "../../components/ui";
+import { type HistoryEntry, historyList } from "../../api/db";
+import { SqlEditor } from "../../components/editor";
+import { Button, Highlighted, SpeedSearchField, createSpeedSearch, matchRanges } from "../../components/ui";
 import { isInternalSql, logTimestamp } from "../output/format";
 import type { ConsoleSession } from "./session";
 
@@ -10,100 +15,121 @@ let open = false;
 
 const oneLine = (s: string): string => s.replace(/\s+/g, " ").trim();
 const when = (ms: number): string => logTimestamp(ms).slice(1, 20);
+const LIST_MIN = 90;
 
 function History(props: { session: ConsoleSession; onClose: () => void }): JSX.Element {
-  const [items, setItems] = createSignal<HistoryEntry[]>([]);
-  const [query, setQuery] = createSignal("");
+  const [all, setAll] = createSignal<HistoryEntry[]>([]);
+  const [loaded, setLoaded] = createSignal(false);
   const [sel, setSel] = createSignal(0);
-  let input!: HTMLInputElement;
+  const [listWidth, setListWidth] = createSignal(145);
+  const search = createSpeedSearch(() => setSel(items().length - 1));
+  let root!: HTMLDivElement;
   let list!: HTMLDivElement;
-  let seq = 0;
 
-  const load = async () => {
-    const my = ++seq;
-    const q = query().trim();
-    try {
-      const r = q ? await historySearch(q, props.session.dsId, 300) : await historyList(props.session.dsId, 0, 300);
-      if (my !== seq) return;
-      setItems(r.filter((e) => !isInternalSql(e.sql)));
-      setSel(0);
-    } catch {
-      if (my === seq) setItems([]);
-    }
-  };
+  const items = createMemo(() => {
+    const q = search.query();
+    return q ? all().filter((e) => !!matchRanges(oneLine(e.sql), q)) : all();
+  });
+  const current = (): HistoryEntry | undefined => items()[Math.min(sel(), items().length - 1)];
+
   onMount(() => {
-    input.focus();
-    void load();
+    root.focus();
+    void historyList(props.session.dsId, 0, 300)
+      .then((r) => {
+        // the backend answers newest first; the dialog lists the latest at the bottom
+        const rows = r.filter((e) => !isInternalSql(e.sql)).reverse();
+        setAll(rows);
+        setSel(rows.length - 1);
+        reveal();
+      })
+      .catch(() => setAll([]))
+      .finally(() => setLoaded(true));
   });
 
-  const insert = (e: HistoryEntry | undefined) => {
+  const reveal = () => queueMicrotask(() => list?.querySelector<HTMLElement>(".dgc-h-row.sel")?.scrollIntoView({ block: "nearest" }));
+
+  const paste = (e: HistoryEntry | undefined) => {
     if (!e) return;
     props.onClose();
-    const v = props.session.editor?.view;
-    if (!v) return;
-    const doc = v.state.doc;
-    const sep = doc.length === 0 ? "" : doc.sliceString(doc.length - 1) === "\n" ? "\n" : "\n\n";
-    const text = e.sql.trim().replace(/;?$/, ";");
-    v.dispatch({ changes: { from: doc.length, insert: sep + text + "\n" }, selection: { anchor: doc.length + sep.length + text.length } });
-    v.focus();
+    props.session.insertSql(e.sql.trim().replace(/;?$/, ";"));
   };
 
   const move = (d: number) => {
     const n = items().length;
     if (!n) return;
-    const i = (sel() + d + n) % n;
-    setSel(i);
-    list.querySelectorAll<HTMLElement>(".dgc-h-row")[i]?.scrollIntoView({ block: "nearest" });
+    setSel(Math.min(n - 1, Math.max(0, Math.min(sel(), n - 1) + d)));
+    reveal();
   };
   const onKey = (e: KeyboardEvent) => {
-    if (e.key === "Escape") (e.preventDefault(), e.stopPropagation(), props.onClose());
-    else if (e.key === "ArrowDown") (e.preventDefault(), move(1));
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      if (search.active()) search.clear();
+      else props.onClose();
+    } else if (e.key === "ArrowDown") (e.preventDefault(), move(1));
     else if (e.key === "ArrowUp") (e.preventDefault(), move(-1));
-    else if (e.key === "Enter") (e.preventDefault(), insert(items()[sel()]));
+    else if (e.key === "Home") (e.preventDefault(), setSel(0), reveal());
+    else if (e.key === "End") (e.preventDefault(), setSel(items().length - 1), reveal());
+    else if (e.key === "Enter") (e.preventDefault(), paste(current()));
+    else if (e.key === "Tab") return;
+    else if (search.handleKey(e)) e.preventDefault();
   };
+
+  const startResize = (ev: PointerEvent) => {
+    ev.preventDefault();
+    const el = ev.currentTarget as HTMLElement;
+    el.setPointerCapture(ev.pointerId);
+    const x0 = ev.clientX;
+    const w0 = listWidth();
+    const move = (m: PointerEvent) => setListWidth(Math.max(LIST_MIN, Math.min(root.clientWidth - 160, w0 + m.clientX - x0)));
+    const up = () => {
+      el.removeEventListener("pointermove", move);
+      el.removeEventListener("pointerup", up);
+    };
+    el.addEventListener("pointermove", move);
+    el.addEventListener("pointerup", up);
+  };
+
+  const meta = (e: HistoryEntry): string =>
+    [when(e.tsMs), e.ok ? "" : "Failed", e.durationMs != null ? `${e.durationMs} ms` : "", e.rows != null && e.ok ? `${e.rows} rows` : ""].filter(Boolean).join("  ·  ");
 
   return (
     <div class="dgc-h-backdrop" onMouseDown={(e) => e.target === e.currentTarget && props.onClose()}>
-      <div class="dgc-h" onKeyDown={onKey}>
-        <div class="dgc-h-title">Query History</div>
-        <div class="dgc-h-search">
-          <Icon name="search" size={16} />
-          <input
-            ref={input}
-            placeholder="Search"
-            spellcheck={false}
-            value={query()}
-            onInput={(e) => {
-              setQuery(e.currentTarget.value);
-              void load();
-            }}
-          />
-        </div>
-        <div class="dgc-h-list" ref={list}>
-          <Show when={items().length} fallback={<div class="dgc-h-empty">{query() ? "Nothing found" : "No query history"}</div>}>
-            <For each={items()}>
-              {(e, i) => (
-                <div class="dgc-h-row" classList={{ sel: i() === sel(), err: !e.ok }} onMouseMove={() => setSel(i())} onDblClick={() => insert(e)} onClick={() => setSel(i())}>
-                  <span class="dgc-h-time">{when(e.tsMs)}</span>
-                  <span class="dgc-h-sql">{oneLine(e.sql)}</span>
-                </div>
-              )}
-            </For>
-          </Show>
-        </div>
-        <Show when={items()[sel()]}>
-          {(e) => (
-            <div class="dgc-h-preview">
-              <pre>{e().sql.trim()}</pre>
-              <div class="dgc-h-meta">
-                {e().ok ? "" : "Failed. "}
-                {e().durationMs != null ? `${e().durationMs} ms` : ""}
-                {e().rows != null ? `, ${e().rows} rows` : ""}
-              </div>
+      <div class="dgc-h" ref={root} tabindex={-1} role="dialog" aria-label="Query History" onKeyDown={onKey}>
+        <div class="dgc-h-body">
+          <div class="dgc-h-left" style={{ width: `${listWidth()}px` }}>
+            <Show when={search.active()}>
+              <SpeedSearchField query={search.query()} noMatch={!items().length} class="dgc-h-search" />
+            </Show>
+            <div class="dgc-h-list" ref={list}>
+              <Show when={items().length} fallback={<div class="dgc-h-empty">{!loaded() ? "" : search.active() ? "Nothing found" : "No query history"}</div>}>
+                <For each={items()}>
+                  {(e, i) => (
+                    <div class="dgc-h-row" classList={{ sel: i() === Math.min(sel(), items().length - 1), err: !e.ok }} onClick={() => setSel(i())} onDblClick={() => paste(e)}>
+                      <span class="dgc-h-sql">
+                        <Highlighted text={oneLine(e.sql)} query={search.query()} />
+                      </span>
+                      <span class="dgc-h-time">{when(e.tsMs)}</span>
+                    </div>
+                  )}
+                </For>
+              </Show>
             </div>
-          )}
-        </Show>
-        <div class="dgc-h-foot">Press Enter to insert into the console, Esc to close</div>
+          </div>
+          <div class="dgc-h-split" onPointerDown={startResize} />
+          <div class="dgc-h-right">
+            <div class="dgc-h-preview">
+              <Show when={current()}>{(e) => <SqlEditor value={e().sql.trim()} dialect={props.session.driver} readOnly stripe={false} statementFrame={false} />}</Show>
+            </div>
+            <Show when={current()}>{(e) => <div class="dgc-h-meta" classList={{ err: !e().ok }} title={e().error ?? undefined}>{meta(e())}</div>}</Show>
+          </div>
+        </div>
+        <div class="dgc-h-buttons">
+          <Button primary disabled={!current()} onClick={() => paste(current())}>
+            Paste
+          </Button>
+          <Button onClick={props.onClose}>Close</Button>
+        </div>
       </div>
     </div>
   );

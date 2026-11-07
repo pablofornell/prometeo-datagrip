@@ -166,6 +166,12 @@
 .sql-editor .cm-sql-param {
   color: var(--dg-editor-parameter);
 }
+/* Ctrl+hover on a resolvable name: link look, like DataGrip */
+.sql-editor .cm-sql-link {
+  color: var(--dg-editor-hyperlink);
+  text-decoration: underline;
+  cursor: pointer;
+}
 .sql-editor .cm-sql-error-wave {
   text-decoration: underline wavy var(--dg-editor-error-wave);
   text-decoration-thickness: 1px;
@@ -185,7 +191,7 @@
 }
 :root[data-theme="light"] .sql-editor .cm-searchMatch,
 :root[data-theme="light"] .sql-editor .cm-searchMatch.cm-searchMatch-selected {
-  color: #000;
+  color: var(--dg-editor-search-fg);
 }
 
 /* ---- gutter ------------------------------------------------------------------------------- */
@@ -233,10 +239,35 @@
   display: block;
 }
 .sql-editor .cm-exec-ok {
-  color: #5fb865;
+  color: var(--dg-icon-success);
 }
 .sql-editor .cm-exec-err {
   color: var(--dg-editor-error-stripe);
+}
+.sql-editor .cm-exec-running {
+  color: var(--dg-icon);
+}
+/* intention bulb: right after the execution icon of the caret line (or in its place) */
+.sql-editor .cm-status-cell {
+  display: flex;
+  align-items: center;
+}
+.sql-editor .cm-bulb {
+  width: 16px;
+  height: 16px;
+  margin-left: 1px;
+  line-height: 0;
+  cursor: pointer;
+  color: var(--dg-editor-bulb);
+}
+.sql-editor .cm-bulb.cm-bulb-first {
+  margin-left: 5px;
+}
+.sql-editor .cm-bulb.cm-bulb-err {
+  color: var(--dg-editor-bulb-error);
+}
+.sql-editor .cm-bulb svg {
+  display: block;
 }
 .sql-editor .cm-exec-hint {
   font-family: var(--dg-font-ui);
@@ -266,13 +297,13 @@
   background: var(--dg-editor-usage-bg);
 }
 :root[data-theme="light"] .sql-editor .cm-stmt-frame {
-  color: #baa8ff;
+  color: var(--dg-editor-stmt-frame-fg);
 }
 
 /* ---- error stripe, inspection widget, scrollbar thumb -------------------------------------- */
 .sql-editor .cm-stripe {
   position: absolute;
-  top: 0;
+  top: var(--cm-find-h, 0px); /* below the find bar, which pushes the text down */
   bottom: 0;
   right: 1px;
   width: 13px;
@@ -293,19 +324,19 @@
   position: absolute;
   left: 0;
   right: 0;
-  background: #42bd77;
+  background: var(--dg-stripe-change);
 }
 .sql-editor .cm-stripe-id {
-  background: #5b786a;
+  background: var(--dg-stripe-id);
 }
 :root[data-theme="light"] .sql-editor .cm-stripe-range {
   position: absolute;
   left: 0;
   right: 0;
-  background: #42bd77;
+  background: var(--dg-stripe-change);
 }
-.sql-editor .cm-stripe-id {
-  background: #d0a1ff;
+:root[data-theme="light"] .sql-editor .cm-stripe-id {
+  background: var(--dg-stripe-id);
 }
 .sql-editor .cm-stripe-err {
   background: var(--dg-editor-error-stripe);
@@ -325,7 +356,7 @@
 }
 .sql-editor .cm-inspect {
   position: absolute;
-  top: 4px;
+  top: calc(var(--cm-find-h, 0px) + 4px);
   right: 6px;
   height: 16px;
   display: flex;
@@ -337,13 +368,17 @@
   color: var(--dg-text);
   user-select: none;
 }
+.sql-editor .cm-inspect-paused {
+  margin-right: 4px;
+  color: var(--dg-text-secondary);
+}
 .sql-editor .cm-inspect-icon {
   display: inline-flex;
   width: 16px;
   height: 16px;
 }
 .sql-editor .cm-inspect-ok .cm-inspect-icon {
-  color: #5fb865;
+  color: var(--dg-icon-success);
 }
 .sql-editor .cm-inspect-err .cm-inspect-icon {
   color: var(--dg-editor-error-stripe);
@@ -387,6 +422,50 @@
   border-radius: 5px;
   color: var(--dg-text);
 }
+/* live inspection tooltip: neutral background (the red one is for the server error of an execution) */
+.cm-inspect-tip {
+  padding: 10px 20px 8px;
+  max-width: 520px;
+  font-family: var(--dg-font-ui);
+  font-size: 13px;
+  line-height: 16px;
+  white-space: pre-wrap;
+  color: var(--dg-text);
+}
+
+/* Ctrl+P: the signature, the argument at the caret in bold */
+.cm-param-info {
+  margin: -1px;
+  padding: 4px 8px;
+  border: 1px solid var(--dg-editor-tooltip-border);
+  border-radius: 6px;
+  background: var(--dg-editor-tooltip-bg);
+  color: var(--dg-text-secondary);
+  font-family: var(--dg-font-mono);
+  font-size: 12px;
+  line-height: 16px;
+  white-space: pre;
+}
+.cm-param-info .cm-param-current {
+  color: var(--dg-text);
+  font-weight: 700;
+}
+.cm-inspect-tip .cm-inspect-foot {
+  display: flex;
+  gap: 24px;
+  margin: 8px -20px -8px;
+  padding: 7px 20px 8px;
+  border-top: 1px solid var(--dg-editor-tooltip-border);
+}
+.cm-inspect-tip .cm-inspect-link {
+  cursor: pointer;
+  color: var(--dg-link);
+  font-size: 12px;
+}
+.cm-inspect-tip .cm-inspect-key {
+  margin-left: 2px;
+  color: var(--dg-text-secondary);
+}
 
 /* ---- completion popup ---------------------------------------------------------------------- */
 .cm-tooltip.cm-tooltip-autocomplete {
@@ -415,6 +494,40 @@
   font-size: 11px;
   color: var(--dg-text-secondary);
   background: var(--dg-popup-advertiser-bg);
+}
+/* Ctrl+J list: the footer carries no text */
+.cm-tooltip.cm-tooltip-autocomplete.cm-comp-templates {
+  min-width: 476px;
+}
+.cm-tooltip.cm-tooltip-autocomplete.cm-comp-templates::after {
+  content: "";
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16'><path d='M8 1.8a4.4 4.4 0 0 0-2.6 7.9c.4.3.6.7.6 1.2v.4h4v-.4c0-.5.2-.9.6-1.2A4.4 4.4 0 0 0 8 1.8z' fill='%23F2C55C'/><rect x='6' y='12' width='4' height='1.2' rx='.6' fill='%23F2C55C'/><rect x='6.6' y='13.7' width='2.8' height='1' rx='.5' fill='%23F2C55C'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 30px center;
+}
+.cm-tooltip.cm-tooltip-autocomplete.cm-comp-templates > ul > li[aria-selected] {
+  background: var(--dg-list-selection-bg);
+}
+.cm-tooltip.cm-tooltip-autocomplete .cm-comp-more {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--dg-icon);
+  line-height: 0;
+  cursor: pointer;
+  z-index: 2;
+}
+.cm-tooltip.cm-tooltip-autocomplete .cm-comp-more:hover {
+  background: var(--dg-hover-bg);
+}
+body.dg-comp-no-types .cm-tooltip.cm-tooltip-autocomplete .cm-completionHint {
+  display: none;
 }
 .cm-tooltip.cm-tooltip-autocomplete.cm-tooltip-autocomplete > ul {
   max-height: 276px;
@@ -467,6 +580,9 @@
   background-position: center;
   background-size: 16px 16px;
 }
+.dg-icon-template {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16' fill='none'><path d='M3.5 2.5h6l3 3v8h-9z' stroke='%23C3C5CB' stroke-linejoin='round'/><path d='M9.5 2.5v3h3' stroke='%23C3C5CB' stroke-linejoin='round'/><path d='M7.8 7l-1.6 2.6h2l-1.2 2.4' stroke='%23F2C55C' stroke-linejoin='round' stroke-linecap='round'/></svg>");
+}
 .dg-icon-table {
   background-image: url("../../assets/icons/dg/table_dark.svg");
 }
@@ -493,6 +609,9 @@
 }
 .dg-icon-keyword {
   background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16' fill='none'><path d='M6 9.5V6.2C6 5 6.8 4 8 4s2 1 2 2.2V9.5' stroke='%23C3C5CB'/><path d='M3 12.5h10M4 9.5h8v3H4z' stroke='%23C3C5CB' stroke-linejoin='round'/></svg>");
+}
+:root[data-theme="light"] .dg-icon-template {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16' fill='none'><path d='M3.5 2.5h6l3 3v8h-9z' stroke='%236C707E' stroke-linejoin='round'/><path d='M9.5 2.5v3h3' stroke='%236C707E' stroke-linejoin='round'/><path d='M7.8 7l-1.6 2.6h2l-1.2 2.4' stroke='%23C29E4A' stroke-linejoin='round' stroke-linecap='round'/></svg>");
 }
 :root[data-theme="light"] .dg-icon-table {
   background-image: url("../../assets/icons/dg/table.svg");
@@ -654,8 +773,41 @@
 .sql-editor .cm-find-btn:hover {
   background: var(--dg-action-button-hover-bg);
 }
-.sql-editor .cm-find-toggle.on {
+.sql-editor .cm-find-toggle.on,
+.sql-editor .cm-find-btn.on {
   background: var(--dg-action-button-selected-bg);
+}
+.sql-editor .cm-find-toggle {
+  color: var(--dg-icon);
+}
+.sql-editor .cm-find-toggle.cm-find-text {
+  width: auto;
+  min-width: 22px;
+  padding: 0 3px;
+  font-family: var(--dg-font-ui);
+  font-size: 13px;
+  color: var(--dg-text);
+}
+.sql-editor .cm-find-collapse {
+  width: 22px;
+  height: 22px;
+  margin-left: -4px;
+}
+.sql-editor .cm-find-hist {
+  width: 16px;
+  height: 22px;
+  margin-left: -2px;
+}
+.sql-editor .cm-find-hist img {
+  width: 12px;
+  height: 12px;
+}
+.sql-editor .cm-find-field .cm-find-btn {
+  width: 18px;
+  height: 22px;
+}
+.sql-editor .cm-find-close {
+  margin-left: auto;
 }
 .sql-editor .cm-find-count {
   min-width: 70px;
@@ -748,4 +900,22 @@
 }
 .sql-editor .cm-placeholder {
   color: var(--dg-input-placeholder);
+}
+
+/* ---- highlighted SQL outside an editor (Quick Documentation DDL block) -------------------------- */
+.dg-sql-hl .cm-sql-kw {
+  color: var(--dg-editor-keyword);
+}
+.dg-sql-hl .cm-sql-str {
+  color: var(--dg-editor-string);
+}
+.dg-sql-hl .cm-sql-num {
+  color: var(--dg-editor-number);
+}
+.dg-sql-hl .cm-sql-cmt {
+  color: var(--dg-editor-line-comment);
+}
+.dg-sql-hl .cm-sql-fn {
+  color: var(--dg-editor-static-method);
+  font-style: italic;
 }

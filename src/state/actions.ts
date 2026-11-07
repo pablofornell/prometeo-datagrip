@@ -32,6 +32,11 @@ export interface Action {
    * editor, Submit in the grid), the ones whose `when()` is true win over unguarded ones.
    */
   when?: () => boolean;
+  /**
+   * The shortcut is only *displayed* (menus, keymap page): the focused component (CodeMirror, grid, text field)
+   * handles the key itself and the action merely routes the menu click to it. Avoids double handling.
+   */
+  menuOnly?: boolean;
 }
 
 const [version, setVersion] = createSignal(0);
@@ -71,9 +76,31 @@ export function isActionEnabled(a: Action | undefined): boolean {
   return a.enabled ? a.enabled() : true;
 }
 
+/** The shortcuts the action is registered with (before the user's keymap edits). */
+export function defaultShortcuts(a: Action): string[] {
+  return Array.isArray(a.shortcut) ? a.shortcut : a.shortcut ? [a.shortcut] : [];
+}
+
+// User edits of the keymap (Settings > Keymap): action id -> its complete shortcut list, `[]` = all removed.
+// The Settings store owns and persists them and pushes them here (`setKeymapOverrides`).
+const [overrides, setOverrides] = createSignal<Record<string, string[]>>({});
+
+export function setKeymapOverrides(m: Record<string, string[]>): void {
+  setOverrides({ ...m });
+}
+
+export function keymapOverrides(): Record<string, string[]> {
+  return overrides();
+}
+
+/** The shortcuts in force: the user's list when the action was edited, else the registered ones. */
+export function effectiveShortcuts(a: Action, edits: Record<string, string[]> = overrides()): string[] {
+  return edits[a.id] ?? defaultShortcuts(a);
+}
+
+/** The first shortcut in force, the one menus and tooltips display. */
 export function actionShortcut(a: Action | undefined): string | undefined {
-  const s = a?.shortcut;
-  return Array.isArray(s) ? s[0] : s;
+  return a ? effectiveShortcuts(a)[0] : undefined;
 }
 
 export async function runAction(id: string, ctx?: unknown): Promise<void> {
@@ -106,6 +133,12 @@ const KEY_ALIASES: Record<string, string> = {
   backslash: "\\",
   slash: "/",
   quote: "'",
+  comma: ",",
+  period: ".",
+  backquote: "`",
+  plus: "+",
+  minus: "-",
+  equals: "=",
 };
 
 function parseChord(s: string): Chord {
@@ -128,6 +161,9 @@ function eventKey(e: KeyboardEvent): string {
   if (c === "Backslash") return "\\";
   if (c === "Slash") return "/";
   if (c === "Quote") return "'";
+  if (c === "Comma") return ",";
+  if (c === "Period") return ".";
+  if (c === "Backquote") return "`";
   return e.key.toLowerCase();
 }
 
@@ -147,8 +183,15 @@ function isEditable(t: EventTarget | null): boolean {
   return el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable;
 }
 
+/**
+ * Shortcuts the global dispatcher handles for the action. A `menuOnly` action keeps the focused component handling
+ * its registered keys; only keys the user added to it are dispatched here.
+ */
 function shortcutsOf(a: Action): string[] {
-  return Array.isArray(a.shortcut) ? a.shortcut : a.shortcut ? [a.shortcut] : [];
+  const sc = effectiveShortcuts(a);
+  if (!a.menuOnly) return sc;
+  const own = defaultShortcuts(a);
+  return sc.filter((s) => !own.includes(s));
 }
 
 let lastShift = 0;

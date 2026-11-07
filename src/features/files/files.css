@@ -1,0 +1,30 @@
+/* Files tool window, file editor tabs, small dialogs. */
+.dgf-tree {
+  flex: 1;
+  min-height: 0;
+}
+.dgf-title-chevron {
+  margin-left: -8px;
+  opacity: 0.8;
+}
+.dgf-target {
+  max-width: 260px;
+}
+.dgf-target span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dgf-prompt {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.dgf-prompt-error {
+  min-height: 16px;
+  color: var(--dg-text-error);
+  font-size: 12px;
+}
+.dgn-popup.dgf-goto {
+  height: 400px;
+}

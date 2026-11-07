@@ -13,6 +13,7 @@ import { render } from "solid-js/web";
 import { registerAction } from "../../state/actions";
 import { type DialogApi, DataSourceDialog } from "./DataSourceDialog";
 import { type Dbms, DBMS, DBMS_ORDER, dbmsIcon } from "./drivers";
+import type { UrlPrefill } from "./urlParse";
 import "./datasource.css";
 
 export { DATA_SOURCES_CHANGED_EVENT, onDataSourcesChanged } from "./events";
@@ -23,6 +24,10 @@ export interface OpenDataSourceDialogOptions {
   selectId?: string;
   /** Start with a new, unsaved data source of this driver selected. */
   newDriver?: "postgres" | "mysql" | "sqlite" | "mariadb";
+  /** Fields of the new data source (Data Source from URL). */
+  prefill?: UrlPrefill;
+  /** Open on the Drivers page. */
+  drivers?: boolean;
 }
 
 let api: DialogApi | null = null;
@@ -30,7 +35,8 @@ let open = false;
 
 export function openDataSourceDialog(opts: OpenDataSourceDialogOptions = {}): void {
   if (open) {
-    if (opts.newDriver) api?.addNew(opts.newDriver as Dbms);
+    if (opts.newDriver) api?.addNew(opts.newDriver as Dbms, opts.prefill);
+    else if (opts.drivers) api?.showDrivers();
     else if (opts.selectId) api?.select(opts.selectId);
     return;
   }
@@ -42,6 +48,8 @@ export function openDataSourceDialog(opts: OpenDataSourceDialogOptions = {}): vo
       <DataSourceDialog
         selectId={opts.selectId}
         newDbms={opts.newDriver as Dbms | undefined}
+        newPrefill={opts.prefill}
+        drivers={opts.drivers}
         register={(a) => (api = a)}
         onClose={() => {
           open = false;
@@ -57,6 +65,22 @@ export function openDataSourceDialog(opts: OpenDataSourceDialogOptions = {}): vo
     host,
   );
 }
+
+registerAction({
+  id: "db.drivers",
+  title: "Drivers",
+  run: () => openDataSourceDialog({ drivers: true }),
+});
+
+/** Data Source from URL: the dialog opens with a new data source of the URL's DBMS and its fields filled in. */
+registerAction({
+  id: "db.newDataSourceFromUrl",
+  title: "Data Source from URL",
+  run: (ctx) => {
+    const p = ctx as UrlPrefill | undefined;
+    if (p) openDataSourceDialog({ newDriver: p.dbms, prefill: p });
+  },
+});
 
 registerAction({
   id: "db.dataSources",

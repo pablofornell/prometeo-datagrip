@@ -1,8 +1,8 @@
-/** Search Everywhere (Shift Shift) and Go to Database Object (Ctrl+N): one popup, tabs All / Database / Consoles / Actions. */
+/** Search Everywhere (Shift Shift) and Go to Database Object (Ctrl+N): one popup, tabs All / Database / Files / Actions / Text. */
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount, type JSX } from "solid-js";
 import { render } from "solid-js/web";
 import type { DataSource } from "../../api/db";
-import { Icon, type MenuItem, openMenu, tip } from "../../components/ui";
+import { Checkbox, Icon, type MenuItem, openMenu, tip } from "../../components/ui";
 import { isActionEnabled, getAction } from "../../state/actions";
 import { explorerDataSources } from "../explorer";
 import { iconOf } from "../explorer/model";
@@ -14,26 +14,41 @@ import {
   type EntryKind,
   type Hit,
   collectActions,
+  collectSettings,
   consoleEntries,
   databaseColumnEntries,
   databaseEntries,
   ensureIndex,
   footerPath,
+  isEntryVisible,
   locationOf,
   parseQuery,
   reloadConsoles,
+  reloadTextIndex,
   search,
+  searchText,
   signatureText,
+  textEntries,
 } from "./sources";
 import type { Range } from "./match";
 
-export type SearchTab = "all" | "db" | "console" | "action";
+export type SearchTab = "all" | "db" | "console" | "action" | "text";
 
 const TABS: { id: SearchTab; label: string }[] = [
   { id: "all", label: "All" },
   { id: "db", label: "Database" },
-  { id: "console", label: "Consoles" },
+  { id: "console", label: "Files" },
   { id: "action", label: "Actions" },
+  { id: "text", label: "Text" },
+];
+
+/** `/` commands: switch the tab (DataGrip's "Type / to see commands"). */
+const COMMANDS: { name: string; tab: SearchTab; desc: string }[] = [
+  { name: "all", tab: "all", desc: "Everywhere" },
+  { name: "db", tab: "db", desc: "Database objects" },
+  { name: "files", tab: "console", desc: "Consoles" },
+  { name: "actions", tab: "action", desc: "Actions and settings" },
+  { name: "text", tab: "text", desc: "Text in consoles" },
 ];
 
 const FILTERS: { label: string; kinds: EntryKind[] }[] = [
@@ -41,13 +56,18 @@ const FILTERS: { label: string; kinds: EntryKind[] }[] = [
   { label: "Views", kinds: ["view", "materializedView"] },
   { label: "Routines", kinds: ["routine", "function", "procedure"] },
   { label: "Sequences", kinds: ["sequence"] },
+  { label: "Indexes", kinds: ["index"] },
+  { label: "Keys", kinds: ["primaryKey", "uniqueKey"] },
+  { label: "Foreign Keys", kinds: ["foreignKey"] },
+  { label: "Checks", kinds: ["check"] },
+  { label: "Triggers", kinds: ["trigger"] },
   { label: "Schemas", kinds: ["schema"] },
   { label: "Columns", kinds: ["column"] },
   { label: "Data Sources", kinds: ["dataSource"] },
 ];
 
 const MAX_ROWS = 200;
-const ALL_LIMITS = { db: 25, console: 6, action: 12 };
+const ALL_LIMITS = { db: 25, console: 6, action: 12, setting: 4, text: 4 };
 
 const [openState, setOpenState] = createSignal<{ tab: SearchTab } | null>(null);
 const [requestedTab, setRequestedTab] = createSignal<{ tab: SearchTab; n: number }>({ tab: "all", n: 0 });
@@ -98,14 +118,19 @@ function Hl(props: { text: string; ranges: Range[] }): JSX.Element {
 function iconFor(e: Entry, ds: DataSource | undefined): string | undefined {
   if (e.group === "console") return "dg/console";
   if (e.group === "action") return undefined;
+  if (e.group === "text") return "dg/console";
   if (e.kind === "dataSource") return ds ? providerIcon(ds.driver) : "dg/dbms";
+  if (e.kind === "index" && e.unique) return "dg/index-unique";
   return iconOf(e.kind as never);
 }
 
 function SearchPopup(props: { initialTab: SearchTab }): JSX.Element {
   ensureIndex();
   void reloadConsoles();
+  void reloadTextIndex();
   const actions = collectActions();
+  const settings = collectSettings();
+  const [includeHidden, setIncludeHidden] = createSignal(false);
   const [tab, setTab] = createSignal<SearchTab>(props.initialTab);
   const [query, setQuery] = createSignal("");
   const [sel, setSel] = createSignal(0);
@@ -116,13 +141,27 @@ function SearchPopup(props: { initialTab: SearchTab }): JSX.Element {
   let list!: HTMLDivElement;
 
   const dsById = (id: string) => explorerDataSources().find((d) => d.id === id);
-  const allDb = createMemo(() => [...databaseEntries(), ...databaseColumnEntries()]);
+  // Only what the explorer shows, unless "Include non-project items" is on (schemas hidden by the schema selector).
+  const allDb = createMemo(() => {
+    const all = [...databaseEntries(), ...databaseColumnEntries()];
+    if (includeHidden()) return all;
+    const byId = new Map(explorerDataSources().map((d) => [d.id, d]));
+    return all.filter((e) => isEntryVisible(e, e.dsId ? byId.get(e.dsId) : undefined));
+  });
 
   const hits = createMemo<Hit[]>(() => {
     const text = query();
     const t = tab();
     const q = parseQuery(text);
     const base = { dsById, hideKinds: hidden(), dsId: scope() };
+    if (text.startsWith("/")) {
+      const c = text.slice(1).trim().toLowerCase();
+      return COMMANDS.filter((x) => x.name.startsWith(c)).map<Hit>((x) => ({
+        entry: { group: "action", kind: "action", name: "/" + x.name, lower: "/" + x.name, goTab: x.tab, right: x.desc },
+        ranges: [],
+        score: 0,
+      }));
+    }
     if (!text.trim() && t === "console") return consoleEntries().slice(0, MAX_ROWS).map((entry) => ({ entry, ranges: [], score: 0 }));
     if (!text.trim()) {
       // Nothing typed: the objects / consoles opened recently from this popup.
@@ -132,11 +171,14 @@ function SearchPopup(props: { initialTab: SearchTab }): JSX.Element {
     }
     if (t === "db") return search(allDb(), q, { ...base, limit: MAX_ROWS });
     if (t === "console") return search(consoleEntries(), q, { ...base, limit: MAX_ROWS, dsId: null });
-    if (t === "action") return search(actions, q, { ...base, limit: MAX_ROWS, dsId: null });
+    if (t === "action") return search([...actions, ...settings], q, { ...base, limit: MAX_ROWS, dsId: null });
+    if (t === "text") return searchText(textEntries(), text, MAX_ROWS);
     return [
       ...search(allDb(), q, { ...base, limit: ALL_LIMITS.db }),
       ...search(consoleEntries(), q, { ...base, limit: ALL_LIMITS.console }),
       ...search(actions, q, { ...base, limit: ALL_LIMITS.action, dsId: null }),
+      ...search(settings, q, { ...base, limit: ALL_LIMITS.setting, dsId: null }),
+      ...searchText(textEntries(), text, ALL_LIMITS.text, scope()),
     ];
   });
 
@@ -166,7 +208,13 @@ function SearchPopup(props: { initialTab: SearchTab }): JSX.Element {
   };
   const activate = (e: Entry | undefined, mode: "default" | "ddl" = "default") => {
     if (!e) return;
-    if (e.group === "action" && !isActionEnabled(getAction(e.actionId ?? ""))) return;
+    if (e.goTab) {
+      setTab(e.goTab as SearchTab);
+      setQuery("");
+      input.focus();
+      return;
+    }
+    if (e.group === "action" && e.actionId && !isActionEnabled(getAction(e.actionId))) return;
     pushRecent(e);
     close(e.group !== "action");
     // Let the previous focus come back first: actions look at the focused component.
@@ -247,6 +295,9 @@ function SearchPopup(props: { initialTab: SearchTab }): JSX.Element {
               </button>
             </Show>
             <Show when={tab() === "all" || tab() === "db"}>
+              <span class="dgn-include" onMouseDown={(e) => e.preventDefault()}>
+                <Checkbox checked={includeHidden()} onChange={setIncludeHidden} label="Include non-project items" />
+              </span>
               <button ref={filterBtn} type="button" class="dgn-iconbtn" tabindex={-1} {...tip("Filter")} onMouseDown={(e) => e.preventDefault()} onClick={openFilter}>
                 <Icon name="filter" />
                 <Show when={hidden().size > 0}>
@@ -262,6 +313,9 @@ function SearchPopup(props: { initialTab: SearchTab }): JSX.Element {
             <path d="M13 6.5h3l-1.5 1.7z" fill="currentColor" transform="translate(-1 .5)" />
           </svg>
           <input ref={input} spellcheck={false} autocomplete="off" value={query()} onInput={(e) => setQuery(e.currentTarget.value)} />
+          <Show when={query().length < 40}>
+            <span class="dgn-hint">Type / to see commands</span>
+          </Show>
         </div>
         <div class="dgn-list" ref={list}>
           <Show when={hits().length === 0 && query().trim()}>
@@ -271,7 +325,7 @@ function SearchPopup(props: { initialTab: SearchTab }): JSX.Element {
             {(h, i) => {
               const e = h.entry;
               const ds = () => (e.dsId ? dsById(e.dsId) : undefined);
-              const dis = () => e.group === "action" && !isActionEnabled(getAction(e.actionId ?? ""));
+              const dis = () => e.group === "action" && !!e.actionId && !isActionEnabled(getAction(e.actionId));
               return (
                 <div class="dgn-row" classList={{ "dgn-sel": i() === sel(), "dgn-dis": dis() }} onClick={() => activate(e)} onMouseMove={() => sel() !== i() && setSel(i())}>
                   <span class="dgn-ico">

@@ -9,8 +9,10 @@ import { friendlyConnectionError } from "../../state/connection-errors";
 import { deleteDataSource, listDataSources, saveDataSource, testConnection } from "../../api/db";
 import type { DataSource, DataSourceConfig } from "../../api/db";
 import { forgetVisibleSchemas } from "../../state/schema-filter";
+import { forgetDsGroup } from "../../state/ds-folders";
 import { saveVisibleSchemas } from "./schemas";
 import { DBMS, type Dbms, buildUrl, parseUrl, sqliteFileOfUrl } from "./drivers";
+import type { UrlPrefill } from "./urlParse";
 import {
   type Draft,
   type Form,
@@ -26,7 +28,7 @@ import {
   uniqueName,
   validate,
 } from "./model";
-import { emitDataSourcesChanged } from "./events";
+import { emitDataSourcesChanged, emitDataSourcesCreated } from "./events";
 
 let keySeq = 0;
 const newKey = () => `ds-${++keySeq}`;
@@ -250,8 +252,17 @@ export function createSession() {
   }
 
   // ---- list operations
-  function addNew(dbms: Dbms) {
+  function addNew(dbms: Dbms, prefill?: UrlPrefill) {
     const form = defaultForm(dbms);
+    if (prefill) {
+      // "Data Source from URL": the parsed fields replace the defaults
+      if (prefill.host !== undefined) form.host = prefill.host;
+      if (prefill.port) form.port = prefill.port;
+      if (prefill.database !== undefined) form.database = prefill.database;
+      if (prefill.user) form.user = prefill.user;
+      if (prefill.file) form.file = prefill.file;
+      form.url = buildUrl(dbms, form);
+    }
     const taken = drafts.map((d) => d.form.name);
     form.name = uniqueName(autoName(form), taken);
     const d: Draft = {
@@ -259,7 +270,7 @@ export function createSession() {
       id: null,
       saved: null,
       form,
-      password: { value: "", touched: false },
+      password: prefill?.password ? { value: prefill.password, touched: true } : { value: "", touched: false },
       nameAuto: true,
       base: snapshot(form),
       test: { state: "idle" },
@@ -381,12 +392,15 @@ export function createSession() {
       for (const id of deletedIds()) {
         await deleteDataSource(id);
         forgetVisibleSchemas(id);
+        forgetDsGroup(id);
       }
       setDeletedIds([]);
       const keys = drafts.filter((d) => isNew(d) || isModified(d)).map((d) => d.key);
+      const created: string[] = [];
       for (const key of keys) {
         const i = indexOf(key);
         const d = drafts[i];
+        const wasNew = isNew(d);
         let saved: DataSource;
         if (d.id != null && d.saved && !needsSave(d)) {
           // only the schema filter changed: a UI-state write, the backend (and its connection) is left alone
@@ -396,6 +410,7 @@ export function createSession() {
           saved = await saveDataSource(cfg);
         }
         saveVisibleSchemas(saved.id, d.form.options.visibleSchemas);
+        if (wasNew) created.push(saved.id);
         const j = indexOf(key);
         if (j < 0) continue;
         batch(() => {
@@ -406,6 +421,7 @@ export function createSession() {
       }
       setError(null);
       emitDataSourcesChanged();
+      if (created.length) emitDataSourcesCreated(created);
       return true;
     } catch (e) {
       setError(String(e));

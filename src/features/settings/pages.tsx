@@ -1,19 +1,26 @@
 /** The Settings pages (operative ones only). Every page edits the dialog's draft, never the live settings. */
 import { For, Show, createSignal } from "solid-js";
-import { Checkbox, ComboBox, TextField } from "../../components/ui";
+import { Checkbox, ComboBox, Icon, TextField } from "../../components/ui";
 import { SqlEditor } from "../../components/editor";
 import { DEFAULT_SETTINGS } from "../../state/settings";
+import { SCHEME_LABEL, type SchemeId } from "../../state/colorScheme";
 import type { ThemePref } from "../../state/theme";
 import type { PageNode } from "./model";
-import { Hint, L, NumberField, Row, Section, type Draft } from "./widgets";
+import { Hint, L, NumberField, Row, Section, type Draft, draftScheme, draftTheme } from "./widgets";
 
-export function AppearancePage(props: { draft: Draft }) {
+export function AppearancePage(props: { draft: Draft; open: (id: string) => void }) {
   const d = () => props.draft;
+  const q = () => d().query();
+  const uiTheme = () => draftTheme(d());
+  const scheme = () => draftScheme(d());
+  const check = (key: "compactMode" | "projectColors" | "menuIcons" | "treeIndentGuides" | "treeSmallIndents", label: string) => (
+    <Checkbox checked={d().values[key]} onChange={(c) => d().set(key, c)} label={<L q={q()}>{label}</L>} />
+  );
   return (
     <div class="st-page">
       <Row field class="st-row-first">
         <span class="st-label">
-          <L q={d().query()}>Theme:</L>
+          <L q={q()}>Theme:</L>
         </span>
         <ComboBox<ThemePref>
           width={193}
@@ -26,6 +33,51 @@ export function AppearancePage(props: { draft: Draft }) {
           ]}
         />
       </Row>
+      <Row field class="st-row-indent">
+        <span class="st-label">
+          <L q={q()}>Editor color scheme:</L>
+        </span>
+        <ComboBox<SchemeId>
+          width={193}
+          value={scheme()}
+          onChange={(s) => d().set("editorScheme", s === uiTheme() ? "auto" : s)}
+          options={(["dark", "light"] as SchemeId[]).map((s) => ({ value: s, label: SCHEME_LABEL[s] }))}
+        />
+        <button type="button" class="st-tool" title="Color Scheme Settings" aria-label="Color Scheme Settings" onClick={() => props.open("editor.color-scheme.sql")}>
+          <Icon name="settings" />
+        </button>
+      </Row>
+      <Row field>
+        <Checkbox checked={d().values.uiCustomFont} onChange={(c) => d().set("uiCustomFont", c)} label={<L q={q()}>Use custom font:</L>} />
+        <ComboBox<"inter" | "system">
+          width={266}
+          disabled={!d().values.uiCustomFont}
+          value={d().values.uiFontFamily}
+          onChange={(f) => d().set("uiFontFamily", f)}
+          options={[
+            { value: "inter", label: "Inter" },
+            { value: "system", label: "System default" },
+          ]}
+        />
+        <span class="st-label st-label-inline" classList={{ "st-muted": !d().values.uiCustomFont }}>
+          <L q={q()}>Size:</L>
+        </span>
+        <NumberField narrow disabled={!d().values.uiCustomFont} value={d().values.uiFontSize} min={9} max={24} step={1} onChange={(n) => d().set("uiFontSize", n)} />
+      </Row>
+      <Hint>The size scales the whole window (13 is 100 %).</Hint>
+      <Section title="UI Options" q={q()}>
+        <Row>{check("compactMode", "Compact mode")}</Row>
+        <Hint>UI elements take up less screen space</Hint>
+        <Row class="st-row-gap">{check("projectColors", "Use project colors in main toolbar")}</Row>
+        <Hint>Distinguish projects with different toolbar colors at a glance.</Hint>
+        <Row class="st-row-gap">{check("menuIcons", "Display icons in menu items")}</Row>
+      </Section>
+      <Section title="Tree Views" q={q()}>
+        <div class="st-two-col">
+          <Row>{check("treeIndentGuides", "Show indent guides")}</Row>
+          <Row>{check("treeSmallIndents", "Use smaller indents")}</Row>
+        </div>
+      </Section>
     </div>
   );
 }
@@ -102,6 +154,13 @@ export function EditorAppearancePage(props: { draft: Draft }) {
             label={<L q={d().query()}>Show line numbers</L>}
           />
         </Row>
+        <Row>
+          <Checkbox
+            checked={d().values.editorIndentGuides}
+            onChange={(c) => d().set("editorIndentGuides", c)}
+            label={<L q={d().query()}>Show indent guides</L>}
+          />
+        </Row>
       </Section>
     </div>
   );
@@ -111,6 +170,24 @@ export function QueryExecutionPage(props: { draft: Draft }) {
   const d = () => props.draft;
   return (
     <div class="st-page">
+      <Section title="Execute" q={d().query()}>
+        <Row field>
+          <span class="st-label st-label-wide">
+            <L q={d().query()}>When caret inside statement execute:</L>
+          </span>
+          <ComboBox<"ask" | "smallest" | "largest">
+            width={210}
+            value={d().values.execCaretInside}
+            onChange={(m) => d().set("execCaretInside", m)}
+            options={[
+              { value: "ask", label: "Ask what to execute" },
+              { value: "smallest", label: "Smallest statement" },
+              { value: "largest", label: "Largest statement" },
+            ]}
+          />
+        </Row>
+        <Hint>Applies when the statement has a comment attached above it: the statement alone is the smallest, with its comment the largest.</Hint>
+      </Section>
       <Section title="Transactions" q={d().query()}>
         <Row field>
           <span class="st-label st-label-wide">
@@ -168,6 +245,35 @@ export function DataEditorPage(props: { draft: Draft }) {
           </span>
           <TextField frameClass="st-null-frame" value={d().values.gridNullText} onInput={(v) => d().set("gridNullText", v)} placeholder={DEFAULT_SETTINGS.gridNullText} />
         </Row>
+        <Row>
+          <Checkbox checked={d().values.gridAlternateRows} onChange={(c) => d().set("gridAlternateRows", c)} label={<L q={q()}>Alternate row colors</L>} />
+        </Row>
+      </Section>
+    </div>
+  );
+}
+
+export function CodeStyleSqlPage(props: { draft: Draft }) {
+  const d = () => props.draft;
+  return (
+    <div class="st-page">
+      <Section title="Letter Case" q={d().query()}>
+        <Row field>
+          <span class="st-label st-label-wide">
+            <L q={d().query()}>Keywords case:</L>
+          </span>
+          <ComboBox<"keep" | "upper" | "lower">
+            width={160}
+            value={d().values.sqlKeywordCase}
+            onChange={(m) => d().set("sqlKeywordCase", m)}
+            options={[
+              { value: "keep", label: "Do not change" },
+              { value: "upper", label: "To upper case" },
+              { value: "lower", label: "To lower case" },
+            ]}
+          />
+        </Row>
+        <Hint>Applied by Reformat Code (Ctrl+Alt+L) to reserved words; names, strings and comments are not touched.</Hint>
       </Section>
     </div>
   );

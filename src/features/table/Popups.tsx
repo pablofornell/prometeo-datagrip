@@ -1,14 +1,18 @@
 /** Popups of the table editor: SQL preview (pending changes / query), column filter, export dialog, confirmations. */
-import { Show, createSignal, onCleanup, onMount, type JSX } from "solid-js";
+import { For, Show, createEffect, createSignal, onCleanup, onMount, type JSX } from "solid-js";
 import { Portal } from "solid-js/web";
 import type { ColumnMeta, Driver, ExportFormat, ExportOptions } from "../../api/types";
 import { SqlEditor } from "../../components/editor";
-import { Button, Checkbox, ComboBox, Dialog, TextField } from "../../components/ui";
+import { chooseExportPath, defaultExportPath } from "../../api/db";
+import { Button, Checkbox, ComboBox, Dialog, Icon, TextField, tip } from "../../components/ui";
+import { EXTRACTORS } from "../output/extractors";
 import { FILTER_OPS, type FilterOp } from "./sql";
 
 // ---------------------------------------------------------------- SQL popup (`60-grid-preview-pending-changes-popup`)
 
 export interface SqlPopupProps {
+  /** Heading above the statement (`Query`). */
+  title?: string;
   sql: string;
   dialect: Driver;
   /** Blue default button (Submit); omitted for a plain viewer. */
@@ -33,7 +37,10 @@ export function SqlPopup(props: SqlPopupProps): JSX.Element {
   return (
     <Portal>
       <div class="dgt-sqlpop-overlay" onMouseDown={(e) => e.target === e.currentTarget && props.onClose()}>
-        <div ref={box} class="dgt-sqlpop" tabindex={-1} role="dialog">
+        <div ref={box} class="dgt-sqlpop" tabindex={-1} role="dialog" aria-label={props.title}>
+          <Show when={props.title}>
+            <div class="dgt-sqlpop-title">{props.title}</div>
+          </Show>
           <div class="dgt-sqlpop-editor" classList={{ compact: !props.primary }}>
             <SqlEditor value={props.sql} dialect={props.dialect} readOnly gutter={false} stripe={false} statementFrame={false} />
           </div>
@@ -118,59 +125,153 @@ export function ColumnFilterPopup(props: ColumnFilterProps): JSX.Element {
 
 // ---------------------------------------------------------------- export dialog
 
-export const EXPORT_FORMATS: { value: ExportFormat; label: string; ext: string; mime: string }[] = [
-  { value: "csv", label: "CSV", ext: "csv", mime: "text/csv" },
-  { value: "tsv", label: "TSV", ext: "tsv", mime: "text/tab-separated-values" },
-  { value: "json", label: "JSON", ext: "json", mime: "application/json" },
-  { value: "sqlInsert", label: "SQL Inserts", ext: "sql", mime: "application/sql" },
-  { value: "markdown", label: "Markdown", ext: "md", mime: "text/markdown" },
-];
+export const EXPORT_FORMATS: { value: ExportFormat; label: string; ext: string; mime: string }[] = EXTRACTORS.map((x) => ({ value: x.id, label: x.label, ext: x.ext, mime: x.mime }));
 
 export type ExportTarget = "file" | "clipboard";
 
-export interface ExportDialogProps {
-  options: ExportOptions;
-  target: ExportTarget;
-  onClose: () => void;
-  onExport: (options: ExportOptions, target: ExportTarget) => void;
+/** The dialog's "Output file": the path, and whether the save dialog (folder button) already picked it. */
+export interface ExportPath {
+  path: string;
+  chosen: boolean;
 }
 
+export interface ExportDialogProps {
+  options: ExportOptions;
+  /** Text of the read-only `Source:` field (`main.orders`). */
+  source: string;
+  /** Name of the default output file, without extension (`main_orders`). */
+  fileBase: string;
+  /** The text of the first rows in the given options (`Export preview`). */
+  preview: (options: ExportOptions) => Promise<string>;
+  onClose: () => void;
+  onExport: (options: ExportOptions, target: ExportTarget, out: ExportPath) => void;
+}
+
+const PREVIEW_ROWS = 10;
+
+/** `main.orders` -> `main_orders`: the default file name of a source. */
+export const exportFileBase = (source: string): string => source.replace(/[^\w-]+/g, "_").replace(/^_+|_+$/g, "") || "export";
+
+/**
+ * Export Data dialog (`106-export-data-dialog-dark.png`): extractor and options on the left, the live preview of
+ * the first rows on the right. Used by the grid's Export Data button, the explorer and the table editor.
+ */
 export function ExportDialog(props: ExportDialogProps): JSX.Element {
   const [opts, setOpts] = createSignal<ExportOptions>(props.options);
-  const [target, setTarget] = createSignal<ExportTarget>(props.target);
   const patch = (p: Partial<ExportOptions>) => setOpts((o) => ({ ...o, ...p }));
-  const textual = () => ["csv", "tsv", "markdown"].includes(opts().format);
-  const run = () => props.onExport(opts(), target());
+  const ext = (f: ExportFormat) => EXPORT_FORMATS.find((x) => x.value === f)?.ext ?? "csv";
+  const [path, setPath] = createSignal(`${props.fileBase}.${ext(props.options.format)}`);
+  const [chosen, setChosen] = createSignal(false);
+  const [preview, setPreview] = createSignal("");
+  const [error, setError] = createSignal("");
+  const fmt = () => opts().format;
+  const textual = () => ["csv", "tsv", "markdown", "csvPipe", "csvSemicolon"].includes(fmt());
+  const nullable = () => textual() || ["html", "pretty"].includes(fmt());
+  const sqlTable = () => ["sqlInsert", "sqlUpdate"].includes(fmt());
+  const out = (): ExportPath => ({ path: path().trim(), chosen: chosen() });
+  const canExport = () => path().trim().length > 0;
+
+  // the default folder is the user's home (decided by the backend); a typed path is checked on export
+  void defaultExportPath(`${props.fileBase}.${ext(props.options.format)}`).then((p) => p && !chosen() && path().startsWith(props.fileBase) && setPath(p));
+
+  // the extension follows the extractor as long as the name still ends with the previous one
+  const changeFormat = (f: ExportFormat) => {
+    const old = `.${ext(fmt())}`;
+    if (path().endsWith(old)) setPath(path().slice(0, -old.length) + `.${ext(f)}`);
+    patch({ format: f });
+  };
+
+  // the preview follows every option (the last request wins)
+  let seq = 0;
+  createEffect(() => {
+    const o = opts();
+    const n = ++seq;
+    props.preview(o).then(
+      (t) => n === seq && (setPreview(t), setError("")),
+      (e) => n === seq && (setPreview(""), setError(String((e as Error)?.message ?? e).replace(/^Error:\s*/, ""))),
+    );
+  });
+  const lines = () => {
+    const l = preview().replace(/\n$/, "").split("\n");
+    return preview() ? l : [];
+  };
+
+  const browse = async () => {
+    try {
+      const p = await chooseExportPath(path().split("/").pop() || undefined, fmt());
+      if (p) (setPath(p), setChosen(true));
+    } catch (e) {
+      setError(String((e as Error)?.message ?? e));
+    }
+  };
+
+  const run = (target: ExportTarget) => props.onExport(opts(), target, out());
   return (
     <Dialog
       title="Export Data"
-      width={420}
+      width={820}
       onClose={props.onClose}
       buttons={[
-        { label: "Export", primary: true, run },
+        { label: "Export to File", primary: true, disabled: !canExport(), run: () => run("file") },
         { label: "Cancel", run: props.onClose },
+        { label: "Copy to Clipboard", run: () => run("clipboard") },
       ]}
     >
       <div class="dgt-export">
-        <label>Extractor</label>
-        <ComboBox options={EXPORT_FORMATS} value={opts().format} onChange={(f) => patch({ format: f })} />
-        <label>Output</label>
-        <ComboBox
-          options={[
-            { value: "file", label: "File" },
-            { value: "clipboard", label: "Clipboard" },
-          ]}
-          value={target()}
-          onChange={setTarget}
-        />
-        <Show when={textual()}>
-          <label>NULL text</label>
-          <TextField value={opts().nullText} onInput={(v) => patch({ nullText: v })} />
-        </Show>
-        <Show when={textual()}>
-          <span />
-          <Checkbox checked={opts().header} onChange={(v) => patch({ header: v })} label="Write column names" />
-        </Show>
+        <div class="dgt-export-left">
+          <label>Source:</label>
+          <div class="dgt-export-source">{props.source}</div>
+          <label>Extractor:</label>
+          <ComboBox options={EXPORT_FORMATS} value={fmt()} onChange={changeFormat} />
+          <div class="dgt-export-checks">
+            <Checkbox checked={!!opts().transpose} onChange={(v) => patch({ transpose: v })} label="Transpose" />
+            <Checkbox checked={opts().header} disabled={!textual()} onChange={(v) => patch({ header: v })} label="Add column header" />
+            <Checkbox checked={!!opts().rowHeader} disabled={!textual()} onChange={(v) => patch({ rowHeader: v })} label="Add row header" />
+          </div>
+          <Show when={nullable()}>
+            <div class="dgt-export-opts">
+              <label>NULL text:</label>
+              <TextField value={opts().nullText} onInput={(v) => patch({ nullText: v })} />
+              <Show when={fmt() === "csv"}>
+                <label>Delimiter:</label>
+                <TextField value={opts().delimiter ?? ","} maxLength={1} onInput={(v) => patch({ delimiter: v || null })} />
+                <label>Quote:</label>
+                <TextField value={opts().quote} maxLength={1} onInput={(v) => patch({ quote: v || '"' })} />
+              </Show>
+            </div>
+          </Show>
+          <Show when={sqlTable()}>
+            <div class="dgt-export-opts">
+              <label>Table name:</label>
+              <TextField value={opts().tableName ?? ""} onInput={(v) => patch({ tableName: v || null })} />
+              <Show when={fmt() === "sqlInsert"}>
+                <label>Rows per INSERT:</label>
+                <TextField value={String(opts().rowsPerInsert)} onInput={(v) => patch({ rowsPerInsert: Math.max(1, parseInt(v, 10) || 1) })} />
+              </Show>
+            </div>
+          </Show>
+          <label>Output file:</label>
+          <TextField
+            value={path()}
+            onInput={(v) => (setPath(v), setChosen(false))}
+            suffix={
+              <button type="button" class="dgt-export-browse" {...tip("Choose the output file")} tabindex={-1} onClick={() => void browse()}>
+                <Icon name="folder" size={16} />
+              </button>
+            }
+          />
+        </div>
+        <div class="dgt-export-right">
+          <label>Export preview (first {PREVIEW_ROWS} rows are shown):</label>
+          <div class="dgt-export-preview">
+            <Show when={!error()} fallback={<div class="dgt-export-error">{error()}</div>}>
+              <div class="dgt-export-gutter">
+                <For each={[...lines(), ""]}>{(_, i) => <div>{i() + 1}</div>}</For>
+              </div>
+              <pre class="dgt-export-text">{preview()}</pre>
+            </Show>
+          </div>
+        </div>
       </div>
     </Dialog>
   );

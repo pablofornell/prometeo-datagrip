@@ -28,18 +28,29 @@
 .dgo-source-ms {
   color: var(--dg-text-secondary);
 }
-.dgo-spinner {
-  width: 14px;
-  height: 14px;
-  box-sizing: border-box;
-  border: 2px solid var(--dg-text-secondary);
-  border-top-color: var(--dg-accent);
-  border-radius: 50%;
-  animation: dgo-spin 0.8s linear infinite;
+
+/* the statement of a result tab still runs: big spinner in the middle of the (empty) grid */
+.dgo-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
 }
-@keyframes dgo-spin {
-  to {
-    transform: rotate(360deg);
+.dgo-loading-tab .dgg-empty {
+  display: none;
+}
+.dgo-bigspin {
+  width: 32px;
+  height: 32px;
+  color: var(--dg-icon);
+  /* a quick query never shows it */
+  animation: dg-spokes-spin 1s steps(12) infinite, dgo-fade-in 0.2s 0.3s backwards;
+}
+@keyframes dgo-fade-in {
+  from {
+    opacity: 0;
   }
 }
 
@@ -89,7 +100,7 @@
 }
 /* idle "Cancel Running Statements": a gray square (red only while a statement runs) */
 .dg-stop-idle rect {
-  fill: #595959;
+  fill: var(--dg-icon-idle);
 }
 [data-theme="light"] .dg-stop-idle rect {
   fill: var(--dg-icon-disabled);
@@ -188,4 +199,104 @@
 }
 .dgo-vtb .dg-action-button {
   color: var(--dg-icon);
+}
+
+/* Query Plan tab (Explain Plan) */
+.dgo-plan {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  background: var(--dg-editor-bg);
+}
+.dgo-plan-main {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  border-left: 1px solid var(--dg-border);
+}
+.dgo-plan-tree {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  outline: none;
+  --plan-cols: minmax(190px, 2fr) minmax(140px, 1.6fr) 110px 120px 120px minmax(140px, 1.4fr);
+}
+.dgo-plan-props {
+  flex: none;
+  width: 36%;
+  min-width: 200px;
+  overflow: auto;
+  border-left: 1px solid var(--dg-border);
+}
+.dgo-plan-cols {
+  display: grid;
+  grid-template-columns: var(--plan-cols);
+  min-width: 760px;
+}
+.dgo-plan-kv {
+  display: grid;
+  grid-template-columns: minmax(100px, 1fr) minmax(100px, 1.2fr);
+}
+.dgo-plan-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  height: 24px;
+  align-items: center;
+  background: var(--dg-table-header-bg);
+  border-bottom: 1px solid var(--dg-table-header-separator);
+  color: var(--dg-text-secondary);
+}
+.dgo-plan-head > div,
+.dgo-plan-row > div,
+.dgo-plan-krow > div {
+  padding: 0 6px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.dgo-plan-head > div + div,
+.dgo-plan-row > div + div,
+.dgo-plan-krow > div + div {
+  border-left: 1px solid var(--dg-table-header-separator);
+}
+.dgo-plan-row,
+.dgo-plan-krow {
+  height: 24px;
+  line-height: 24px;
+  color: var(--dg-text);
+}
+.dgo-plan-row.sel {
+  background: var(--dg-table-selection-bg);
+}
+.dgo-plan-tree:not(:focus-within) .dgo-plan-row.sel {
+  background: var(--dg-table-selection-inactive-bg);
+}
+.dgo-plan .r {
+  text-align: right;
+}
+.dgo-plan-op {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.dgo-plan-chev {
+  flex: none;
+  width: 16px;
+  height: 16px;
+}
+.dgo-plan-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* the Output log next to the selected result (layout toggle of the log toolbar) */
+.dgo-aside .dgo-result {
+  right: 38%;
+}
+.dgo-aside .dgo-pane-log {
+  left: 62%;
+  border-left: 1px solid var(--dg-border);
 }

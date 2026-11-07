@@ -4,9 +4,10 @@ import { createStore, unwrap } from "solid-js/store";
 import { Dialog, Highlighted, Icon, TextField } from "../../components/ui";
 import { DEFAULT_SETTINGS, type Settings, settings, updateSettings } from "../../state/settings";
 import { type ThemePref, setThemePref, themePref } from "../../state/theme";
+import { ColorSchemePage } from "./ColorSchemePage";
 import { KeymapPage } from "./KeymapPage";
 import { PAGES, type PageNode, filterTree, findNode, firstLeaf, pathOf, visibleRows } from "./model";
-import { AppearancePage, DataEditorPage, EditorAppearancePage, EditorFontPage, GroupPage, QueryExecutionPage } from "./pages";
+import { AppearancePage, CodeStyleSqlPage, DataEditorPage, EditorAppearancePage, EditorFontPage, GroupPage, QueryExecutionPage } from "./pages";
 import type { Draft } from "./widgets";
 
 export interface SettingsDialogProps {
@@ -17,7 +18,8 @@ export interface SettingsDialogProps {
 }
 
 export function SettingsDialog(props: SettingsDialogProps) {
-  const [values, setValues] = createStore<Settings>({ ...settings });
+  // a copy that shares nothing with the live store (the colour and keymap edits are nested objects)
+  const [values, setValues] = createStore<Settings>(structuredClone(unwrap(settings)));
   const [theme, setTheme] = createSignal<ThemePref>(themePref());
   const [query, setQuery] = createSignal("");
   const [page, setPage] = createSignal(findNode(props.initialPage) ? props.initialPage : "appearance");
@@ -26,22 +28,26 @@ export function SettingsDialog(props: SettingsDialogProps) {
 
   const draft: Draft = {
     values,
-    set: (k, v) => setValues(k, v as never),
+    // the root form assigns the property; `setValues(k, v)` would merge an object into the old one (a removed key would stay)
+    set: (k, v) => setValues({ [k]: v } as Partial<Settings>),
     theme,
     setTheme,
     query,
   };
 
+  // values are primitives, except the colour and keymap edits (objects replaced as a whole by the pages)
+  const same = (a: unknown, b: unknown) => a === b || (typeof a === "object" && JSON.stringify(a) === JSON.stringify(b));
+
   const dirty = createMemo(() => {
     if (theme() !== themePref()) return true;
     const cur = settings as Settings;
-    return (Object.keys(DEFAULT_SETTINGS) as (keyof Settings)[]).some((k) => values[k] !== cur[k]);
+    return (Object.keys(DEFAULT_SETTINGS) as (keyof Settings)[]).some((k) => !same(values[k], cur[k]));
   });
 
   const apply = () => {
     const patch: Partial<Settings> = {};
     const v = unwrap(values);
-    for (const k of Object.keys(DEFAULT_SETTINGS) as (keyof Settings)[]) if (v[k] !== settings[k]) (patch as Record<string, unknown>)[k] = v[k];
+    for (const k of Object.keys(DEFAULT_SETTINGS) as (keyof Settings)[]) if (!same(v[k], settings[k])) (patch as Record<string, unknown>)[k] = structuredClone(v[k]);
     if (Object.keys(patch).length) updateSettings(patch);
     if (theme() !== themePref()) setThemePref(theme());
   };
@@ -218,10 +224,10 @@ export function SettingsDialog(props: SettingsDialogProps) {
               <Icon name="chevron-right" />
             </button>
           </div>
-          <div class="st-content" classList={{ "st-content-fixed": page() === "keymap" || page() === "editor.font" }}>
+          <div class="st-content" classList={{ "st-content-fixed": page() === "keymap" || page() === "editor.font" || page() === "editor.color-scheme.sql" }}>
             <Switch fallback={<Show when={node()}>{(n) => <GroupPage node={n() as PageNode} open={(id) => select(id)} />}</Show>}>
               <Match when={page() === "appearance"}>
-                <AppearancePage draft={draft} />
+                <AppearancePage draft={draft} open={(id) => select(id)} />
               </Match>
               <Match when={page() === "editor.font"}>
                 <EditorFontPage draft={draft} />
@@ -236,7 +242,13 @@ export function SettingsDialog(props: SettingsDialogProps) {
                 <DataEditorPage draft={draft} />
               </Match>
               <Match when={page() === "keymap"}>
-                <KeymapPage />
+                <KeymapPage draft={draft} />
+              </Match>
+              <Match when={page() === "editor.color-scheme.sql"}>
+                <ColorSchemePage draft={draft} open={(id) => select(id)} />
+              </Match>
+              <Match when={page() === "editor.code-style.sql"}>
+                <CodeStyleSqlPage draft={draft} />
               </Match>
             </Switch>
           </div>

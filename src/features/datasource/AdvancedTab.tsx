@@ -9,15 +9,31 @@ interface KnownProp {
   description: string;
 }
 
-/** Driver properties dbcore reads from `DataSourceConfig.options` (see crates/dbcore/src/conn.rs). */
+/** Driver properties dbcore reads from `DataSourceConfig.options` (`build_opts` in crates/dbcore/src/conn.rs). */
+const CONNECT_TIMEOUT = { name: "connectTimeout", description: "Seconds to wait while connecting. Default: 15." };
+const MYSQL: KnownProp[] = [
+  { name: "charset", description: "Character set of the connection (SET NAMES). Default: utf8mb4." },
+  { name: "collation", description: "Collation of the connection, e.g. utf8mb4_unicode_ci. Default: the server's for the character set." },
+  CONNECT_TIMEOUT,
+  { name: "timezone", description: "Session time zone, e.g. +00:00 or Europe/Madrid. Default: not set (values show as the server stores them)." },
+];
+
 const KNOWN: Record<Dbms, KnownProp[]> = {
   postgres: [
     { name: "application_name", description: "Name of the client shown in pg_stat_activity. Default: Prometeo DataGrip." },
-    { name: "connectTimeout", description: "Seconds to wait while connecting. Default: 15." },
+    CONNECT_TIMEOUT,
+    { name: "options", description: "Command-line options sent at start-up, like libpq: -c search_path=sales -c lock_timeout=5000." },
+    { name: "statement_timeout", description: "Milliseconds after which the server cancels a statement. 0 = no limit. Default: the server's." },
   ],
-  mysql: [{ name: "connectTimeout", description: "Seconds to wait while connecting. Default: 15." }],
-  mariadb: [{ name: "connectTimeout", description: "Seconds to wait while connecting. Default: 15." }],
-  sqlite: [{ name: "connectTimeout", description: "Seconds to wait while opening the pool. Default: 15." }],
+  mysql: MYSQL,
+  mariadb: MYSQL,
+  sqlite: [
+    { name: "busy_timeout", description: "Milliseconds to wait for a locked database before failing. Default: 5000." },
+    { ...CONNECT_TIMEOUT, description: "Seconds to wait while opening the pool. Default: 15." },
+    { name: "foreign_keys", description: "true / false: enforce foreign keys. Default: true." },
+    { name: "journal_mode", description: "delete, truncate, persist, memory, wal or off. Default: the database's." },
+    { name: "synchronous", description: "off, normal, full or extra: how hard SQLite syncs to disk. Default: full." },
+  ],
 };
 
 export function AdvancedTab(props: { s: Session }) {

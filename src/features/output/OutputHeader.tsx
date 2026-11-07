@@ -4,7 +4,7 @@ import { ActionButton, Icon, Tabs, type MenuItem, openMenu } from "../../compone
 import { activateTab, tabs } from "../../state/tabs";
 import { dsIconUrl } from "./dsicon";
 import { formatDuration } from "./format";
-import { type ConsoleOutput, allOutputs, currentOutput } from "./model";
+import { type ConsoleOutput, PLAN_TAB, allOutputs, currentOutput } from "./model";
 
 const tabTitle = (o: ConsoleOutput): string => tabs().find((t) => t.id === o.tabId)?.title ?? "console";
 
@@ -14,6 +14,7 @@ export function OutputHeader(): JSX.Element {
     const o = out();
     return [
       { id: "output", title: "Output", icon: "dg/console", closeable: false },
+      ...(o?.plan() ? [{ id: PLAN_TAB, title: "Query Plan", icon: "explain-plan", closeable: true }] : []),
       ...(o?.results() ?? []).map((r) => ({ id: r.id, title: r.title(), icon: "dg/table", closeable: true, pinned: r.pinned() })),
     ];
   };
@@ -21,6 +22,7 @@ export function OutputHeader(): JSX.Element {
   const tabMenu = (id: string): MenuItem[] => {
     const o = out();
     const r = o?.results().find((x) => x.id === id);
+    if (o && id === PLAN_TAB) return [{ label: "Close Tab", run: () => o.closePlan() }];
     if (!o || !r) return [];
     return [
       { label: r.pinned() ? "Unpin Tab" : "Pin Tab", icon: "pin", run: () => r.setPinned(!r.pinned()) },
@@ -57,12 +59,10 @@ export function OutputHeader(): JSX.Element {
         >
           {(o) => (
             <>
-              <Show when={o().running()} fallback={<img class="dg-icon" width="16" height="16" src={dsIconUrl(o().dialect)} alt="" />}>
-                <span class="dgo-spinner" />
-              </Show>
+              <img class="dg-icon" width="16" height="16" src={dsIconUrl(o().dialect)} alt="" />
               <span class="dgo-source-title">{tabTitle(o())}</span>
-              <Show when={o().lastMs() !== null}>
-                <span class="dgo-source-ms">{formatDuration(o().lastMs()!)}</span>
+              <Show when={o().running() ? true : o().lastMs() !== null}>
+                <span class="dgo-source-ms">{formatDuration(o().running() ? o().elapsed() : o().lastMs()!)}</span>
               </Show>
             </>
           )}
