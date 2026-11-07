@@ -14,6 +14,7 @@ import {
 import {
   badges,
   busy,
+  colorOfNode,
   connected,
   loadChildren,
   loaded,
@@ -197,6 +198,7 @@ export function ExplorerBody(): JSX.Element {
           onSpeedSearchChange={setSearchQuery}
           speedSearchField={false}
           renderLabel={renderLabel}
+          rowColor={colorOfNode}
           emptyText={<EmptyState />}
           ref={setController}
         />

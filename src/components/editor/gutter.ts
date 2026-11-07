@@ -8,29 +8,36 @@ const SVG_ERR =
   '<svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="currentColor"/><rect x="7.1" y="3.6" width="1.8" height="5.4" rx=".9" fill="#fff"/><circle cx="8" cy="11.4" r="1" fill="#fff"/></svg>';
 
 class StatusMarker extends GutterMarker {
-  constructor(readonly ok: boolean) {
+  constructor(readonly kind: "ok" | "error" | "running") {
     super();
   }
   eq(o: StatusMarker): boolean {
-    return o.ok === this.ok;
+    return o.kind === this.kind;
   }
   toDOM(): HTMLElement {
     const d = document.createElement("div");
-    d.className = this.ok ? "cm-exec-icon cm-exec-ok" : "cm-exec-icon cm-exec-err";
-    d.innerHTML = this.ok ? SVG_OK : SVG_ERR;
+    if (this.kind === "running") {
+      d.className = "cm-exec-icon cm-exec-running";
+      d.innerHTML = '<span class="dg-spokes"></span>';
+      return d;
+    }
+    const ok = this.kind === "ok";
+    d.className = ok ? "cm-exec-icon cm-exec-ok" : "cm-exec-icon cm-exec-err";
+    d.innerHTML = ok ? SVG_OK : SVG_ERR;
     return d;
   }
 }
 
-const OK = new StatusMarker(true);
-const ERR = new StatusMarker(false);
+const OK = new StatusMarker("ok");
+const ERR = new StatusMarker("error");
+const RUNNING = new StatusMarker("running");
 
 /** Gutter column after the line numbers: green check / red `!` for executed statements. */
 const statusGutter = gutter({
   class: "cm-status-gutter",
   lineMarker(view, line) {
     for (const m of view.state.field(execMarksField)) {
-      if (m.from >= line.from && m.from <= line.to) return m.status === "ok" ? OK : ERR;
+      if (m.from >= line.from && m.from <= line.to) return m.status === "ok" ? OK : m.status === "running" ? RUNNING : ERR;
     }
     for (const e of view.state.field(errorsField)) {
       if (e.statementFrom >= line.from && e.statementFrom <= line.to) return ERR;
@@ -71,14 +78,16 @@ const hints = EditorView.decorations.compute([execMarksField], (state): Decorati
       pos = Math.min(m.to, state.doc.length);
       if (state.doc.sliceString(pos, pos + 1) === ";") pos += 1;
     }
-    return { pos, ms: m.ms as number };
+    return { pos, ms: m.ms as number, running: m.status === "running" };
   });
   placed.sort((a, c) => a.pos - c.pos);
   let last = -1;
   for (const m of placed) {
     if (m.pos < last) continue;
     last = m.pos;
-    b.add(m.pos, m.pos, Decoration.widget({ widget: new HintWidget(formatMs(m.ms)), side: 1 }));
+    // a running statement shows whole seconds (`4 s`), and nothing during the first one
+    const text = m.running ? (m.ms >= 1000 ? `${Math.floor(m.ms / 1000)} s` : "") : formatMs(m.ms);
+    if (text) b.add(m.pos, m.pos, Decoration.widget({ widget: new HintWidget(text), side: 1 }));
   }
   return b.finish();
 });

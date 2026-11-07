@@ -199,7 +199,8 @@ async fn pg_children(
         0 => {
             let rows = pool
                 .query_strings(
-                    "select datname, (datname = current_database())::text, pg_encoding_to_char(encoding) \
+                    "select datname, (datname = current_database())::text, pg_encoding_to_char(encoding), \
+                     coalesce(shobj_description(oid, 'pg_database'), '') \
                      from pg_database where not datistemplate and datallowconn order by (datname = current_database()) desc, datname",
                 )
                 .await?;
@@ -214,7 +215,7 @@ async fn pg_children(
                         None,
                         vec![s(r, 0)],
                         current,
-                        json!({ "current": current, "encoding": s(r, 2) }),
+                        json!({ "current": current, "encoding": s(r, 2), "comment": s(r, 3) }),
                     )
                 })
                 .collect())

@@ -28,18 +28,29 @@
 .dgo-source-ms {
   color: var(--dg-text-secondary);
 }
-.dgo-spinner {
-  width: 14px;
-  height: 14px;
-  box-sizing: border-box;
-  border: 2px solid var(--dg-text-secondary);
-  border-top-color: var(--dg-accent);
-  border-radius: 50%;
-  animation: dgo-spin 0.8s linear infinite;
+
+/* the statement of a result tab still runs: big spinner in the middle of the (empty) grid */
+.dgo-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
 }
-@keyframes dgo-spin {
-  to {
-    transform: rotate(360deg);
+.dgo-loading-tab .dgg-empty {
+  display: none;
+}
+.dgo-bigspin {
+  width: 32px;
+  height: 32px;
+  color: var(--dg-icon);
+  /* a quick query never shows it */
+  animation: dg-spokes-spin 1s steps(12) infinite, dgo-fade-in 0.2s 0.3s backwards;
+}
+@keyframes dgo-fade-in {
+  from {
+    opacity: 0;
   }
 }
 

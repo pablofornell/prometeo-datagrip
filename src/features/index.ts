@@ -8,3 +8,5 @@ import "./console";
 import "./output";
 import "./navigate";
 import "./settings";
+import "./import";
+import "./services";

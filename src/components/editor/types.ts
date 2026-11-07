@@ -1,6 +1,8 @@
+import type { NavHandlers } from "./navigate";
 import type { Dialect } from "./split";
 
 export type { Dialect } from "./split";
+export type { NavHandlers, NavTarget } from "./navigate";
 
 /** Column of a table in the schema snapshot used for highlighting and completion. */
 export interface SchemaColumn {
@@ -68,11 +70,14 @@ export interface EditorError {
   message: string;
 }
 
-/** Result of an executed statement: gutter check / red `!` and the gray inline `994 ms` hint. */
+/**
+ * Result of an executed statement: gutter check / red `!` and the gray inline `994 ms` hint. `running`: a spinner
+ * instead of the icon, and `ms` is the elapsed time (shown as `4 s` once it reached a second).
+ */
 export interface ExecMark {
   from: number;
   to: number;
-  status: "ok" | "error";
+  status: "ok" | "error" | "running";
   ms?: number;
 }
 
@@ -136,6 +141,8 @@ export interface SqlEditorProps {
   scopeTable?: { schema?: string; name: string };
   autofocus?: boolean;
   class?: string;
+  /** Ctrl+B / Ctrl+Click, Ctrl+Q and Alt+Shift+B on the identifier at the caret (the host opens tabs and popups). */
+  navigate?: NavHandlers;
   /** Receives the imperative handle once the editor is mounted. */
   ref?: (handle: SqlEditorHandle) => void;
 }

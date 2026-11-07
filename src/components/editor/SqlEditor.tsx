@@ -24,15 +24,18 @@ import { duplicate, extendSelection, goToLine, moveLine, moveStatement, shiftTab
 import { sqlCompletion } from "./complete";
 import { completionExtras, withExtras } from "./extras";
 import { errorExtension } from "./errors";
+import { openEditorMenu, placeCaretAt, writeText } from "./contextMenu";
 import { closeChooser, isChooserOpen, scriptRequest, selectionOrStatement, showChooser } from "./execute";
 import { formatScript } from "./format";
 import { previewField, previewFill, statementFrame } from "./frame";
 import { statusGutterExtension } from "./gutter";
 import { docAnalysis, indentGuides, sqlHighlighting } from "./highlight";
+import { inspectExtension, jumpProblem } from "./inspect";
 import { editorLayers } from "./layers";
+import { goToDeclaration, navigationExtension, quickDocAtCaret, referenceAtCaret, selectInExplorerAtCaret } from "./navigate";
 import { schemaIndexFor } from "./schemaIndex";
 import { sqlSearch } from "./search";
-import { configField, errorsField, execMarksField, setConfig, setErrors, setExecMarks } from "./state";
+import { configField, errorsField, execMarksField, problemsField, setConfig, setErrors, setExecMarks } from "./state";
 import { stripeExtension } from "./stripe";
 import type { ExecuteRequest, Range, SqlEditorHandle, SqlEditorProps } from "./types";
 
@@ -133,6 +136,15 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
     return true;
   };
 
+  const nav = () => props.navigate ?? {};
+  const goTo = goToDeclaration(nav);
+  const copyReference: Command = (v) => {
+    const ref = nav().goTo ? referenceAtCaret(v) : null;
+    if (!ref) return false;
+    void writeText(ref);
+    return true;
+  };
+
   const handle: SqlEditorHandle = {
     focus: () => view?.focus(),
     getSelectionOrStatement: () => (view ? (selectionOrStatement(view.state)?.req ?? null) : null),
@@ -202,6 +214,11 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
         { key: "Mod-w", run: extendSelection, preventDefault: true },
         { key: "Mod-Shift-w", run: shrinkSelection, preventDefault: true },
         { key: "Mod-g", run: goToLine, preventDefault: true },
+        { key: "Mod-b", run: goTo, preventDefault: true },
+        { key: "Mod-q", run: quickDocAtCaret(nav), preventDefault: true },
+        { key: "Alt-Shift-b", run: selectInExplorerAtCaret(nav), preventDefault: true },
+        { key: "Mod-Alt-Shift-c", run: copyReference, preventDefault: true },
+        ...(single ? [] : [{ key: "F2", run: (v: EditorView) => jumpProblem(v, 1), preventDefault: true }, { key: "Shift-F2", run: (v: EditorView) => jumpProblem(v, -1), preventDefault: true }]),
         { key: "Alt-j", run: selectNextOccurrence, preventDefault: true },
         { key: "Mod-Alt-Shift-j", run: selectSelectionMatches, preventDefault: true },
         { key: "Mod-Shift-l", run: selectLine },
@@ -226,6 +243,7 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
       extensions: [
         configField,
         errorsField,
+        problemsField,
         execMarksField,
         previewField,
         EditorState.allowMultipleSelections.of(true),
@@ -251,6 +269,17 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
         closeBrackets(),
         sqlHighlighting(),
         errorExtension(),
+        ...(props.stripe !== false && !single ? [inspectExtension()] : []),
+        navigationExtension(nav),
+        EditorView.domEventHandlers({
+          contextmenu(e, v) {
+            e.preventDefault();
+            v.focus();
+            placeCaretAt(v, e);
+            openEditorMenu(v, e, { single, nav: nav(), canExecute: !!props.onExecute, reformat, goToDeclaration: goTo });
+            return true;
+          },
+        }),
         statementFrame,
         ...(props.stripe !== false && !single ? [stripeExtension()] : []),
         sqlCompletion(),

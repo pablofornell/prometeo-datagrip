@@ -1,5 +1,7 @@
 export { SqlEditor, default } from "./SqlEditor";
 export type {
+  NavHandlers,
+  NavTarget,
   Dialect,
   EditorError,
   ExecMark,
@@ -17,3 +19,4 @@ export type {
 export { splitStatements, statementAt, type Statement } from "./split";
 export { formatScript, formatStatement } from "./format";
 export { setCompletionExtrasProvider, type CompletionExtras, type ExtrasProvider, type ExtrasQuery } from "./extras";
+export { highlightSql } from "./highlight";

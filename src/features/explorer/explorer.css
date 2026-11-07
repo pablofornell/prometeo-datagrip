@@ -11,8 +11,16 @@
 .dg-explorer-ds-icon .dg-icon {
   margin: 0;
 }
+/* 16px segmented spinner (DataGrip's "busy" data source icon) */
 .dg-explorer-ds-icon .dg-spinner {
   flex: none;
+  width: 16px;
+  height: 16px;
+  border: 0;
+  background: repeating-conic-gradient(var(--dg-tree-secondary-fg) 0 14deg, transparent 14deg 30deg);
+  -webkit-mask: radial-gradient(circle, transparent 4px, #000 4.5px, #000 7.5px, transparent 8px);
+  mask: radial-gradient(circle, transparent 4px, #000 4.5px, #000 7.5px, transparent 8px);
+  animation: dg-spin 0.9s steps(12) infinite;
 }
 /* "connected" marker: small green dot at the lower right of the DBMS icon */
 .dg-explorer-dot {
@@ -239,4 +247,60 @@
 }
 .dg-quickdoc-loading {
   color: var(--dg-text-secondary);
+}
+
+/* ---- data source color (Set Color): tree rows, editor tabs, console background */
+.dg-tree-row.dg-tinted:not(.dg-selected) {
+  border-radius: 0; /* no seams between the tinted rows */
+  background: color-mix(in srgb, var(--dg-row-tint) var(--dg-ds-tint-mix), transparent);
+}
+.dg-tab.dg-tab-tinted:not(.dg-selected):not(:hover) {
+  background: color-mix(in srgb, var(--dg-tab-tint) var(--dg-ds-tint-mix), transparent);
+}
+.dg-tab.dg-tab-tinted.dg-selected {
+  background: color-mix(in srgb, var(--dg-tab-tint) var(--dg-ds-tint-mix), var(--dg-tab-selected-inactive-bg));
+}
+.dg-island:focus-within .dg-tab.dg-tab-tinted.dg-selected,
+.dg-tabs-focused .dg-tab.dg-tab-tinted.dg-selected {
+  background: color-mix(in srgb, var(--dg-tab-tint) var(--dg-ds-tint-mix), var(--dg-tab-selected-bg));
+}
+.dgc-editor.dg-ds-tinted .sql-editor .cm-editor,
+.dgc-editor.dg-ds-tinted .sql-editor .cm-gutters {
+  background: color-mix(in srgb, var(--dg-ds-tint) var(--dg-ds-tint-mix), var(--dg-editor-bg));
+}
+
+/* Quick Documentation of a table / column named in the SQL editor (Ctrl+Q) */
+.dg-quickdoc-ref {
+  width: 495px;
+  max-height: 520px;
+  padding: 12px 20px 10px;
+  background: var(--dg-editor-doc-bg);
+  font-family: var(--dg-font-ui);
+  font-size: 13px;
+}
+.dg-quickdoc-line {
+  line-height: 21px;
+}
+.dg-quickdoc-code {
+  margin: 14px 0 6px;
+  padding: 14px 16px;
+  max-height: 360px;
+  overflow: auto;
+  box-sizing: border-box;
+  background: var(--dg-editor-bg);
+  border-radius: 6px;
+  font-family: var(--dg-font-mono);
+  font-size: 12px;
+  line-height: 20px;
+  color: var(--dg-editor-identifier);
+  white-space: pre;
+}
+.dg-quickdoc-link {
+  display: inline-block;
+  margin-top: 4px;
+  color: var(--dg-link);
+  text-decoration: none;
+}
+.dg-quickdoc-link:hover {
+  text-decoration: underline;
 }

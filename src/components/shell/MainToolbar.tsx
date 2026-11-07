@@ -1,12 +1,12 @@
-import { For, Show, createEffect, createSignal, on, type JSX } from "solid-js";
+import { For, Show, createEffect, createSignal, on, onCleanup, onMount, type JSX } from "solid-js";
 import { isTauri } from "../../api/tauri";
 import { minimizeWindow, toggleMaximizeWindow, closeWindow } from "../../api/window";
 import { ACTION_IDS } from "../../state/core-actions";
-import { TOOL_WINDOWS, isToolWindowVisible, toggleToolWindow } from "../../state/layout";
+import { TOOL_WINDOWS, isPinned, isToolWindowVisible, setToolWindowPinned, toggleToolWindow, toolbarWindows } from "../../state/layout";
 import { menuBarOpen, setMenuBarOpen } from "../../state/ui";
 import { ActionButton } from "../ui/ActionButton";
 import { Icon } from "../ui/Icon";
-import { closeMenu, openMenu } from "../ui/Menu";
+import { type MenuItem, Mnemonic, closeMenu, openMenu } from "../ui/Menu";
 import { tip } from "../ui/Tooltip";
 import { GEAR_MENU, MAIN_MENU } from "./menus";
 
@@ -16,8 +16,13 @@ export function MainToolbar(): JSX.Element {
   const [openIdx, setOpenIdx] = createSignal(-1);
   const barItems: HTMLElement[] = [];
   let gearBtn!: HTMLButtonElement;
+  let moreBtn!: HTMLButtonElement;
 
-  const showMenu = (i: number) => {
+  /** Menu to drop down when the bar opens (Alt+letter); the hamburger opens File. */
+  let pendingIdx = 0;
+
+  /** `preselect`: highlight the first item, as when the bar is driven from the keyboard (DataGrip does it on hamburger open too). */
+  const showMenu = (i: number, preselect = false) => {
     const n = MAIN_MENU.length;
     const idx = (i + n) % n;
     const el = barItems[idx];
@@ -27,6 +32,7 @@ export function MainToolbar(): JSX.Element {
       anchor: el,
       variant: "bar",
       gap: 4,
+      selected: preselect ? "first" : undefined,
       onClose: () => {
         // Closed for real (not replaced by a neighbour menu): the bar collapses back to the hamburger.
         if (openIdx() === idx) {
@@ -34,7 +40,7 @@ export function MainToolbar(): JSX.Element {
           setMenuBarOpen(false);
         }
       },
-      onHorizontal: (d) => showMenu(idx + d),
+      onHorizontal: (d) => showMenu(idx + d, true),
     });
   };
 
@@ -44,7 +50,11 @@ export function MainToolbar(): JSX.Element {
       menuBarOpen,
       (open) => {
         if (open) {
-          if (openIdx() < 0) queueMicrotask(() => showMenu(0));
+          if (openIdx() < 0) {
+            const i = pendingIdx;
+            pendingIdx = 0;
+            queueMicrotask(() => showMenu(i, true));
+          }
         } else if (openIdx() >= 0) {
           setOpenIdx(-1);
           closeMenu();
@@ -53,6 +63,37 @@ export function MainToolbar(): JSX.Element {
       { defer: true },
     ),
   );
+
+  /** "…" More tool windows: every window with its shortcut and a pin toggle for its toolbar button. */
+  const moreToolWindows = (): MenuItem[] =>
+    TOOL_WINDOWS.map((t) => ({
+      action: "toolwindow." + t.id,
+      trailing: {
+        icon: "pin",
+        selectedIcon: "pin-selected",
+        selected: () => isPinned(t.id),
+        title: isPinned(t.id) ? "Unpin from the Toolbar" : "Pin to the Toolbar",
+        run: () => setToolWindowPinned(t.id, !isPinned(t.id)),
+      },
+    }));
+
+  // Alt+<letter> opens that menu of the bar (File Edit View Navigate Run Window Help), expanding the bar when needed.
+  onMount(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || !e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || e.isComposing) return;
+      const m = /^Key([A-Z])$/.exec(e.code)?.[1];
+      const idx = m ? MAIN_MENU.findIndex((x) => x.mnemonic === m) : -1;
+      if (idx < 0) return;
+      e.preventDefault();
+      if (menuBarOpen()) showMenu(idx, true);
+      else {
+        pendingIdx = idx;
+        setMenuBarOpen(true);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    onCleanup(() => window.removeEventListener("keydown", onKey));
+  });
 
   const dragProps = { "data-tauri-drag-region": "" } as Record<string, string>;
 
@@ -89,7 +130,7 @@ export function MainToolbar(): JSX.Element {
                     if (openIdx() >= 0 && openIdx() !== i()) showMenu(i());
                   }}
                 >
-                  {m.label}
+                  <Mnemonic label={m.label} letter={m.mnemonic} />
                 </span>
               )}
             </For>
@@ -98,7 +139,7 @@ export function MainToolbar(): JSX.Element {
       </div>
 
       <div class="dg-toolbar-center" {...dragProps}>
-        <For each={TOOL_WINDOWS}>
+        <For each={toolbarWindows()}>
           {(t) => (
             <button
               type="button"
@@ -113,6 +154,17 @@ export function MainToolbar(): JSX.Element {
             </button>
           )}
         </For>
+        <button
+          type="button"
+          class="dg-toolwindow-button"
+          tabindex={-1}
+          ref={moreBtn}
+          {...tip("More Tool Windows")}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => openMenu(moreToolWindows(), { anchor: moreBtn, gap: 4 })}
+        >
+          <Icon name="more-horizontal" size={20} />
+        </button>
       </div>
 
       <div class="dg-toolbar-right" {...dragProps}>

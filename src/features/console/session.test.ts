@@ -254,3 +254,26 @@ describe("MySQL USE earlier in the script", () => {
     expect((resolveEdit.mock.calls.at(-1) as unknown[])[3]).toBe("other");
   });
 });
+
+describe("a failed statement", () => {
+  it("keeps the earlier result in front and shows the error for the banner", async () => {
+    const s = mk();
+    await s.run(req("select 1"));
+    const tab = s.out.results()[0];
+    s.out.select("output");
+    s.out.select(tab.id);
+    await s.run(req("boom"));
+    expect(s.out.selected()).toBe(tab.id); // not switched to the log
+    expect(s.out.results()).toHaveLength(1);
+    expect(s.execError()).toBe("boom");
+    await s.run(req("select 1")); // the next run clears it
+    expect(s.execError()).toBeNull();
+  });
+  it("a statement without rows still shows the log", async () => {
+    const s = mk();
+    await s.run(req("select 1"));
+    await s.run(req("update t set a = 1"));
+    expect(s.out.selected()).toBe("output");
+    expect(s.execError()).toBeNull();
+  });
+});

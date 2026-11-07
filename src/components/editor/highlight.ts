@@ -2,7 +2,8 @@ import { RangeSetBuilder, type Extension, type Text } from "@codemirror/state";
 import { Decoration, type DecorationSet, EditorView, ViewPlugin, type ViewUpdate } from "@codemirror/view";
 import { HARD_KEYWORDS, keywordsFor } from "./keywords";
 import { lex, type Token } from "./lexer";
-import { analyzeStatement, identName, type Mark, type MarkCls } from "./semantic";
+import { SchemaIndex } from "./schemaIndex";
+import { analyzeStatement, identName, type Mark, type MarkCls, type TableRef } from "./semantic";
 import { configField, errorsField, setConfig } from "./state";
 import { splitStatements, type Dialect, type Statement } from "./split";
 
@@ -48,10 +49,8 @@ const classes: Record<MarkCls, Decoration> = {
   param: Decoration.mark({ class: "cm-sql-param" }),
 };
 
-/** All semantic marks for the statements intersecting `[vFrom, vTo]`. */
-export function computeMarks(view: EditorView, vFrom: number, vTo: number): Mark[] {
-  const cfg = view.state.field(configField);
-  const a = docAnalysis(view.state.doc, cfg.dialect);
+/** Semantic marks for the statements of `a` intersecting `[vFrom, vTo]`. */
+function marksOf(a: DocAnalysis, index: SchemaIndex, dialect: Dialect, implicit: TableRef[] | undefined, vFrom: number, vTo: number): Mark[] {
   const marks: Mark[] = [];
   const toks = a.tokens;
   let ti = 0;
@@ -68,11 +67,23 @@ export function computeMarks(view: EditorView, vFrom: number, vTo: number): Mark
     const begin = ti;
     while (ti < toks.length && toks[ti].from < st.fullEnd) ti++;
     if (st.fullEnd < vFrom || st.start > vTo) continue;
-    const an = analyzeStatement(a.text, toks.slice(begin, ti), cfg.index, cfg.dialect, cfg.implicit);
+    const an = analyzeStatement(a.text, toks.slice(begin, ti), index, dialect, implicit);
     for (const m of an.marks) marks.push(m);
   }
   plainGap(Infinity);
   return marks;
+}
+
+/** All semantic marks for the statements intersecting `[vFrom, vTo]`. */
+export function computeMarks(view: EditorView, vFrom: number, vTo: number): Mark[] {
+  const cfg = view.state.field(configField);
+  return marksOf(docAnalysis(view.state.doc, cfg.dialect), cfg.index, cfg.dialect, cfg.implicit, vFrom, vTo);
+}
+
+/** Marks of a plain text (no schema): keywords, strings, numbers, comments, functions. For read-only displays such as Quick Documentation. */
+export function highlightSql(text: string, dialect: Dialect): Mark[] {
+  const a: DocAnalysis = { text, tokens: lex(text, dialect), statements: splitStatements(text, dialect) };
+  return marksOf(a, new SchemaIndex(undefined), dialect, undefined, 0, text.length);
 }
 
 function build(view: EditorView): DecorationSet {

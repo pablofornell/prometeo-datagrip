@@ -53,6 +53,46 @@
   min-height: 0;
 }
 
+/* the error of the last run, docked under the editor (121) */
+.dgc-banner {
+  display: flex;
+  align-items: center;
+  flex: none;
+  gap: 12px;
+  height: 32px;
+  padding: 0 8px 0 9px;
+  box-sizing: border-box;
+  background: var(--dg-banner-error-bg);
+  border-top: 1px solid var(--dg-banner-error-border);
+  color: var(--dg-text);
+}
+.dgc-banner-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: text;
+}
+.dgc-banner-link {
+  flex: none;
+  color: var(--dg-link, #548af7);
+  cursor: pointer;
+}
+.dgc-banner-close {
+  display: inline-flex;
+  flex: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--dg-icon);
+  cursor: default;
+}
+.dgc-text-btn:disabled {
+  color: var(--dg-text-disabled);
+  pointer-events: none;
+}
+
 /* Query History popup */
 .dgc-h-backdrop {
   position: fixed;

@@ -28,7 +28,7 @@ import {
 } from "../../components/grid";
 import { notify, openMenu } from "../../components/ui";
 import { settings } from "../../state/settings";
-import { setStatus } from "../../state/status";
+import { setGridSelection, setStatus } from "../../state/status";
 import { type EditorTab, activateTab, updateTab } from "../../state/tabs";
 import { type ObjectTabData, openDdlTab } from "./commands";
 import { registerController } from "./controller";
@@ -38,7 +38,7 @@ import { rowsRetrieved } from "../output/format";
 import { CONNECTION_LOST_LOG, CONNECTION_LOST_TX_LOG } from "../../state/connection-errors";
 import { type ConsoleOutput, createOutput, removeOutput } from "../output/model";
 import { dsInfo, errText, loadDataSources, writeClipboard } from "./ds";
-import { exportTableQuery } from "./exportData";
+import { type ExportSource, exportPreview, exportTableQuery } from "./exportData";
 import {
   SERVER_ROLLBACK_BODY,
   SERVER_ROLLBACK_LOG,
@@ -51,7 +51,7 @@ import {
   txLabel,
 } from "./session";
 import { FilterBar } from "./FilterBar";
-import { ChoiceDialog, ColumnFilterPopup, EXPORT_FORMATS, ExportDialog, SqlPopup, type ExportTarget } from "./Popups";
+import { ChoiceDialog, ColumnFilterPopup, EXPORT_FORMATS, ExportDialog, SqlPopup, exportFileBase, type ExportPath, type ExportTarget } from "./Popups";
 import { type PageSize, type Query, type QueryReport, createTableSource } from "./source";
 import { appendCondition, buildCondition, orderByToSort, previewSql, qualifiedName, selectSql, sortToOrderBy, tableQuerySql, toRowChanges } from "./sql";
 import "./table.css";
@@ -504,11 +504,7 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
   // status bar: row:col and the aggregate of the selection
   const onSelection = (info: SelectionInfo) => {
     if (!props.active) return;
-    const n = info.numeric;
-    setStatus({
-      caret: info.row ? { line: info.row, col: info.col ?? 1 } : null,
-      aggregator: n && n.count > 1 ? `SUM: ${n.sum}` : info.cells > 1 ? "SUM: Not enough values" : "No aggregator selected",
-    });
+    setGridSelection(props.tab.id, info);
   };
 
   // ---------------------------------------------------------------- toolbar bits
@@ -541,12 +537,24 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
 
   const exportOptions = (): ExportOptions => ({ ...defaultExportOptions(driver()), format: extractor(), tableName: tableName() });
 
-  async function doExport(options: ExportOptions, target: ExportTarget): Promise<void> {
+  /** What the Export Data dialog exports: the rows the editor holds when they are all loaded, else the query again. */
+  const exportSource = (): ExportSource => {
+    const q = src.applied();
+    return {
+      dsId,
+      label: tableName(),
+      sql: selectSql(driver(), ref, q.where, q.orderBy),
+      options: exportOptions(),
+      loaded: () => ({ columns: cols() ?? [], rows: src.pageRows(), complete: !!cols() && src.complete() }),
+    };
+  };
+
+  async function doExport(options: ExportOptions, target: ExportTarget, out: ExportPath): Promise<void> {
     setExportDlg(false);
     setExtractor(options.format);
     const q = src.applied();
     if (target === "file") {
-      await exportTableQuery(dsId, ref, driver(), options, "file", { where: q.where, orderBy: q.orderBy });
+      await exportTableQuery(dsId, ref, driver(), options, "file", out, { where: q.where, orderBy: q.orderBy });
       return;
     }
     const fmt = EXPORT_FORMATS.find((f) => f.value === options.format) ?? EXPORT_FORMATS[0];
@@ -688,7 +696,14 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
         )}
       </Show>
       <Show when={exportDlg()}>
-        <ExportDialog options={exportOptions()} target="file" onClose={() => setExportDlg(false)} onExport={(o, t) => void doExport(o, t)} />
+        <ExportDialog
+          options={exportOptions()}
+          source={tableName()}
+          fileBase={exportFileBase(tableName())}
+          preview={(o) => exportPreview(exportSource(), o)}
+          onClose={() => setExportDlg(false)}
+          onExport={(o, t, out) => void doExport(o, t, out)}
+        />
       </Show>
       <Show when={colFilter()}>
         {(f) => (

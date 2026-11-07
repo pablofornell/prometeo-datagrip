@@ -17,17 +17,19 @@ import {
   openSession,
   sessionTxStatus,
 } from "../../api/db";
+import type { ColumnMeta } from "../../api/types";
 import { type EditorError, type ExecMark, type ExecuteRequest, type SqlEditorHandle, splitStatements } from "../../components/editor";
 import { errorsField, execMarksField } from "../../components/editor/state";
 import type { GridChange, PageSize } from "../../components/grid";
 import { type MenuItem, notify, openMenu } from "../../components/ui";
 import { showToolWindow } from "../../state/layout";
 import { settings } from "../../state/settings";
-import { activateTab } from "../../state/tabs";
+import { activateTab, activeTab } from "../../state/tabs";
 import { ensureConnected } from "../explorer";
 import {
   INTERNAL_MARK,
   completedIn,
+  firstKeyword,
   leadingComment,
   reportsCount,
   rowsAffected,
@@ -86,6 +88,14 @@ export function sessionSetting(sql: string): { text: string; autocommit?: boolea
   return { text: text.replace(/\s+/g, " ").replace(/;+$/, ""), autocommit: ac ? /^(?:0|false|off)$/i.test(ac[1]) : undefined };
 }
 
+/** Statements that may return rows: their result tab shows (spinning) while they run. */
+const ROW_QUERY = new Set(["SELECT", "WITH", "SHOW", "VALUES", "TABLE", "EXPLAIN", "PRAGMA", "DESCRIBE", "DESC", "CALL", "EXEC", "EXECUTE"]);
+export const returnsRows = (sql: string): boolean => ROW_QUERY.has(firstKeyword(sql));
+/** A statement that takes longer than this ends with a balloon when the console is out of sight. */
+const LONG_RUN_MS = 5000;
+/** The pending result tab appears when the statement still runs after this (a quick statement never flashes it). */
+const PENDING_DELAY_MS = 150;
+
 export interface RunOptions {
   /** Result tab to replace in place (Reload Page). */
   replace?: ResultTab;
@@ -103,7 +113,14 @@ export class ConsoleSession implements OutputHost {
   readonly out: ConsoleOutput;
   readonly driver: DataSource["driver"];
   editor?: SqlEditorHandle;
-  sessionId?: string;
+  /** The DB session of the console (undefined until the first run / after it was lost); reactive for the Services window. */
+  private readonly sidSig = createSignal<string | undefined>(undefined);
+  get sessionId(): string | undefined {
+    return this.sidSig[0]();
+  }
+  set sessionId(v: string | undefined) {
+    this.sidSig[1](v);
+  }
   private opening?: Promise<string>;
   private disposed = false;
   /** SET commands etc. of the live session, and (after the session was lost) of the dead one, until the reopen says so. */
@@ -141,6 +158,9 @@ export class ConsoleSession implements OutputHost {
   private readonly setMarks: (m: ExecMark[]) => void;
   readonly errors: Accessor<EditorError[]>;
   private readonly setErrors: (e: EditorError[]) => void;
+  /** The error of the last run (full text), shown in the banner at the bottom of the editor until dismissed or the next run. */
+  readonly execError: Accessor<string | null>;
+  readonly setExecError: (m: string | null) => void;
   /** The page size of this console: the pill's choice, else the Settings page size (reactive). */
   readonly pageSize: Accessor<PageSize>;
   private readonly setPageSize: (p: PageSize) => void;
@@ -168,6 +188,7 @@ export class ConsoleSession implements OutputHost {
     );
     [this.marks, this.setMarks] = sig<ExecMark[]>([]);
     [this.errors, this.setErrors] = sig<EditorError[]>([]);
+    [this.execError, this.setExecError] = sig<string | null>(null);
     const [sizeOverride, setSizeOverride] = createSignal<PageSize | null>(null);
     this.pageSize = () => sizeOverride() ?? defaultPageSize();
     this.setPageSize = (p) => void setSizeOverride(() => p);
@@ -383,6 +404,13 @@ export class ConsoleSession implements OutputHost {
     this.editor?.focus();
   }
 
+  /** `Open in Console` of the SQL popup: the text goes in at the caret (replacing the selection). */
+  insertSql(text: string): void {
+    const v = this.editor?.view;
+    if (v) v.dispatch(v.state.replaceSelection(text), { scrollIntoView: true });
+    this.focusEditor();
+  }
+
   cancel(): void {
     void this.curHandle?.then((h) => h.cancel()).catch(() => {});
   }
@@ -472,6 +500,7 @@ export class ConsoleSession implements OutputHost {
       if (out.running()) return;
     }
     out.setRunning(true);
+    this.setExecError(null);
     showToolWindow("output", false);
     const pageSize = o.pageSize ?? this.pageSize();
     const stmtTotal = Math.max(1, splitStatements(req.sql, this.driver).length);
@@ -513,27 +542,70 @@ export class ConsoleSession implements OutputHost {
 
     let doneEvent: { elapsedMs: number; executionMs: number; fetchingMs: number } | null = null;
 
+    // --- the running state: the gutter spinner + elapsed inlay of the statement and its pending result tab
+    let pendingTimer: ReturnType<typeof setTimeout> | undefined;
+    let placeholder: ResultTab | null = null;
+    const stopPending = () => {
+      clearTimeout(pendingTimer);
+      pendingTimer = undefined;
+      if (placeholder) out.clearPending();
+      placeholder = null;
+    };
+    // the inlay counts whole seconds: the marks are only rewritten when the number changes
+    let shownSecs = 0;
+    const tickRunning = () => {
+      if (!cur) return;
+      const ms = nowMs() - cur.t0;
+      const secs = Math.floor(ms / 1000);
+      if (secs === shownSecs) return;
+      shownSecs = secs;
+      const marks = this.currentMarks();
+      if (marks.some((m) => m.status === "running")) this.setMarks(marks.map((m) => (m.status === "running" ? { ...m, ms } : m)));
+    };
+    const tick = setInterval(tickRunning, 250);
+    const resultTitle = (meta: ColumnMeta[], sql: string, from: number | null, n: number) => {
+      const parts = resultTable(meta, sql, this.driver);
+      return (
+        leadingComment(sql) ?? (req.ranges.length && from !== null ? this.attachedComment(from) : null) ?? (parts ? qualifiedTitle(parts, this.driver, this.ds.database, scriptSchema) : `Result ${n}`)
+      );
+    };
+
     const handlers: ExecHandlers = {
       onStatement: (e) => {
         executed++;
         const from = this.docOffset(req, e.range.startUtf16);
         const to = this.docOffset(req, e.range.endUtf16);
         this.noteSetting(e.sql);
+        stopPending();
         cur = { sql: e.sql, t0: nowMs(), from, to, errored: false, schema: schemaChange(e.sql, this.driver) ?? undefined };
+        shownSecs = 0;
         out.log("sql", e.sql, this.prompt());
         if (req.ranges.length) {
           const r = this.editorStatement(from, to);
           this.setErrors(this.currentErrors().filter((x) => !(x.statementFrom >= r.from && x.statementFrom < r.to) && x.statementFrom !== from));
+          // spinner instead of the check mark, and the elapsed time after the statement
+          const keep = this.currentMarks().filter((m) => !(m.from < r.to && m.to > r.from) && m.from !== r.from);
+          this.setMarks([...keep, { from: r.from, to: r.to, status: "running", ms: 0 }]);
+        }
+        // the result tab of a statement that returns rows replaces the unpinned ones while it runs
+        if (first && returnsRows(e.sql)) {
+          const sql = e.sql;
+          const startFrom = from;
+          pendingTimer = setTimeout(() => {
+            pendingTimer = undefined;
+            const tab = new ResultTab([], [], false, resultTitle([], sql, startFrom, ordinal + 1), sql, e.index, () => handleP, pageSize);
+            placeholder = tab;
+            out.showPending(tab, o.replace);
+          }, PENDING_DELAY_MS);
         }
       },
       onResultSet: (e) => {
         const ms = nowMs() - (cur?.t0 ?? t00);
+        stopPending();
         ordinal++;
         const sql = cur?.sql ?? req.sql;
         const meta = e.columns;
-        const parts = resultTable(meta, sql, this.driver);
-        const title =
-          leadingComment(sql) ?? (req.ranges.length && cur ? this.attachedComment(cur.from) : null) ?? (parts ? qualifiedTitle(parts, this.driver, this.ds.database, scriptSchema) : `Result ${ordinal}`);
+        const title = resultTitle(meta, sql, req.ranges.length && cur ? cur.from : null, ordinal);
         const tab = new ResultTab(meta, e.rows, e.hasMore, title, sql, e.index, () => handleP, pageSize);
         tab.ms = ms;
         // editable when it is one table with a usable key (resolved with the table's metadata, so a moment later)
@@ -546,6 +618,7 @@ export class ConsoleSession implements OutputHost {
         if (pageSize === "all" && e.hasMore) void tab.loadAll();
       },
       onUpdate: (e) => {
+        stopPending();
         if (cur?.schema) {
           schemaTouched = true;
           if (cur.schema.schema) scriptSchema = cur.schema.schema;
@@ -560,7 +633,9 @@ export class ConsoleSession implements OutputHost {
         mark("ok", ms);
       },
       onError: (e) => {
+        stopPending(); // the earlier result stays selected
         failed++;
+        this.setExecError(e.message);
         out.log("error", e.message);
         if (isConnectionLost(e)) sessionClosed = true; // `connectionLost`, `[08006]` / `[08S01]`, or the session is gone
         const ms = nowMs() - (cur?.t0 ?? t00);
@@ -636,12 +711,18 @@ export class ConsoleSession implements OutputHost {
       await handle.done;
     };
 
+    let launchFailed = false;
     try {
       await launch();
     } catch (e) {
       rejectHandle(e);
+      launchFailed = true;
       out.log("error", errText(e));
     }
+    clearInterval(tick);
+    stopPending();
+    // a statement that never reported back (the call itself failed) must not keep its spinner
+    if (this.currentMarks().some((m) => m.status === "running")) this.setMarks(this.currentMarks().filter((m) => m.status !== "running"));
 
     // timing breakdown (`execution: x ms, fetching: y ms`): exact for one statement, proportional for scripts
     const total = nowMs() - t00;
@@ -657,7 +738,7 @@ export class ConsoleSession implements OutputHost {
         else out.patchLine(r.lineId, r.kind === "update" ? rowsAffected(r.n, ms) : completedIn(ms));
       }
       // the server reports whole milliseconds (0 for fast statements): fall back to the client clock
-      const roundTrip = Math.max(de.elapsedMs, de.executionMs + de.fetchingMs) || recs.reduce((a, r) => a + r.ms, 0);
+      const roundTrip = Math.max(de.elapsedMs, de.executionMs + de.fetchingMs) || recs.reduce((a, r) => a + r.ms, 0) || total;
       if (recs.length === 1 && cur) {
         // the gutter hint shows the whole round trip, like the header
         const c = cur as { from: number; to: number };
@@ -672,11 +753,21 @@ export class ConsoleSession implements OutputHost {
       out.setLastMs(total);
     }
     for (const r of staleTabs) r.announce();
-    if (first) out.select("output"); // nothing returned rows: show the log
+    // nothing returned rows: show the log, unless a statement failed (the earlier result stays in front, the editor shows the error)
+    if (first && !failed && !launchFailed) out.select("output");
     if (sessionClosed) this.sessionLost({ tx: txLost || txAtStart || this.inTx() });
     if (this.sessionId && schemaTouched) await this.afterSchemaChange(this.sessionId, scriptSchema, schemaUnknown, searchPath ?? null);
     out.setRunning(false);
     if (reloadEdited) this.reloadEdited();
+    this.announceLongRun(req, total);
+  }
+
+  /** A long run ended while the console is out of sight (another tab, or the window has no focus): a balloon says so. */
+  private announceLongRun(req: ExecuteRequest, ms: number): void {
+    if (ms < LONG_RUN_MS || this.disposed || typeof document === "undefined") return;
+    if (document.hasFocus() && activeTab()?.id === this.tabId) return;
+    const text = req.sql.replace(/\s+/g, " ").trim();
+    notify({ kind: "info", title: this.consoleName, body: `${text.length > 30 ? `${text.slice(0, 30)}...` : text} completed.`, timeout: 8000 });
   }
 
   /**

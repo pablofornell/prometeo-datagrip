@@ -6,8 +6,9 @@ use std::path::PathBuf;
 
 use dbcore::{
     ApplyResult, ConnectInfo, DataSourceConfig, Driver, ExecEvent, ExecOptions, ExportFormat,
-    ExportOptions, FetchedRows, HistoryEntry, ObjectRef, ResultSet, RowChange, SessionState,
-    SnapshotObject, Statement, TableDataRequest, TestResult, TreeNode, TxStatus,
+    ExportOptions, FetchedRows, HistoryEntry, ImportFormat, ImportPreview, ImportProgress,
+    ImportRequest, ImportResult, ObjectRef, ResultSet, RowChange, SessionState, SnapshotObject,
+    Statement, TableDataRequest, TestResult, TreeNode, TxStatus,
 };
 use serde_json::Value;
 use tauri::ipc::Channel;
@@ -278,6 +279,58 @@ pub async fn choose_export_path(
     Ok(Some(path.display().to_string()))
 }
 
+/// The user's home directory.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|h| h.is_absolute())
+}
+
+/// `<home>/<file name>`: the default of the Export Data dialog's "Output file" (only the file name of
+/// `file_name` is used). `null` when the home directory is unknown.
+#[tauri::command]
+pub async fn default_export_path(file_name: String) -> Res<Option<String>> {
+    let name = std::path::Path::new(&file_name)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty() && !n.starts_with('.'));
+    Ok(home_dir()
+        .zip(name)
+        .map(|(h, n)| h.join(n).display().to_string()))
+}
+
+/// May the backend write a NEW file at `path` without the save dialog? Only a file that does not exist yet,
+/// directly inside an existing folder under `home`, with no hidden (dot) component below `home`: the user
+/// typed it in the Export Data dialog, but it cannot overwrite anything or reach `~/.ssh`, `~/.bashrc`...
+fn typed_export_path_ok(path: &std::path::Path, home: &std::path::Path) -> bool {
+    use std::path::Component;
+    let Ok(rel) = path.strip_prefix(home) else {
+        return false;
+    };
+    if !path.is_absolute() || rel.as_os_str().is_empty() {
+        return false;
+    }
+    let plain = rel.components().all(|c| match c {
+        Component::Normal(n) => !n.to_string_lossy().starts_with('.'),
+        _ => false,
+    });
+    plain && !path.exists() && path.parent().is_some_and(|d| d.is_dir())
+}
+
+/// The Export Data dialog's typed "Output file": permits `export_query` / `export_result` to write that path
+/// when it is a new file under the home directory (see [`typed_export_path_ok`]). `false`: the caller must
+/// go through `choose_export_path` (the save dialog asks before it overwrites).
+#[tauri::command]
+pub async fn approve_export_path(state: State<'_, AppState>, path: String) -> Res<bool> {
+    let path = PathBuf::from(path);
+    let ok = home_dir().is_some_and(|h| typed_export_path_ok(&path, &h));
+    if ok {
+        state.allow_export_path(path);
+    }
+    Ok(ok)
+}
+
 /// `path` must come from `choose_export_path`.
 #[tauri::command]
 pub async fn export_query(
@@ -322,6 +375,97 @@ pub async fn export_to_string(
     options: ExportOptions,
 ) -> Res<String> {
     state.export_to_string(result, options).await
+}
+
+// ---------------------------------------------------------------- import
+
+/// The file picked in the import dialog.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSource {
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+    /// Where the rows that fail are written unless the user picks another file.
+    pub default_error_file: String,
+}
+
+/// Open the native "Open" dialog from the backend and return the chosen file (`null` = cancelled). Only a file
+/// returned here is read by `import_preview` / `import_file`: the webview cannot make the backend read an
+/// arbitrary path.
+#[tauri::command]
+pub async fn choose_import_file(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Res<Option<ImportSource>> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_parent(&window)
+        .add_filter("Delimited text", &["csv", "tsv", "txt"])
+        .add_filter("All files", &["*"])
+        .pick_file(move |p| {
+            let _ = tx.send(p);
+        });
+    let Some(chosen) = rx
+        .await
+        .map_err(|_| "The open dialog was closed".to_string())?
+    else {
+        return Ok(None);
+    };
+    let path = chosen.into_path().map_err(|e| e.to_string())?;
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let default_error_file = AppState::default_error_file(&path).display().to_string();
+    state.allow_import_path(path.clone());
+    Ok(Some(ImportSource {
+        path: path.display().to_string(),
+        name,
+        size,
+        default_error_file,
+    }))
+}
+
+/// Column names, the first `limit` rows and an inferred type per column of a file from `choose_import_file`.
+#[tauri::command]
+pub async fn import_preview(
+    state: State<'_, AppState>,
+    path: String,
+    format: ImportFormat,
+    limit: Option<usize>,
+) -> Res<ImportPreview> {
+    state
+        .import_preview(&path, format, limit.unwrap_or(10))
+        .await
+}
+
+/// Streams the file into the table in one transaction; `on_progress` gets a progress event after every batch.
+/// `request.path` must come from `choose_import_file`; `request.options.errorFile` must be the default error
+/// file of that path or come from `choose_export_path`.
+#[tauri::command]
+pub async fn import_file(
+    state: State<'_, AppState>,
+    ds_id: String,
+    import_id: String,
+    request: ImportRequest,
+    on_progress: Channel<ImportProgress>,
+) -> Res<ImportResult> {
+    state
+        .import_file(&ds_id, &import_id, request, move |p| {
+            let _ = on_progress.send(p);
+        })
+        .await
+}
+
+#[tauri::command]
+pub async fn cancel_import(state: State<'_, AppState>, import_id: String) -> Res<()> {
+    state.cancel_import(&import_id);
+    Ok(())
 }
 
 // ---------------------------------------------------------------- splitter
@@ -434,4 +578,31 @@ pub async fn rename_console(
     to: String,
 ) -> Res<()> {
     state.rename_console(&ds_id, &from, &to).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::typed_export_path_ok;
+
+    #[test]
+    fn typed_export_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        std::fs::create_dir(h.join("docs")).unwrap();
+        std::fs::create_dir(h.join(".ssh")).unwrap();
+        std::fs::write(h.join("old.csv"), "x").unwrap();
+        assert!(typed_export_path_ok(&h.join("new.csv"), h));
+        assert!(typed_export_path_ok(&h.join("docs/new.csv"), h));
+        // exists, hidden, missing folder, outside home, traversal, the home itself
+        assert!(!typed_export_path_ok(&h.join("old.csv"), h));
+        assert!(!typed_export_path_ok(&h.join(".bashrc"), h));
+        assert!(!typed_export_path_ok(&h.join(".ssh/authorized_keys"), h));
+        assert!(!typed_export_path_ok(&h.join("nope/new.csv"), h));
+        assert!(!typed_export_path_ok(
+            std::path::Path::new("/etc/new.csv"),
+            h
+        ));
+        assert!(!typed_export_path_ok(&h.join("docs/../../x.csv"), h));
+        assert!(!typed_export_path_ok(h, h));
+    }
 }

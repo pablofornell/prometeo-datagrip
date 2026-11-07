@@ -165,13 +165,22 @@ function routineHint(hint: string): string {
   return `(${out.join(", ")})${m[2]}`;
 }
 
+/** Objects whose comment is shown as a hover tooltip (never as an inline hint, like DataGrip). */
+const COMMENTED: ReadonlySet<NodeKind> = new Set(["database", "schema", "table", "view", "materializedView"]);
+
+export function commentOf(tn: TreeNode): string | undefined {
+  if (!COMMENTED.has(tn.kind)) return undefined;
+  // SQLite reports the database file as the "comment" of a schema; MySQL reports "VIEW" for views
+  const c = typeof tn.extra.comment === "string" ? tn.extra.comment : tn.extra.file || tn.kind === "database" ? undefined : tn.hint;
+  const t = c?.trim();
+  return !t || (tn.kind === "view" && t === "VIEW") ? undefined : t;
+}
+
 export function hintOf(tn: TreeNode): string | undefined {
+  if (COMMENTED.has(tn.kind)) return undefined;
   switch (tn.kind) {
     case "column":
       return columnHint(tn) || undefined;
-    case "schema":
-      // SQLite reports the database file as the "comment" of a schema: DataGrip shows just `main`.
-      return tn.extra.file ? undefined : (tn.hint ?? undefined);
     case "foreignKey":
       return tn.hint ? fkHint(tn.hint) : undefined;
     case "check":

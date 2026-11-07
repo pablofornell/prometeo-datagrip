@@ -166,6 +166,12 @@
 .sql-editor .cm-sql-param {
   color: var(--dg-editor-parameter);
 }
+/* Ctrl+hover on a resolvable name: link look, like DataGrip */
+.sql-editor .cm-sql-link {
+  color: var(--dg-editor-hyperlink);
+  text-decoration: underline;
+  cursor: pointer;
+}
 .sql-editor .cm-sql-error-wave {
   text-decoration: underline wavy var(--dg-editor-error-wave);
   text-decoration-thickness: 1px;
@@ -237,6 +243,9 @@
 }
 .sql-editor .cm-exec-err {
   color: var(--dg-editor-error-stripe);
+}
+.sql-editor .cm-exec-running {
+  color: var(--dg-icon);
 }
 .sql-editor .cm-exec-hint {
   font-family: var(--dg-font-ui);
@@ -337,6 +346,10 @@
   color: var(--dg-text);
   user-select: none;
 }
+.sql-editor .cm-inspect-paused {
+  margin-right: 4px;
+  color: var(--dg-text-secondary);
+}
 .sql-editor .cm-inspect-icon {
   display: inline-flex;
   width: 16px;
@@ -385,6 +398,16 @@
   white-space: pre-wrap;
   background: var(--dg-editor-tooltip-error-bg);
   border-radius: 5px;
+  color: var(--dg-text);
+}
+/* live inspection tooltip: neutral background (the red one is for the server error of an execution) */
+.cm-inspect-tip {
+  padding: 8px 10px;
+  max-width: 520px;
+  font-family: var(--dg-font-ui);
+  font-size: 13px;
+  line-height: 16px;
+  white-space: pre-wrap;
   color: var(--dg-text);
 }
 
@@ -748,4 +771,22 @@
 }
 .sql-editor .cm-placeholder {
   color: var(--dg-input-placeholder);
+}
+
+/* ---- highlighted SQL outside an editor (Quick Documentation DDL block) -------------------------- */
+.dg-sql-hl .cm-sql-kw {
+  color: var(--dg-editor-keyword);
+}
+.dg-sql-hl .cm-sql-str {
+  color: var(--dg-editor-string);
+}
+.dg-sql-hl .cm-sql-num {
+  color: var(--dg-editor-number);
+}
+.dg-sql-hl .cm-sql-cmt {
+  color: var(--dg-editor-line-comment);
+}
+.dg-sql-hl .cm-sql-fn {
+  color: var(--dg-editor-static-method);
+  font-style: italic;
 }

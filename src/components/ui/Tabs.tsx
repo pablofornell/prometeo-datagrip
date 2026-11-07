@@ -12,6 +12,8 @@ export interface TabItem {
   /** Unsaved changes: a dot replaces the × until the pointer is over the tab button. */
   modified?: boolean;
   tooltip?: string;
+  /** Data source color: tints the tab (see explorer.css). */
+  color?: string;
 }
 
 export interface TabsProps {
@@ -77,7 +79,8 @@ export function Tabs(props: TabsProps): JSX.Element {
             <div
               role="tab"
               class="dg-tab"
-              classList={{ "dg-selected": props.active === t.id, "dg-tab-is-modified": !!t.modified }}
+              classList={{ "dg-selected": props.active === t.id, "dg-tab-is-modified": !!t.modified, "dg-tab-tinted": !!t.color }}
+              style={t.color ? { "--dg-tab-tint": t.color } : undefined}
               aria-selected={props.active === t.id}
               draggable={!!props.onReorder && variant() !== "dialog"}
               onDragStart={(e) => {

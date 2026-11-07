@@ -58,10 +58,16 @@ impl fmt::Display for ServerError {
                 Some(n) => write!(f, "[{}][{}] {}", self.code, n, self.message),
                 None => write!(f, "[{}] {}", self.code, self.message),
             },
-            Driver::Sqlite => match sqlite_description(self.native_code.unwrap_or(0)) {
-                Some(desc) => write!(f, "[{}] {} ({})", self.code, desc, self.message),
-                None => write!(f, "[{}] {}", self.code, self.message),
-            },
+            // DataGrip prefixes the (extended) result code: `[1] [SQLITE_ERROR] SQL error or missing database (...)`
+            Driver::Sqlite => {
+                if let Some(n) = self.native_code.filter(|n| *n != 0) {
+                    write!(f, "[{n}] ")?;
+                }
+                match sqlite_description(self.native_code.unwrap_or(0)) {
+                    Some(desc) => write!(f, "[{}] {} ({})", self.code, desc, self.message),
+                    None => write!(f, "[{}] {}", self.code, self.message),
+                }
+            }
         }
     }
 }

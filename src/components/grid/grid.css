@@ -593,6 +593,7 @@
 .dgg-pill-main { padding: 0 5px 0 12px; gap: 1px; border-radius: 7px 0 0 7px; }
 .dgg-pill-more { padding: 0 9px 0 9px; border-radius: 0 7px 7px 0; }
 .dgg-pill button:hover { background: var(--dg-hover-bg, #ffffff17); }
+.dgg-pill-of { padding: 0 10px 0 6px; }
 .dgg-pill-sep { width: 1px; height: 20px; background: var(--dg-separator, #414346); flex: none; }
 
 /* ======================================================================================================

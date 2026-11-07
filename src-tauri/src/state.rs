@@ -11,11 +11,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use dbcore::import::CancellationToken;
 use dbcore::{
     export_result, export_to_string, ApplyResult, ConnectInfo, ConnectionManager, DataSourceConfig,
     Driver, ExecEvent, ExecOptions, ExecutionId, ExportOptions, FetchedRows, HistoryEntry,
-    ObjectRef, QueryHistory, ResultSet, RowChange, SessionId, SessionState, SnapshotObject,
-    Statement, TableDataRequest, TestResult, TreeNode, TxStatus,
+    ImportFormat, ImportPreview, ImportProgress, ImportRequest, ImportResult, ObjectRef,
+    QueryHistory, ResultSet, RowChange, SessionId, SessionState, SnapshotObject, Statement,
+    TableDataRequest, TestResult, TreeNode, TxStatus,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -42,6 +44,9 @@ pub struct AppInfo {
 /// How long a path chosen in the save dialog stays valid for `export_query` / `export_result`.
 const EXPORT_PATH_TTL: Duration = Duration::from_secs(300);
 
+/// How long a file chosen in the import dialog may be previewed and imported (renewed by every use).
+const IMPORT_PATH_TTL: Duration = Duration::from_secs(3600);
+
 /// A running (or still pageable) execution.
 #[derive(Debug, Clone)]
 pub struct ExecMeta {
@@ -65,6 +70,11 @@ pub struct AppState {
     /// Export targets the user picked in a save dialog opened by the backend (`choose_export_path`), each
     /// valid once and for [`EXPORT_PATH_TTL`]. `export_query` / `export_result` write nowhere else.
     export_paths: Mutex<HashMap<PathBuf, Instant>>,
+    /// Files the user picked in the open dialog opened by the backend (`choose_import_file`): the only ones
+    /// `import_preview` / `import_file` read.
+    import_paths: Mutex<HashMap<PathBuf, Instant>>,
+    /// import id -> cancellation token of a running import.
+    imports: Mutex<HashMap<String, CancellationToken>>,
 }
 
 /// Run blocking work (file IO, keyring) off the async workers.
@@ -159,6 +169,8 @@ impl AppState {
             sessions: Mutex::new(HashMap::new()),
             executions: Arc::new(Mutex::new(HashMap::new())),
             export_paths: Mutex::new(HashMap::new()),
+            import_paths: Mutex::new(HashMap::new()),
+            imports: Mutex::new(HashMap::new()),
         })
     }
 
@@ -591,6 +603,84 @@ impl AppState {
         opts: ExportOptions,
     ) -> Result<String, String> {
         export_to_string(&rs, &opts).map_err(String::from)
+    }
+
+    // ------------------------------------------------------------ import
+
+    /// Remember `path` as chosen by the user in the open dialog.
+    pub fn allow_import_path(&self, path: PathBuf) {
+        let mut m = self.import_paths.lock().unwrap();
+        m.retain(|_, t| t.elapsed() < IMPORT_PATH_TTL);
+        m.insert(path, Instant::now());
+    }
+
+    /// The path of a file picked by the user (its permission is renewed), or the reason it is refused.
+    fn check_import_path(&self, path: &str) -> Result<PathBuf, String> {
+        let path = PathBuf::from(path);
+        let mut m = self.import_paths.lock().unwrap();
+        m.retain(|_, t| t.elapsed() < IMPORT_PATH_TTL);
+        match m.get_mut(&path) {
+            Some(t) => {
+                *t = Instant::now();
+                Ok(path)
+            }
+            None => Err(format!(
+                "Refusing to read {}: import files must be chosen in the open dialog (choose_import_file)",
+                path.display()
+            )),
+        }
+    }
+
+    /// `<folder of the file>/<name of the file>_errors.txt`: where the rows that fail are written unless the user
+    /// picks another place.
+    pub fn default_error_file(path: &Path) -> PathBuf {
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "import".into());
+        path.with_file_name(format!("{stem}_errors.txt"))
+    }
+
+    pub async fn import_preview(
+        &self,
+        path: &str,
+        format: ImportFormat,
+        limit: usize,
+    ) -> Result<ImportPreview, String> {
+        let path = self.check_import_path(path)?;
+        blocking(move || dbcore::import::preview(&path, &format, limit).map_err(String::from)).await
+    }
+
+    /// Runs the import; `import_id` (chosen by the caller) lets [`cancel_import`](Self::cancel_import) stop it.
+    pub async fn import_file(
+        &self,
+        ds_id: &str,
+        import_id: &str,
+        mut req: ImportRequest,
+        progress: impl Fn(ImportProgress) + Send + Sync,
+    ) -> Result<ImportResult, String> {
+        req.path = self.check_import_path(&req.path.to_string_lossy())?;
+        if let Some(p) = req.options.error_file.clone() {
+            // the default place, or a file the user picked in a save dialog
+            if p != Self::default_error_file(&req.path) {
+                self.take_export_path(&p)?;
+            }
+        }
+        let token = CancellationToken::new();
+        self.imports
+            .lock()
+            .unwrap()
+            .insert(import_id.to_string(), token.clone());
+        let res = self.mgr.import_file(ds_id, &req, &token, &progress).await;
+        self.imports.lock().unwrap().remove(import_id);
+        res.map_err(String::from)
+    }
+
+    /// Rolls a running import back. No-op when it already ended.
+    pub fn cancel_import(&self, import_id: &str) {
+        if let Some(t) = self.imports.lock().unwrap().get(import_id) {
+            t.cancel();
+        }
     }
 
     // ------------------------------------------------------------ splitter

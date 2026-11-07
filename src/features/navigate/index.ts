@@ -1,6 +1,7 @@
 /**
- * Navigation popups: Search Everywhere (Shift Shift, toolbar search button) and Go to Database Object (Ctrl+N).
- * Importing this module registers the actions `nav.searchEverywhere` and `nav.gotoObject` (the registry prefers an
+ * Navigation popups: Search Everywhere (Shift Shift, toolbar search button), Go to Database Object (Ctrl+N) and
+ * Find Action (Ctrl+Shift+A, the Actions tab of the same popup).
+ * Importing this module registers the actions `nav.searchEverywhere`, `nav.gotoObject` and `nav.findAction` (the registry prefers an
  * implemented action over the shell's stub whatever the registration order).
  */
 import { registerActions } from "../../state/actions";
@@ -11,6 +12,7 @@ import "./navigate.css";
 const dispose = registerActions([
   { id: ACTION_IDS.searchEverywhere, title: "Search Everywhere", shortcut: "Shift Shift", icon: "search", run: () => openSearch("all") },
   { id: ACTION_IDS.gotoObject, title: "Go to Database Object…", shortcut: "Ctrl+N", run: () => openSearch("db") },
+  { id: "nav.findAction", title: "Find Action…", shortcut: "Ctrl+Shift+A", run: () => openSearch("action") },
 ]);
 
 if (import.meta.hot) import.meta.hot.dispose(dispose);

@@ -26,7 +26,7 @@ import {
   uniqueName,
   validate,
 } from "./model";
-import { emitDataSourcesChanged } from "./events";
+import { emitDataSourcesChanged, emitDataSourcesCreated } from "./events";
 
 let keySeq = 0;
 const newKey = () => `ds-${++keySeq}`;
@@ -384,9 +384,11 @@ export function createSession() {
       }
       setDeletedIds([]);
       const keys = drafts.filter((d) => isNew(d) || isModified(d)).map((d) => d.key);
+      const created: string[] = [];
       for (const key of keys) {
         const i = indexOf(key);
         const d = drafts[i];
+        const wasNew = isNew(d);
         let saved: DataSource;
         if (d.id != null && d.saved && !needsSave(d)) {
           // only the schema filter changed: a UI-state write, the backend (and its connection) is left alone
@@ -396,6 +398,7 @@ export function createSession() {
           saved = await saveDataSource(cfg);
         }
         saveVisibleSchemas(saved.id, d.form.options.visibleSchemas);
+        if (wasNew) created.push(saved.id);
         const j = indexOf(key);
         if (j < 0) continue;
         batch(() => {
@@ -406,6 +409,7 @@ export function createSession() {
       }
       setError(null);
       emitDataSourcesChanged();
+      if (created.length) emitDataSourcesCreated(created);
       return true;
     } catch (e) {
       setError(String(e));

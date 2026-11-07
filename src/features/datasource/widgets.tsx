@@ -122,7 +122,7 @@ export const COLORS: ColorOption[] = [
   { name: "Gray", value: "#8B8E94" },
 ];
 
-const swatch = (color: string) =>
+export const swatch = (color: string) =>
   "data:image/svg+xml;utf8," +
   encodeURIComponent(
     `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><rect x="2" y="2" width="12" height="12" rx="3" fill="${color}"/></svg>`,

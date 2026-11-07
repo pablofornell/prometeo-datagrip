@@ -43,6 +43,8 @@ export interface TreeItem {
   children?: TreeItem[];
   labelClass?: string;
   tooltip?: string;
+  /** Draw the tooltip in the editor font (object comments). */
+  tooltipMono?: boolean;
   /** Free payload for the owner. */
   data?: unknown;
 }
@@ -82,6 +84,8 @@ export interface TreeProps<T extends TreeItem = TreeItem> {
   onSpeedSearchChange?: (query: string) => void;
   /** Show the floating speed-search field over the tree (default true). */
   speedSearchField?: boolean;
+  /** Tint of a row (CSS color, painted at the alpha of `--dg-ds-tint-mix` behind the selection). */
+  rowColor?: (item: T) => string | undefined;
   /** Custom label content (default: highlighted label + hint + badge). */
   renderLabel?: (item: T, query: string) => JSX.Element;
   emptyText?: JSX.Element;
@@ -463,13 +467,14 @@ export function Tree<T extends TreeItem = TreeItem>(props: TreeProps<T>): JSX.El
             return (
             <div
               class="dg-tree-row"
-              classList={{ "dg-selected": r().item.id === selId() }}
+              classList={{ "dg-selected": r().item.id === selId(), "dg-tinted": !!props.rowColor?.(r().item) }}
               data-row-id={r().item.id}
               role="treeitem"
               aria-expanded={r().hasChildren ? r().expanded : undefined}
               aria-selected={r().item.id === selId()}
-              style={{ top: v().i * ROW_H + "px", "padding-left": r().depth * 19 + "px" }}
-              title={r().item.tooltip}
+              style={{ top: v().i * ROW_H + "px", "padding-left": r().depth * 19 + "px", "--dg-row-tint": props.rowColor?.(r().item) }}
+              data-tip={r().item.tooltip}
+              data-tip-mono={r().item.tooltip && r().item.tooltipMono ? "" : undefined}
               onDblClick={() => {
                 const done = props.onActivate?.(r().item, "dblclick");
                 if (!done && r().hasChildren) toggle(r().item.id);

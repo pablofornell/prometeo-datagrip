@@ -34,7 +34,7 @@ function adoptTitle(t: Element | null): Element | null {
 }
 
 export function TooltipHost(): JSX.Element {
-  const [shown, setShown] = createSignal<{ text: string; shortcut?: string; x: number; y: number } | null>(null);
+  const [shown, setShown] = createSignal<{ text: string; shortcut?: string; mono?: boolean; x: number; y: number } | null>(null);
   const [pos, setPos] = createSignal<{ left: number; top: number } | null>(null);
   let el: HTMLDivElement | undefined;
   let timer = 0;
@@ -60,7 +60,8 @@ export function TooltipHost(): JSX.Element {
     const delay = performance.now() - lastHidden < REUSE_WINDOW ? REUSE_DELAY : INITIAL_DELAY;
     timer = window.setTimeout(() => {
       const text = (t as HTMLElement).dataset.tip;
-      if (text) setShown({ text, shortcut: (t as HTMLElement).dataset.tipShortcut, x: mx, y: my });
+      // `data-tip-mono`: object comments are shown in the editor font (explorer tree)
+      if (text) setShown({ text, shortcut: (t as HTMLElement).dataset.tipShortcut, mono: "tipMono" in (t as HTMLElement).dataset, x: mx, y: my });
     }, delay);
   };
   const move = (e: MouseEvent) => {
@@ -104,6 +105,7 @@ export function TooltipHost(): JSX.Element {
           <div
             ref={el}
             class="dg-tooltip"
+            classList={{ "dg-tooltip-mono": s().mono }}
             style={{ left: (pos()?.left ?? 0) + "px", top: (pos()?.top ?? 0) + "px", visibility: pos() ? "visible" : "hidden" }}
           >
             <For each={s().text.split("\n")}>

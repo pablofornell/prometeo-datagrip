@@ -1,8 +1,11 @@
 /** The 34px toolbar under the header: log mini toolbar on the Output tab, the grid toolbar on result tabs. */
 import { Show, type JSX } from "solid-js";
 import { GridToolbar } from "../../components/grid";
+import type { ObjectRef } from "../../api/types";
 import { ActionButton, Icon, type MenuItem, openMenu } from "../../components/ui";
-import { FORMATS, copyResult, exportResultToFile, formatLabel } from "./export";
+import { openDdlTab } from "../table/commands";
+import { FORMATS, copyResult, exportResultData, formatLabel } from "./export";
+import { resultTable } from "../console/title";
 import { currentOutput, type ConsoleOutput, type ResultTab } from "./model";
 
 /** Cancel Running Statements: gray square while idle, the red stop icon only while something runs. */
@@ -24,6 +27,17 @@ function ResultToolbar(props: { out: ConsoleOutput; tab: ResultTab }): JSX.Eleme
 
   const api = () => tab().gridApi;
   const edit = () => !!tab().edit();
+  /** The table the result reads (`Go to DDL`): the editable target, else the one table of a plain select. */
+  const ddl = (): ObjectRef | null => {
+    const h = host();
+    if (!h) return null;
+    const e = tab().edit();
+    if (e) return e.table;
+    const parts = resultTable(tab().meta, tab().sql, h.driver);
+    if (!parts) return null;
+    const schema = parts.length > 1 ? parts[0] : h.driver === "sqlite" ? "main" : (h.schema?.() ?? null);
+    return { schema, name: parts[parts.length - 1], kind: "table" };
+  };
   return (
     <div>
       <GridToolbar
@@ -66,15 +80,9 @@ function ResultToolbar(props: { out: ConsoleOutput; tab: ResultTab }): JSX.Eleme
         }
         pinned={tab().pinned()}
         onPin={() => tab().setPinned(!tab().pinned())}
-        onExport={(anchor) =>
-          at(
-            [
-              { label: "Export to File...", icon: "export", run: () => host() && void exportResultToFile(tab(), host()!, tab().extractor()) },
-              { label: "Copy to Clipboard", icon: "copy", run: () => host() && void copyResult(tab(), host()!, tab().extractor()) },
-            ],
-            anchor,
-          )
-        }
+        onSql={() => tab().setShowQuery(true)}
+        onDDL={ddl() ? () => void openDdlTab(host()!.dsId, ddl()!) : undefined}
+        onExport={() => host() && exportResultData(tab(), host()!)}
         onOptions={(r) =>
           at(
             [

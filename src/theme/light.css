@@ -237,6 +237,7 @@
   --dg-counter-fg: #FFFFFF;
   --dg-progress-fg: #3871E1;
   --dg-progress-track: #DDDFE4;
+  --dg-ds-tint-mix: 25%;                   /* data source color tint (tree rows, tabs, console) */
 
   /* ---- Swing tables ---- */
   --dg-table-bg: #F7F8F9;
@@ -354,4 +355,7 @@
   /* icons */
   --dg-icon: #6C707E;                   /* light SVG stroke as shipped (icon-default-stroke token is #73767C) */
   --dg-icon-disabled: #C3C5CB;
+
+  /* tool windows */
+  --dg-services-connected-dot: #1FB61F;      /* green "connected" dot on data source / session icons (Services) */
 }

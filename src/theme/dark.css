@@ -235,6 +235,7 @@
   --dg-counter-fg: #000000;
   --dg-progress-fg: #3871E1;            /* ProgressBar.progressColor */
   --dg-progress-track: #40434A;         /* ProgressBar.trackColor */
+  --dg-ds-tint-mix: 18%;                   /* data source color tint (tree rows, tabs, console) */
 
   /* ---- Swing tables (dialogs, e.g. driver properties) ---- */
   --dg-table-bg: #191A1C;
@@ -352,4 +353,7 @@
   /* icons */
   --dg-icon: #C3C5CB;                   /* icon-default-stroke (dark SVGs already recolored) */
   --dg-icon-disabled: #5F6269;
+
+  /* tool windows */
+  --dg-services-connected-dot: #1FD11F;      /* green "connected" dot on data source / session icons (Services) */
 }

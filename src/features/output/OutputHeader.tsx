@@ -57,12 +57,10 @@ export function OutputHeader(): JSX.Element {
         >
           {(o) => (
             <>
-              <Show when={o().running()} fallback={<img class="dg-icon" width="16" height="16" src={dsIconUrl(o().dialect)} alt="" />}>
-                <span class="dgo-spinner" />
-              </Show>
+              <img class="dg-icon" width="16" height="16" src={dsIconUrl(o().dialect)} alt="" />
               <span class="dgo-source-title">{tabTitle(o())}</span>
-              <Show when={o().lastMs() !== null}>
-                <span class="dgo-source-ms">{formatDuration(o().lastMs()!)}</span>
+              <Show when={o().running() ? true : o().lastMs() !== null}>
+                <span class="dgo-source-ms">{formatDuration(o().running() ? o().elapsed() : o().lastMs()!)}</span>
               </Show>
             </>
           )}

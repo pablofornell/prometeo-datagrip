@@ -1,8 +1,8 @@
 # Shell, slot API and UI kit (read this first if you plug a component into the main window)
 
 The shell (`src/App.tsx`, `src/components/shell/*`) renders the Islands window: 43px main toolbar, the
-Database Explorer island (left), the editor island with pill tabs, the Database Output island (bottom,
-full width), the 34px status bar and the splitters between the islands. It owns **no** database logic:
+tool window islands around the editor island (left, right and bottom docks; Database Explorer, Files, Database
+Output, Services), the 34px status bar and the splitters between the islands. It owns **no** database logic:
 everything else is plugged in through **slots**, **actions** and small **stores** in `src/state/`.
 
 ## 1. Slots: replace a placeholder
@@ -22,6 +22,9 @@ unless noted.
 | `explorer.toolbar` | 34px toolbar under the explorer header (use `ActionButton`, `ToolbarSeparator`, class `dg-toolbar dg-tw-toolbar`) | - |
 | `explorer.headerActions` | header buttons left of the built-in ⋮ and — (locate, expand all, collapse all); shown on hover/focus | - |
 | `explorer.header` | content right of the "Database Explorer" title | - |
+| `files.body` | Files tool window body (placeholder: `FilesToolWindow` of `src/features/files`) | - |
+| `services.body` | Services tool window body (`src/features/services`) | - |
+| `<id>.header` / `.headerActions` / `.toolbar` | same slots for every window id (`explorer`, `files`, `output`, `services`) | - |
 | `output.body` | Database Output body (results grid / log) | - |
 | `output.header` | next to the "Database Output" title: `Tabs variant="result"` (Output + result tabs) | - |
 | `output.headerActions` | right side of the output header (source + duration, open in editor), before ⋮ and — | - |
@@ -34,7 +37,7 @@ unless noted.
 * A tool window body is mounted the first time the window is shown, then kept alive.
 * Give the element that should receive focus when the tool window is activated (Alt+1, Alt+8) the attribute
   `data-focus-target` (the `Tree` already has it).
-* Header actions are only visible while the tool window is hovered, focused or the last active one (DataGrip behaviour).
+* Header actions are only visible while the tool window is hovered or has focus (DataGrip behaviour).
 
 ## 2. Actions and shortcuts (`src/state/actions.ts`)
 
@@ -61,7 +64,12 @@ handled (`preventDefault`) by a focused component (CodeMirror, Tree) is not disp
   `tabs()`, `activeTab()`. Persisted (id, title, icon, kind, pinned, data: keep `data` JSON).
 * `layout.ts`: `showToolWindow(id)`, `hideToolWindow(id)`, `toggleToolWindow(id)`, `layout.visible`, sizes
   (persisted via `saveUiState`; backend `get_ui_state` / `set_ui_state` with key `shell.layout`, localStorage mirror).
-  Tool windows are declared in `TOOL_WINDOWS` (`explorer` Alt+1, `output` Alt+8).
+  Tool windows are declared in `TOOL_WINDOWS` (`explorer` Alt+1, `files` Alt+4, `output` Alt+8, `services`): each has a
+  default anchor (`left` / `right` / `bottom`), size and toolbar pin; the user's anchor, size and pins are persisted
+  per window. At most one window is visible per anchor (showing `services` hides `output`). Also in `layout.ts`:
+  `moveToolWindow`, `stretchToolWindow`, `toggleMaximizeToolWindow`, `hideAllToolWindows` (second call restores the
+  set), `toolWindowMenuItems()` (entries of View › Tool Windows). The panels stay at a fixed place in the DOM and
+  `Shell` lays them out as a CSS grid (`data-anchor`), so moving a window keeps its body mounted.
 * `status.ts`: `setStatus({ path: [{label, icon}], caret: {line, col}, lineSeparator, encoding, readOnly, txMode, task })`
   feeds the status bar. Set `caret` from the editor, `path` from the explorer selection.
 * `theme.ts`: `theme()` ("dark"|"light"), `themePref()` ("dark" default), `setThemePref()`; sets `<html data-theme>`.

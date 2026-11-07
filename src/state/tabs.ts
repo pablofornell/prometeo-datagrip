@@ -14,6 +14,8 @@ export interface EditorTab {
   pinned: boolean;
   /** Unsaved/dirty marker shown on the tab (table editors with pending changes; consoles autosave). Not persisted. */
   modified?: boolean;
+  /** Color of the tab's data source (tint); kept up to date by the explorer. */
+  color?: string;
   /** Free-form JSON payload for the view (data source id, table ref, ...). Persisted. */
   data?: unknown;
 }

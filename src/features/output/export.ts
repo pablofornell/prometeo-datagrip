@@ -1,15 +1,7 @@
-/** Export / copy of a result: file (save dialog), clipboard, browser download fallback. */
-import {
-  type ExportFormat,
-  type ExportOptions,
-  defaultExportOptions,
-  exportQueryToFile,
-  exportQueryToString,
-  exportResultToFile as exportResultToFileDialog,
-  exportToString,
-  isTauri,
-} from "../../api/db";
+/** Export / copy of a result: the Export Data dialog (file, clipboard) and the quick copy of the Options menu. */
+import { type ExportFormat, type ExportOptions, defaultExportOptions, exportQueryToString, exportToString, isTauri } from "../../api/db";
 import { notify } from "../../components/ui";
+import { type ExportSource, openExportDialog } from "../table/exportData";
 import { type OutputHost, type ResultTab, currentOutput } from "./model";
 
 export const FORMATS: { id: ExportFormat; label: string; ext: string }[] = [
@@ -70,28 +62,21 @@ export async function copyResult(tab: ResultTab, host: OutputHost, format: Expor
   }
 }
 
-/** Export Data to File...: save dialog in the app, download in a plain browser. */
-export async function exportResultToFile(tab: ResultTab, host: OutputHost, format: ExportFormat): Promise<void> {
-  const fmt = FORMATS.find((f) => f.id === format)!;
-  const name = `${tab.title().replace(/[^\w.-]+/g, "_")}.${fmt.ext}`;
-  try {
-    if (!isTauri()) {
-      const text = await resultText(tab, host, format);
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
-      a.download = name;
-      a.click();
-      URL.revokeObjectURL(a.href);
-      return;
-    }
-    // the backend opens the Save dialog and only writes to the path it returned
-    const o = optionsFor(tab, host, format);
-    const done = tab.hasMore() ? await exportQueryToFile(host.dsId, tab.sql, o, name) : await exportResultToFileDialog({ columns: tab.meta, rows: tab.rows }, o, name);
-    if (!done) return; // the dialog was cancelled
-    notify({ kind: "info", title: "Export finished", body: `${done.rows.toLocaleString("en-US")} rows exported to ${done.path}` });
-  } catch (e) {
-    notify({ kind: "error", title: "Export failed", body: errText(e) });
-  }
+/** What the Export Data dialog exports for a result tab: its loaded rows, or its statement again when it has more. */
+function exportSource(tab: ResultTab, host: OutputHost): ExportSource {
+  return {
+    dsId: host.dsId,
+    label: tab.title(),
+    sql: tab.sql,
+    options: optionsFor(tab, host, tab.extractor()),
+    loaded: () => ({ columns: tab.meta, rows: tab.rows, complete: !tab.hasMore() }),
+    onOptions: (o) => tab.setExtractor(o.format),
+  };
+}
+
+/** The grid's Export Data button: the Export Data dialog (extractor, options, preview, output file). */
+export function exportResultData(tab: ResultTab, host: OutputHost): void {
+  openExportDialog(exportSource(tab, host));
 }
 
 /** `grid.export` without a target: Export Data to File of the selected result of the output. False when none. */
@@ -99,6 +84,6 @@ export function exportCurrentResult(): boolean {
   const out = currentOutput();
   const tab = out?.current();
   if (!out?.host || !tab) return false;
-  void exportResultToFile(tab, out.host, tab.extractor());
+  exportResultData(tab, out.host);
   return true;
 }

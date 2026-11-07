@@ -9,12 +9,14 @@
  *   schemaSnapshotFor(dsId, s?)  reactive cached schemaSnapshot (tables + columns) for completion
  *   ensureConnected(dsId)        connects a data source if needed (tree spinner, connection state); idempotent
  */
-import { crumbsOfTab, onRefreshed, reloadDataSources, loadSaved, refreshConnectionState, setLoaded, selectedNode, nodeInfo, dataSources } from "./core";
+import { crumbsOfTab, onRefreshed, reloadDataSources, loadSaved, loaded, refreshConnectionState, setLoaded, selectedNode, nodeInfo, dataSources } from "./core";
 import { closeStaleTabs } from "./restore";
 import { registerSlot } from "../../state/slots";
-import { activeTab, activeTabId } from "../../state/tabs";
-import { setStatus } from "../../state/status";
+import { activeTab, activeTabId, tabs, updateTab } from "../../state/tabs";
+import { setEditorPath, setFocusArea } from "../../state/status";
 import { createRoot, createEffect, on } from "solid-js";
+import { onDataSourcesCreated } from "../datasource/events";
+import { bootstrapNewDataSources } from "./bootstrap";
 import { registerExplorerActions } from "./actions";
 import { ExplorerBody } from "./ExplorerBody";
 import { ExplorerHeaderActions, ExplorerToolbar } from "./ExplorerToolbar";
@@ -33,7 +35,8 @@ export {
   ensureConnected,
 } from "./core";
 export { schemaSnapshotFor, loadSchemaSnapshot } from "./schema";
-export { openTable as openTableTab, openDdl as openDdlTab, newConsole, jumpToConsole } from "./commands";
+export { openTable as openTableTab, openDdl as openDdlTab, openDdlRef, openTableRef, newConsole, jumpToConsole } from "./commands";
+export { showQuickDocRef, type QuickDocTarget } from "./QuickDoc";
 
 /** The selected explorer node, or undefined when nothing (or a placeholder row) is selected. */
 export function getSelectedNode(): import("./model").ExplorerNodeInfo | undefined {
@@ -61,18 +64,33 @@ function start(): void {
   })();
   const reload = () => void reloadDataSources().catch(() => {});
   window.addEventListener(DATA_SOURCES_CHANGED, reload);
+  // OK in the Data Sources dialog with new data sources: a console each, connect + introspect in the background
+  onDataSourcesCreated((ids) => void bootstrapNewDataSources(ids));
   window.addEventListener("focus", () => {
     reload();
   });
   createRoot(() => {
     createEffect(on(activeTabId, () => void refreshConnectionState(), { defer: true }));
+    // editor tabs carry the color of their data source (production / dev cue)
+    createEffect(() => {
+      if (!loaded()) return;
+      const list = dataSources();
+      for (const t of tabs()) {
+        const dsId = (t.data as { dsId?: string } | undefined)?.dsId;
+        if (!dsId) continue;
+        const color = list.find((d) => d.id === dsId)?.color ?? undefined;
+        if (t.color !== color) updateTab(t.id, { color });
+      }
+    });
     // the breadcrumb follows the active tab (table / DDL tabs; consoles push their own path)
     createEffect(
       on(
         activeTabId,
         () => {
           const path = crumbsOfTab(activeTab());
-          if (path) setStatus("path", path);
+          if (path) setEditorPath(path);
+          // a tab was activated: the editor is the context now (DataGrip's breadcrumbs follow the focused component)
+          if (activeTabId()) setFocusArea("editor");
         },
         { defer: true },
       ),

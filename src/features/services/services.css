@@ -1,0 +1,98 @@
+/* Services tool window: toolbar column | connections tree | Information / Output pane. */
+.dg-svc {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.dg-svc-vtb {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  width: 37px;
+  padding-top: 5px;
+}
+.dg-svc-left {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  min-width: 0;
+  max-width: 65%;
+}
+.dg-svc-toolbar {
+  height: 34px;
+  padding: 0 8px 0 4px;
+}
+.dg-svc-tree {
+  flex: 1;
+  min-height: 0;
+}
+/* the splitter is a 1px divider with a wider hit area */
+.dg-svc .dg-svc-split {
+  flex: none;
+  width: 1px;
+  background: var(--dg-toolwindow-header-border);
+}
+.dg-svc .dg-svc-split::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -3px;
+  right: -3px;
+}
+.dg-svc-right {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.dg-svc-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.dg-svc-pane-tabs {
+  flex: none;
+  height: 34px;
+  padding: 0 4px;
+}
+.dg-svc-info {
+  padding: 8px 13px;
+  user-select: text;
+  cursor: text;
+}
+.dg-svc-info-group {
+  margin-bottom: 17px;
+  line-height: 17px;
+}
+.dg-svc-info-group:last-child {
+  margin-bottom: 0;
+}
+.dg-svc-info b {
+  font-weight: 600;
+}
+/* DBMS icon / session icon with the green "connected" dot at its lower right */
+.dg-svc-icon {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+}
+.dg-svc-icon .dg-icon {
+  margin: 0;
+}
+.dg-svc-dot {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--dg-services-connected-dot);
+}

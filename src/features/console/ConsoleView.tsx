@@ -1,11 +1,14 @@
 /** Content of a `console` editor tab (slot `editor.view.console`): toolbar + SQL editor bound to the console file. */
 import { Show, createEffect, createMemo, createSignal, on, onCleanup, onMount, type JSX } from "solid-js";
-import { listDataSources, readConsole, writeConsole } from "../../api/db";
-import { SqlEditor, type SqlEditorHandle } from "../../components/editor";
-import { setStatus } from "../../state/status";
+import { type ObjectRef, listDataSources, readConsole, writeConsole } from "../../api/db";
+import { type NavHandlers, type NavTarget, SqlEditor, type SqlEditorHandle } from "../../components/editor";
+import { showToolWindow } from "../../state/layout";
+import { setEditorPath, setStatus } from "../../state/status";
 import { type EditorTab, updateTab } from "../../state/tabs";
-import { connectedDataSourceIds, explorerDataSources, schemaSnapshotFor } from "../explorer";
+import { connectedDataSourceIds, explorerDataSources, openDdlRef, revealObject, schemaSnapshotFor, showQuickDocRef } from "../explorer";
+import { Icon } from "../../components/ui";
 import { dsIconUrl } from "../output/dsicon";
+import { copyText } from "../output/export";
 import { markConsoleActive } from "../output/model";
 import { txLabel } from "../table/session";
 import { ConsoleToolbar } from "./ConsoleToolbar";
@@ -14,6 +17,9 @@ import { registerSession, unregisterSession } from "./registry";
 import { ConsoleSession } from "./session";
 
 const SAVE_DELAY = 600;
+
+/** The database object a name in the SQL refers to (for a column: its table). */
+const objectRefOf = (t: NavTarget): ObjectRef => ({ schema: t.schema, name: t.name, kind: t.kind === "matview" ? "materializedView" : (t.kind as ObjectRef["kind"]) });
 
 export function ConsoleView(props: { tab: EditorTab; active: boolean }): JSX.Element {
   const data = () => props.tab.data as { dsId?: string; consoleName?: string } | undefined;
@@ -82,18 +88,28 @@ function ConsoleInner(props: { tab: EditorTab; active: boolean; dsId: string; co
     unregisterSession(props.tab.id);
   });
 
+  // ---- Ctrl+B / Ctrl+Click, Ctrl+Q, Alt+Shift+B on a table / column named in the SQL
+  const navigate: NavHandlers = {
+    goTo: (t) => void openDdlRef(props.dsId, objectRefOf(t), t.column?.name),
+    quickDoc: (t, anchor) => showQuickDocRef({ dsId: props.dsId, ref: objectRefOf(t), column: t.column }, anchor),
+    selectInExplorer: (t) => {
+      showToolWindow("explorer", false);
+      void revealObject(props.dsId, t.column ? { schema: t.schema, name: t.column.name, kind: "column", table: t.name } : objectRefOf(t));
+    },
+  };
+
   // ---- completion data: loaded lazily, the first time the tab is shown
   const schema = createMemo(() => (everActive() ? toEditorSchema(schemaSnapshotFor(props.dsId), ds.database || undefined) : undefined));
 
   // ---- status bar, focus, eager session
-  const pushStatus = () =>
-    setStatus({
-      path: [{ label: "Database Consoles" }, { label: ds.name }, { label: props.tab.title, icon: "dg/console" }],
-      caret,
-      lineSeparator: "LF",
-      encoding: "UTF-8",
-      readOnly: false,
-    });
+  const pushStatus = () => {
+    setEditorPath([
+      { label: "Database Consoles" },
+      { label: ds.name, onClick: () => void revealObject(props.dsId, null) },
+      { label: props.tab.title, icon: dsIconUrl(ds.driver) ?? "dg/console" },
+    ]);
+    setStatus({ caret, lineSeparator: "LF", encoding: "UTF-8", readOnly: false });
+  };
   createEffect(
     on(
       () => props.active,
@@ -130,7 +146,11 @@ function ConsoleInner(props: { tab: EditorTab; active: boolean; dsId: string; co
   return (
     <div class="dgc-view">
       <ConsoleToolbar session={session} />
-      <div class="dgc-editor">
+      <div
+        class="dgc-editor"
+        classList={{ "dg-ds-tinted": !!dsOf(props.dsId)?.color }}
+        style={dsOf(props.dsId)?.color ? { "--dg-ds-tint": dsOf(props.dsId)!.color! } : undefined}
+      >
         <Show when={loaded()}>
           <SqlEditor
             value={text()}
@@ -146,6 +166,7 @@ function ConsoleInner(props: { tab: EditorTab; active: boolean; dsId: string; co
             sourceLabel={ds.name}
             errors={session.errors()}
             execMarks={session.marks()}
+            navigate={navigate}
             onExecute={(req) => void session.run(req)}
             onCaretChange={(line, col) => {
               caret = { line, col };
@@ -159,6 +180,26 @@ function ConsoleInner(props: { tab: EditorTab; active: boolean; dsId: string; co
           />
         </Show>
       </div>
+      <ExecErrorBanner session={session} />
     </div>
+  );
+}
+
+/** The error of the last run: red banner docked at the bottom of the editor (first line, `Copy`, close). */
+function ExecErrorBanner(props: { session: ConsoleSession }): JSX.Element {
+  return (
+    <Show when={props.session.execError()}>
+      {(m) => (
+        <div class="dgc-banner" role="alert">
+          <span class="dgc-banner-text">{m().split("\n")[0]}</span>
+          <a class="dgc-banner-link" onClick={() => void copyText(m())}>
+            Copy
+          </a>
+          <button type="button" class="dgc-banner-close" tabindex={-1} aria-label="Close" onClick={() => props.session.setExecError(null)}>
+            <Icon name="close" size={16} />
+          </button>
+        </div>
+      )}
+    </Show>
   );
 }

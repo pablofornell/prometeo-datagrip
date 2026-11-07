@@ -22,6 +22,12 @@ import type {
   ExecOptions,
   ExportOptions,
   HistoryEntry,
+  ImportFormat,
+  ImportPreview,
+  ImportProgress,
+  ImportRequest,
+  ImportResult,
+  ImportRowError,
   NodeKind,
   ObjectRef,
   ResultSet,
@@ -421,7 +427,7 @@ function introspect(ds: string, path: string[], showSystem: boolean): TreeNode[]
     case 0:
       return [
         node(ds, "database", DB_NAME, null, [DB_NAME], true, { current: true, encoding: "UTF8" }),
-        node(ds, "database", "postgres", null, ["postgres"], false, { current: false, encoding: "UTF8" }),
+        node(ds, "database", "postgres", null, ["postgres"], false, { current: false, encoding: "UTF8", comment: "default administrative connection database" }),
       ];
     case 1: {
       if (path[0] !== DB_NAME)
@@ -944,7 +950,18 @@ async function runExecution(
 
 // ---------------------------------------------------------------- export
 
-function exportText(res: Pick<ResultSet, "columns" | "rows">, o: ExportOptions): string {
+function exportText(src: Pick<ResultSet, "columns" | "rows">, o: ExportOptions): string {
+  let res = src;
+  if (o.transpose) {
+    const col = (name: string) => ({ name, typeName: "text", nullable: true, isPk: false, tableRef: null });
+    res = {
+      columns: [col("column"), ...src.rows.map((_, i) => col(String(i + 1)))],
+      rows: src.columns.map((c, i) => [c.name, ...src.rows.map((r) => r[i] ?? null)]),
+    };
+  }
+  if (o.rowHeader && ["csv", "tsv", "markdown"].includes(o.format)) {
+    res = { columns: [{ name: "", typeName: "int4", nullable: false, isPk: false, tableRef: null }, ...res.columns], rows: res.rows.map((r, i) => [i + 1, ...r]) };
+  }
   const txt = (v: Cell): string =>
     v === null ? o.nullText : typeof v === "object" ? ("$bin" in (v as object) ? "0x" + (v as { $bin: string }).$bin : JSON.stringify(v)) : String(v);
   const names = res.columns.map((x) => x.name);
@@ -1021,6 +1038,67 @@ const toView = (cfg: Partial<DataSourceConfig>, prev?: DataSource): DataSource =
 };
 
 type A = Record<string, any>;
+// ---------------------------------------------------------------- import sample
+
+const MOCK_IMPORT_PATH = "/mock/import-sample.csv";
+const MOCK_IMPORT_CSV = "id,name,price,in_stock\n1,Widget,9.99,true\n2,Gadget,24.50,false\n3,Doohickey,3.25,true\n";
+const mockImports = new Map<string, { cancelled: boolean }>();
+
+/** Minimal delimited-text parser for the mock (quotes, doubled quotes, line breaks inside quotes). */
+function mockParseImport(f: ImportFormat): { rows: (string | null)[][] } {
+  const rows: (string | null)[][] = [];
+  let row: (string | null)[] = [];
+  let cur = "";
+  let quoted = false;
+  let inQ = false;
+  const text = MOCK_IMPORT_CSV;
+  const endField = () => {
+    const v = f.trim ? cur.trim() : cur;
+    row.push(!quoted && v === f.nullText ? null : v);
+    cur = "";
+    quoted = false;
+  };
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQ) {
+      if (ch === f.quote && text[i + 1] === f.quote) (cur += ch), i++;
+      else if (ch === f.quote) inQ = false;
+      else cur += ch;
+    } else if (f.quote && ch === f.quote && cur === "") (inQ = true), (quoted = true);
+    else if (ch === f.delimiter) endField();
+    else if (ch === "\n") {
+      endField();
+      if (!(row.length === 1 && row[0] === "")) rows.push(row);
+      row = [];
+    } else cur += ch;
+  }
+  return { rows };
+}
+
+function mockImportPreview(f: ImportFormat, limit: number): ImportPreview {
+  let { rows } = mockParseImport(f);
+  if (f.firstColumnHeader) rows = rows.map((r) => r.slice(1));
+  const names = f.header ? rows[0].map((n, i) => (n || `column${i + 1}`).trim()) : (rows[0] ?? []).map((_, i) => `column${i + 1}`);
+  const body = rows.slice(f.header ? 1 : 0);
+  const infer = (col: number): ImportPreview["columns"][number]["inferredType"] => {
+    const vs = body.map((r) => r[col]).filter((v): v is string => !!v?.trim());
+    if (!vs.length) return "text";
+    if (vs.every((v) => /^(true|false)$/i.test(v))) return "boolean";
+    if (vs.every((v) => /^-?(0|[1-9]\d*)$/.test(v))) return vs.some((v) => Math.abs(Number(v)) > 2147483647) ? "bigint" : "integer";
+    if (vs.every((v) => /^-?(0|[1-9]\d*)?\.?\d+([eE][-+]?\d+)?$/.test(v))) return "double";
+    if (vs.every((v) => /^\d{4}-\d{2}-\d{2}$/.test(v))) return "date";
+    if (vs.every((v) => /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(v))) return "timestamp";
+    return "text";
+  };
+  return {
+    columns: names.map((name, i) => ({ name, inferredType: infer(i) })),
+    rows: body.slice(0, limit).map((r) => names.map((_, i) => r[i] ?? null)),
+    sampled: body.length,
+    truncated: false,
+    fileSize: MOCK_IMPORT_CSV.length,
+  };
+}
+
 const h = (f: (a: A) => unknown | Promise<unknown>): MockHandler => (args) => f((args ?? {}) as A);
 
 export const mockHandlers: Record<string, MockHandler> = {
@@ -1248,6 +1326,8 @@ export const mockHandlers: Record<string, MockHandler> = {
 
   // ---- export (no file system in a browser: files are only counted)
   choose_export_path: h((a) => `/mock/${(a.suggestedName as string | null) ?? "export.csv"}`),
+  default_export_path: h((a) => `/home/mock/${a.fileName as string}`),
+  approve_export_path: h((a) => !/\/\./.test(a.path as string) && (a.path as string).startsWith("/home/mock/")),
   export_query: h(async (a) => {
     needConn(a.dsId);
     await sleep(100);
@@ -1263,6 +1343,79 @@ export const mockHandlers: Record<string, MockHandler> = {
     return (a.result as ResultSet).rows.length;
   }),
   export_to_string: h((a) => exportText(a.result, a.options)),
+
+  // ---- import (a browser has no file system: one built-in sample file)
+  choose_import_file: h(() => ({ path: MOCK_IMPORT_PATH, name: "import-sample.csv", size: MOCK_IMPORT_CSV.length, defaultErrorFile: "/mock/import-sample_errors.txt" })),
+  import_preview: h(async (a) => {
+    await sleep(60);
+    if (a.path !== MOCK_IMPORT_PATH) fail(`Refusing to read ${a.path}: import files must be chosen in the open dialog (choose_import_file)`);
+    return mockImportPreview(a.format as ImportFormat, (a.limit as number | undefined) ?? 10);
+  }),
+  import_file: h(async (a) => {
+    needConn(a.dsId);
+    const req = a.request as ImportRequest;
+    const sink = a.onProgress as { onmessage?: (p: ImportProgress) => void } | undefined;
+    const token = { cancelled: false };
+    mockImports.set(a.importId as string, token);
+    const { rows } = mockParseImport(req.format);
+    const body = rows.slice(req.format.header ? 1 : 0);
+    const failed: ImportRowError[] = [];
+    let imported = 0;
+    const out: Cell[][] = [];
+    for (const [i, r] of body.entries()) {
+      await sleep(250 / Math.max(1, body.length));
+      if (token.cancelled) break;
+      const row: Cell[] = [];
+      let bad = "";
+      for (const c of req.columns) {
+        const v = c.source === null ? null : r[c.source + (req.format.firstColumnHeader ? 1 : 0)] ?? null;
+        if (v !== null && /int|numeric|double|real/i.test(c.type) && !(v.trim() === "" || !Number.isNaN(Number(v)))) {
+          bad = `Column ${c.name}: '${v}' is not a valid number`;
+          if (!req.options.insertInconvertibleAsNull) break;
+          row.push(null);
+          bad = "";
+          continue;
+        }
+        row.push(v === null || (v === "" && !/char|text/i.test(c.type)) ? null : /int|numeric|double|real/i.test(c.type) ? Number(v) : v);
+      }
+      if (bad) failed.push({ row: i + 2, message: bad });
+      else {
+        out.push(row);
+        imported++;
+      }
+      sink?.onmessage?.({ rows: imported + failed.length, failed: failed.length, fraction: (i + 1) / body.length });
+    }
+    mockImports.delete(a.importId as string);
+    const rolledBack = token.cancelled || (req.options.abortOnError && failed.length > 0);
+    if (!rolledBack && req.createTable) {
+      const sc = SCHEMAS[req.schema ?? "shop"];
+      const t: TableDef = {
+        name: req.table,
+        kind: "table",
+        rows: out.length,
+        cols: req.columns.map((x) => c(x.name, x.type, x.type.replace(/\(.*/, ""), { nullable: true })),
+      };
+      if (sc && !sc.tables.some((x) => x.name === req.table)) {
+        sc.tables.push(t);
+        rowCache.set(t, out);
+      }
+    }
+    return {
+      imported: rolledBack ? 0 : imported,
+      failed: failed.length,
+      errors: failed.slice(0, 50),
+      errorFile: failed.length && req.options.errorFile ? req.options.errorFile : null,
+      errorFileError: null,
+      cancelled: token.cancelled,
+      rolledBack,
+      createdTable: !rolledBack && req.createTable,
+      elapsedMs: 250,
+    } satisfies ImportResult;
+  }),
+  cancel_import: h((a) => {
+    const t = mockImports.get(a.importId as string);
+    if (t) t.cancelled = true;
+  }),
 
   // ---- splitter
   split_statements: h((a) => toStatements(a.sql)),

@@ -17,6 +17,12 @@ import type {
   ExportOptions,
   FetchedRows,
   HistoryEntry,
+  ImportFormat,
+  ImportPreview,
+  ImportProgress,
+  ImportRequest,
+  ImportResult,
+  ImportSource,
   ObjectRef,
   ResultSet,
   RowChange,
@@ -231,6 +237,8 @@ export const defaultExportOptions = (driver: Driver = "postgres"): ExportOptions
   tableName: null,
   dialect: driver,
   rowsPerInsert: 1,
+  transpose: false,
+  rowHeader: false,
 });
 
 /**
@@ -241,6 +249,25 @@ export const defaultExportOptions = (driver: Driver = "postgres"): ExportOptions
  */
 export const chooseExportPath = (suggestedName?: string, format?: ExportFormat): Promise<string | null> =>
   invoke("choose_export_path", { suggestedName: suggestedName ?? null, format: format ?? null });
+
+/** `<home>/<file name>`: the default "Output file" of the Export Data dialog (`null`: the home folder is unknown). */
+export const defaultExportPath = (fileName: string): Promise<string | null> => invoke("default_export_path", { fileName });
+
+/**
+ * Lets the backend write the typed `path` without the save dialog. Granted only for a NEW file under the home
+ * folder (no hidden folders): resolves `false` otherwise, and the export has to go through `chooseExportPath`.
+ */
+export const approveExportPath = (path: string): Promise<boolean> => invoke("approve_export_path", { path });
+
+/**
+ * The target of the Export Data dialog: `path` is exported straight away when the backend approves it, else
+ * (an existing file, outside the home folder) the save dialog opens with its file name and decides.
+ * Resolves the path written, or `null` when the user cancels that dialog.
+ */
+export async function resolveExportPath(path: string, format: ExportFormat): Promise<string | null> {
+  if (await approveExportPath(path)) return path;
+  return chooseExportPath(path.split("/").pop() || undefined, format);
+}
 
 /** `chooseExportPath` + `exportQuery`. Resolves `null` when the user cancels the dialog. */
 export async function exportQueryToFile(
@@ -284,6 +311,47 @@ export const exportResult = (result: Pick<ResultSet, "columns" | "rows">, option
 /** Format an in-memory result set as text (for the clipboard). */
 export const exportToString = (result: Pick<ResultSet, "columns" | "rows">, options: ExportOptions): Promise<string> =>
   invoke("export_to_string", { result: { hasMore: false, totalHint: null, ...result }, options });
+
+// ---------------------------------------------------------------- import
+
+export const defaultImportFormat = (): ImportFormat => ({
+  encoding: "UTF-8",
+  delimiter: ",",
+  quote: '"',
+  header: true,
+  firstColumnHeader: false,
+  trim: false,
+  nullText: "",
+});
+
+/**
+ * Open the native Open dialog FROM THE BACKEND and resolve with the chosen file (`null` = cancelled). Only a file
+ * returned here is read by `importPreview` / `importFile`.
+ */
+export const chooseImportFile = (): Promise<ImportSource | null> => invoke("choose_import_file");
+
+/** Column names, the first `limit` rows and an inferred type per column. `path` comes from `chooseImportFile`. */
+export const importPreview = (path: string, format: ImportFormat, limit = 10): Promise<ImportPreview> =>
+  invoke("import_preview", { path, format, limit });
+
+/**
+ * Stream the file into the table in ONE transaction. `importId` (any unique string) lets `cancelImport` roll it
+ * back; `onProgress` is called after every batch. Resolves with the outcome (rows that failed are in the result,
+ * not a rejection); rejects when the import could not run at all.
+ */
+export function importFile(
+  dsId: string,
+  importId: string,
+  request: ImportRequest,
+  onProgress?: (p: ImportProgress) => void,
+): Promise<ImportResult> {
+  const sink: { onmessage: (p: ImportProgress) => void } = isTauri() ? new Channel<ImportProgress>() : { onmessage: () => {} };
+  sink.onmessage = (p) => onProgress?.(p);
+  return invoke("import_file", { dsId, importId, request, onProgress: sink });
+}
+
+/** Roll a running import back. No-op when it already ended. */
+export const cancelImport = (importId: string): Promise<void> => invoke("cancel_import", { importId });
 
 // ---------------------------------------------------------------- SQL splitter (same as the backend)
 

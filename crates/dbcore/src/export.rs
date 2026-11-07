@@ -39,6 +39,11 @@ pub struct ExportOptions {
     pub dialect: Driver,
     /// Rows per INSERT statement (multi-row VALUES when > 1).
     pub rows_per_insert: usize,
+    /// Write the result transposed: one output row per column (first cell: the column name), one output
+    /// column per result row. The whole result is held in memory.
+    pub transpose: bool,
+    /// Add a first column with the row number (CSV / TSV / Markdown only; the header cell is empty).
+    pub row_header: bool,
 }
 
 impl Default for ExportOptions {
@@ -52,6 +57,8 @@ impl Default for ExportOptions {
             table_name: None,
             dialect: Driver::Postgres,
             rows_per_insert: 1,
+            transpose: false,
+            row_header: false,
         }
     }
 }
@@ -124,10 +131,18 @@ fn sql_literal(d: Driver, c: &Cell) -> String {
 pub struct Exporter<W: Write> {
     w: W,
     o: ExportOptions,
+    /// Column names as written (with the row header column).
     cols: Vec<String>,
+    /// Column names of the result being exported.
+    src_cols: Vec<String>,
+    /// Rows of the result seen so far.
     rows: usize,
+    /// Rows written (differs from `rows` when transposed).
+    emitted: usize,
     began: bool,
     batch: Vec<String>,
+    /// Rows held back until `finish` (transposed export).
+    held: Vec<Vec<Cell>>,
 }
 
 impl<W: Write> Exporter<W> {
@@ -136,9 +151,12 @@ impl<W: Write> Exporter<W> {
             w,
             o: opts,
             cols: Vec::new(),
+            src_cols: Vec::new(),
             rows: 0,
+            emitted: 0,
             began: false,
             batch: Vec::new(),
+            held: Vec::new(),
         }
     }
 
@@ -184,9 +202,30 @@ impl<W: Write> Exporter<W> {
             .join(".")
     }
 
+    fn row_header(&self) -> bool {
+        self.o.row_header
+            && matches!(
+                self.o.format,
+                ExportFormat::Csv | ExportFormat::Tsv | ExportFormat::Markdown
+            )
+    }
+
     pub fn begin(&mut self, columns: &[ColumnMeta]) -> io::Result<()> {
-        self.cols = columns.iter().map(|c| c.name.clone()).collect();
+        self.src_cols = columns.iter().map(|c| c.name.clone()).collect();
         self.began = true;
+        if self.o.transpose {
+            return Ok(());
+        }
+        let names = self.src_cols.clone();
+        self.start(names)
+    }
+
+    /// Writes the header of the output (`names` are the columns of the output, without the row header).
+    fn start(&mut self, names: Vec<String>) -> io::Result<()> {
+        self.cols = names;
+        if self.row_header() {
+            self.cols.insert(0, String::new());
+        }
         match self.o.format {
             ExportFormat::Csv | ExportFormat::Tsv => {
                 if self.o.header {
@@ -224,6 +263,24 @@ impl<W: Write> Exporter<W> {
     }
 
     pub fn row(&mut self, row: &[Cell]) -> io::Result<()> {
+        self.rows += 1;
+        if self.o.transpose {
+            self.held.push(row.to_vec());
+            return Ok(());
+        }
+        self.emit(row)
+    }
+
+    fn emit(&mut self, row: &[Cell]) -> io::Result<()> {
+        let with_header;
+        let row = if self.row_header() {
+            with_header = std::iter::once(Value::from(self.emitted + 1))
+                .chain(row.iter().cloned())
+                .collect::<Vec<_>>();
+            &with_header[..]
+        } else {
+            row
+        };
         match self.o.format {
             ExportFormat::Csv => {
                 let line: Vec<String> = row
@@ -265,7 +322,7 @@ impl<W: Write> Exporter<W> {
                     }
                     obj.insert(key, cell_json(c));
                 }
-                write!(self.w, "{}\n  ", if self.rows == 0 { "" } else { "," })?;
+                write!(self.w, "{}\n  ", if self.emitted == 0 { "" } else { "," })?;
                 serde_json::to_writer(&mut self.w, &Value::Object(obj))?;
             }
             ExportFormat::SqlInsert => {
@@ -277,7 +334,7 @@ impl<W: Write> Exporter<W> {
                 }
             }
         }
-        self.rows += 1;
+        self.emitted += 1;
         Ok(())
     }
 
@@ -303,9 +360,23 @@ impl<W: Write> Exporter<W> {
 
     /// Flush and return the writer and the number of rows written.
     pub fn finish(mut self) -> io::Result<(W, usize)> {
+        if self.o.transpose && self.began {
+            let held = std::mem::take(&mut self.held);
+            let mut names = vec!["column".to_string()];
+            names.extend((1..=held.len()).map(|i| i.to_string()));
+            self.start(names)?;
+            for (i, name) in self.src_cols.clone().into_iter().enumerate() {
+                let mut row = vec![Value::String(name)];
+                row.extend(
+                    held.iter()
+                        .map(|r| r.get(i).cloned().unwrap_or(Value::Null)),
+                );
+                self.emit(&row)?;
+            }
+        }
         match self.o.format {
             ExportFormat::Json => {
-                if self.rows == 0 {
+                if self.emitted == 0 {
                     writeln!(self.w, "]")?;
                 } else {
                     writeln!(self.w, "\n]")?;
@@ -353,7 +424,7 @@ impl ConnectionManager {
         let cols = query_pool(&live, sql, usize::MAX, |cols, row| {
             if !e.began {
                 e.begin(cols)?;
-            } else if !cols.iter().map(|c| &c.name).eq(e.cols.iter()) {
+            } else if !cols.iter().map(|c| &c.name).eq(e.src_cols.iter()) {
                 // a later result set of the same call with other columns: only the first
                 // shape is exported (rows of equally shaped result sets are appended)
                 return Ok(());
@@ -434,6 +505,42 @@ mod tests {
         let md = run(ExportFormat::Markdown, |_| {});
         assert!(md.starts_with("| id | name | data |\n| --- | --- | --- |\n"));
         assert!(md.contains("l1<br>l2\\|x"));
+    }
+
+    #[test]
+    fn row_header_and_transpose() {
+        let out = run(ExportFormat::Csv, |o| o.row_header = true);
+        assert_eq!(out.lines().next().unwrap(), ",id,name,data");
+        assert!(
+            out.lines().nth(2).unwrap().starts_with("2,2,,true"),
+            "{out}"
+        );
+        let md = run(ExportFormat::Markdown, |o| o.row_header = true);
+        assert!(md.starts_with("|  | id | name | data |\n"), "{md}");
+        // not for formats that have no such column
+        let sql = run(ExportFormat::SqlInsert, |o| o.row_header = true);
+        assert!(
+            sql.starts_with("insert into \"table_name\" (\"id\", \"name\", \"data\") values (1,"),
+            "{sql}"
+        );
+        let t = run(ExportFormat::Csv, |o| o.transpose = true);
+        let lines: Vec<&str> = t.lines().collect();
+        assert_eq!(lines[0], "column,1,2,3");
+        assert_eq!(lines[1], "id,1,2,9007199254740993");
+        assert_eq!(lines[2], "name,\"a,b \"\"q\"\"\",,\"l1");
+        let t = run(ExportFormat::Csv, |o| {
+            o.transpose = true;
+            o.header = false;
+            o.row_header = true;
+        });
+        assert!(t.starts_with("1,id,1,2,9007199254740993\n2,name,"), "{t}");
+        // the row count is the number of result rows
+        let mut buf = Vec::new();
+        let o = ExportOptions {
+            transpose: true,
+            ..Default::default()
+        };
+        assert_eq!(export_result(&rs(), &o, &mut buf).unwrap(), 3);
     }
 
     #[test]

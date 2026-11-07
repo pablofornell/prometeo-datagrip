@@ -1,77 +1,114 @@
-import { Show, createSignal, onCleanup, onMount, type JSX } from "solid-js";
+import { Show, onCleanup, onMount, type JSX } from "solid-js";
+import { FilesToolWindow } from "../../features/files";
 import {
-  MIN_BOTTOM,
-  MIN_EDITOR_H,
-  MIN_EDITOR_W,
-  MIN_LEFT,
+  type ToolWindowAnchor,
+  anchorOf,
   commitLayout,
-  layout,
-  setBottomHeight,
-  setLeftWidth,
+  effectiveSize,
+  maxSizeOf,
+  maximizedToolWindow,
+  MIN_BOTTOM,
+  MIN_LEFT,
+  MIN_RIGHT,
+  GAP,
+  setBodyBox,
+  setToolWindowSize,
+  visibleAt,
 } from "../../state/layout";
 import { Splitter } from "../ui/Splitter";
 import { EditorArea } from "./EditorArea";
 import { ExplorerBodyPlaceholder, ExplorerToolbarPlaceholder, OutputBodyPlaceholder } from "./Placeholders";
 import { ToolWindowPanel } from "./ToolWindowPanel";
 
-const GAP = 5;
-
-/** The island layout: [explorer | editor] over [output], resizable with sizes persisted. */
+/**
+ * The island layout: a grid with a left, a right and a bottom dock around the editor. Every tool window panel
+ * stays at the same place in the DOM (its body keeps its state when it is moved to another anchor); its anchor
+ * only picks the grid area (shell.css). Sizes are persisted per window.
+ */
 export function Shell(): JSX.Element {
   let body!: HTMLDivElement;
-  const [bodyW, setBodyW] = createSignal(1600);
-  const [bodyH, setBodyH] = createSignal(900);
 
   onMount(() => {
-    const ro = new ResizeObserver(() => {
-      setBodyW(body.clientWidth);
-      setBodyH(body.clientHeight);
-    });
+    const ro = new ResizeObserver(() => setBodyBox(body.clientWidth, body.clientHeight));
     ro.observe(body);
+    setBodyBox(body.clientWidth, body.clientHeight);
     onCleanup(() => ro.disconnect());
   });
 
-  const leftVisible = () => !!layout.visible.explorer;
-  const bottomVisible = () => !!layout.visible.output;
-  // Effective sizes: persisted size clamped to what fits the current window.
-  const maxLeft = () => Math.max(MIN_LEFT, bodyW() - 13 - MIN_EDITOR_W - GAP);
-  const maxBottom = () => Math.max(MIN_BOTTOM, bodyH() - MIN_EDITOR_H - 41 - GAP);
-  const leftW = () => Math.min(Math.max(layout.leftWidth, MIN_LEFT), maxLeft());
-  const bottomH = () => Math.min(Math.max(layout.bottomHeight, MIN_BOTTOM), maxBottom());
+  /** Anchor of the maximized window (it spans the editor area). */
+  const maxAnchor = (): ToolWindowAnchor | null => {
+    const id = maximizedToolWindow();
+    return id ? anchorOf(id) : null;
+  };
+  const shown = (a: ToolWindowAnchor) => !!visibleAt(a);
+  const splitter = (a: ToolWindowAnchor) => shown(a) && maxAnchor() !== a && !(a !== "bottom" && maxAnchor() === "bottom");
+
+  const columns = () => {
+    const l = effectiveSize("left");
+    const r = effectiveSize("right");
+    return `${l}px ${l ? GAP : 0}px minmax(0, 1fr) ${r ? GAP : 0}px ${r}px`;
+  };
+  const rows = () => {
+    const b = effectiveSize("bottom");
+    return maxAnchor() === "bottom" ? "0px 0px minmax(0, 1fr)" : `minmax(0, 1fr) ${b ? GAP : 0}px ${b}px`;
+  };
+
+  const sizeOf = (a: ToolWindowAnchor) => ({
+    size: effectiveSize(a),
+    onResize: (px: number) => {
+      const id = visibleAt(a);
+      if (id) setToolWindowSize(id, px);
+    },
+  });
 
   return (
-    <div class="dg-body" ref={body}>
-      <div class="dg-top">
-        <ToolWindowPanel
-          id="explorer"
-          style={{ width: leftW() + "px" }}
-          fallbackToolbar={ExplorerToolbarPlaceholder}
-          fallbackBody={ExplorerBodyPlaceholder}
-        />
-        <Show when={leftVisible()}>
-          <Splitter
-            orientation="vertical"
-            size={leftW()}
-            min={MIN_LEFT}
-            max={maxLeft}
-            onResize={setLeftWidth}
-            onResizeEnd={commitLayout}
-          />
-        </Show>
-        <EditorArea />
-      </div>
-      <Show when={bottomVisible()}>
+    <div
+      class="dg-body"
+      ref={body}
+      data-max={maxAnchor() ?? undefined}
+      style={{ "grid-template-columns": columns(), "grid-template-rows": rows() }}
+    >
+      <ToolWindowPanel
+        id="explorer"
+        fallbackToolbar={ExplorerToolbarPlaceholder}
+        fallbackBody={ExplorerBodyPlaceholder}
+      />
+      <ToolWindowPanel id="files" fallbackBody={FilesToolWindow} />
+      <ToolWindowPanel id="output" fallbackBody={OutputBodyPlaceholder} />
+      <ToolWindowPanel id="services" />
+      <Show when={splitter("left")}>
         <Splitter
-          orientation="horizontal"
-          size={bottomH()}
-          min={MIN_BOTTOM}
-          max={maxBottom}
-          reverse
-          onResize={setBottomHeight}
+          class="dg-split-left"
+          orientation="vertical"
+          {...sizeOf("left")}
+          min={MIN_LEFT}
+          max={() => maxSizeOf("left")}
           onResizeEnd={commitLayout}
         />
       </Show>
-      <ToolWindowPanel id="output" style={{ height: bottomH() + "px" }} fallbackBody={OutputBodyPlaceholder} />
+      <EditorArea />
+      <Show when={splitter("right")}>
+        <Splitter
+          class="dg-split-right"
+          orientation="vertical"
+          {...sizeOf("right")}
+          min={MIN_RIGHT}
+          max={() => maxSizeOf("right")}
+          reverse
+          onResizeEnd={commitLayout}
+        />
+      </Show>
+      <Show when={splitter("bottom")}>
+        <Splitter
+          class="dg-split-bottom"
+          orientation="horizontal"
+          {...sizeOf("bottom")}
+          min={MIN_BOTTOM}
+          max={() => maxSizeOf("bottom")}
+          reverse
+          onResizeEnd={commitLayout}
+        />
+      </Show>
     </div>
   );
 }

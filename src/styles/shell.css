@@ -130,16 +130,13 @@
 
 /* ---------------------------------------------------------------- Body / islands */
 .dg-body {
-  display: flex;
-  flex-direction: column;
+  display: grid;
   flex: 1;
   min-height: 0;
   padding: 0 var(--dg-body-pad-right) 0 var(--dg-body-pad-left);
-}
-.dg-top {
-  display: flex;
-  flex: 1;
-  min-height: 0;
+  /* tracks (set by Shell): [left] [gap] [editor] [gap] [right] / [top] [gap] [bottom] */
+  grid-template-columns: 0 0 minmax(0, 1fr) 0 0;
+  grid-template-rows: minmax(0, 1fr) 0 0;
 }
 .dg-island {
   position: relative;
@@ -151,17 +148,39 @@
   background: var(--dg-island-bg);
   border-radius: var(--dg-island-radius);
 }
-.dg-toolwindow {
-  flex: none;
+.dg-toolwindow[data-anchor="left"] {
+  grid-area: 1 / 1;
 }
-.dg-toolwindow-explorer {
-  flex: none;
+.dg-toolwindow[data-anchor="right"] {
+  grid-area: 1 / 5;
 }
-.dg-toolwindow-output {
-  flex: none;
+.dg-toolwindow[data-anchor="bottom"] {
+  grid-area: 3 / 1 / 4 / 6;
 }
-.dg-editor-area {
-  flex: 1;
+.dg-body > .dg-editor-area {
+  grid-area: 1 / 3;
+}
+.dg-body > .dg-split-left {
+  grid-area: 1 / 2;
+}
+.dg-body > .dg-split-right {
+  grid-area: 1 / 4;
+}
+.dg-body > .dg-split-bottom {
+  grid-area: 2 / 1 / 3 / 6;
+}
+/* maximized tool window: takes the editor's place (a bottom one the whole island area) */
+.dg-body[data-max] > .dg-editor-area {
+  display: none;
+}
+.dg-body[data-max="left"] > .dg-toolwindow.dg-maximized {
+  grid-area: 1 / 1 / 2 / 4;
+}
+.dg-body[data-max="right"] > .dg-toolwindow.dg-maximized {
+  grid-area: 1 / 3 / 2 / 6;
+}
+.dg-body[data-max="bottom"] > .dg-toolwindow:not(.dg-maximized) {
+  display: none;
 }
 
 /* ---------------------------------------------------------------- Tool window panel */
@@ -203,8 +222,7 @@
   margin-left: auto;
 }
 .dg-toolwindow:hover .dg-tw-actions,
-.dg-toolwindow:focus-within .dg-tw-actions,
-.dg-toolwindow.dg-active .dg-tw-actions {
+.dg-toolwindow:focus-within .dg-tw-actions {
   visibility: visible;
 }
 .dg-tw-body {
@@ -308,7 +326,7 @@
 }
 .dg-progress {
   display: inline-block;
-  width: 100px;
+  width: 104px;
   height: 4px;
   overflow: hidden;
   border-radius: 2px;
@@ -330,6 +348,24 @@
     margin-left: 70%;
   }
 }
+.dg-status-widget.dg-clickable:hover {
+  color: var(--dg-statusbar-hover-fg);
+}
+.dg-status-task {
+  gap: 8px;
+}
 .dg-status-cancel {
   display: flex;
+  margin-left: -2px;
+  cursor: default;
+}
+.dg-status-cancel:hover {
+  color: var(--dg-statusbar-hover-fg);
+}
+.dg-status-more {
+  margin-left: -2px;
+  cursor: default;
+}
+.dg-status-more:hover {
+  color: var(--dg-statusbar-hover-fg);
 }

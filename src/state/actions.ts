@@ -32,6 +32,11 @@ export interface Action {
    * editor, Submit in the grid), the ones whose `when()` is true win over unguarded ones.
    */
   when?: () => boolean;
+  /**
+   * The shortcut is only *displayed* (menus, keymap page): the focused component (CodeMirror, grid, text field)
+   * handles the key itself and the action merely routes the menu click to it. Avoids double handling.
+   */
+  menuOnly?: boolean;
 }
 
 const [version, setVersion] = createSignal(0);
@@ -106,6 +111,9 @@ const KEY_ALIASES: Record<string, string> = {
   backslash: "\\",
   slash: "/",
   quote: "'",
+  comma: ",",
+  period: ".",
+  backquote: "`",
 };
 
 function parseChord(s: string): Chord {
@@ -128,6 +136,9 @@ function eventKey(e: KeyboardEvent): string {
   if (c === "Backslash") return "\\";
   if (c === "Slash") return "/";
   if (c === "Quote") return "'";
+  if (c === "Comma") return ",";
+  if (c === "Period") return ".";
+  if (c === "Backquote") return "`";
   return e.key.toLowerCase();
 }
 
@@ -185,7 +196,7 @@ function dispatch(match: (shortcut: string) => boolean, _e: KeyboardEvent): bool
   const candidates: Action[] = [];
   for (let i = stack.length - 1; i >= 0; i--) {
     const a = stack[i];
-    if (!isActionEnabled(a)) continue;
+    if (a.menuOnly || !isActionEnabled(a)) continue;
     if (shortcutsOf(a).some(match)) candidates.push(a);
   }
   if (!candidates.length) return false;

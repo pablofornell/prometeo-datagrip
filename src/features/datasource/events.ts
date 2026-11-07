@@ -21,3 +21,22 @@ export function emitDataSourcesChanged(): void {
   }
   window.dispatchEvent(new CustomEvent(DATA_SOURCES_CHANGED_EVENT));
 }
+
+/** Data sources that were created (not just edited) by the same Apply: the explorer opens a console and introspects them. */
+type CreatedListener = (ids: string[]) => void;
+const createdListeners = new Set<CreatedListener>();
+
+export function onDataSourcesCreated(cb: CreatedListener): () => void {
+  createdListeners.add(cb);
+  return () => createdListeners.delete(cb);
+}
+
+export function emitDataSourcesCreated(ids: string[]): void {
+  for (const l of [...createdListeners]) {
+    try {
+      l(ids);
+    } catch (e) {
+      console.error(e);
+    }
+  }
+}

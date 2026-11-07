@@ -93,6 +93,11 @@ async fn introspection_tree() {
         .expect("current db");
     assert_eq!(cur.kind, NodeKind::Database);
     assert!(cur.has_children);
+    // the database comment (hover tooltip of the explorer node) travels in `extra`
+    assert!(
+        dbs.iter().all(|d| d.extra["comment"].is_string()),
+        "{dbs:?}"
+    );
     let db = cur.name.as_str();
 
     let schemas = children(&mgr, "pg", &[db]).await;

@@ -32,7 +32,7 @@ Status: **CAPTURED** = same state reached; **PARTIAL** = the state exists but a 
 - 15-dbexplorer-context-menu-table-dark — PARTIAL — right-click invoices, crop 0,120 520x770. Diff: 10 items vs ~22. Missing: Modify Table, Set Color, Join Across Data Sources, Compare, Find Usages, Introspection Level, Object Actions, Tools, Diagrams, Diagnostics.
 - 15-dbexplorer-context-menu-table-light — PARTIAL — same, light, clients tab with WHERE/ORDER BY behind, 1920 wide. Diff: as dark.
 - 16-dbexplorer-context-menu-datasource-dark — PARTIAL — right-click postgres@localhost, crop 0,144 440x610. Diff: no Move, Set Color, Compare, Introspection Level, Tools, Diagrams, DDL Mapping, Diagnostics.
-- 17-dbexplorer-context-menu-schema-new-submenu-dark — PARTIAL — right-click public › New, crop 0,190 820x640. Diff: New has only Query Console and Data Source. No Table/View/Sequence/Schema/Role etc., and no Modify Schema.
+- 17-dbexplorer-context-menu-schema-new-submenu-dark — PARTIAL — right-click public › New, crop 0,190 820x640. Diff: New has Query Console, Table, Materialized View, View, Sequence, Schema, Data Source; missing Query File, Operator, Collation, Language, Database, Role, User, Virtual View, Data Source from ..., Driver. `Modify Schema…  Ctrl+F6` is there.
 - 18-dbexplorer-speed-search-dark — CAPTURED — typed `inv` in tree, crop 0,41 500x480. Diff: the first match (inventory) gets selected, so the selection differs; highlight style matches.
 - 19-crop-dbexplorer-header-toolbar-x2-dark — CAPTURED — 0,43 500x77 x2. Diff: toolbar has no "compare" and "jump to console" icons (DDL present).
 - 19b-crop-dbexplorer-tree-rows-x2-dark — CAPTURED — 0,120 420x360 x2, orders selected. Diff: rows shifted one row up because SQLite ds is first; `tables 5` vs `6`.
@@ -134,9 +134,9 @@ Status: **CAPTURED** = same state reached; **PARTIAL** = the state exists but a 
 - 72-table-editor-where-completion-dark — PARTIAL — typing `active = fa` (1920). Diff: offers only `false`/`default`; DataGrip also lists functions.
 - 73-ddl-view-dark — CAPTURED — invoices (DDL) tab. Diff: object names are schema-qualified (`sales.invoices`, `references sales.clients`).
 - 73-ddl-view-light — CAPTURED — light. Diff: as dark.
-- 104-modify-table-dialog-dark — MISSING — Ctrl+F6 does nothing and no "Modify Table…" menu item exists.
-- 104b-modify-table-column-selected-dark — MISSING — same reason.
-- 105-create-table-dialog-dark — MISSING — New submenu has no Table.
+- 104-modify-table-dialog-dark — PARTIAL — Ctrl+F6 on shop.categories (PostgreSQL), full window. Diff: no Persistence / With OIDs / Partition / Options / Access Method rows, no `?` help and gear buttons, the indexes folder leaves out the indexes behind keys, the Comment field has no expand button.
+- 104b-modify-table-column-selected-dark — PARTIAL — same dialog with the column `name` selected. Diff: no Storage / Min / Max / Step rows of the identity section, otherwise the same fields.
+- 105-create-table-dialog-dark — PARTIAL — New > Table on the `tables` folder of shop (Alt+Insert, Table). Diff: no virtual columns / virtual foreign keys folders, no Persistence / Partition rows.
 - 107-import-data-dialog-dark — MISSING — Import/Export submenu only has Export Data…
 - 107b-import-data-dialog-source-format-dark — MISSING — same reason.
 - 102-run-configurations-dialog-dark — MISSING — no run configurations and no Run menu.

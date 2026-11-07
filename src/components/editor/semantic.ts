@@ -2,6 +2,7 @@ import { HARD_KEYWORDS, KEYWORD_FUNCTIONS, TABLE_INTRO, TYPE_NAMES, keywordsFor 
 import type { Token } from "./lexer";
 import type { SchemaIndex, TableIdx } from "./schemaIndex";
 import type { Dialect } from "./split";
+import type { SchemaColumn } from "./types";
 
 export type MarkCls = "kw" | "str" | "num" | "cmt" | "fn" | "col" | "bad" | "param";
 
@@ -32,9 +33,27 @@ export interface Scope {
   allResolved: boolean;
 }
 
+/** A name that does not resolve: the message of the inspection ("Unable to resolve column 'x'"). */
+export interface Unresolved {
+  from: number;
+  to: number;
+  kind: "table" | "column" | "schema";
+  message: string;
+}
+
+/** An identifier that resolved to a table or column of the schema snapshot (navigation, quick documentation). */
+export interface Resolved {
+  from: number;
+  to: number;
+  table: TableIdx;
+  column?: SchemaColumn;
+}
+
 export interface Analysis {
   marks: Mark[];
   scope: Scope;
+  unresolved: Unresolved[];
+  resolved: Resolved[];
 }
 
 const keywordSets = new Map<Dialect, Set<string>>();
@@ -60,6 +79,8 @@ type Role = "tbl" | "sch" | "alias" | "decl" | "collist";
  */
 export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, dialect: Dialect, implicit?: TableRef[]): Analysis {
   const marks: Mark[] = [];
+  const unresolved: Unresolved[] = [];
+  const resolved: Resolved[] = [];
   const kws = kwSet(dialect);
   const sig: Token[] = [];
   for (const t of toks) {
@@ -269,6 +290,42 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
   const ddl = first === "create" || first === "alter";
 
   const scopeColumn = (name: string): boolean => resolvedRefs.some((r) => r.table?.byName.has(name));
+  const plain = (i: number): string => {
+    const r = raw[i];
+    const c = r[0];
+    if (c === '"' || c === "`") return r.slice(1, r.endsWith(c) && r.length > 1 ? -1 : undefined).replace(new RegExp(c + c, "g"), c);
+    return c === "[" ? r.slice(1, r.endsWith("]") ? -1 : undefined) : r;
+  };
+  const flag = (i: number, kind: Unresolved["kind"]): void => {
+    unresolved.push({ from: sig[i].from, to: sig[i].to, kind, message: `Unable to resolve ${kind} '${plain(i)}'` });
+  };
+  const hit = (i: number, table: TableIdx, column?: string): void => {
+    resolved.push({ from: sig[i].from, to: sig[i].to, table, column: column === undefined ? undefined : table.byName.get(column) });
+  };
+  // Unqualified columns are only judged in a plain query over real tables: no CTE, derived table or table function
+  // (their columns are unknown), and not at positions where a word may be an alias, a type or a function keyword.
+  const judgeBare = ["select", "update", "delete"].includes(first) && ctes.size === 0 && refs.length > 0 && refs.every((r) => !r.opaque && !!r.table);
+  const aliasNames = new Set<string>();
+  if (judgeBare) {
+    for (let i = 1; i < n; i++) {
+      if (sig[i].kind !== "word" && sig[i].kind !== "qident") continue;
+      const pk = sig[i - 1].kind;
+      if (isWordAt(i - 1) && lw[i - 1] === "as") aliasNames.add(lw[i]);
+      else if (pk === "string" || pk === "number" || (pk === "qident" && !joinDot(i - 1)) || isP(i - 1, ")") || (isWordAt(i - 1) && !HARD_KEYWORDS.has(lw[i - 1]) && !kws.has(lw[i - 1]))) aliasNames.add(lw[i]);
+    }
+  }
+  const BARE_PREV = new Set(["select", "where", "and", "or", "on", "by", "having", "set", "when", "then", "else", "not", "in", "like", "ilike", "between", "is", "case", "distinct", "returning", "using", "limit", "offset"]);
+  const BARE_PUNCT = new Set([",", "(", "=", "<", ">", "+", "-", "*", "/", "%", "|", "&", "!"]);
+  const NOT_COLUMNS = new Set(["current_date", "current_time", "current_timestamp", "localtime", "localtimestamp", "current_user", "session_user", "user", "current_schema", "current_catalog", "sysdate", "true", "false", "null", "unknown", "default", "excluded", "rowid", "_rowid_", "oid", "ctid", "xmin", "xmax", "cmin", "cmax", "tableoid", "all", "any", "some", "value"]);
+  const bareJudged = (i: number): boolean => {
+    if (!judgeBare || !isNameAt(i) || NOT_COLUMNS.has(lw[i]) || aliasNames.has(lw[i]) || isP(i + 1, "(") || joinDot(i + 1)) return false;
+    if (sig[i].kind === "word" && (kws.has(lw[i]) || TYPE_NAMES.has(lw[i]))) return false;
+    if (["extract", "substring", "trim", "overlay", "position", "interval", "cast"].includes(owners[i] ?? "")) return false;
+    if (i === 0) return false;
+    const pv = sig[i - 1];
+    if (pv.kind === "punct") return BARE_PUNCT.has(raw[i - 1]);
+    return pv.kind === "word" && BARE_PREV.has(lw[i - 1]);
+  };
 
   // function call detection: ident followed by "(" and not in a table-introducing position
   const isCall = (i: number): boolean => {
@@ -317,9 +374,13 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
       if (flagUnresolved) {
         if (role === "tbl") {
           const owner = tokRef.get(i);
-          if (owner && !owner.table && !(ctes.has(w) && owner.parts.length === 1)) mk("bad");
+          if (owner && !owner.table && !(ctes.has(w) && owner.parts.length === 1)) {
+            mk("bad");
+            flag(i, "table");
+          } else if (owner?.table) hit(i, owner.table);
         } else if (!idx.hasSchema(w) && !ctes.has(w)) {
           mk("bad");
+          flag(i, "schema");
         }
       }
       continue;
@@ -327,7 +388,15 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
     if (role === "collist") continue;
     const lref = colLists.get(i);
     if (lref) {
-      if (lref.table) mk(lref.table.byName.has(w) ? "col" : "bad");
+      if (lref.table) {
+        if (lref.table.byName.has(w)) {
+          mk("col");
+          hit(i, lref.table, w);
+        } else {
+          mk("bad");
+          flag(i, "column");
+        }
+      }
       continue;
     }
 
@@ -354,21 +423,37 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
         else if (idx.hasSchema(qn)) continue; // schema.table in an expression position: nothing to color
       }
       if (tbl) {
-        if (tbl.byName.has(w)) mk("col");
-        else if (flagUnresolved && !opaque) mk("bad");
+        if (tbl.byName.has(w)) {
+          mk("col");
+          hit(i, tbl, w);
+        } else if (flagUnresolved && !opaque) {
+          mk("bad");
+          flag(i, "column");
+        }
       }
       continue;
     }
 
     if (beforeDot) {
       // qualifier: alias, table or schema. Plain, red when it names nothing.
-      if (flagUnresolved && !role && refs.length > 0 && !anyOpaque && !byName.has(w) && !idx.hasSchema(w) && !ctes.has(w) && ["select", "with", "update", "delete", "insert"].includes(first)) mk("bad");
+      const qref = byName.get(w);
+      if (qref?.table) hit(i, qref.table);
+      if (flagUnresolved && !role && refs.length > 0 && !anyOpaque && !byName.has(w) && !idx.hasSchema(w) && !ctes.has(w) && ["select", "with", "update", "delete", "insert"].includes(first)) {
+        mk("bad");
+        flag(i, "table");
+      }
       continue;
     }
 
     // unqualified word / quoted identifier
     if (t.kind === "qident") {
-      if (resolvedRefs.length && scopeColumn(w)) mk("col");
+      if (resolvedRefs.length && scopeColumn(w)) {
+        mk("col");
+        hit(i, resolvedRefs.find((r) => r.table?.byName.has(w))!.table!, w);
+      } else if (flagUnresolved && bareJudged(i)) {
+        mk("bad");
+        flag(i, "column");
+      }
       continue;
     }
     if (TYPE_NAMES.has(w)) {
@@ -389,13 +474,18 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
     }
     if (scopeColumn(w) && !isP(i + 1, "(")) {
       mk("col");
+      hit(i, resolvedRefs.find((r) => r.table?.byName.has(w))!.table!, w);
       continue;
     }
     if (kws.has(w)) {
       mk("kw");
       continue;
     }
+    if (flagUnresolved && bareJudged(i)) {
+      mk("bad");
+      flag(i, "column");
+    }
   }
   marks.sort((a, b) => a.from - b.from);
-  return { marks, scope };
+  return { marks, scope, unresolved, resolved };
 }

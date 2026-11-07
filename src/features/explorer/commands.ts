@@ -3,6 +3,7 @@ import { createSignal } from "solid-js";
 import {
   type DataSource,
   type Driver,
+  type ObjectRef,
   closeSession,
   createConsole,
   deleteDataSource,
@@ -46,35 +47,43 @@ const fail = (title: string, e: unknown): void => {
 
 export async function openTable(d: NodeData | undefined): Promise<void> {
   const ref = d && tableRefOf(d);
-  if (!d || !ref) return;
+  if (d && ref) await openTableRef(d.dsId, ref);
+}
+
+/** Opens the data editor tab of a table / view given by reference (explorer nodes and names in the SQL editor). */
+export async function openTableRef(dsId: string, ref: ObjectRef): Promise<void> {
   try {
-    await ensureConnected(d.dsId);
+    await ensureConnected(dsId);
   } catch (e) {
-    return fail(`Connection to ${dsName(d.dsId)} failed`, e);
+    return fail(`Connection to ${dsName(dsId)} failed`, e);
   }
   openTab({
-    id: `table:${d.dsId}:${ref.schema ?? ""}.${ref.name}`,
+    id: `table:${dsId}:${ref.schema ?? ""}.${ref.name}`,
     kind: "table",
-    title: `${ref.name} [${dsName(d.dsId)}]`,
+    title: `${ref.name} [${dsName(dsId)}]`,
     icon: tabIconOf(ref.kind),
-    data: { dsId: d.dsId, objectRef: ref },
+    data: { dsId, objectRef: ref },
   });
 }
 
 export async function openDdl(d: NodeData | undefined): Promise<void> {
   const ref = d && ddlRefOf(d);
-  if (!d || !ref) return;
+  if (d && ref) await openDdlRef(d.dsId, ref);
+}
+
+/** Opens the DDL tab of an object given by reference; `column` puts the caret on that column's definition. */
+export async function openDdlRef(dsId: string, ref: ObjectRef, column?: string): Promise<void> {
   try {
-    await ensureConnected(d.dsId);
+    await ensureConnected(dsId);
   } catch (e) {
-    return fail(`Connection to ${dsName(d.dsId)} failed`, e);
+    return fail(`Connection to ${dsName(dsId)} failed`, e);
   }
   openTab({
-    id: `ddl:${d.dsId}:${ref.schema ?? ""}.${ref.name}${ref.signature != null ? `(${ref.signature})` : ""}`,
+    id: `ddl:${dsId}:${ref.schema ?? ""}.${ref.name}${ref.signature != null ? `(${ref.signature})` : ""}`,
     kind: "ddl",
-    title: `${ref.name} (DDL) [${dsName(d.dsId)}]`,
+    title: `${ref.name} (DDL) [${dsName(dsId)}]`,
     icon: tabIconOf(ref.kind),
-    data: { dsId: d.dsId, objectRef: ref },
+    data: { dsId, objectRef: ref, ...(column ? { column } : {}) },
   });
 }
 

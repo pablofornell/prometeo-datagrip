@@ -28,6 +28,7 @@ export function ConsoleToolbar(props: { session: ConsoleSession }): JSX.Element 
         ref={txBtn}
         type="button"
         class="dgc-text-btn"
+        disabled={s().out.running()}
         title={s().txStatus() === "failed" ? "The transaction has failed: an earlier statement raised an error. Roll it back to continue." : undefined}
         tabindex={-1}
         onMouseDown={(e) => e.preventDefault()}

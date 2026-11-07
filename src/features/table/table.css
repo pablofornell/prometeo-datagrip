@@ -55,6 +55,10 @@
   box-shadow: 0 8px 24px #00000066;
   outline: none;
 }
+.dgt-sqlpop-title {
+  padding: 10px 12px 0;
+  font: 600 13px / 18px var(--dg-font-ui, "Inter", sans-serif);
+}
 .dgt-sqlpop-editor {
   height: 310px;
   margin: 8px 8px 0;
@@ -90,13 +94,107 @@
 .dgt-colfilter-field { flex: 1; min-width: 0; }
 .dgt-colfilter-footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
 
-/* export dialog */
+/* export dialog (106): options on the left, live preview on the right */
 .dgt-export {
-  display: grid;
-  grid-template-columns: 90px 1fr;
-  align-items: center;
-  gap: 10px 8px;
+  display: flex;
+  gap: 12px;
+  height: 440px;
   font: 13px / 18px var(--dg-font-ui, "Inter", sans-serif);
+}
+.dgt-export label {
+  display: block;
+  margin: 0 0 4px;
+}
+.dgt-export-left {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  width: 400px;
+  min-width: 0;
+}
+.dgt-export-left > label:not(:first-child) {
+  margin-top: 12px;
+}
+.dgt-export-source {
+  display: flex;
+  align-items: center;
+  height: var(--dg-control-height);
+  padding: var(--dg-input-padding);
+  box-sizing: border-box;
+  background: var(--dg-input-bg);
+  border: 1px solid var(--dg-input-disabled-border);
+  border-radius: var(--dg-input-radius);
+  color: var(--dg-text);
+  overflow: hidden;
+  white-space: nowrap;
+}
+.dgt-export-left .dg-combo {
+  width: 280px;
+}
+.dgt-export-checks {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+}
+.dgt-export-opts {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  align-items: center;
+  gap: 8px 8px;
+  margin-top: 14px;
+}
+.dgt-export-opts label {
+  margin: 0;
+}
+.dgt-export-browse {
+  display: inline-flex;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: default;
+}
+.dgt-export-right {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+}
+.dgt-export-preview {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: var(--dg-editor-bg);
+  border: 1px solid var(--dg-input-border);
+  border-radius: var(--dg-input-radius);
+  font: var(--dg-editor-font-size, 13px) / 22px var(--dg-font-mono);
+}
+.dgt-export-gutter {
+  position: sticky;
+  left: 0;
+  flex: none;
+  min-width: 44px;
+  padding: 0 8px;
+  box-sizing: border-box;
+  background: var(--dg-editor-gutter-bg);
+  color: var(--dg-editor-line-number);
+  text-align: right;
+  user-select: none;
+}
+.dgt-export-text {
+  flex: none;
+  margin: 0;
+  padding: 0 8px;
+  color: var(--dg-editor-fg);
+  font: inherit;
+  white-space: pre;
+}
+.dgt-export-error {
+  padding: 8px 10px;
+  color: var(--dg-error);
+  white-space: pre-wrap;
 }
 .dgt-choice { font: 13px / 18px var(--dg-font-ui, "Inter", sans-serif); white-space: pre-wrap; }
 

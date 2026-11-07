@@ -353,12 +353,12 @@ async fn execute_types_errors_and_state() {
     assert_eq!(
         errors(&ev),
         vec![
-            "[SQLITE_ERROR] SQL error or missing database (no such table: nonexistent_table_xyz)"
+            "[1] [SQLITE_ERROR] SQL error or missing database (no such table: nonexistent_table_xyz)"
                 .to_string()
         ]
     );
     let ev = run(&mgr, &s, "insert into categories (name) values ('Books')").await;
-    assert_eq!(errors(&ev), vec!["[SQLITE_CONSTRAINT_UNIQUE] A UNIQUE constraint failed (UNIQUE constraint failed: categories.name)".to_string()]);
+    assert_eq!(errors(&ev), vec!["[2067] [SQLITE_CONSTRAINT_UNIQUE] A UNIQUE constraint failed (UNIQUE constraint failed: categories.name)".to_string()]);
     let ev = run(
         &mgr,
         &s,
