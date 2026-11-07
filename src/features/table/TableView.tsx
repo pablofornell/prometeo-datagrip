@@ -52,10 +52,11 @@ import {
 } from "./session";
 import { FilterBar } from "./FilterBar";
 import { createFkNavigation } from "./fkNav";
+import { logSubmitted } from "../output/edit";
 import { extractorMenuItems } from "../output/extractors";
 import { ChoiceDialog, ColumnFilterPopup, EXPORT_FORMATS, ExportDialog, SqlPopup, exportFileBase, type ExportPath, type ExportTarget } from "./Popups";
 import { type PageSize, type Query, type QueryReport, createTableSource } from "./source";
-import { appendCondition, buildCondition, orderByToSort, previewSql, qualifiedName, selectSql, sortToOrderBy, tableQuerySql, toRowChanges } from "./sql";
+import { appendCondition, buildCondition, changeStatements, orderByToSort, previewSql, qualifiedName, selectSql, sortToOrderBy, tableQuerySql, toRowChanges } from "./sql";
 import "./table.css";
 
 interface Choice {
@@ -235,10 +236,16 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
           return false;
         }
       }
+      const t0 = performance.now();
       const res = id ? await applyChangesInSession(dsId, id, ref, rowChanges) : await applyChanges(dsId, ref, rowChanges);
       if (id) await syncTxStatus(id);
+      const bad = res.results.find((r) => r.error);
+      if (out) {
+        const statements = changeStatements(driver(), ref, cs, changes);
+        const affected = res.results.reduce((n, r) => n + (r.rowsAffected || 0), 0);
+        logSubmitted((k, t, p) => out?.log(k, t, p), prompt(), statements, !res.committed ? { error: bad?.error ?? "The transaction was rolled back." } : { rowsAffected: affected, ms: Math.round(performance.now() - t0) });
+      }
       if (!res.committed) {
-        const bad = res.results.find((r) => r.error);
         notify({ kind: "error", title: "Cannot submit the changes", body: bad?.error ?? "The transaction was rolled back." });
         return false;
       }
@@ -271,20 +278,42 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
     return ok;
   }
 
+  const askPending = (n: number) => {
+    activateTab(props.tab.id);
+    return ask({
+      title: "Uncommitted Changes",
+      message: `'${props.tab.title}' has ${plural(n, "uncommitted change")}. Submit them to the database before closing?`,
+      choices: [
+        { label: "Submit", value: "submit", primary: true },
+        { label: "Discard", value: "discard" },
+        { label: "Cancel", value: "cancel" },
+      ],
+      cancel: "cancel",
+    });
+  };
+
+  /**
+   * Quitting: only the question about the pending changes; nothing is sent until every prompt of the quit was answered.
+   * A transaction that was open before is ended by the quit's own transaction question; one that Submit opens (Tx:
+   * Manual) is asked after the submit.
+   */
+  async function askQuit(): Promise<false | null | (() => Promise<boolean>)> {
+    const n = pending();
+    if (n === 0) return null;
+    const a = await askPending(n);
+    if (a === "cancel") return false;
+    if (a !== "submit") return null;
+    const hadTx = inTx();
+    return async () => {
+      if (!(await submitNow())) return false;
+      return hadTx || confirmEndTransactions({ tabId: props.tab.id, reason: "closing the editor" });
+    };
+  }
+
   async function confirmClose(): Promise<boolean> {
     const n = pending();
     if (n > 0) {
-      activateTab(props.tab.id);
-      const a = await ask({
-        title: "Uncommitted Changes",
-        message: `'${props.tab.title}' has ${plural(n, "uncommitted change")}. Submit them to the database before closing?`,
-        choices: [
-          { label: "Submit", value: "submit", primary: true },
-          { label: "Discard", value: "discard" },
-          { label: "Cancel", value: "cancel" },
-        ],
-        cancel: "cancel",
-      });
+      const a = await askPending(n);
       if (a === "cancel") return false;
       if (a === "submit" && !(await submitNow())) return false;
     }
@@ -453,6 +482,7 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
       prevPage,
       openDdl,
       confirmClose,
+      askQuit,
       txMode,
       inTx,
       txStatus,
@@ -549,9 +579,12 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
       label: tableName(),
       sql: selectSql(driver(), ref, q.where, q.orderBy),
       options: exportOptions(),
-      loaded: () => ({ columns: cols() ?? [], rows: src.pageRows(), complete: !!cols() && src.complete() }),
+      loaded: () => ({ columns: cols() ?? [], rows: src.pageRows(), complete: wholeTableLoaded() }),
     };
   };
+
+  /** Every row of the (filtered) table is in memory: the page is the first one and nothing follows it. */
+  const wholeTableLoaded = () => !!cols() && src.rowOffset() === 0 && !src.hasMore() && src.complete();
 
   async function doExport(options: ExportOptions, target: ExportTarget, out: ExportPath): Promise<void> {
     setExportDlg(false);
@@ -565,7 +598,7 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
     try {
       const cs = cols();
       const sql = selectSql(driver(), ref, q.where, q.orderBy);
-      const text = cs && src.complete() ? await exportToString({ columns: cs, rows: src.pageRows() }, options) : await exportQueryToString(dsId, sql, options);
+      const text = cs && wholeTableLoaded() ? await exportToString({ columns: cs, rows: src.pageRows() }, options) : await exportQueryToString(dsId, sql, options);
       await writeClipboard(text);
       notify({ kind: "success", title: "Copied to the clipboard", body: `${fmt.label} of ${plural(src.rowCount(), "row")}`, timeout: 4000 });
     } catch (e) {

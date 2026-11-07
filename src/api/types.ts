@@ -22,7 +22,7 @@ export interface BinaryCell {
 
 // ---------------------------------------------------------------- data sources
 
-export type Driver = "postgres" | "mysql" | "sqlite";
+export type Driver = "postgres" | "mysql" | "sqlite" | "oracle";
 
 /** Where the password of a data source is stored. */
 export type PasswordStorage = "keyring" | "file";
@@ -84,6 +84,8 @@ export type NodeKind =
   | "table"
   | "view"
   | "materializedView"
+  | "package"
+  | "synonym"
   | "column"
   | "primaryKey"
   | "foreignKey"
@@ -224,6 +226,11 @@ export interface ExecOptions {
    * (default 120, 0 = never). Later `fetch_more` fails with "result set is closed".
    */
   keepOpenSecs: number;
+  /**
+   * Oracle only (it has no server-side autocommit): commit after every statement that succeeded. The console sends it in
+   * Auto transaction mode; absent / false = the transaction stays open until COMMIT.
+   */
+  autoCommit?: boolean;
 }
 
 /** Range of an executed statement in the editor text (byte / char / UTF-16 offsets). */
@@ -274,6 +281,12 @@ export type ExecEvent =
       connectionLost: boolean;
     }
   | { kind: "message"; index: number | null; text: string }
+  /**
+   * The statement succeeded with a warning (Oracle: `CREATE [OR REPLACE] PROCEDURE ...` that left the object INVALID).
+   * `message` is `Warning: PROCEDURE P compiled with errors`, `details` one `LINE/COL: text` per error. Follows the
+   * statement's `update` event; mark the statement as a warning instead of a success.
+   */
+  | { kind: "warning"; index: number; message: string; details: string[] }
   /** The session's transaction state changed (sent right after the statement that changed it, before `done`). */
   | { kind: "txStatus"; status: TxStatus }
   /**

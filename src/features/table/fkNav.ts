@@ -7,6 +7,7 @@ import { createEffect, createSignal, on } from "solid-js";
 import { introspect } from "../../api/db";
 import type { Driver, ObjectRef } from "../../api/types";
 import type { GridNavTarget, GridNavigation } from "../../components/grid/types";
+import { ensureConnected } from "../explorer";
 import { openTableTab } from "./commands";
 import { dsInfo } from "./ds";
 import { literal, quoteIdent } from "./sql";
@@ -98,6 +99,8 @@ export function createFkNavigation(dsIdOf: () => string, table: () => ObjectRef 
         setFkColumns(new Set<string>());
         if (!t || !d || t.kind !== "table") return;
         const mine = t;
+        // a restored tab opens before its data source is connected: introspection needs the connection
+        await ensureConnected(dsId()).catch(() => {});
         const out = await loadForeignKeys(dsId(), d.driver, d.database, mine);
         if (table()?.name !== mine.name) return;
         setOutgoing(out);

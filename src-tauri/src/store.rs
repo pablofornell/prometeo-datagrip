@@ -148,10 +148,37 @@ fn is_password_param(key: &str) -> bool {
     )
 }
 
+/// The Oracle thin form `[jdbc:]oracle:thin:user/PASS@target`: `(clean URL, password)` with the password taken out
+/// (`...:user@target`). The password may hold '@' and '/', so the target starts after the LAST '@' and the user ends at
+/// the first '/'. `None` when the URL is not of that form or has no password (`oracle:thin:@//host/svc`).
+fn strip_oracle_thin_password(url: &str) -> Option<(String, String)> {
+    let lower = url.to_ascii_lowercase();
+    let prefix = ["jdbc:oracle:thin:", "oracle:thin:"]
+        .into_iter()
+        .find(|p| lower.starts_with(p))?
+        .len();
+    let at = url.rfind('@')?;
+    if at < prefix {
+        return None;
+    }
+    let cred = &url[prefix..at];
+    let (user, pw) = cred.split_once('/')?;
+    if pw.is_empty() {
+        return None;
+    }
+    Some((
+        format!("{}{user}{}", &url[..prefix], &url[at..]),
+        pw.to_string(),
+    ))
+}
+
 /// Split the password out of a connection URL: `scheme://user:PASS@host/db?password=PASS&x=1` becomes
 /// `scheme://user@host/db?x=1` plus `Some(PASS)` (percent-decoded). Everything else is kept byte for byte.
 /// A URL without a password comes back unchanged with `None`.
 pub fn strip_url_password(url: &str) -> (String, Option<String>) {
+    if let Some((clean, pw)) = strip_oracle_thin_password(url) {
+        return (clean, Some(pw));
+    }
     let Some(i) = url.find("://") else {
         return (url.to_string(), None);
     };
@@ -220,8 +247,35 @@ pub fn url_has_password(url: &str) -> bool {
     strip_url_password(url).1.is_some()
 }
 
+/// `oracle:thin:user/PASS@target` -> `oracle:thin:user/***@target` wherever it appears in `msg`.
+fn redact_oracle_thin(msg: &str) -> String {
+    const KEY: &str = "oracle:thin:";
+    let lower = msg.to_ascii_lowercase();
+    let mut out = String::with_capacity(msg.len());
+    let mut pos = 0;
+    while let Some(i) = lower[pos..].find(KEY) {
+        let start = pos + i + KEY.len();
+        out.push_str(&msg[pos..start]);
+        let end = msg[start..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\''))
+            .map_or(msg.len(), |e| start + e);
+        let token = &msg[start..end];
+        match token.rfind('@').and_then(|at| Some((token.find('/')?, at))) {
+            Some((slash, at)) if slash < at && slash + 1 < at => {
+                out.push_str(&token[..slash + 1]);
+                out.push_str("***");
+                out.push_str(&token[at..]);
+            }
+            _ => out.push_str(token),
+        }
+        pos = end;
+    }
+    out.push_str(&msg[pos..]);
+    out
+}
+
 /// Remove secrets from a message that is shown to the user or logged: `known` passwords, the password of any
-/// `scheme://user:PASS@host` URL and `password=...` parameters in it.
+/// `scheme://user:PASS@host` URL, of an Oracle `oracle:thin:user/PASS@host` URL and `password=...` parameters in it.
 pub fn redact(msg: &str, known: &[&str]) -> String {
     let mut out = msg.to_string();
     for k in known.iter().filter(|k| k.chars().count() >= 3) {
@@ -261,6 +315,8 @@ pub fn redact(msg: &str, known: &[&str]) -> String {
         rest = after;
     }
     res.push_str(rest);
+    // oracle:thin:user/pass@target -> oracle:thin:user/***@target
+    let res = redact_oracle_thin(&res);
     // password=... / passwd=... / pwd=... until the next separator
     let mut cleaned = String::with_capacity(res.len());
     let lower = res.to_ascii_lowercase();
@@ -678,6 +734,15 @@ impl DataSourceStore {
         // an empty string would clear; a missing password must stay missing
         self.save(cfg)
     }
+
+    /// Gives `to` a copy of the stored password of `from` (the dialog's Duplicate: the UI never sees passwords).
+    /// A source without a password leaves `to` unchanged.
+    pub fn copy_password(&self, from: &str, to: &str) -> Result<DataSourceView, String> {
+        let password = self.get(from)?.password;
+        let mut cfg = self.get(to)?;
+        cfg.password = password.filter(|p| !p.is_empty());
+        self.save(cfg)
+    }
 }
 
 // ====================================================================== ui state
@@ -968,6 +1033,16 @@ mod tests {
             store.get(&dup.cfg.id).unwrap().password.as_deref(),
             Some("pw")
         );
+        // the dialog's Duplicate: a fresh source takes the stored password of the original
+        let fresh = store.save(cfg("fresh", None)).unwrap();
+        assert_eq!(store.get(&fresh.cfg.id).unwrap().password, None);
+        let copied = store.copy_password(&v.cfg.id, &fresh.cfg.id).unwrap();
+        assert!(copied.has_password);
+        assert_eq!(
+            store.get(&fresh.cfg.id).unwrap().password.as_deref(),
+            Some("pw")
+        );
+        store.delete(&fresh.cfg.id).unwrap();
         store.delete(&v.cfg.id).unwrap();
         assert_eq!(store.list().len(), 1);
     }
@@ -1023,6 +1098,32 @@ mod tests {
                 "postgres://u@/db?host=%2Ftmp",
                 Some("pw"),
             ),
+            // Oracle thin: user/password@target, split at the last '@'
+            (
+                "jdbc:oracle:thin:scott/tiger@//db:1521/FREEPDB1",
+                "jdbc:oracle:thin:scott@//db:1521/FREEPDB1",
+                Some("tiger"),
+            ),
+            (
+                "jdbc:oracle:thin:scott/p@ss/w@db:1521:ORCL",
+                "jdbc:oracle:thin:scott@db:1521:ORCL",
+                Some("p@ss/w"),
+            ),
+            (
+                "oracle:thin:u/pw@(DESCRIPTION=(ADDRESS=(HOST=h)))",
+                "oracle:thin:u@(DESCRIPTION=(ADDRESS=(HOST=h)))",
+                Some("pw"),
+            ),
+            (
+                "jdbc:oracle:thin:@//db:1521/FREEPDB1",
+                "jdbc:oracle:thin:@//db:1521/FREEPDB1",
+                None,
+            ),
+            (
+                "jdbc:oracle:thin:scott@db:1521:ORCL",
+                "jdbc:oracle:thin:scott@db:1521:ORCL",
+                None,
+            ),
             ("sqlite::memory:", "sqlite::memory:", None),
             ("not a url", "not a url", None),
         ];
@@ -1042,12 +1143,44 @@ mod tests {
             m.contains("postgres://bob:***@db.example/x?password=***&a=b"),
             "{m}"
         );
+        let m = redact(
+            "bad url jdbc:oracle:thin:scott/p@ss@db:1521/svc: refused; jdbc:oracle:thin:@//h/s ok",
+            &[],
+        );
+        assert_eq!(
+            m,
+            "bad url jdbc:oracle:thin:scott/***@db:1521/svc: refused; jdbc:oracle:thin:@//h/s ok"
+        );
         let m = redact("see mysql://u:hunter2@h and PWD=zzz tail", &[]);
         assert_eq!(m, "see mysql://u:***@h and PWD=*** tail");
         // short passwords are not replaced blindly inside ordinary words, text without secrets is untouched
         assert_eq!(
             redact("connection refused (os error 111)", &["ab"]),
             "connection refused (os error 111)"
+        );
+    }
+
+    #[test]
+    fn oracle_thin_url_password_goes_to_the_keyring() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ds.json");
+        let secrets = Arc::new(MemSecrets::default());
+        let store = DataSourceStore::load(path.clone(), secrets).unwrap();
+        let mut c = url_cfg("jdbc:oracle:thin:scott/s3cret@//db:1521/FREEPDB1", None);
+        c.driver = dbcore::Driver::Oracle;
+        let v = store.save(c).unwrap();
+        assert_eq!(
+            v.cfg.url_override.as_deref(),
+            Some("jdbc:oracle:thin:scott@//db:1521/FREEPDB1")
+        );
+        assert!(v.has_password);
+        assert!(!fs::read_to_string(&path).unwrap().contains("s3cret"));
+        assert!(!serde_json::to_string(&store.list())
+            .unwrap()
+            .contains("s3cret"));
+        assert_eq!(
+            store.get(&v.cfg.id).unwrap().password.as_deref(),
+            Some("s3cret")
         );
     }
 

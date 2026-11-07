@@ -37,7 +37,7 @@ import { measuredViewport } from "./viewport";
 import { logicalPos, logicalShift, scrollExtent, scrollPos } from "./virtualScroll";
 import {
   DEFAULT_VALUE,
-  classifyType,
+  columnKind,
   compareKeys,
   displayCell,
   displayLength,
@@ -47,6 +47,7 @@ import {
   isExprCell,
   isRightAligned,
   parseEdit,
+  validateEdit,
   sortKey,
 } from "./format";
 import { GridMenu, type MenuItem } from "./GridMenu";
@@ -147,7 +148,7 @@ export interface DataGridProps {
   /** `Export Table to Clipboard` of the cell menu; omitted = no entry. */
   onExportToClipboard?: () => void;
   /** SQL dialect, for the expressions offered by `Set SQL Expression`. */
-  dialect?: "postgres" | "mysql" | "sqlite";
+  dialect?: "postgres" | "mysql" | "sqlite" | "oracle";
   /** Extra scroll room below the last row (the floating paging pill). */
   bottomPad?: number;
   /** Names of the columns that hold a foreign key (their icon shows the key); read reactively, no grid reset. */
@@ -238,7 +239,8 @@ export function DataGrid(props: DataGridProps): JSX.Element {
 
   // ---- columns ----
   const iconOf = (c: GridColumn | undefined) => iconClass(c && !c.isFk && props.fkColumns?.().has(c.name) ? { ...c, isFk: true } : c);
-  const kinds = createMemo<ColumnKind[]>(() => props.columns.map((c) => classifyType(c.typeName)));
+  // an Oracle DATE holds a time of day too: its editor offers (and keeps) the time
+  const kinds = createMemo<ColumnKind[]>(() => props.columns.map((c) => columnKind(c.typeName, props.dialect)));
   const [widths, setWidths] = createSignal<number[]>([]);
   const [order, setOrder] = createSignal<number[]>([]);
   const [hidden, setHidden] = createSignal<Set<number>>(new Set());
@@ -1396,17 +1398,23 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     const a = active();
     if (!props.editable || !a || !text) return;
     const lines = text.replace(/\r\n/g, "\n").replace(/\n$/, "").split("\n");
+    let r1 = a.r;
+    let c1 = a.c;
     batch(() => {
       lines.forEach((line, i) => {
         const r = a.r + i;
         if (r >= total()) return;
+        r1 = Math.max(r1, r);
         line.split("\t").forEach((cellText, j) => {
           const c = a.c + j;
           if (c >= nCols()) return;
+          c1 = Math.max(c1, c);
           const ci = vis()[c];
           if (canEditCell(r, ci)) applyValue(r, ci, parseEdit(cellText, kinds()[ci]));
         });
       });
+      // the pasted block is selected afterwards (so Revert Selected / Set NULL act on all of it)
+      if (r1 > a.r || c1 > a.c) setRanges([{ r0: a.r, r1, c0: a.c, c1 }]);
     });
   }
   function onPaste(e: ClipboardEvent) {
@@ -1495,7 +1503,7 @@ export function DataGrid(props: DataGridProps): JSX.Element {
       const a = active();
       if (a) selectCols(a.c, a.c, false);
     } else if (k === "Enter" && mod && shift && !alt) toggleRecordView();
-    else if (k === "F12" && mod) openManageColumns();
+    else if (k === "F12" && mod && !shift && !alt) openManageColumns();
     else if (k.toLowerCase() === "f" && mod && !alt && !shift) openFind();
     else if (k === "Enter" && mod && !alt) submit();
     else if (k === "Enter" && shift && !mod) openValueEditor();
@@ -1608,6 +1616,11 @@ export function DataGrid(props: DataGridProps): JSX.Element {
   function expressionChoices(ci: number): string[] {
     const k = kinds()[ci];
     const lite = props.dialect === "sqlite";
+    if (props.dialect === "oracle") {
+      if (k === "datetime") return ["systimestamp", "sysdate", "current_timestamp"];
+      if (k === "date") return ["sysdate", "current_date"];
+      return [];
+    }
     if (k === "datetime") return lite ? ["current_timestamp"] : ["now()", "current_timestamp"];
     if (k === "date") return lite ? ["current_date"] : ["current_date", "now()"];
     if (k === "time") return ["current_time"];
@@ -1735,6 +1748,9 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     const a = active();
     const rs = ranges();
     if (!props.onSelectionChange) return;
+    // the rows behind the selection changed (server-side sort / filter, reload, edits): recompute the aggregate
+    touch(props.version);
+    pending.version();
     let cells = 0;
     for (const g of rs) cells += (g.r1 - g.r0 + 1) * (g.c1 - g.c0 + 1);
     let numeric: SelectionInfo["numeric"] = null;
@@ -2132,6 +2148,10 @@ export function DataGrid(props: DataGridProps): JSX.Element {
         kind={kinds()[ed.ci]}
         right={!T() && isRightAligned(kinds()[ed.ci], cellValue(ed.r, ed.ci))}
         onCommit={commitEdit}
+        onCommitSubmit={(t) => {
+          commitEdit(t, true);
+          void submit();
+        }}
         onCancel={cancelEdit}
         onValueEditor={(t) => {
           const s = edit();
@@ -2413,6 +2433,8 @@ interface CellEditorProps {
   kind: ColumnKind;
   right: boolean;
   onCommit: (text: string, refocus?: boolean) => void;
+  /** Ctrl+Enter: commit the edit, then submit the pending changes. */
+  onCommitSubmit: (text: string) => void;
   onCancel: () => void;
   onValueEditor: (text: string) => void;
   onTab: (back: boolean, text: string) => void;
@@ -2428,6 +2450,13 @@ function CellEditor(props: CellEditorProps): JSX.Element {
   let done = false;
   let refocus = false;
   const [text, setText] = createSignal(props.state.text);
+  /** Why the text cannot be saved (the editor stays open until it can, or Esc cancels). */
+  const [problem, setProblem] = createSignal<string | null>(null);
+  const check = (): boolean => {
+    const why = props.state.expr ? null : validateEdit(text(), props.kind);
+    setProblem(why);
+    return !why;
+  };
   const isDate = () => !props.state.expr && (props.kind === "date" || props.kind === "datetime" || props.kind === "time");
   onMount(() => {
     input.focus();
@@ -2442,12 +2471,14 @@ function CellEditor(props: CellEditorProps): JSX.Element {
     <div
       ref={wrap}
       class="dgg-ew"
-      classList={{ expr: !!props.state.expr, dt: isDate() }}
+      classList={{ expr: !!props.state.expr, dt: isDate(), invalid: !!problem() }}
       style={props.style}
       onMouseDown={(e) => e.stopPropagation()}
       onDblClick={(e) => e.stopPropagation()}
       onFocusOut={(e) => {
-        if (!wrap.contains(e.relatedTarget as Node | null)) finish(() => props.onCommit(text(), refocus));
+        if (wrap.contains(e.relatedTarget as Node | null)) return;
+        if (check()) finish(() => props.onCommit(text(), refocus));
+        else queueMicrotask(() => input.focus());
       }}
       onKeyDown={(e) => {
         e.stopPropagation();
@@ -2455,10 +2486,14 @@ function CellEditor(props: CellEditorProps): JSX.Element {
         if (e.key === "Enter" && e.shiftKey && inInput) {
           e.preventDefault();
           finish(() => props.onValueEditor(text()));
+        } else if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.altKey) {
+          e.preventDefault();
+          if (check()) finish(() => props.onCommitSubmit(text()));
         } else if (e.key === "Enter") {
           e.preventDefault();
-          if (inInput) finish(() => props.onCommit(text(), true));
-          else {
+          if (inInput) {
+            if (check()) finish(() => props.onCommit(text(), true));
+          } else {
             // a picker field: its pending change event fires on blur, then the focus-out commits
             refocus = true;
             (e.target as HTMLElement).blur();
@@ -2468,7 +2503,7 @@ function CellEditor(props: CellEditorProps): JSX.Element {
           finish(() => props.onCancel());
         } else if (e.key === "Tab" && inInput) {
           e.preventDefault();
-          finish(() => props.onTab(e.shiftKey, text()));
+          if (check()) finish(() => props.onTab(e.shiftKey, text()));
         }
       }}
     >
@@ -2478,8 +2513,10 @@ function CellEditor(props: CellEditorProps): JSX.Element {
         classList={{ r: props.right }}
         value={text()}
         spellcheck={false}
-        onInput={(e) => setText(e.currentTarget.value)}
+        onInput={(e) => (setText(e.currentTarget.value), setProblem(null))}
+        aria-invalid={!!problem()}
       />
+      <Show when={problem()}>{(m) => <div class="dgg-ew-error" role="alert">{m()}</div>}</Show>
       <Show when={isDate()}>
         <button class="dgg-ew-more" tabIndex={-1} title="Open value editor" onMouseDown={(e) => e.preventDefault()} onClick={() => finish(() => props.onValueEditor(text()))}>
           ...

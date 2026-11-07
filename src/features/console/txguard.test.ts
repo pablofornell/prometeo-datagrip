@@ -16,7 +16,7 @@ vi.mock("../table/dialogs", () => ({
     return asked.length > 1 && next.length ? next.shift() : answer;
   },
 }));
-import { STUCK_AFTER_MS, confirmEndTransactions, txDialogText } from "./txguard";
+import { STUCK_AFTER_MS, askEndTransactions, confirmEndTransactions, txDialogText } from "./txguard";
 
 const ended: string[] = [];
 let rollbackOk = false;
@@ -168,6 +168,27 @@ describe("the COMMIT / ROLLBACK of the quit guard shows its progress", () => {
     expect(result).toBe(true);
     expect(pr.log.at(-1)).toBe("close");
     expect(asked).toHaveLength(1); // no "Cannot commit" dialog: the user already chose
+  });
+  it("asking ends nothing; the plan resolves 'exit' on Quit anyway and leaves the other transactions alone", async () => {
+    const { s } = hanging();
+    sessions.push(s, con("c2", "ds1", "active"));
+    const pr = progress();
+    const plan = await askEndTransactions({ reason: "quitting the application", progress: pr.p });
+    expect(ended).toEqual([]); // the question alone commits nothing
+    expect(typeof plan).toBe("function");
+    let result: unknown;
+    void (plan as () => Promise<unknown>)().then((r) => (result = r));
+    await vi.advanceTimersByTimeAsync(STUCK_AFTER_MS);
+    pr.quit();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(result).toBe("exit");
+    expect(ended).toEqual(["c1:commit"]); // c2 is not awaited
+  });
+  it("Cancel in the question is false and nothing is ended", async () => {
+    sessions.push(con("c1", "ds1", "active"));
+    answer = "cancel";
+    expect(await askEndTransactions({ reason: "quitting" })).toBe(false);
+    expect(ended).toEqual([]);
   });
   it("a COMMIT that fails closes the progress before the failure dialog", async () => {
     sessions.push(con("c1", "ds1", "active", false));

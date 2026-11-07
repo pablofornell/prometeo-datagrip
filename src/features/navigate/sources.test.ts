@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { DataSource } from "../../api/db";
 import { storeVisibleSchemas, resetVisibleSchemasCache } from "../../state/schema-filter";
-import { type Entry, collectSettings, isEntryVisible, searchText } from "./sources";
+import { type Entry, collectSettings, footerPath, isEntryVisible, searchText } from "./sources";
 
 // sources.ts reaches the explorer, the menus and the action registry; none of that is needed here
 vi.mock("../explorer", () => ({ connectedDataSourceIds: () => new Set(), explorerDataSources: () => [], loadSchemaSnapshot: async () => [], schemaSnapshotFor: () => [] }));
@@ -23,6 +23,17 @@ describe("isEntryVisible", () => {
     expect(isEntryVisible(e("shop"), ds)).toBe(false);
     expect(isEntryVisible(e("shop", "dataSource"), ds)).toBe(true);
     resetVisibleSchemasCache();
+  });
+});
+
+describe("footerPath", () => {
+  it("is the readable path of the object, never the internal data source id", () => {
+    const pg = { ...ds, name: "qa-pg", database: "postgres" } as DataSource;
+    expect(footerPath({ ...e("qa_day"), name: "emp" }, pg)).toBe("qa-pg/postgres/qa_day/emp");
+    expect(footerPath({ ...e("qa_day", "primaryKey"), name: "emp_pkey", table: "emp", tableKind: "table" }, pg)).toBe("qa-pg/postgres/qa_day/emp/emp_pkey");
+    expect(footerPath({ ...e("qa_day", "dataSource"), name: "qa-pg" }, pg)).toBe("qa-pg");
+    expect(footerPath({ ...e("qa_day"), name: "emp" }, pg)).not.toContain("ds1");
+    expect(footerPath({ group: "console", kind: "console", name: "console", lower: "console", dsId: "ds1" } as Entry, pg)).toBe("Database Consoles/qa-pg/console");
   });
 });
 

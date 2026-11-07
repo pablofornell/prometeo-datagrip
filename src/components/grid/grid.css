@@ -1099,6 +1099,20 @@
 /* ---- cell editors: expression, date / time picker, boolean list ---- */
 .dgg-ew { position: absolute; z-index: 5; box-sizing: border-box; }
 .dgg-ew .dgg-editor { position: static; display: block; width: 100%; }
+.dgg-ew.invalid .dgg-editor { outline: 1px solid var(--dg-input-error-border); outline-offset: -1px; }
+.dgg-ew-error {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: 2px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: var(--dg-editor-tooltip-error-bg);
+  border: 1px solid var(--dg-editor-tooltip-error-border);
+  color: var(--dg-text);
+  font: 12px / 16px var(--dg-font-ui, "Inter", sans-serif);
+  white-space: nowrap;
+}
 .dgg-ew.dt .dgg-editor { padding-right: 32px; }
 .dgg-ew.expr .dgg-editor { padding-left: 22px; }
 .dgg-ew.expr::before {

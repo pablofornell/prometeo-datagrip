@@ -28,10 +28,16 @@ export function classifyType(typeName: string): ColumnKind {
   if (t === "date") return "date";
   if (t.startsWith("time")) return "time";
   if (t.startsWith("interval")) return "other";
+  if (/^binary_(float|double)\b/.test(t)) return "number"; // Oracle
   if (/^(bytea|blob|tinyblob|mediumblob|longblob|binary|varbinary|image|raw)\b/.test(t)) return "binary";
   if (NUMBER_RE.test(t)) return "number";
-  if (/^(char|varchar|nvarchar|nchar|text|tinytext|mediumtext|longtext|string|citext|name|clob|character|bpchar|enum)/.test(t)) return "text";
+  if (/^(char|varchar|nvarchar|nchar|text|tinytext|mediumtext|longtext|string|citext|name|clob|nclob|character|bpchar|enum|rowid|urowid)/.test(t) || /^long\b(?! raw)/.test(t)) return "text";
   return "other";
+}
+
+/** `classifyType`, for a grid of `dialect`: an Oracle DATE carries a time of day, so it is a `datetime`. */
+export function columnKind(typeName: string, dialect?: string): ColumnKind {
+  return dialect === "oracle" && typeName.trim().toLowerCase() === "date" ? "datetime" : classifyType(typeName);
 }
 
 const MAX_DISPLAY = 400;
@@ -92,6 +98,17 @@ export function editText(v: Cell): string {
 }
 
 const NUM_LITERAL = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+
+/**
+ * Why `text` cannot be saved in a column of `kind` (`null`: fine). Only numeric columns are checked: an empty
+ * text is NULL, anything else must be a number (a blank text is not silently NULL).
+ */
+export function validateEdit(text: string, kind: ColumnKind): string | null {
+  if (kind !== "number" || text === "") return null;
+  const t = text.trim();
+  if (NUM_LITERAL.test(t) || /^[+-]?(nan|infinity)$/i.test(t)) return null;
+  return t === "" ? "A number is expected (clear the field to set NULL)" : `"${t}" is not a valid number`;
+}
 
 /** Parses text typed in an editor into a cell value for the given column kind. */
 export function parseEdit(text: string, kind: ColumnKind): Cell {

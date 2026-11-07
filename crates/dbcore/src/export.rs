@@ -10,7 +10,10 @@ use crate::error::Result;
 use crate::exec::query_pool;
 use crate::manager::ConnectionManager;
 use crate::model::*;
-use crate::quote::{quote_ident, quote_literal};
+use crate::quote::{
+    oracle_raw_literal, oracle_text_literal, oracle_time_kind, oracle_time_literal, quote_ident,
+    quote_literal,
+};
 use crate::value::describe_columns_pool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,11 +95,118 @@ fn cell_text(c: &Cell, null: &str) -> String {
     }
 }
 
+/// A float cell with no fractional part (`3.0`: SQLite REAL, PG / MySQL double). serde_json writes it as `3.0` but
+/// the grid shows `3` (a JSON number has no int / float distinction in the browser).
+fn is_integral_float(c: &Cell) -> bool {
+    matches!(c, Value::Number(n) if n.is_f64() && n.as_f64().is_some_and(|f| f.fract() == 0.0 && f.abs() < 1e15))
+}
+
+/// The cell as the grid shows it: an integral float is written without `.0`.
+fn integral_as_int(c: &Cell) -> Cell {
+    match c {
+        Value::Number(n) if is_integral_float(c) => {
+            Value::from(n.as_f64().unwrap_or_default() as i64)
+        }
+        other => other.clone(),
+    }
+}
+
 /// JSON value with binary cells replaced by `"0x..."` strings.
 fn cell_json(c: &Cell) -> Value {
     match c {
         Value::Object(m) if m.contains_key("$bin") => Value::String(cell_text(c, "")),
         other => other.clone(),
+    }
+}
+
+/// Is `ty` a number type whose values a driver may deliver as text (exact decimals, big integers)?
+fn is_numeric_type(ty: &str) -> bool {
+    let ty = ty.trim().to_ascii_lowercase();
+    let base = ty
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or("");
+    matches!(
+        base,
+        "numeric"
+            | "decimal"
+            | "dec"
+            | "fixed"
+            | "number"
+            | "bigint"
+            | "int8"
+            | "int"
+            | "integer"
+            | "int4"
+            | "int2"
+            | "smallint"
+            | "mediumint"
+            | "tinyint"
+            | "float"
+            | "float4"
+            | "float8"
+            | "double"
+            | "real"
+    )
+}
+
+/// The text of a number cell that arrived as a string (`'1001.00'` of a DECIMAL column) when it can stand as a
+/// numeric literal as it is (no precision lost by going through a float).
+fn numeric_text<'a>(c: &'a Cell, ty: &str) -> Option<&'a str> {
+    let Value::String(s) = c else {
+        return None;
+    };
+    let t = s.trim();
+    (is_numeric_type(ty)
+        && t.bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'e' | b'E'))
+        && t.parse::<f64>().is_ok_and(f64::is_finite))
+    .then_some(t)
+}
+
+/// `t` is written the way JSON writes numbers (`-?int[.frac][e[+-]exp]`).
+fn is_json_number(t: &str) -> bool {
+    let b = t.as_bytes();
+    let digits = |mut i: usize| {
+        let from = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        (i, i > from)
+    };
+    let mut i = usize::from(b.first() == Some(&b'-'));
+    match b.get(i) {
+        Some(b'0') => i += 1,
+        Some(b'1'..=b'9') => i = digits(i).0,
+        _ => return false,
+    }
+    if b.get(i) == Some(&b'.') {
+        let (j, ok) = digits(i + 1);
+        if !ok {
+            return false;
+        }
+        i = j;
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(b.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        let (j, ok) = digits(i);
+        if !ok {
+            return false;
+        }
+        i = j;
+    }
+    i == b.len()
+}
+
+/// The JSON text of cell `c` of a column of declared type `ty`: a number cell that arrived as a string is written
+/// as a JSON number with its digits unchanged.
+fn json_text(c: &Cell, ty: &str) -> String {
+    match numeric_text(c, ty) {
+        Some(t) if is_json_number(t) => t.to_string(),
+        _ => cell_json(c).to_string(),
     }
 }
 
@@ -120,6 +230,32 @@ fn pg_array_element(c: &Cell) -> String {
     }
 }
 
+/// [`sql_literal`] for a value of a column of declared type `ty`: Oracle writes dates, timestamps and long text with
+/// conversion functions, the others only look at the value.
+fn sql_literal_typed(d: Driver, c: &Cell, ty: &str) -> String {
+    // a DECIMAL / BIGINT that arrived as text is a number, not a string
+    if let Some(t) = numeric_text(c, ty) {
+        return t.to_string();
+    }
+    if d != Driver::Oracle {
+        return sql_literal(d, c);
+    }
+    match c {
+        Value::String(s) => {
+            if let Some(l) = oracle_time_kind(ty).and_then(|k| oracle_time_literal(k, s)) {
+                l
+            } else if ty.to_ascii_uppercase().starts_with("NUMBER")
+                && s.trim().parse::<f64>().is_ok_and(f64::is_finite)
+            {
+                s.trim().to_string()
+            } else {
+                oracle_text_literal(s)
+            }
+        }
+        _ => sql_literal(d, c),
+    }
+}
+
 fn sql_literal(d: Driver, c: &Cell) -> String {
     match c {
         // PG arrays arrive as JSON arrays: write them back as an array literal ('{1,2}')
@@ -130,14 +266,17 @@ fn sql_literal(d: Driver, c: &Cell) -> String {
             _ => if *b { "1" } else { "0" }.into(),
         },
         Value::Number(n) => n.to_string(),
+        Value::String(s) if d == Driver::Oracle => oracle_text_literal(s),
         Value::String(s) => quote_literal(d, s),
         Value::Object(m) if m.contains_key("$bin") => {
             let hex = m["$bin"].as_str().unwrap_or("");
             match d {
                 Driver::Postgres => format!("'\\x{hex}'::bytea"),
+                Driver::Oracle => oracle_raw_literal(hex),
                 _ => format!("X'{hex}'"),
             }
         }
+        other if d == Driver::Oracle => oracle_text_literal(&other.to_string()),
         other => quote_literal(d, &other.to_string()),
     }
 }
@@ -160,6 +299,8 @@ pub struct Exporter<W: Write> {
     held: Vec<Vec<Cell>>,
     /// Primary key flag of each column of the result (SQL UPDATE / WHERE key).
     src_pk: Vec<bool>,
+    /// Declared type of each column of the result (literals of dates and the like).
+    src_types: Vec<String>,
     /// Text rows of the `Pretty` table (needs every row to align the columns).
     text_rows: Vec<Vec<String>>,
 }
@@ -177,6 +318,7 @@ impl<W: Write> Exporter<W> {
             batch: Vec::new(),
             held: Vec::new(),
             src_pk: Vec::new(),
+            src_types: Vec::new(),
             text_rows: Vec::new(),
         }
     }
@@ -232,12 +374,21 @@ impl<W: Write> Exporter<W> {
         }
     }
 
+    /// The SQL literal of cell `c` of column `i` of the result.
+    fn lit(&self, i: usize, c: &Cell) -> String {
+        sql_literal_typed(
+            self.o.dialect,
+            c,
+            self.src_types.get(i).map(String::as_str).unwrap_or(""),
+        )
+    }
+
     /// `"col" = literal` (`is null` for NULL).
     fn eq_pred(&self, i: usize, row: &[Cell]) -> String {
         let col = quote_ident(self.o.dialect, &self.src_cols[i]);
         match row.get(i) {
             None | Some(Value::Null) => format!("{col} is null"),
-            Some(c) => format!("{col} = {}", sql_literal(self.o.dialect, c)),
+            Some(c) => format!("{col} = {}", self.lit(i, c)),
         }
     }
 
@@ -285,6 +436,7 @@ impl<W: Write> Exporter<W> {
     pub fn begin(&mut self, columns: &[ColumnMeta]) -> io::Result<()> {
         self.src_cols = columns.iter().map(|c| c.name.clone()).collect();
         self.src_pk = columns.iter().map(|c| c.is_pk).collect();
+        self.src_types = columns.iter().map(|c| c.type_name.clone()).collect();
         self.began = true;
         if self.o.transpose {
             return Ok(());
@@ -368,6 +520,13 @@ impl<W: Write> Exporter<W> {
     }
 
     fn emit(&mut self, row: &[Cell]) -> io::Result<()> {
+        let plain;
+        let row = if row.iter().any(is_integral_float) {
+            plain = row.iter().map(integral_as_int).collect::<Vec<_>>();
+            &plain[..]
+        } else {
+            row
+        };
         let with_header;
         let row = if self.row_header() {
             with_header = std::iter::once(Value::from(self.emitted + 1))
@@ -406,24 +565,35 @@ impl<W: Write> Exporter<W> {
                 writeln!(self.w, "| {} |", line.join(" | "))?;
             }
             ExportFormat::Json | ExportFormat::JsonLines => {
-                let mut obj = serde_json::Map::new();
+                // (key, JSON text) in column order
+                let mut obj: Vec<(String, String)> = Vec::with_capacity(row.len());
                 for (i, c) in row.iter().enumerate() {
                     let mut key = self
                         .cols
                         .get(i)
                         .cloned()
                         .unwrap_or_else(|| format!("column{i}"));
-                    while obj.contains_key(&key) {
+                    while obj.iter().any(|(k, _)| *k == key) {
                         key.push('_');
                     }
-                    obj.insert(key, cell_json(c));
+                    let ty = self.src_types.get(i).map(String::as_str).unwrap_or("");
+                    obj.push((key, json_text(c, ty)));
                 }
+                let text = format!(
+                    "{{{}}}",
+                    obj.iter()
+                        .map(|(k, v)| format!("{}:{v}", Value::String(k.clone())))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
                 if self.o.format == ExportFormat::JsonLines {
-                    serde_json::to_writer(&mut self.w, &Value::Object(obj))?;
-                    writeln!(self.w)?;
+                    writeln!(self.w, "{text}")?;
                 } else {
-                    write!(self.w, "{}\n  ", if self.emitted == 0 { "" } else { "," })?;
-                    serde_json::to_writer(&mut self.w, &Value::Object(obj))?;
+                    write!(
+                        self.w,
+                        "{}\n  {text}",
+                        if self.emitted == 0 { "" } else { "," }
+                    )?;
                 }
             }
             ExportFormat::SqlUpdate => {
@@ -441,7 +611,7 @@ impl<W: Write> Exporter<W> {
                             "{} = {}",
                             quote_ident(self.o.dialect, &self.src_cols[i]),
                             row.get(i)
-                                .map(|c| sql_literal(self.o.dialect, c))
+                                .map(|c| self.lit(i, c))
                                 .unwrap_or_else(|| "NULL".into())
                         )
                     })
@@ -460,7 +630,7 @@ impl<W: Write> Exporter<W> {
                 if key.len() == 1 {
                     // one key column: a single `in (...)` list, written by `finish`
                     let c = row.get(key[0]).cloned().unwrap_or(Value::Null);
-                    self.batch.push(sql_literal(self.o.dialect, &c));
+                    self.batch.push(self.lit(key[0], &c));
                 } else {
                     let preds: Vec<String> = key.iter().map(|&i| self.eq_pred(i, row)).collect();
                     write!(
@@ -520,8 +690,11 @@ impl<W: Write> Exporter<W> {
                 self.text_rows.push(line);
             }
             ExportFormat::SqlInsert => {
-                let vals: Vec<String> =
-                    row.iter().map(|c| sql_literal(self.o.dialect, c)).collect();
+                let vals: Vec<String> = row
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| self.lit(i, c))
+                    .collect();
                 self.batch.push(format!("({})", vals.join(", ")));
                 if self.batch.len() >= self.o.rows_per_insert.max(1) {
                     self.flush_batch()?;
@@ -541,13 +714,27 @@ impl<W: Write> Exporter<W> {
             .iter()
             .map(|c| quote_ident(self.o.dialect, c))
             .collect();
-        writeln!(
-            self.w,
-            "insert into {} ({}) values {};",
-            self.table(),
-            cols.join(", "),
-            self.batch.join(",\n    ")
-        )?;
+        if self.o.dialect == Driver::Oracle && self.batch.len() > 1 {
+            // no multi-row VALUES before 23ai: one `insert all` with a target per row
+            let into = format!("into {} ({}) values ", self.table(), cols.join(", "));
+            writeln!(
+                self.w,
+                "insert all\n    {}\nselect 1 from dual;",
+                self.batch
+                    .iter()
+                    .map(|t| format!("{into}{t}"))
+                    .collect::<Vec<_>>()
+                    .join("\n    ")
+            )?;
+        } else {
+            writeln!(
+                self.w,
+                "insert into {} ({}) values {};",
+                self.table(),
+                cols.join(", "),
+                self.batch.join(",\n    ")
+            )?;
+        }
         self.batch.clear();
         Ok(())
     }
@@ -788,8 +975,51 @@ mod tests {
     }
 
     #[test]
+    fn integral_floats_are_written_like_the_grid_shows_them() {
+        let rs = ResultSet {
+            columns: vec![
+                ColumnMeta {
+                    name: "r".into(),
+                    type_name: "REAL".into(),
+                    nullable: true,
+                    is_pk: false,
+                    table_ref: None,
+                },
+                ColumnMeta {
+                    name: "a".into(),
+                    type_name: "REAL".into(),
+                    nullable: true,
+                    is_pk: false,
+                    table_ref: None,
+                },
+            ],
+            rows: vec![vec![json!(3.0), json!(2.5)], vec![json!(-4.0), json!(7)]],
+            ..Default::default()
+        };
+        let o = |format| ExportOptions {
+            format,
+            table_name: Some("t".into()),
+            ..Default::default()
+        };
+        let csv = export_to_string(&rs, &o(ExportFormat::Csv)).unwrap();
+        assert!(csv.contains("3,2.5") && csv.contains("-4,7"), "{csv}");
+        let j = export_to_string(&rs, &o(ExportFormat::Json)).unwrap();
+        assert!(
+            j.contains(r#"{"r":3,"a":2.5}"#) && j.contains(r#"{"r":-4,"a":7}"#),
+            "{j}"
+        );
+        let sql = export_to_string(&rs, &o(ExportFormat::SqlInsert)).unwrap();
+        assert!(sql.contains("(3, 2.5)"), "{sql}");
+    }
+
+    #[test]
     fn json() {
         let out = run(ExportFormat::Json, |_| {});
+        // keys keep the column order (not alphabetical: `name` is after `id`, `data` last)
+        assert!(
+            out.contains(r#"{"id":1,"name":"a,b \"q\"","data":"0xff00"}"#),
+            "{out}"
+        );
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
             v[0],
@@ -806,6 +1036,66 @@ mod tests {
         )
         .unwrap();
         assert_eq!(serde_json::from_str::<Value>(&empty).unwrap(), json!([]));
+    }
+
+    /// A DECIMAL column of the result: values arrive as strings (`"1001.00"`) but are numbers.
+    fn decimals() -> ResultSet {
+        let col = |n: &str, t: &str| ColumnMeta {
+            name: n.into(),
+            type_name: t.into(),
+            nullable: true,
+            is_pk: false,
+            table_ref: None,
+        };
+        ResultSet {
+            columns: vec![
+                col("amount", "NUMERIC(10,2)"),
+                col("label", "text"),
+                col("big", "bigint"),
+            ],
+            rows: vec![
+                vec![
+                    json!("1001.00"),
+                    json!("1001.00"),
+                    json!("9007199254740993"),
+                ],
+                vec![json!("-0.50"), json!("NaN"), json!("+5")],
+                vec![json!("NaN"), json!("x"), Value::Null],
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn decimals_are_numbers_in_sql_and_json() {
+        let o = |format| ExportOptions {
+            format,
+            table_name: Some("t".into()),
+            ..Default::default()
+        };
+        let sql = export_to_string(&decimals(), &o(ExportFormat::SqlInsert)).unwrap();
+        assert!(
+            sql.contains("values (1001.00, '1001.00', 9007199254740993)"),
+            "{sql}"
+        );
+        assert!(sql.contains("(-0.50, 'NaN', +5)"), "{sql}");
+        // NaN is not a literal number: it stays a string
+        assert!(sql.contains("('NaN', 'x', NULL)"), "{sql}");
+        let json = export_to_string(&decimals(), &o(ExportFormat::Json)).unwrap();
+        // the digits are kept as they are (no float round trip); "+5" is no JSON number, so it stays a string
+        assert!(
+            json.contains(r#"{"amount":1001.00,"label":"1001.00","big":9007199254740993}"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#"{"amount":-0.50,"label":"NaN","big":"+5"}"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#"{"amount":"NaN","label":"x","big":null}"#),
+            "{json}"
+        );
+        assert!(serde_json::from_str::<Value>(&json).is_ok());
     }
 
     #[test]
@@ -852,6 +1142,97 @@ mod tests {
     }
 
     /// A result with a primary key column (`id`), for the key based formats.
+    #[test]
+    fn sql_insert_oracle() {
+        let col = |n: &str, t: &str, pk: bool| ColumnMeta {
+            name: n.into(),
+            type_name: t.into(),
+            nullable: true,
+            is_pk: pk,
+            table_ref: None,
+        };
+        let rs = ResultSet {
+            columns: vec![
+                col("ID", "NUMBER", true),
+                col("name", "VARCHAR2(20)", false),
+                col("D", "DATE", false),
+                col("TS", "TIMESTAMP(6)", false),
+                col("TZ", "TIMESTAMP(6) WITH TIME ZONE", false),
+                col("B", "BLOB", false),
+                col("N", "NUMBER(30,10)", false),
+            ],
+            rows: vec![
+                vec![
+                    json!("1"),
+                    json!("it's"),
+                    json!("2024-02-29 13:45:10"),
+                    json!("2024-02-29 13:45:10.5"),
+                    json!("2024-02-29 13:45:10.5 +02:00"),
+                    json!({"$bin": "cafe"}),
+                    json!("12345678901234567890.1234567890"),
+                ],
+                vec![
+                    json!(2),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    json!(true),
+                ],
+            ],
+            has_more: false,
+            total_hint: None,
+            row_locators: None,
+        };
+        let opts = |n: usize| ExportOptions {
+            format: ExportFormat::SqlInsert,
+            dialect: Driver::Oracle,
+            table_name: Some("DEMO.T".into()),
+            rows_per_insert: n,
+            ..Default::default()
+        };
+        let one = export_to_string(&rs, &opts(1)).unwrap();
+        assert_eq!(
+            one.lines().next().unwrap(),
+            "insert into DEMO.T (ID, \"name\", D, TS, TZ, B, N) values (1, 'it''s', \
+             TO_DATE('2024-02-29 13:45:10', 'YYYY-MM-DD HH24:MI:SS'), \
+             TO_TIMESTAMP('2024-02-29 13:45:10.500000000', 'YYYY-MM-DD HH24:MI:SS.FF9'), \
+             TO_TIMESTAMP_TZ('2024-02-29 13:45:10.500000000 +02:00', 'YYYY-MM-DD HH24:MI:SS.FF9 TZH:TZM'), \
+             HEXTORAW('cafe'), 12345678901234567890.1234567890);"
+        );
+        assert!(
+            one.contains("values (2, NULL, NULL, NULL, NULL, NULL, 1);"),
+            "{one}"
+        );
+        // no multi-row VALUES: one `insert all`
+        let all = export_to_string(&rs, &opts(10)).unwrap();
+        assert!(
+            all.starts_with("insert all\n    into DEMO.T (ID, "),
+            "{all}"
+        );
+        assert!(all.ends_with("select 1 from dual;\n"), "{all}");
+        assert_eq!(all.matches("\n    into DEMO.T").count(), 2, "{all}");
+        assert_eq!(all.matches("into DEMO.T").count(), 2, "{all}");
+        // update / where use the same literals
+        let upd = export_to_string(
+            &rs,
+            &ExportOptions {
+                format: ExportFormat::SqlUpdate,
+                ..opts(1)
+            },
+        )
+        .unwrap();
+        assert!(
+            upd.starts_with("update DEMO.T set \"name\" = 'it''s', D = TO_DATE("),
+            "{upd}"
+        );
+        assert!(
+            upd.lines().next().unwrap().ends_with("where ID = 1;"),
+            "{upd}"
+        );
+    }
+
     fn rs_pk() -> ResultSet {
         let mut r = rs();
         r.columns[0].is_pk = true;

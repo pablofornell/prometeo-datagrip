@@ -74,8 +74,12 @@ export function firstKeyword(sql: string): string {
   return (/^\(*([A-Za-z]+)/.exec(s)?.[1] ?? "").toUpperCase();
 }
 
-export function reportsCount(sql: string): boolean {
-  return !NO_COUNT.has(firstKeyword(sql));
+/** Oracle PL/SQL blocks and calls: the server reports no row count for them (the driver says 1). */
+const ORACLE_NO_COUNT = new Set(["DECLARE", "CALL", "EXEC", "EXECUTE"]);
+
+export function reportsCount(sql: string, driver?: string): boolean {
+  const kw = firstKeyword(sql);
+  return !NO_COUNT.has(kw) && !(driver === "oracle" && ORACLE_NO_COUNT.has(kw));
 }
 
 // Leading line or block comment of a statement, used to name the result tab.

@@ -1,4 +1,4 @@
-import type { SchemaColumn, SchemaRoutine, SchemaSnapshot } from "./types";
+import type { SchemaColumn, SchemaRoutine, SchemaSnapshot, SchemaSynonym } from "./types";
 
 export interface TableIdx {
   schema: string;
@@ -13,6 +13,8 @@ export interface SchemaIdx {
   tables: Map<string, TableIdx>;
   list: TableIdx[];
   routines: SchemaRoutine[];
+  /** Synonyms by lower-case name. */
+  synonyms: Map<string, SchemaSynonym>;
 }
 
 /** Case-insensitive lookup structure over a {@link SchemaSnapshot}. */
@@ -23,7 +25,7 @@ export class SchemaIndex {
   constructor(snapshot: SchemaSnapshot | undefined, readonly defaultSchema?: string) {
     this.database = snapshot?.database;
     for (const s of snapshot?.schemas ?? []) {
-      const idx: SchemaIdx = { name: s.name, tables: new Map(), list: [], routines: s.routines ?? [] };
+      const idx: SchemaIdx = { name: s.name, tables: new Map(), list: [], routines: s.routines ?? [], synonyms: new Map((s.synonyms ?? []).map((x) => [x.name.toLowerCase(), x])) };
       for (const t of s.tables) {
         const ti: TableIdx = {
           schema: s.name,
@@ -48,17 +50,36 @@ export class SchemaIndex {
     return this.schemas.has(name.toLowerCase());
   }
 
-  /** `parts` are lower-case, unquoted: `[table]`, `[schema, table]` or `[db, schema, table]`. */
-  findTable(parts: string[]): TableIdx | undefined {
+  /** `parts` are lower-case, unquoted: `[table]`, `[schema, table]` or `[db, schema, table]`. A synonym resolves to its target. */
+  findTable(parts: string[], depth = 0): TableIdx | undefined {
     if (parts.length === 0) return undefined;
     const t = parts[parts.length - 1];
-    if (parts.length >= 2) return this.schemas.get(parts[parts.length - 2])?.tables.get(t);
+    const direct = this.lookup(parts, (s) => s.tables.get(t));
+    if (direct) return direct;
+    const syn = this.synonym(parts);
+    // a chain of synonyms is followed a few levels (a loop must not hang the inspection)
+    return syn?.target && depth < 4 ? this.findTable(syn.target.map((x) => x.toLowerCase()), depth + 1) : undefined;
+  }
+
+  /** The synonym `parts` names (its target may be outside the snapshot, or a database link). */
+  synonym(parts: string[]): SchemaSynonym | undefined {
+    if (parts.length === 0) return undefined;
+    const t = parts[parts.length - 1];
+    return this.lookup(parts, (s) => s.synonyms.get(t));
+  }
+
+  private lookup<T>(parts: string[], get: (s: SchemaIdx) => T | undefined): T | undefined {
+    if (parts.length >= 2) {
+      const s = this.schemas.get(parts[parts.length - 2]);
+      return s && get(s);
+    }
     if (this.defaultSchema) {
-      const hit = this.schemas.get(this.defaultSchema.toLowerCase())?.tables.get(t);
+      const s = this.schemas.get(this.defaultSchema.toLowerCase());
+      const hit = s && get(s);
       if (hit) return hit;
     }
     for (const s of this.list) {
-      const hit = s.tables.get(t);
+      const hit = get(s);
       if (hit) return hit;
     }
     return undefined;

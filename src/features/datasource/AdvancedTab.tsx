@@ -27,6 +27,7 @@ const KNOWN: Record<Dbms, KnownProp[]> = {
   ],
   mysql: MYSQL,
   mariadb: MYSQL,
+  oracle: [CONNECT_TIMEOUT],
   sqlite: [
     { name: "busy_timeout", description: "Milliseconds to wait for a locked database before failing. Default: 5000." },
     { ...CONNECT_TIMEOUT, description: "Seconds to wait while opening the pool. Default: 15." },

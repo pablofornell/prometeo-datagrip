@@ -1,6 +1,6 @@
 /** The 34px toolbar of a query console (operative items of DataGrip's: run, explain, history, Tx, commit / rollback, stop, schema). */
 import { Show, type JSX } from "solid-js";
-import { ActionButton, Icon, ToolbarSeparator, openMenu } from "../../components/ui";
+import { ActionButton, Icon, ToolbarSeparator, openMenu, overflowToolbar } from "../../components/ui";
 import { StopButton } from "../output/OutputToolbar";
 import { openSettings } from "../settings";
 import type { ConsoleSession } from "./session";
@@ -11,7 +11,7 @@ export function ConsoleToolbar(props: { session: ConsoleSession; /** Shown left 
   let schemaBtn!: HTMLButtonElement;
   let explainBtn!: HTMLButtonElement;
   return (
-    <div class="dg-toolbar dgc-toolbar">
+    <div class="dg-toolbar dgc-toolbar" ref={overflowToolbar}>
       <span
         class="dgc-run"
         onContextMenu={(e) => {
@@ -27,7 +27,7 @@ export function ConsoleToolbar(props: { session: ConsoleSession; /** Shown left 
         title="Explain Plan"
         dropdown
         disabled={s().out.running()}
-        onClick={() => openMenu([{ action: "sql.explainPlan" }, ...(s().driver === "sqlite" ? [] : [{ action: "sql.explainAnalyse" }])], { anchor: explainBtn })}
+        onClick={() => openMenu([{ action: "sql.explainPlan" }, ...(s().driver === "sqlite" || s().driver === "oracle" ? [] : [{ action: "sql.explainAnalyse" }])], { anchor: explainBtn })}
       />
       <ToolbarSeparator />
       <ActionButton action="sql.history" icon="history" title="Browse Query History" />

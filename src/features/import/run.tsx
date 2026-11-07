@@ -1,5 +1,6 @@
 /** Starts an import: native file dialog, the Import Data dialog, then the background import with its balloon. */
 import {
+  type Driver,
   type ImportRequest,
   cancelImport,
   chooseImportFile,
@@ -11,7 +12,7 @@ import { notify } from "../../components/ui";
 import { startTask } from "../../state/status";
 import { ensureConnected, refreshNode } from "../explorer";
 import { mountDialog } from "../table/dialogs";
-import { dsInfo, errText, loadDataSources } from "../table/ds";
+import { dsInfo, errText, requireDriver } from "../table/ds";
 import { ImportDialog, type TableInfo } from "./ImportDialog";
 import { resultMessage } from "./model";
 
@@ -68,21 +69,21 @@ export async function runImport(dsId: string, req: ImportRequest, fileName: stri
 
 /** `import.file`: choose a file, then the Import Data dialog. */
 export async function openImport(t: ImportTarget): Promise<void> {
+  let driver: Driver;
   try {
-    await loadDataSources();
+    driver = await requireDriver(t.dsId);
     await ensureConnected(t.dsId);
   } catch (e) {
     notify({ kind: "error", title: "Cannot import the data", body: errText(e) });
     return;
   }
   const ds = dsInfo(t.dsId);
-  const driver = ds?.driver ?? "postgres";
   try {
     const source = await chooseImportFile();
     if (!source) return;
     const schemas = await loadSchemas(t.dsId, driver === "postgres");
     const names = schemas.map((s) => s.name);
-    const usual = driver === "postgres" ? "public" : "main";
+    const usual = driver === "postgres" ? "public" : driver === "oracle" ? (ds?.user ?? "").toUpperCase() : "main";
     const schema = t.schema && names.includes(t.schema) ? t.schema : names.includes(usual) ? usual : (names[0] ?? null);
     const cache = new Map<string, Promise<TableInfo[]>>();
     const loadTables = (s: string | null): Promise<TableInfo[]> => {

@@ -7,6 +7,7 @@
 //!   itself (view bodies, function bodies) is passed through unchanged.
 //! * MySQL: `SHOW CREATE ...` (server text, unchanged; our own `create index` is lower-case).
 //! * SQLite: `sqlite_master.sql` (stored text, unchanged).
+//! * Oracle: `DBMS_METADATA.GET_DDL` (server text; tables get their indexes and comments appended).
 
 use crate::conn::{Live, Pool};
 use crate::error::{DbError, Result};
@@ -68,6 +69,20 @@ impl ConnectionManager {
             }
             Driver::MySql => my_ddl(&live, obj).await,
             Driver::Sqlite => lite_ddl(&live, obj).await,
+            Driver::Oracle => {
+                let text = ora_ddl(&live, obj).await?;
+                let routine = matches!(
+                    obj.kind,
+                    NodeKind::Function
+                        | NodeKind::Procedure
+                        | NodeKind::Routine
+                        | NodeKind::Package
+                );
+                Ok(match (&obj.schema, unqualified && !routine) {
+                    (Some(sc), true) => unqualify_schema(&text, sc),
+                    _ => text,
+                })
+            }
         }
     }
 }
@@ -832,6 +847,136 @@ async fn my_ddl(live: &Live, o: &ObjectRef) -> Result<String> {
         }
         k => Err(DbError::Unsupported(format!("No DDL for {k:?}"))),
     }
+}
+
+// ================================================================= Oracle
+
+fn oq(v: &str) -> String {
+    quote_literal(Driver::Oracle, v)
+}
+
+/// One statement that sets the `DBMS_METADATA` transforms and fetches the DDL, so both run on the same session
+/// whatever connection of the pool serves it (`WITH FUNCTION`, 12c+). Tables also get their indexes (the ones no
+/// constraint creates) and comments; packages their body.
+fn ora_ddl_sql(object_type: &str, name: &str, owner: &str) -> String {
+    format!(
+        "with function prometeo_ddl(t varchar2, n varchar2, o varchar2) return clob is \
+           r clob; \
+         begin \
+           dbms_metadata.set_transform_param(dbms_metadata.session_transform, 'SQLTERMINATOR', true); \
+           dbms_metadata.set_transform_param(dbms_metadata.session_transform, 'PRETTY', true); \
+           dbms_metadata.set_transform_param(dbms_metadata.session_transform, 'STORAGE', false); \
+           dbms_metadata.set_transform_param(dbms_metadata.session_transform, 'SEGMENT_ATTRIBUTES', false); \
+           dbms_metadata.set_transform_param(dbms_metadata.session_transform, 'TABLESPACE', false); \
+           r := dbms_metadata.get_ddl(t, n, o); \
+           if t = 'TABLE' then \
+             for i in (select x.owner, x.index_name from all_indexes x where x.table_owner = o and x.table_name = n \
+                         and x.generated = 'N' and x.index_type <> 'LOB' \
+                         and not exists (select 1 from all_constraints k where k.owner = x.owner and k.index_name = x.index_name) \
+                       order by x.index_name) loop \
+               r := r || chr(10) || dbms_metadata.get_ddl('INDEX', i.index_name, i.owner); \
+             end loop; \
+           end if; \
+           if t in ('TABLE', 'VIEW', 'MATERIALIZED_VIEW') then \
+             begin r := r || chr(10) || dbms_metadata.get_dependent_ddl('COMMENT', n, o); exception when others then null; end; \
+           elsif t = 'PACKAGE' then \
+             begin r := r || chr(10) || dbms_metadata.get_ddl('PACKAGE_BODY', n, o); exception when others then null; end; \
+           end if; \
+           return r; \
+         end; \
+         select prometeo_ddl({}, {}, {}) from dual",
+        oq(object_type),
+        oq(name),
+        oq(owner)
+    )
+}
+
+/// Blank lines in a row become one, and the two blanks `GET_DDL` indents a statement with go.
+fn ora_tidy(text: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut at_start = true;
+    for line in text.trim().lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            if !at_start {
+                out.push("");
+            }
+            at_start = true;
+            continue;
+        }
+        let head = line.trim_start();
+        let statement = ["CREATE ", "ALTER ", "COMMENT ON "]
+            .iter()
+            .any(|k| head.starts_with(k));
+        out.push(if at_start && statement { head } else { line });
+        at_start = false;
+    }
+    out.join("\n")
+}
+
+async fn ora_ddl(live: &Live, o: &ObjectRef) -> Result<String> {
+    let pool = &live.pool;
+    let sc = match &o.schema {
+        Some(s) => s.clone(),
+        None => crate::introspect::ora_current_schema(pool).await?,
+    };
+    let table_of = || {
+        o.table
+            .clone()
+            .ok_or_else(|| DbError::InvalidArgument("object needs a table".into()))
+    };
+    let (ty, name) = match o.kind {
+        NodeKind::Table => ("TABLE", o.name.clone()),
+        NodeKind::View => ("VIEW", o.name.clone()),
+        NodeKind::MaterializedView => ("MATERIALIZED_VIEW", o.name.clone()),
+        NodeKind::Sequence => ("SEQUENCE", o.name.clone()),
+        NodeKind::Index => ("INDEX", o.name.clone()),
+        NodeKind::Synonym => ("SYNONYM", o.name.clone()),
+        NodeKind::Package => ("PACKAGE", o.name.clone()),
+        NodeKind::Trigger => ("TRIGGER", o.name.clone()),
+        NodeKind::Procedure => match &o.table {
+            // a package member: the DDL of its package
+            Some(pkg) => ("PACKAGE", pkg.clone()),
+            None => ("PROCEDURE", o.name.clone()),
+        },
+        NodeKind::Function => match &o.table {
+            Some(pkg) => ("PACKAGE", pkg.clone()),
+            None => ("FUNCTION", o.name.clone()),
+        },
+        NodeKind::Routine => {
+            let rows = pool
+                .query_strings(&format!(
+                    "select object_type from all_objects where owner = {} and object_name = {} \
+                     and object_type in ('PROCEDURE', 'FUNCTION', 'PACKAGE')",
+                    oq(&sc),
+                    oq(&o.name)
+                ))
+                .await?;
+            let t = rows
+                .first()
+                .map(|r| g(r, 0))
+                .ok_or_else(|| DbError::NotFound(format!("Routine {sc}.{} not found", o.name)))?;
+            (
+                match t.as_str() {
+                    "FUNCTION" => "FUNCTION",
+                    "PACKAGE" => "PACKAGE",
+                    _ => "PROCEDURE",
+                },
+                o.name.clone(),
+            )
+        }
+        NodeKind::Column
+        | NodeKind::PrimaryKey
+        | NodeKind::ForeignKey
+        | NodeKind::UniqueKey
+        | NodeKind::Check => ("TABLE", table_of()?),
+        NodeKind::Schema | NodeKind::Database => return Ok(format!("-- schema {}", o.name)),
+        k => return Err(DbError::Unsupported(format!("No DDL for {k:?}"))),
+    };
+    let text = first_cell(pool, &ora_ddl_sql(ty, &name, &sc))
+        .await?
+        .ok_or_else(|| DbError::NotFound(format!("{} {sc}.{name} not found", ty.to_lowercase())))?;
+    Ok(ora_tidy(&text))
 }
 
 // ================================================================ SQLite

@@ -1,7 +1,7 @@
 /**
  * Frame shared by the Modify Table / New Table dialog and the small object dialogs (view, sequence, schema):
  * toolbar over an object tree (left) and the property sheet (right), a collapsible SQL Preview, OK / Cancel.
- * No title bar, like DataGrip's (`104-modify-table-dialog-dark.png`).
+ * DataGrip's dialog has no title bar (`104-modify-table-dialog-dark.png`); ours has an optional one (`title`) to match our other dialogs.
  */
 import { Show, type JSX, createEffect, createSignal, onMount } from "solid-js";
 import { Portal } from "solid-js/web";
@@ -11,6 +11,8 @@ import type { Driver } from "./model";
 import "./schema-editor.css";
 
 export interface FrameProps {
+  /** Title row with a close button, like the other dialogs ("Modify Table emp"). Without it the dialog has none. */
+  title?: string;
   toolbar: JSX.Element;
   tree: JSX.Element;
   sheet: JSX.Element;
@@ -86,7 +88,15 @@ export function EditorFrame(props: FrameProps): JSX.Element {
   return (
     <Portal>
       <div class="dg-dialog-overlay" onMouseDown={(e) => e.target === e.currentTarget && e.preventDefault()}>
-        <div ref={frame} class="dg-dialog dgse" role="dialog" aria-label="Modify" tabindex={-1} onKeyDown={onKeyDown}>
+        <div ref={frame} class="dg-dialog dgse" role="dialog" aria-label={props.title ?? "Modify"} tabindex={-1} onKeyDown={onKeyDown}>
+          <Show when={props.title}>
+            <div class="dg-dialog-titlebar">
+              <span class="dg-dialog-title">{props.title}</span>
+              <span class="dg-dialog-close" onClick={() => props.onCancel()}>
+                <Icon name="close" />
+              </span>
+            </div>
+          </Show>
           <div class="dgse-main">
             <div class="dgse-toolbar" role="toolbar">
               {props.toolbar}

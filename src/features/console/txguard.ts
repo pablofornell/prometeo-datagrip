@@ -5,6 +5,7 @@
  * The transaction state is the server's (`ConsoleSession.txStatus`, the table editors' `txStatus`), never keywords.
  */
 import type { TxStatus } from "../../api/types";
+import type { Plan } from "../../state/decisions";
 import { activateTab } from "../../state/tabs";
 import { allControllers } from "../table/controller";
 import { askChoice } from "../table/dialogs";
@@ -90,12 +91,13 @@ export function txDialogText(open: Pick<OpenTx, "title" | "status">[], reason: s
 }
 
 /**
- * Resolves true when nothing in `scope` is left open (there was no transaction, or the user chose Commit / Roll Back
- * and it ended), false when the user cancelled or a transaction could not be ended: the caller must then not proceed.
+ * Asks Commit / Roll Back / Cancel about the open transactions in `scope` and ends nothing yet: false when the user
+ * cancelled, null when none is open, else the plan that ends them (resolves "exit" when the user gave up waiting for a
+ * COMMIT that hangs: "Quit anyway", the remaining transactions are then left to the server).
  */
-export async function confirmEndTransactions(scope: TxScope): Promise<boolean> {
+export async function askEndTransactions(scope: TxScope): Promise<Plan | null | false> {
   const open = openTransactions(scope);
-  if (open.length === 0) return true;
+  if (open.length === 0) return null;
   if (scope.tabId) activateTab(scope.tabId);
   const t = txDialogText(open, scope.reason);
   const answer = await askChoice({
@@ -114,8 +116,24 @@ export async function confirmEndTransactions(scope: TxScope): Promise<boolean> {
     cancel: "cancel",
   });
   if (answer !== "commit" && answer !== "rollback") return false;
-  for (const o of open) if (!(await endOne(o, answer, scope))) return false;
-  return true;
+  return async () => {
+    for (const o of open) {
+      const r = await endOne(o, answer, scope);
+      if (r === "quitAnyway") return "exit";
+      if (!r) return false;
+    }
+    return true;
+  };
+}
+
+/**
+ * Resolves true when nothing in `scope` is left open (there was no transaction, or the user chose Commit / Roll Back
+ * and it ended), false when the user cancelled or a transaction could not be ended: the caller must then not proceed.
+ */
+export async function confirmEndTransactions(scope: TxScope): Promise<boolean> {
+  const plan = await askEndTransactions(scope);
+  if (plan === false) return false;
+  return plan ? (await plan()) !== false : true;
 }
 
 /** `o.end(kind)`, with the progress dialog of `scope` while it runs; "quitAnyway" when the user gave up waiting. */
@@ -139,11 +157,12 @@ async function endWithProgress(o: OpenTx, kind: "commit" | "rollback", scope: Tx
  * Closing the connection makes the server roll back what is not committed, so Close anyway loses nothing the
  * failed COMMIT had not already lost. (A session that stays alive has no Close anyway.)
  */
-async function endOne(o: OpenTx, first: "commit" | "rollback", scope: TxScope): Promise<boolean> {
+async function endOne(o: OpenTx, first: "commit" | "rollback", scope: TxScope): Promise<boolean | "quitAnyway"> {
   let kind = first;
   for (;;) {
     const ended = await endWithProgress(o, kind, scope);
-    if (ended === "quitAnyway" || ended === true) return true;
+    if (ended === "quitAnyway") return "quitAnyway";
+    if (ended === true) return true;
     const why = o.error() ?? "the server did not answer";
     const verb = kind === "commit" ? "commit" : "roll back";
     const choices = [

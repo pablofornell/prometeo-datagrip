@@ -52,6 +52,15 @@ pub async fn duplicate_data_source(state: State<'_, AppState>, id: String) -> Re
 }
 
 #[tauri::command]
+pub async fn copy_data_source_password(
+    state: State<'_, AppState>,
+    from: String,
+    to: String,
+) -> Res<DataSourceView> {
+    state.copy_data_source_password(&from, &to).await
+}
+
+#[tauri::command]
 pub async fn test_connection(state: State<'_, AppState>, ds: DataSourceConfig) -> Res<TestResult> {
     state.test_connection(ds).await
 }
@@ -282,6 +291,7 @@ pub async fn choose_export_path(
     state: State<'_, AppState>,
     suggested_name: Option<String>,
     format: Option<ExportFormat>,
+    folder: Option<String>,
 ) -> Res<Option<String>> {
     use tauri_plugin_dialog::DialogExt;
     let (ext, label) = export_extension(format);
@@ -298,6 +308,13 @@ pub async fn choose_export_path(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         dlg = dlg.set_file_name(name);
+    }
+    // the folder the user typed in the Export Data dialog (only used when it exists)
+    if let Some(dir) = folder
+        .map(PathBuf::from)
+        .filter(|d| d.is_absolute() && d.is_dir())
+    {
+        dlg = dlg.set_directory(dir);
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
     dlg.save_file(move |p| {
@@ -322,17 +339,20 @@ fn home_dir() -> Option<PathBuf> {
         .filter(|h| h.is_absolute())
 }
 
-/// `<home>/<file name>`: the default of the Export Data dialog's "Output file" (only the file name of
-/// `file_name` is used). `null` when the home directory is unknown.
+/// `<home>/Downloads/<file name>` (`<home>/<file name>` without a Downloads folder): the default of the Export
+/// Data dialog's "Output file" (only the file name of `file_name` is used). `null` when the home directory is
+/// unknown.
 #[tauri::command]
 pub async fn default_export_path(file_name: String) -> Res<Option<String>> {
     let name = std::path::Path::new(&file_name)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .filter(|n| !n.is_empty() && !n.starts_with('.'));
-    Ok(home_dir()
-        .zip(name)
-        .map(|(h, n)| h.join(n).display().to_string()))
+    Ok(home_dir().zip(name).map(|(h, n)| {
+        let downloads = h.join("Downloads");
+        let dir = if downloads.is_dir() { downloads } else { h };
+        dir.join(n).display().to_string()
+    }))
 }
 
 /// Folders below the home directory whose files programs run or load on their own (macOS agents and launch
@@ -347,25 +367,27 @@ const AUTORUN_HOME_DIRS: [&str; 2] = ["library", "appdata"];
 ///
 /// Returns the path to write: the resolved folder plus the file name (the caller writes there, so a folder
 /// replaced by a symlink after this check is not followed).
-fn typed_export_path_ok(
+fn typed_export_path_check(
     path: &std::path::Path,
     home: &std::path::Path,
     format: Option<ExportFormat>,
-) -> Option<PathBuf> {
+) -> Result<PathBuf, String> {
     use std::path::Component;
     if !path.is_absolute() {
-        return None;
+        return Err("The output file must be an absolute path.".into());
     }
     // "..", "." and the like are never typed on purpose
     if path
         .components()
         .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
     {
-        return None;
+        return Err("The output file must not contain \".\" or \"..\" components.".into());
     }
-    let name = path.file_name()?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| "The output file has no file name.".to_string())?;
     let name_text = name.to_string_lossy();
-    let (ext, _) = export_extension(format);
+    let (ext, label) = export_extension(format);
     let stem_ok = std::path::Path::new(name)
         .file_stem()
         .is_some_and(|s| !s.is_empty() && !s.to_string_lossy().starts_with('.'));
@@ -373,14 +395,24 @@ fn typed_export_path_ok(
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case(ext));
     if name_text.starts_with('.') || !stem_ok || !ext_ok {
-        return None;
+        return Err(format!(
+            "The file name must end with .{ext} ({label}) and must not start with a dot."
+        ));
     }
-    let home = home.canonicalize().ok()?;
-    let dir = path.parent()?.canonicalize().ok()?;
-    if !dir.is_dir() {
-        return None;
-    }
-    let rel = dir.strip_prefix(&home).ok()?;
+    let home = home
+        .canonicalize()
+        .map_err(|_| "The home folder is not available.".to_string())?;
+    let dir = path
+        .parent()
+        .and_then(|d| d.canonicalize().ok())
+        .filter(|d| d.is_dir())
+        .ok_or_else(|| "The folder of the output file does not exist.".to_string())?;
+    let rel = dir.strip_prefix(&home).map_err(|_| {
+        format!(
+            "Only folders below your home folder ({}) are accepted here.",
+            home.display()
+        )
+    })?;
     let plain = rel.components().enumerate().all(|(i, c)| match c {
         Component::Normal(n) => {
             let n = n.to_string_lossy();
@@ -390,32 +422,37 @@ fn typed_export_path_ok(
         _ => false,
     });
     if !plain {
-        return None;
+        return Err("Hidden and autostart folders are not allowed as an output folder.".into());
     }
     let target = dir.join(name);
     // symlink_metadata: a dangling symlink "does not exist" for exists(), but File::create would follow it
     match std::fs::symlink_metadata(&target) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(target),
-        _ => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(target),
+        _ => Err("The file already exists. Choose it in the save dialog to overwrite it.".into()),
     }
 }
 
 /// The Export Data dialog's typed "Output file": permits `export_query` / `export_result` to write that path
-/// when it is a new file of the right type under the home directory (see [`typed_export_path_ok`]). `false`:
-/// the caller must go through `choose_export_path` (the save dialog asks before it overwrites).
+/// when it is a new file of the right type under the home directory (see [`typed_export_path_check`]).
+/// Returns `null` when approved, else the reason it is refused: the dialog shows it and offers the save
+/// dialog (`choose_export_path`, which asks before it overwrites).
 #[tauri::command]
 pub async fn approve_export_path(
     state: State<'_, AppState>,
     path: String,
     format: Option<ExportFormat>,
-) -> Res<bool> {
+) -> Res<Option<String>> {
     let path = PathBuf::from(path);
-    let resolved = home_dir().and_then(|h| typed_export_path_ok(&path, &h, format));
-    let ok = resolved.is_some();
-    if let Some(resolved) = resolved {
-        state.allow_typed_export_path(path, resolved);
+    let checked = home_dir()
+        .ok_or_else(|| "The home folder is not known.".to_string())
+        .and_then(|h| typed_export_path_check(&path, &h, format));
+    match checked {
+        Ok(resolved) => {
+            state.allow_typed_export_path(path, resolved);
+            Ok(None)
+        }
+        Err(reason) => Ok(Some(reason)),
     }
-    Ok(ok)
 }
 
 /// `path` must come from `choose_export_path`.
@@ -793,8 +830,12 @@ pub async fn rename_scratch(state: State<'_, AppState>, path: String, to: String
 
 #[cfg(test)]
 mod tests {
-    use super::{typed_export_path_ok, ExportFormat};
-    use std::path::Path;
+    use super::{typed_export_path_check, ExportFormat};
+    use std::path::{Path, PathBuf};
+
+    fn typed_export_path_ok(p: &Path, h: &Path, f: Option<ExportFormat>) -> Option<PathBuf> {
+        typed_export_path_check(p, h, f).ok()
+    }
 
     fn ok(p: &Path, h: &Path, f: Option<ExportFormat>) -> bool {
         typed_export_path_ok(p, h, f).is_some()
@@ -852,6 +893,20 @@ mod tests {
         std::fs::create_dir(h.join("docs")).unwrap();
         let got = typed_export_path_ok(&h.join("docs/new.csv"), &h, None).unwrap();
         assert_eq!(got, h.join("docs/new.csv"));
+    }
+
+    #[test]
+    fn typed_export_refusals_say_why() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(h.join("taken.csv"), "x").unwrap();
+        let why = |p: &Path| typed_export_path_check(p, h, None).unwrap_err();
+        assert!(why(Path::new("rel.csv")).contains("absolute"));
+        assert!(why(&outside.path().join("a.csv")).contains("home folder"));
+        assert!(why(&h.join("a.txt")).contains(".csv"));
+        assert!(why(&h.join("missing/a.csv")).contains("does not exist"));
+        assert!(why(&h.join("taken.csv")).contains("already exists"));
     }
 
     #[test]

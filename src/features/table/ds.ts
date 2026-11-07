@@ -1,6 +1,6 @@
 /** Small cache of the data sources (name, driver, read-only flag) for the table / DDL views. */
 import { createSignal } from "solid-js";
-import { type DataSource, listDataSources } from "../../api/db";
+import { type DataSource, type Driver, listDataSources } from "../../api/db";
 
 const [list, setList] = createSignal<DataSource[]>([]);
 let loading: Promise<void> | undefined;
@@ -19,6 +19,20 @@ export function loadDataSources(force = false): Promise<void> {
     loading = p;
   }
   return loading;
+}
+
+/** The explorer's reload (a data source was added / edited / deleted) refreshes this cache too: it must never lag behind. */
+export function setDataSourceList(l: DataSource[]): void {
+  setList(l);
+  loading = Promise.resolve();
+}
+
+/** The driver of `dsId`, or an error: a missing data source must never fall back to another dialect. */
+export async function requireDriver(dsId: string): Promise<Driver> {
+  await loadDataSources();
+  const d = list().find((x) => x.id === dsId);
+  if (!d) throw new Error("The data source no longer exists.");
+  return d.driver;
 }
 
 /** Reactive lookup (loads the list on first use). */

@@ -2,9 +2,11 @@
  * Keywords that an identifier must not be written as without quotes, per dialect (the lists of the servers).
  * PostgreSQL: the keywords that are not "unreserved" (`pg_get_keywords()` categories R, T, C -- what pg_dump quotes).
  * MySQL: the reserved words of 8.0 / 8.4 (`information_schema.KEYWORDS where RESERVED`).
+ * Oracle: V$RESERVED_WORDS plus the reserved words of the SQL reference (`ORACLE_RESERVED`, shared with the editor).
  * SQLite: the complete keyword list of the language (https://sqlite.org/lang_keywords.html); many of them also work as
  * names, quoting them is always safe.
  */
+import { ORACLE_RESERVED } from "../../components/editor/keywords";
 import type { Driver } from "./model";
 
 /** PostgreSQL 16. */
@@ -62,6 +64,7 @@ const SETS: Record<Driver, Set<string>> = {
   postgres: new Set(POSTGRES.split(" ")),
   mysql: new Set(MYSQL.split(" ")),
   sqlite: new Set(SQLITE.split(" ")),
+  oracle: ORACLE_RESERVED,
 };
 
 /** Whether `name` (lower case) is a keyword of the dialect that needs quotes as an identifier. */

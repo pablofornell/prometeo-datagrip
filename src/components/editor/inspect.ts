@@ -29,7 +29,9 @@ export function computeProblems(state: EditorState): Problem[] {
     while (ti < toks.length && toks[ti].from < st.start) ti++;
     const begin = ti;
     while (ti < toks.length && toks[ti].from < st.fullEnd) ti++;
-    const own = toks.slice(begin, ti);
+    let own = toks.slice(begin, ti);
+    // Oracle: the `/` line that ends a PL/SQL unit is a terminator, not an expression
+    if (cfg.dialect === "oracle") own = own.filter((t) => !(t.from >= st.end && t.to - t.from === 1 && a.text[t.from] === "/"));
     for (const p of syntaxProblems(a.text, own)) out.push({ ...p, kind: "syntax" });
     for (const u of analyzeStatement(a.text, own, cfg.index, cfg.dialect, cfg.implicit).unresolved) out.push({ from: u.from, to: u.to, message: u.message, kind: "unresolved" });
   }

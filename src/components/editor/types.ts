@@ -29,9 +29,17 @@ export interface SchemaRoutine {
   returns?: string;
 }
 
+/** An Oracle synonym: `name` stands for the table / view `target` (`[schema, name]`, `[name]` when unqualified; none: a database link). */
+export interface SchemaSynonym {
+  name: string;
+  target?: string[];
+}
+
 export interface SchemaNode {
   name: string;
   tables: SchemaTable[];
+  /** Synonyms of the schema: they resolve like the object they point at. */
+  synonyms?: SchemaSynonym[];
   /** Functions / procedures of the schema (offered by completion). */
   routines?: SchemaRoutine[];
 }
@@ -82,7 +90,7 @@ export interface EditorError {
 export interface ExecMark {
   from: number;
   to: number;
-  status: "ok" | "error" | "running";
+  status: "ok" | "error" | "warning" | "running";
   ms?: number;
 }
 

@@ -15,7 +15,7 @@ import { askChoice } from "../table/dialogs";
 import { PlanError, runPlan } from "./apply";
 import { ColumnList, Choice, Field, Text, TypeCombo } from "./fields";
 import { ArrowDown, ArrowUp, EditorFrame, TbButton } from "./Frame";
-import { type EditorCtx, errText, loadColumnNames, loadTable, loadTableNames } from "./load";
+import { type EditorCtx, errText, loadColumnNames, loadPrimaryKeyColumns, loadTable, loadTableNames } from "./load";
 import {
   type ColumnDef,
   FK_ACTIONS,
@@ -65,7 +65,7 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
   const [origT, setOrig] = createSignal<TableDef | undefined>(props.orig);
   const orig = origT;
   const create = (): boolean => !orig();
-  const initial = props.orig ? cloneTable(props.orig) : emptyTable(ctx.schema);
+  const initial = props.orig ? cloneTable(props.orig) : emptyTable(ctx.schema, d === "oracle" ? "TABLE_NAME" : undefined);
   bindColumnRefs(initial);
   const [cur, setCur] = createStore<TableDef>(initial);
   let initialJson = JSON.stringify(initial);
@@ -246,7 +246,7 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
     let id = "";
     switch (kind) {
       case "columns": {
-        const c = newColumn({ name: `column_${n}`, type: d === "sqlite" ? "" : d === "mysql" ? "int" : "integer" });
+        const c = newColumn({ name: d === "oracle" ? `COLUMN_${n}` : `column_${n}`, type: d === "sqlite" ? "" : d === "mysql" ? "int" : d === "oracle" ? "NUMBER" : "integer" });
         setCur("columns", (l) => [...l, c]);
         id = "col:" + c.uid;
         break;
@@ -264,7 +264,7 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
         break;
       }
       case "indexes": {
-        const i = newIndex({ name: `${cur.name || "table"}_idx_${n}` });
+        const i = newIndex({ name: d === "oracle" ? `${cur.name || "TABLE"}_IDX_${n}` : `${cur.name || "table"}_idx_${n}` });
         setCur("indexes", (l) => [...l, i]);
         id = "idx:" + i.uid;
         break;
@@ -482,6 +482,11 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
               <Text value={cur.tablespace} onInput={(v) => setCur("tablespace", v)} disabled={!create()} />
             </Field>
           </Show>
+          <Show when={d === "oracle"}>
+            <Field label="Tablespace">
+              <Text value={cur.tablespace} onInput={(v) => setCur("tablespace", v)} disabled={!create()} />
+            </Field>
+          </Show>
         </Match>
         <Match when={kind === "f"}>
           <div class="dgse-empty">{emptyText(uid as ListKey)}</div>
@@ -536,7 +541,7 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
         <Field label="Default Expression">
           <Text mono value={c().default} onInput={(v) => set("default", v)} disabled={!!c().generated} />
         </Field>
-        <Show when={d === "postgres"}>
+        <Show when={d === "postgres" || d === "oracle"}>
           <Field label="Generated Always As">
             <Text mono value={c().generated === "?" ? "" : c().generated} onInput={(v) => set("generated", v)} disabled={existing() || !!c().identity} />
           </Field>
@@ -597,6 +602,16 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
     );
   }
 
+  /** The target columns of a foreign key start as the primary key of the target table (what DataGrip preselects). */
+  async function preselectTarget(uid: string, table: string): Promise<void> {
+    if (!table) return;
+    const isSelf = table === cur.name || (!!orig() && table === orig()!.name);
+    const pk = isSelf ? (cur.keys.find((k) => k.primary)?.columns ?? []) : await loadPrimaryKeyColumns(ctx, table);
+    // the user may have picked another table or columns while the keys were loading
+    const f = cur.fks.find((x) => x.uid === uid);
+    if (pk.length && f && f.refTable === table && f.refColumns.length === 0) setCur("fks", (x) => x.uid === uid, { refColumns: [...pk] });
+  }
+
   function FkSheet(p: { uid: string }): JSX.Element {
     const f = () => cur.fks.find((x) => x.uid === p.uid);
     const self = () => f()?.refTable === cur.name || (!!orig() && f()?.refTable === orig()!.name);
@@ -619,7 +634,10 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
             value={f()!.refTable}
             options={names()}
             allowEmpty
-            onChange={(v) => setF({ refTable: v, refSchema: f()!.refSchema || ctx.schema, refColumns: [] })}
+            onChange={(v) => {
+              setF({ refTable: v, refSchema: f()!.refSchema || ctx.schema, refColumns: [] });
+              void preselectTarget(p.uid, v);
+            }}
           />
         </Field>
         <Field label="Columns" top>
@@ -628,11 +646,18 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
         <Field label="Target Columns" top>
           <ColumnList all={targetCols() ?? []} value={f()!.refColumns} onChange={(v) => setF({ refColumns: v })} disabled={!f()!.refTable} />
         </Field>
-        <Field label="On Update">
-          <Choice value={f()!.onUpdate || "NO ACTION"} options={[...FK_ACTIONS]} width={160} onChange={(v) => setF({ onUpdate: v })} />
-        </Field>
+        <Show when={d !== "oracle"}>
+          <Field label="On Update">
+            <Choice value={f()!.onUpdate || "NO ACTION"} options={[...FK_ACTIONS]} width={160} onChange={(v) => setF({ onUpdate: v })} />
+          </Field>
+        </Show>
         <Field label="On Delete">
-          <Choice value={f()!.onDelete || "NO ACTION"} options={[...FK_ACTIONS]} width={160} onChange={(v) => setF({ onDelete: v })} />
+          <Choice
+            value={f()!.onDelete || "NO ACTION"}
+            options={d === "oracle" ? ["NO ACTION", "CASCADE", "SET NULL"] : [...FK_ACTIONS]}
+            width={160}
+            onChange={(v) => setF({ onDelete: v })}
+          />
         </Field>
       </Show>
     );
@@ -695,6 +720,7 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
 
   return (
     <EditorFrame
+      title={create() ? "Create Table" : `Modify Table ${orig()!.name}`}
       toolbar={
         <>
           <TbButton title="Add" onClick={openAddMenu} ref={(el) => (addButton = el)}>

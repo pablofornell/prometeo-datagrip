@@ -68,6 +68,8 @@ impl fmt::Display for ServerError {
                     None => write!(f, "[{}] {}", self.code, self.message),
                 }
             }
+            // the message already starts with the `ORA-NNNNN: ` code
+            Driver::Oracle => f.write_str(&self.message),
         }
     }
 }
@@ -105,6 +107,9 @@ impl fmt::Display for ConnectionLost {
                 f.write_str("Communications link failure: the connection to the server was lost.")?
             }
             (None, Some(Driver::Sqlite)) => f.write_str("The database connection is closed.")?,
+            (None, Some(Driver::Oracle)) => {
+                f.write_str("The connection to the database was lost.")?
+            }
             (None, _) => f.write_str("An I/O error occurred while sending to the backend.")?,
         }
         if self.server.is_none() && !self.cause.is_empty() {
@@ -261,6 +266,9 @@ fn known_codes_end_connection(s: &ServerError) -> bool {
             matches!(s.native_code, Some(2006 | 2013 | 1927 | 1053 | 4031)) || s.code == "08S01"
         }
         Driver::Sqlite => false,
+        Driver::Oracle => {
+            matches!(s.native_code, Some(c) if crate::oracle::ends_connection(c))
+        }
     }
 }
 
@@ -413,6 +421,34 @@ mod tests {
             server: server.map(str::to_string),
             cause: "boom".into(),
         })
+    }
+
+    #[test]
+    fn oracle_codes_that_end_the_session() {
+        let e = lost(None, None).for_driver(Driver::Oracle);
+        assert!(
+            e.to_string()
+                .starts_with("[08006] The connection to the database was lost."),
+            "{e}"
+        );
+        let ora = |n: i64| ServerError {
+            driver: Driver::Oracle,
+            code: format!("ORA-{n:05}"),
+            native_code: Some(n),
+            severity: None,
+            message: format!("ORA-{n:05}: x"),
+            detail: None,
+            hint: None,
+            position: None,
+        };
+        // killed session, end-of-file on the channel, not logged on, shutdown in progress
+        for n in [28, 1012, 1033, 1089, 3113, 3114, 3135, 12537, 12541] {
+            assert!(known_codes_end_connection(&ora(n)), "ORA-{n:05}");
+        }
+        // a statement error does not end it (table missing, cancelled, unique violation, deadlock)
+        for n in [942, 1013, 1, 60, 1017] {
+            assert!(!known_codes_end_connection(&ora(n)), "ORA-{n:05}");
+        }
     }
 
     #[test]

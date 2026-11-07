@@ -8,6 +8,7 @@ const URL_TEMPLATE: Record<Dbms, string> = {
   postgres: "jdbc:postgresql://{host::localhost}?[:{port::5432}][/{database}?]",
   mysql: "jdbc:mysql://{host::localhost}?[:{port::3306}][/{database}]",
   mariadb: "jdbc:mariadb://{host::localhost}?[:{port::3306}][/{database}]",
+  oracle: "jdbc:oracle:thin:@//{host::localhost}?[:{port::1521}]/{service}  |  jdbc:oracle:thin:@{host::localhost}?[:{port::1521}]:{sid}",
   sqlite: "jdbc:sqlite:{file}",
 };
 
@@ -15,6 +16,7 @@ const NOTES: Record<Dbms, string> = {
   postgres: "Built in. Connections use the sqlx PostgreSQL driver; no files to download.",
   mysql: "Built in. Connections use the sqlx MySQL driver; no files to download.",
   mariadb: "Built in. MariaDB servers are reached through the MySQL driver.",
+  oracle: "Built in. Oracle's pure-Rust thin driver: no Instant Client or other files to download.",
   sqlite: "Built in. SQLite is linked into the application; no files to download.",
 };
 

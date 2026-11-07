@@ -19,7 +19,7 @@ import {
   openSession,
   sessionTxStatus,
 } from "../../api/db";
-import type { ColumnMeta } from "../../api/types";
+import type { ColumnMeta, TreeNode } from "../../api/types";
 import { type EditorError, type ExecMark, type ExecuteRequest, type SqlEditorHandle, splitStatements } from "../../components/editor";
 import { errorsField, execMarksField } from "../../components/editor/state";
 import type { GridChange, PageSize } from "../../components/grid";
@@ -27,6 +27,7 @@ import { type MenuItem, notify, openMenu } from "../../components/ui";
 import { showToolWindow } from "../../state/layout";
 import { settings } from "../../state/settings";
 import { activateTab, activeTab } from "../../state/tabs";
+import { visibleSchemaNodes } from "../datasource/schemas";
 import { autoSyncAfter, ensureConnected } from "../explorer";
 import {
   INTERNAL_MARK,
@@ -39,11 +40,11 @@ import {
   summary,
   underlinePosition,
 } from "../output/format";
-import { CONNECTION_LOST_LOG, CONNECTION_LOST_TX_LOG, isConnectionLost } from "../../state/connection-errors";
+import { CONNECTION_LOST_LOG, CONNECTION_LOST_TX_LOG, friendlyConnectionError, isConnectionLost } from "../../state/connection-errors";
 import { saveSchema, saveSearchPath, savedSchema, savedSearchPath } from "./schemaPref";
 import { qualifiedTitle, resultTable } from "./title";
 import { type SchemaChange, resolveEdit, schemaChange } from "./editable";
-import { keyedChanges } from "../output/edit";
+import { keyedChanges, logSubmitted } from "../output/edit";
 import { ALL_FIRST_CHUNK, ConsoleOutput, type OutputHost, ResultTab, createOutput, defaultPageSize, removeOutput } from "../output/model";
 import { askChoice } from "../table/dialogs";
 import {
@@ -58,7 +59,7 @@ import {
   isSessionLost,
   txReport,
 } from "../table/session";
-import { previewSql, toRowChanges } from "../table/sql";
+import { changeStatements, previewSql, toRowChanges } from "../table/sql";
 import { confirmEndTransactions } from "./txguard";
 import { findParams, loadValues, paramList, saveValues, substitute } from "./params";
 import { askParams } from "./paramsDialog";
@@ -67,11 +68,17 @@ export type TxMode = "auto" | "manual";
 /** `default`: the server's own level (nothing is set on the session). */
 export type Isolation = "default" | "read uncommitted" | "read committed" | "repeatable read" | "serializable";
 
-/** The isolation levels of the Tx menu; Read Uncommitted only exists on MySQL (PostgreSQL runs it as Read Committed). */
+/** The isolation levels of the Tx menu; Read Uncommitted only exists on MySQL (PostgreSQL runs it as Read Committed), Oracle has two. */
 export const isolationLevels = (driver: DataSource["driver"]): Isolation[] =>
-  driver === "mysql" ? ["default", "read uncommitted", "read committed", "repeatable read", "serializable"] : ["default", "read committed", "repeatable read", "serializable"];
+  driver === "mysql"
+    ? ["default", "read uncommitted", "read committed", "repeatable read", "serializable"]
+    : driver === "oracle"
+      ? ["default", "read committed", "serializable"]
+      : ["default", "read committed", "repeatable read", "serializable"];
 const isolationLabel = (i: Isolation): string => (i === "default" ? "Database Default" : cap(i));
 const cap = (s: string): string => s.replace(/\b\w/g, (c) => c.toUpperCase());
+/** A database / schema node of the tree, not a `Server Objects` / `Database Objects` group (those are no schemas to switch to). */
+export const isNamespace = (n: TreeNode): boolean => n.kind !== "folder" && !n.extra.group;
 const errText = (e: unknown): string => String((e as Error)?.message ?? e).replace(/^Error:\s*/, "");
 
 /** What the user changed in the session with their own statements; a new session does not have it. */
@@ -191,7 +198,7 @@ export class ConsoleSession implements OutputHost {
     this.inTx = () => this.txStatus() !== "idle";
     // the schema chosen last time shows at once; it is applied to the session when that opens (`ensureSession`)
     [this.schema, this.setSchema] = sig<string | null>(
-      ds.driver === "sqlite" ? "main" : (savedSchema(ds.id, consoleName) ?? (ds.driver === "mysql" ? ds.database || null : null)),
+      ds.driver === "sqlite" ? "main" : (savedSchema(ds.id, consoleName) ?? (ds.driver === "mysql" ? ds.database || null : ds.driver === "oracle" ? ds.user.toUpperCase() || null : null)),
     );
     [this.marks, this.setMarks] = sig<ExecMark[]>([]);
     [this.errors, this.setErrors] = sig<EditorError[]>([]);
@@ -242,6 +249,8 @@ export class ConsoleSession implements OutputHost {
   }
 
   private isolationSql(i: Isolation): string {
+    // Oracle: the level of the transactions that follow; its default is READ COMMITTED
+    if (this.driver === "oracle") return `ALTER SESSION SET ISOLATION_LEVEL = ${i === "serializable" ? "SERIALIZABLE" : "READ COMMITTED"}`;
     if (i === "default") return this.driver === "postgres" ? "RESET default_transaction_isolation" : "SET SESSION transaction_isolation = DEFAULT";
     const lvl = i.toUpperCase();
     return this.driver === "postgres" ? `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ${lvl}` : `SET SESSION TRANSACTION ISOLATION LEVEL ${lvl}`;
@@ -327,7 +336,10 @@ export class ConsoleSession implements OutputHost {
       return "main";
     }
     try {
-      const ev = await this.silent(sid, this.driver === "postgres" ? "select current_schema()" : "select database()");
+      const ev = await this.silent(
+        sid,
+        this.driver === "postgres" ? "select current_schema()" : this.driver === "oracle" ? "select sys_context('USERENV', 'CURRENT_SCHEMA') from dual" : "select database()",
+      );
       const rs = ev.find((e) => e.kind === "resultset");
       const v = rs && rs.kind === "resultset" ? rs.rows[0]?.[0] : null;
       if (typeof v === "string") {
@@ -341,6 +353,7 @@ export class ConsoleSession implements OutputHost {
   }
 
   private useSchemaSql(name: string): string {
+    if (this.driver === "oracle") return `ALTER SESSION SET CURRENT_SCHEMA = "${name.replace(/"/g, '""')}"`;
     const q = this.driver === "postgres" ? `"${name.replace(/"/g, '""')}"` : `\`${name.replace(/`/g, "``")}\``;
     return this.driver === "postgres" ? `SET search_path TO ${q}` : `USE ${q}`;
   }
@@ -442,7 +455,7 @@ export class ConsoleSession implements OutputHost {
       notify({ kind: "info", title: "Nothing to explain", body: "Put the caret in a statement." });
       return;
     }
-    if (analyze && this.driver === "sqlite") return;
+    if (analyze && (this.driver === "sqlite" || this.driver === "oracle")) return;
     out.setRunning(true);
     this.explaining = true;
     this.setExecError(null);
@@ -553,7 +566,7 @@ export class ConsoleSession implements OutputHost {
 
   private async startExecute(sid: string, sql: string, o: RunOptions, handlers: ExecHandlers) {
     const size = o.pageSize ?? this.pageSize();
-    const options = { maxRows: size === "all" ? ALL_FIRST_CHUNK : size, keepOpenSecs: 600 };
+    const options = { maxRows: size === "all" ? ALL_FIRST_CHUNK : size, keepOpenSecs: 600, ...(this.driver === "oracle" && this.txMode() === "auto" ? { autoCommit: true } : {}) };
     return execute(sid, sql, handlers, options);
   }
 
@@ -615,7 +628,7 @@ export class ConsoleSession implements OutputHost {
     const staleTabs = out.results().filter((r) => r.id !== o.replace?.id);
     for (const r of staleTabs) r.detach(undefined, true);
 
-    const mark = (status: "ok" | "error", ms: number) => {
+    const mark = (status: "ok" | "error" | "warning", ms: number) => {
       if (!cur || !req.ranges.length) return;
       const r = this.editorStatement(cur.from, cur.to);
       const keep = this.currentMarks().filter((m) => !(m.from < r.to && m.to > r.from) && m.from !== r.from);
@@ -709,7 +722,7 @@ export class ConsoleSession implements OutputHost {
         }
         const ms = nowMs() - (cur?.t0 ?? t00);
         const sql = cur?.sql ?? req.sql;
-        const count = reportsCount(sql);
+        const count = reportsCount(sql, this.driver);
         const id = out.log("text", count ? rowsAffected(e.rowsAffected, ms) : completedIn(ms));
         recs.push({ lineId: id, kind: count ? "update" : "done", n: e.rowsAffected, ms });
         mark("ok", ms);
@@ -731,6 +744,12 @@ export class ConsoleSession implements OutputHost {
         }
       },
       onMessage: (e) => void out.log("text", e.text),
+      onWarning: (e) => {
+        // succeeded, but the object is INVALID (Oracle): the check mark becomes a warning, the errors go to the log
+        out.log("warning", e.message);
+        for (const d of e.details) out.log("warning", d);
+        mark("warning", nowMs() - (cur?.t0 ?? t00));
+      },
       onTxStatus: (e) => this.setTxStatus(e.status),
       onTxEnded: (e) => {
         const kind = classifyTxEnd(cur?.sql ?? null, e);
@@ -765,7 +784,8 @@ export class ConsoleSession implements OutputHost {
       if (this.txMode() === "manual") {
         const st = await sessionTxStatus(sid);
         this.setTxStatus(st);
-        if (st === "idle") await this.silent(sid, this.driver === "mysql" ? "START TRANSACTION" : "BEGIN");
+        // Oracle has no BEGIN: the transaction starts with the first DML statement
+        if (st === "idle" && this.driver !== "oracle") await this.silent(sid, this.driver === "mysql" ? "START TRANSACTION" : "BEGIN");
       }
       return sid;
     };
@@ -801,7 +821,16 @@ export class ConsoleSession implements OutputHost {
     } catch (e) {
       rejectHandle(e);
       launchFailed = true;
-      out.log("error", errText(e));
+      // the data source is unreachable (or the session could not be opened): DataGrip's wording, like Test Connection,
+      // and the statement that did not run gets the red mark of a failed one
+      const msg = friendlyConnectionError(errText(e), { driver: this.ds.driver, host: this.ds.host, port: this.ds.port, file: this.ds.file });
+      this.setExecError(msg);
+      out.log("error", msg);
+      if (req.ranges.length) {
+        const r = this.editorStatement(req.ranges[0].from, req.ranges[0].to);
+        this.setMarks([...this.currentMarks().filter((m) => !(m.from < r.to && m.to > r.from) && m.from !== r.from), { from: r.from, to: r.to, status: "error" }]);
+        this.setErrors([...this.currentErrors().filter((x) => x.statementFrom !== r.from), { statementFrom: r.from, statementTo: r.to, message: msg.split("\n")[0] }]);
+      }
     }
     clearInterval(tick);
     stopPending();
@@ -903,7 +932,9 @@ export class ConsoleSession implements OutputHost {
     };
     tab.setApplying(true);
     try {
-      const rowChanges = toRowChanges(keyedChanges(edit, tab.meta, tab.rows, changes), []);
+      const keyed = keyedChanges(edit, tab.meta, tab.rows, changes);
+      const rowChanges = toRowChanges(keyed, []);
+      const t0 = performance.now();
       let res;
       if (this.txMode() === "manual") {
         const sid = await this.ensureSession();
@@ -917,7 +948,14 @@ export class ConsoleSession implements OutputHost {
       } else {
         res = await applyChanges(this.ds.id, edit.table, rowChanges);
       }
-      if (!res.committed) return fail(res.results.find((r) => r.error)?.error ?? "The transaction was rolled back.");
+      const bad = res.results.find((r) => r.error)?.error ?? (res.committed ? null : "The transaction was rolled back.");
+      logSubmitted(
+        (k, t, p) => this.out.log(k, t, p),
+        this.prompt(),
+        changeStatements(this.driver, edit.table, tab.meta, keyed),
+        bad ? { error: bad } : { rowsAffected: res.results.reduce((n, r) => n + (r.rowsAffected || 0), 0), ms: Math.round(performance.now() - t0) },
+      );
+      if (bad) return fail(bad);
     } catch (e) {
       if (isSessionLost(e)) {
         this.sessionLost();
@@ -1048,8 +1086,8 @@ export class ConsoleSession implements OutputHost {
       const cur = this.schema();
       let items: MenuItem[];
       if (this.driver === "postgres") {
-        const dbs = await introspect(this.ds.id, []);
-        const schemas = await introspect(this.ds.id, [this.ds.database]);
+        const dbs = (await introspect(this.ds.id, [])).filter(isNamespace);
+        const schemas = visibleSchemaNodes(this.ds, await introspect(this.ds.id, [this.ds.database], true)).filter(isNamespace);
         items = dbs.map<MenuItem>((d) =>
           d.name === this.ds.database
             ? {
@@ -1060,7 +1098,7 @@ export class ConsoleSession implements OutputHost {
         );
         items.push({ type: "separator" }, { type: "hint", label: "Connect to database (Enter)" });
       } else {
-        const list = await introspect(this.ds.id, []);
+        const list = visibleSchemaNodes(this.ds, await introspect(this.ds.id, [], true)).filter(isNamespace);
         items = list.map<MenuItem>((s) => ({ label: s.name, icon: "dg/schema", checked: s.name === cur, run: () => void this.switchSchema(s.name) }));
       }
       if (anchor instanceof HTMLElement) openMenu(items, { anchor, minWidth: 230 });

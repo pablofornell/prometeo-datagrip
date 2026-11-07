@@ -1,4 +1,4 @@
-import { Show, createSignal, onCleanup } from "solid-js";
+import { Show, createEffect, createSignal, on, onCleanup } from "solid-js";
 import { isTauri } from "../../api/db";
 import { Icon } from "../../components/ui";
 import { DBMS, type Dbms } from "./drivers";
@@ -10,22 +10,30 @@ const CASE: Record<Dbms, string> = {
   postgres: "plain=lower, delimited=exact",
   mysql: "plain=exact, delimited=exact",
   mariadb: "plain=exact, delimited=exact",
+  oracle: "plain=upper, delimited=exact",
   sqlite: "plain=mixed, delimited=mixed",
 };
 
-const SQLX_VERSION = "0.8";
+/** "Driver:" line of the balloon: the library behind each DBMS (`DBMS[x].library` has the full text of the Drivers page). */
+const DRIVER_LINE: Record<Dbms, string> = {
+  postgres: "sqlx PostgreSQL (ver. 0.8)",
+  mysql: "sqlx MySQL (ver. 0.8)",
+  mariadb: "sqlx MariaDB (ver. 0.8)",
+  sqlite: "sqlx SQLite (ver. 0.8)",
+  oracle: "Oracle thin driver (oracledb)",
+};
 
 /** `["DBMS: PostgreSQL (ver. 16.15 (Debian ...))", "Case sensitivity: ...", "Driver: ..."]`. */
 function infoLines(t: TestInfo): string[] {
   const out: string[] = [];
   if (t.version) {
-    const m = /^(PostgreSQL|MySQL|MariaDB|SQLite)\s+(.*)$/s.exec(t.version);
+    const m = /^(PostgreSQL|MySQL|MariaDB|SQLite|Oracle)\s+(.*)$/s.exec(t.version);
     out.push(`DBMS: ${m ? m[1] : DBMS[t.dbms].label}${m ? ` (ver. ${m[2]})` : ""}`);
   } else {
     out.push(`DBMS: ${DBMS[t.dbms].label}`);
   }
   out.push(`Case sensitivity: ${CASE[t.dbms]}`);
-  out.push(`Driver: sqlx ${DBMS[t.dbms].label} (ver. ${SQLX_VERSION})`);
+  out.push(`Driver: ${DRIVER_LINE[t.dbms]}`);
   return out;
 }
 
@@ -64,7 +72,7 @@ async function copyText(text: string) {
 }
 
 /** Bottom bar of the right pane: "Test Connection" link, result icon, driver / version text and the result balloon. */
-export function TestBar(props: { s: Session }) {
+export function TestBar(props: { s: Session; /** The dialog tab shown: a switch closes the balloon. */ tab?: string }) {
   const s = props.s;
   const d = () => s.current()!;
   const t = () => d().test;
@@ -86,6 +94,35 @@ export function TestBar(props: { s: Session }) {
   };
   window.addEventListener("keydown", onKey, true);
   onCleanup(() => window.removeEventListener("keydown", onKey, true));
+
+  // the result describes the settings it was run with: an edit, another tab / data source or a click elsewhere closes it
+  createEffect(
+    on(
+      () => [props.tab, s.selectedKey(), JSON.stringify(d().form), d().password.value] as const,
+      () => setOpen(false),
+      { defer: true },
+    ),
+  );
+  // ... and what it found (the check / error icon, the DBMS info) is dropped when the connection settings change
+  // (the name, color and read-only flag do not matter to the server)
+  const connection = () => {
+    const { name: _n, color: _c, readOnly: _r, ...rest } = d().form;
+    return JSON.stringify(rest) + "\u0000" + d().password.value;
+  };
+  createEffect(
+    on(
+      () => [s.selectedKey(), connection()] as const,
+      ([key, fp], prev) => {
+        if (key && prev && prev[0] === key && prev[1] !== fp) s.resetTest(key);
+      },
+      { defer: true },
+    ),
+  );
+  const onDown = (e: MouseEvent) => {
+    if (open() && !(e.target as Element | null)?.closest?.(".ds-balloon, .ds-test-status, .ds-testbar a, .ds-testbar button")) setOpen(false);
+  };
+  document.addEventListener("mousedown", onDown, true);
+  onCleanup(() => document.removeEventListener("mousedown", onDown, true));
 
   const status = () => {
     const x = t().info ?? t().lastOk;

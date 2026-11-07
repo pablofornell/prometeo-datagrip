@@ -1,4 +1,4 @@
-import type { Dialect } from "./split";
+import { type Dialect, skipQQuote } from "./split";
 
 export type TokKind = "comment" | "string" | "number" | "word" | "qident" | "punct" | "param";
 
@@ -101,7 +101,7 @@ export function lex(s: string, d: Dialect): Token[] {
       i = j;
       continue;
     }
-    if (c === 0x60 && d !== "postgres") {
+    if (c === 0x60 && d !== "postgres" && d !== "oracle") {
       const j = skipQuoted(s, i, 0x60, false);
       push("qident", i, j);
       i = j;
@@ -158,11 +158,20 @@ export function lex(s: string, d: Dialect): Token[] {
       continue;
     }
     if (isIdentStart(c)) {
+      if (d === "oracle") {
+        // q'[..]' / nq'[..]' alternative quoting
+        const e = skipQQuote(s, i);
+        if (e !== null) {
+          push("string", i, e);
+          i = e;
+          continue;
+        }
+      }
       let j = i + 1;
-      while (j < n && isIdentPart(s.charCodeAt(j))) j++;
+      while (j < n && (isIdentPart(s.charCodeAt(j)) || (d === "oracle" && s.charCodeAt(j) === 0x23))) j++;
       // string prefixes: E'..', B'..', X'..', N'..'
-      if (j === i + 1 && s.charCodeAt(j) === 0x27 && /[eEbBxXnN]/.test(s[i]) && (d !== "sqlite" || /[xX]/.test(s[i]))) {
-        const bs = d === "mysql" || /[eE]/.test(s[i]);
+      if (j === i + 1 && s.charCodeAt(j) === 0x27 && /[eEbBxXnN]/.test(s[i]) && (d === "oracle" ? /[nNxX]/.test(s[i]) : d !== "sqlite" || /[xX]/.test(s[i]))) {
+        const bs = d === "mysql" || (d !== "oracle" && /[eE]/.test(s[i]));
         const e = skipQuoted(s, j, 0x27, bs);
         push("string", i, e);
         i = e;
@@ -177,7 +186,7 @@ export function lex(s: string, d: Dialect): Token[] {
       i += 2;
       continue;
     }
-    if ((c === 0x3a || c === 0x40) && (isIdentStart(c1) || (c === 0x40 && c1 === 0x40) || (c === 0x3a && isDigit(c1)))) {
+    if ((c === 0x3a || (c === 0x40 && d !== "oracle")) && (isIdentStart(c1) || (c === 0x40 && c1 === 0x40) || (c === 0x3a && isDigit(c1)))) {
       let j = i + 1;
       if (c1 === 0x40) j++;
       while (j < n && isIdentPart(s.charCodeAt(j))) j++;

@@ -38,6 +38,9 @@ function answer(sid: string, sql: string): ExecEvent[] {
       ev.push({ kind: "error", index: i, message: "boom", position: null, positionUtf16: null, connectionLost: false });
       if (cur === "active") set("failed");
       break;
+    } else if (w === "WARN") {
+      ev.push({ kind: "update", index: i, rowsAffected: 1 });
+      ev.push({ kind: "warning", index: i, message: "Warning: PROCEDURE P compiled with errors", details: ["3/3: PL/SQL: ORA-00904: \"NOSUCHCOL\": invalid identifier"] });
     } else if (w === "SELECT") {
       const cs = /current_schema|database\(\)/.test(st);
       ev.push({ kind: "resultset", index: i, columns: [{ name: "c", typeName: "int4", nullable: true, isPk: false, tableRef: null }], rows: cs ? [[be.schema]] : [[1]], hasMore: /\bbig_table\b/.test(st) });
@@ -75,7 +78,7 @@ vi.mock("../../api/db", () => ({
     let done!: (e: unknown) => void;
     const p = new Promise((r) => (done = r));
     for (const e of events) {
-      const h = { statement: "onStatement", resultset: "onResultSet", update: "onUpdate", error: "onError", message: "onMessage", txStatus: "onTxStatus", txEnded: "onTxEnded", done: "onDone" }[e.kind];
+      const h = { statement: "onStatement", resultset: "onResultSet", update: "onUpdate", error: "onError", message: "onMessage", warning: "onWarning", txStatus: "onTxStatus", txEnded: "onTxEnded", done: "onDone" }[e.kind];
       handlers[h]?.(e);
       if (e.kind === "done") done(e);
     }
@@ -114,8 +117,9 @@ vi.mock("./schemaPref", () => {
   };
 });
 
+import { openSession } from "../../api/db";
 import { savedSchema, savedSearchPath } from "./schemaPref";
-import { ConsoleSession, isolationLevels } from "./session";
+import { ConsoleSession, isNamespace, isolationLevels } from "./session";
 
 const ds = (driver: "postgres" | "mysql" = "postgres") => ({ id: "d1", name: "pg", driver, database: "shop", readOnly: false }) as never;
 const mk = (driver: "postgres" | "mysql" = "postgres") => new ConsoleSession("tab1", ds(driver), "console", () => "console [pg]");
@@ -284,10 +288,46 @@ describe("a failed statement", () => {
   });
 });
 
+describe("a statement that succeeds with a warning", () => {
+  it("marks it as a warning and lists the details in the log", async () => {
+    const s = mk();
+    await s.run({ sql: "warn p;", ranges: [{ from: 0, to: 6 }], source: "statement" });
+    expect(lines(s)).toContain("Warning: PROCEDURE P compiled with errors");
+    expect(lines(s).some((l) => l.startsWith("3/3: "))).toBe(true);
+    expect(s.marks().map((m) => [m.from, m.to, m.status])).toEqual([[0, 6, "warning"]]);
+    expect(s.execError()).toBeNull();
+  });
+});
+
+describe("an unreachable data source", () => {
+  it("logs DataGrip's wording and marks the statement as failed", async () => {
+    const s = new ConsoleSession("tab1", { id: "dead1", name: "dead", driver: "postgres", host: "127.0.0.1", port: 54398, database: "x", readOnly: false } as never, "console", () => "console [dead]");
+    vi.mocked(openSession).mockRejectedValueOnce(new Error("error communicating with database: Connection refused (os error 111)"));
+    await s.run({ sql: "select 1;", ranges: [{ from: 0, to: 9 }], source: "statement" });
+    const want = "Connection to 127.0.0.1:54398 refused. Check that the hostname and port are correct and that the postmaster is accepting TCP/IP connections.";
+    expect(lines(s)).toContain(want);
+    expect(lines(s).join("\n")).not.toContain("os error");
+    expect(s.execError()).toBe(want);
+    expect(s.marks().map((m) => [m.from, m.to, m.status])).toEqual([[0, 9, "error"]]);
+    expect(s.errors().map((e) => [e.statementFrom, e.message])).toEqual([[0, want]]);
+  });
+});
+
+describe("schema switcher", () => {
+  const n = (kind: string, name: string, extra = {}) => ({ id: name, kind, name, hint: null, path: [name], hasChildren: true, extra }) as never;
+  it("lists databases and schemas, not the Server / Database Objects groups", () => {
+    const nodes = [n("schema", "public"), n("schema", "shop"), n("folder", "Database Objects", { group: true, folder: "$objects" })];
+    expect(nodes.filter(isNamespace).map((x: { name: string }) => x.name)).toEqual(["public", "shop"]);
+    expect(isNamespace(n("database", "postgres"))).toBe(true);
+    expect(isNamespace(n("folder", "Server Objects", { group: true }))).toBe(false);
+  });
+});
+
 describe("Tx isolation", () => {
   it("lists Database Default first, and Read Uncommitted only for MySQL", () => {
     expect(isolationLevels("postgres")).toEqual(["default", "read committed", "repeatable read", "serializable"]);
     expect(isolationLevels("mysql")[1]).toBe("read uncommitted");
+    expect(isolationLevels("oracle")).toEqual(["default", "read committed", "serializable"]);
     expect(isolationLevels("sqlite")).not.toContain("read uncommitted");
   });
   it("a new console sets nothing; going back to the default resets the session", async () => {

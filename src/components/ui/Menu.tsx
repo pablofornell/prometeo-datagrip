@@ -12,6 +12,7 @@ import { Index, Show, createEffect, createSignal, on, onCleanup, type JSX } from
 import { Portal } from "solid-js/web";
 import { actionShortcut, getAction, isActionEnabled } from "../../state/actions";
 import { Icon } from "./Icon";
+import { anchorRect } from "./anchor-redirect";
 import { mnemonicIndex, pruneItems } from "./menu-util";
 
 export type MenuItem =
@@ -90,6 +91,7 @@ let restoreFocus: HTMLElement | null = null;
 export function closeMenu(): void {
   const s = state();
   if (!s) return;
+  clearTimeout(subTimer);
   setState(null);
   restoreFocus?.focus?.({ preventScroll: true });
   restoreFocus = null;
@@ -109,7 +111,7 @@ export function openMenu(rawItems: MenuItem[], opts: OpenMenuOptions = {}): void
   }
   let rect: Level["rect"];
   if (opts.anchor) {
-    const r = opts.anchor.getBoundingClientRect();
+    const r = anchorRect(opts.anchor);
     rect = { left: r.left, right: r.right, top: r.top, bottom: r.bottom };
   } else {
     const x = opts.x ?? 0;
@@ -183,6 +185,10 @@ let hoveredBarItem: HTMLElement | null = null;
 function elementBelow(e: MouseEvent): HTMLElement | undefined {
   return document.elementsFromPoint(e.clientX, e.clientY).find((el) => !el.classList.contains("dg-menu-backdrop")) as HTMLElement | undefined;
 }
+
+/** How long the pointer rests on a row with a submenu before the submenu opens. */
+const SUBMENU_DELAY_MS = 200;
+let subTimer: ReturnType<typeof setTimeout> | undefined;
 
 export function MenuHost(): JSX.Element {
   const setLevelIndex = (l: number, i: number) => {
@@ -392,13 +398,21 @@ export function MenuHost(): JSX.Element {
                 level={lv}
                 depth={l}
                 opts={s().opts}
+                subOpen={() => (state()?.levels.length ?? 0) > l + 1}
                 onHover={(i, rowEl) => {
                   const cur = state();
                   if (!cur) return;
                   const it = cur.levels[l].items[i];
                   const r = resolve(it);
-                  if (r.hasChildren) openSub(l, i, rowEl.getBoundingClientRect(), false);
-                  else setLevelIndex(l, i);
+                  clearTimeout(subTimer);
+                  if (r.hasChildren && r.enabled) {
+                    if (cur.levels[l].index !== i || cur.levels.length > l + 1) setLevelIndex(l, i); // highlight now, open after the delay
+                    // like DataGrip: a submenu opens when the pointer rests on its row, not when it passes over it
+                    subTimer = setTimeout(() => {
+                      const s2 = state();
+                      if (s2 && s2.levels[l]?.index === i && s2.levels.length === l + 1 && rowEl.isConnected) openSub(l, i, rowEl.getBoundingClientRect(), false);
+                    }, SUBMENU_DELAY_MS);
+                  } else setLevelIndex(l, i);
                 }}
                 onActivate={(i, rowEl) => activate(l, i, rowEl)}
               />
@@ -415,6 +429,8 @@ function MenuPanel(props: {
   depth: number;
   opts: OpenMenuOptions;
   onHover: (i: number, row: HTMLElement) => void;
+  /** Is a submenu of this panel open? */
+  subOpen: () => boolean;
   onActivate: (i: number, row: HTMLElement) => void;
 }): JSX.Element {
   let el!: HTMLDivElement;
@@ -505,7 +521,8 @@ function MenuPanel(props: {
                   "dg-disabled": !r().enabled,
                 }}
                 onMouseMove={(e) => {
-                  if (props.level().index !== i) props.onHover(i, e.currentTarget);
+                  // a highlighted row (the keyboard / the first item of a bar menu) still has to open its submenu on hover
+                  if (props.level().index !== i || (r().hasChildren && !props.subOpen())) props.onHover(i, e.currentTarget);
                 }}
                 onClick={(e) => props.onActivate(i, e.currentTarget)}
               >

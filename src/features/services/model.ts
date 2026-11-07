@@ -90,6 +90,7 @@ const DIALECT: Record<Driver, { label: string; case: string; driver: string }> =
   postgres: { label: "PostgreSQL", case: "plain=lower, delimited=exact", driver: "PostgreSQL driver (sqlx)" },
   mysql: { label: "MySQL", case: "plain=exact, delimited=exact", driver: "MySQL driver (sqlx)" },
   sqlite: { label: "SQLite", case: "plain=mixed, delimited=mixed", driver: "SQLite driver (sqlx)" },
+  oracle: { label: "Oracle", case: "plain=upper, delimited=exact", driver: "Oracle thin driver (oracledb)" },
 };
 
 /** `PostgreSQL 16.15 (Debian ...)` -> `PostgreSQL (ver. 16.15 (Debian ...))`. */

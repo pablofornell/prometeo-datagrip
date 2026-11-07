@@ -5,7 +5,7 @@ import { type NavHandlers, type NavTarget, SqlEditor, type SqlEditorHandle } fro
 import { showToolWindow } from "../../state/layout";
 import { type Crumb, setEditorPath, setStatus } from "../../state/status";
 import { type EditorTab, updateTab } from "../../state/tabs";
-import { connectedDataSourceIds, explorerDataSources, openDdlRef, refreshNode, revealObject, schemaSnapshotFor, showQuickDocRef } from "../explorer";
+import { connectedDataSourceIds, explorerDataSources, openDdlRef, refreshNode, revealObject, schemaSnapshotFor, showQuickDocRef, synonymsFor } from "../explorer";
 import { Icon } from "../../components/ui";
 import { dsIconUrl } from "../output/dsicon";
 import { copyText } from "../output/export";
@@ -120,14 +120,14 @@ export function ConsoleInner(props: { tab: EditorTab; active: boolean; dsId: str
   };
 
   // ---- completion data: loaded lazily, the first time the tab is shown
-  const schema = createMemo(() => (everActive() ? toEditorSchema(schemaSnapshotFor(props.dsId), ds.database || undefined) : undefined));
+  const schema = createMemo(() => (everActive() ? toEditorSchema(schemaSnapshotFor(props.dsId), ds.database || undefined, synonymsFor(props.dsId)) : undefined));
 
   // ---- status bar, focus, eager session
   const pushStatus = () => {
     setEditorPath(
       props.backing?.crumbs() ?? [
         { label: "Database Consoles" },
-        { label: ds.name, onClick: () => void revealObject(props.dsId, null) },
+        { label: dsOf(props.dsId)?.name ?? ds.name, onClick: () => void revealObject(props.dsId, null) },
         { label: props.tab.title, icon: dsIconUrl(ds.driver) ?? "dg/console" },
       ],
     );
@@ -143,6 +143,16 @@ export function ConsoleInner(props: { tab: EditorTab; active: boolean; dsId: str
         pushStatus();
         requestAnimationFrame(() => editor?.focus());
       },
+    ),
+  );
+  // the data source was renamed: the breadcrumb at the bottom follows
+  createEffect(
+    on(
+      () => dsOf(props.dsId)?.name,
+      () => {
+        if (props.active) pushStatus();
+      },
+      { defer: true },
     ),
   );
   createEffect(() => {

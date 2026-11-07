@@ -6,7 +6,7 @@ import { confirmEndTransactions } from "../console/txguard";
 import { batch, createMemo, createSignal } from "solid-js";
 import { createStore, produce, unwrap } from "solid-js/store";
 import { friendlyConnectionError } from "../../state/connection-errors";
-import { deleteDataSource, listDataSources, saveDataSource, testConnection } from "../../api/db";
+import { copyDataSourcePassword, deleteDataSource, listDataSources, saveDataSource, testConnection } from "../../api/db";
 import type { DataSource, DataSourceConfig } from "../../api/db";
 import { forgetVisibleSchemas } from "../../state/schema-filter";
 import { forgetDsGroup } from "../../state/ds-folders";
@@ -192,11 +192,22 @@ export function createSession() {
     const d = drafts[i];
     batch(() => {
       setDrafts(i, "form", "url", text);
-      if (d.form.connType !== "default") return;
       const dbms = d.form.dbms;
+      // Oracle keeps User / Password / Service / SID fields in "URL only" mode too: the URL feeds them as it is typed
+      const follow = d.form.connType === "default" || (d.form.connType === "url" && dbms === "oracle");
+      if (!follow) return;
       const p = parseUrl(dbms, text);
       if (!p) return;
-      if (p.query) {
+      if (dbms === "oracle") {
+        setDrafts(i, "form", { host: p.host, port: p.port, database: p.database });
+        setOption("oracleConnType", p.sid ? "sid" : undefined);
+        if (p.user) setDrafts(i, "form", "user", p.user);
+        if (p.password) setDrafts(i, "password", { value: p.password, touched: true });
+        if (d.form.connType === "default" && (p.query || p.user)) setDrafts(i, "form", "connType", "url");
+        derive(i, { url: false });
+        return;
+      }
+      if (p.query || p.user) {
         // parameters cannot be represented by the fields: keep the URL as the source of truth
         setDrafts(i, "form", "connType", "url");
         return;
@@ -221,6 +232,21 @@ export function createSession() {
     });
   }
 
+  /** Oracle's "Connection type" combo: Service name / SID (the default fields) or URL only. */
+  function setOracleConnType(t: "service" | "sid" | "url") {
+    const i = indexOf(selectedKey());
+    if (i < 0) return;
+    batch(() => {
+      if (t === "url") {
+        setDrafts(i, "form", "connType", "url");
+        return;
+      }
+      setDrafts(i, "form", "connType", "default");
+      setOption("oracleConnType", t === "sid" ? "sid" : undefined);
+      derive(i);
+    });
+  }
+
   function setDbms(dbms: Dbms) {
     const i = indexOf(selectedKey());
     if (i < 0) return;
@@ -239,12 +265,15 @@ export function createSession() {
         if (f.connType === "memory") patch.connType = "default";
         if (dbms === "postgres" && !f.database) patch.database = "postgres";
         if (old.id === "postgres" && f.database === "postgres") patch.database = "";
+        if (old.id === "oracle" || dbms === "oracle") patch.database = dbms === "postgres" ? "postgres" : dbms === "oracle" ? "XE" : "";
       }
       setDrafts(i, "form", patch);
       const mode = f.options.sslmode;
       if (mode && !info.sslModes.some((m) => m.value === mode)) setDrafts(i, "form", "options", "sslmode", undefined as never);
       if (dbms === "sqlite") setDrafts(i, "form", "options", "sslmode", undefined as never);
       if (dbms !== "sqlite") setDrafts(i, "form", "options", "create", undefined as never);
+      if (dbms !== "oracle") setDrafts(i, "form", "options", "oracleConnType", undefined as never);
+      if (dbms === "oracle") setDrafts(i, "form", "auth", "password");
       if (d.form.connType === "url") setDrafts(i, "form", "url", buildUrl(dbms, d.form));
       derive(i);
       setDrafts(i, "test", { state: "idle" });
@@ -261,6 +290,7 @@ export function createSession() {
       if (prefill.database !== undefined) form.database = prefill.database;
       if (prefill.user) form.user = prefill.user;
       if (prefill.file) form.file = prefill.file;
+      if (prefill.oracleConnType === "sid") form.options.oracleConnType = "sid";
       form.url = buildUrl(dbms, form);
     }
     const taken = drafts.map((d) => d.form.name);
@@ -302,8 +332,9 @@ export function createSession() {
     copy.saved = null;
     copy.nameAuto = false;
     copy.form.name = uniqueName(d.form.name, drafts.map((x) => x.form.name));
-    // the stored password cannot be read back: a copy of a saved source starts without one
+    // the stored password cannot be read back: a copy of a saved source takes it over on the backend when applied
     copy.password = d.password.touched ? { ...d.password } : { value: "", touched: false };
+    copy.passwordFrom = d.password.touched ? null : (d.passwordFrom ?? (d.saved?.hasPassword ? d.id : null));
     copy.base = snapshot(copy.form);
     copy.test = { state: "idle" };
     const at = indexOf(d.key) + 1;
@@ -327,6 +358,8 @@ export function createSession() {
     }
     setError(null);
     const cfg: Partial<DataSourceConfig> = { ...configFromForm(d.form, d.id, d.saved), password: passwordToSend(d) };
+    // a duplicate that was not applied yet: the backend looks the password up by the id of the original
+    if (d.passwordFrom && !d.id && cfg.password == null && d.form.auth === "password" && (d.form.connType !== "url" || d.form.dbms === "oracle")) cfg.id = d.passwordFrom;
     const sslmode = d.form.options.sslmode ?? null;
     const dbms = d.form.dbms;
     const target = { driver: dbms, host: d.form.host, port: d.form.port, file: d.form.file };
@@ -361,8 +394,20 @@ export function createSession() {
     );
   }
 
+  /** The connection settings changed since the last Test Connection: its icon and DBMS info no longer describe them. */
+  function resetTest(key: string): void {
+    const j = indexOf(key);
+    if (j < 0 || drafts[j].test.state === "running") return;
+    setDrafts(j, "test", produce((x) => {
+      x.state = "idle";
+      delete x.info;
+      delete x.lastOk;
+    }));
+  }
+
   function passwordToSend(d: Draft): string | null {
-    if (d.form.connType === "url") return null; // credentials travel inside the URL
+    // PostgreSQL / MySQL: credentials travel inside the URL; Oracle's "URL only" has its own User / Password fields
+    if (d.form.connType === "url" && d.form.dbms !== "oracle") return null;
     if (d.form.auth === "none") return d.saved?.hasPassword || d.password.touched ? "" : null;
     return d.password.touched ? d.password.value : null;
   }
@@ -408,6 +453,9 @@ export function createSession() {
         } else {
           const cfg = { ...configFromForm(d.form, d.id, d.saved), password: passwordToSend(d) } as Partial<DataSourceConfig> & { name: string };
           saved = await saveDataSource(cfg);
+          if (wasNew && d.passwordFrom && cfg.password == null && d.form.auth === "password" && d.form.connType !== "url") {
+            saved = await copyDataSourcePassword(d.passwordFrom, saved.id).catch(() => saved);
+          }
         }
         saveVisibleSchemas(saved.id, d.form.options.visibleSchemas);
         if (wasNew) created.push(saved.id);
@@ -455,11 +503,13 @@ export function createSession() {
     setPassword,
     setUrl,
     setConnType,
+    setOracleConnType,
     setDbms,
     addNew,
     removeSelected,
     duplicateSelected,
     test,
+    resetTest,
     apply,
     indexOf,
   };

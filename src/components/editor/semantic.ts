@@ -71,6 +71,18 @@ export function identName(text: string): string {
   return text.toLowerCase();
 }
 
+/**
+ * Oracle objects every session sees that the schema snapshot leaves out (Oracle-maintained schemas are hidden):
+ * the data dictionary and dynamic performance views (`ALL_*`, `USER_*`, `DBA_*`, `V$*`, `GV$*`) and `DUAL`, bare or
+ * qualified with `SYS` / `SYSTEM` / `PUBLIC`, which are public synonyms of them.
+ */
+const ORACLE_DICTIONARY = /^((all|user|dba|cdb)_.+|g?v\$.+|dual|dictionary|dict|dict_columns|tab|cat|col|obj|seq|syn|ind)$/;
+export function isOracleDictionaryName(parts: string[]): boolean {
+  if (parts.length === 0 || parts.length > 2) return false;
+  if (parts.length === 2 && !["sys", "system", "public"].includes(parts[0])) return false;
+  return ORACLE_DICTIONARY.test(parts[parts.length - 1]);
+}
+
 type Role = "tbl" | "sch" | "alias" | "decl" | "collist";
 
 /**
@@ -189,7 +201,10 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
           refs.push(ref);
           j = a;
         } else {
-          const ref: TableRef = { parts: nm.parts, opaque: false, table: idx.findTable(nm.parts) };
+          const table = idx.findTable(nm.parts);
+          // Oracle: a synonym whose target is not in the snapshot, a dictionary view: real objects of unknown columns
+          const known = !table && dialect === "oracle" && (!!idx.synonym(nm.parts) || isOracleDictionaryName(nm.parts));
+          const ref: TableRef = { parts: nm.parts, opaque: known, table };
           for (let q = 0; q < nm.idxs.length; q++) {
             roles[nm.idxs[q]] = q === nm.idxs.length - 1 ? "tbl" : "sch";
             tokRef.set(nm.idxs[q], ref);
@@ -270,8 +285,10 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
       default:
         break;
     }
-    // CTE: name AS ( ... )   preceded by WITH [RECURSIVE] or ','
-    if (isNameAt(i) && isWordAt(i + 1) && lw[i + 1] === "as" && (isP(i + 2, "(") || (isWordAt(i + 2) && ["materialized", "not"].includes(lw[i + 2])))) {
+    // CTE: name [(col, ..)] AS ( ... )   preceded by WITH [RECURSIVE] or ','
+    let ca = i + 1;
+    if (isNameAt(i) && isP(ca, "(") && match[ca] > ca) ca = match[ca] + 1; // column list: `r(n) AS (..)`
+    if (isNameAt(i) && isWordAt(ca) && lw[ca] === "as" && (isP(ca + 1, "(") || (isWordAt(ca + 1) && ["materialized", "not"].includes(lw[ca + 1])))) {
       if (i === 0 ? false : lw[i - 1] === "with" || lw[i - 1] === "recursive" || isP(i - 1, ",")) {
         ctes.add(lw[i]);
         roles[i] = "decl";
@@ -285,6 +302,22 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
       roles[j] = "decl";
       if (joinDot(j + 1)) j += 2;
       else break;
+    }
+  }
+
+  // MySQL 8 row alias: `INSERT .. VALUES (..) AS nw [(x, y)] ON DUPLICATE KEY UPDATE a = nw.a`
+  if ((first === "insert" || first === "replace") && refs.length) {
+    for (let d = 1; d + 2 < n; d++) {
+      if (!(owners[d] === undefined && lw[d] === "on" && isWordAt(d) && lw[d + 1] === "duplicate" && lw[d + 2] === "key")) continue;
+      let a = d - 1;
+      const listed = isP(a, ")") && match[a] >= 0 && isNameAt(match[a] - 1) && isWordAt(match[a] - 2) && lw[match[a] - 2] === "as";
+      if (listed) a = match[a] - 1;
+      if (isNameAt(a) && isWordAt(a - 1) && lw[a - 1] === "as") {
+        roles[a] = "alias";
+        const target = refs.find((r) => r.parts.length);
+        refs.push({ parts: [], alias: lw[a], aliasText: raw[a], table: target?.table, opaque: listed || !target?.table });
+      }
+      break;
     }
   }
 
@@ -346,6 +379,7 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
   // function call detection: ident followed by "(" and not in a table-introducing position
   const isCall = (i: number): boolean => {
     if (!isP(i + 1, "(") || roles[i]) return false;
+    if (lw[i] === "conflict" && isWordAt(i - 1) && lw[i - 1] === "on") return false; // `ON CONFLICT (id)`
     let b = i - 1;
     while (joinDot(b) && isNameAt(b - 1)) b -= 2;
     return !(isWordAt(b) && (TABLE_INTRO.has(lw[b]) || ["function", "procedure", "type", "as", "returns"].includes(lw[b])));
@@ -390,11 +424,11 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
       if (flagUnresolved) {
         if (role === "tbl") {
           const owner = tokRef.get(i);
-          if (owner && !owner.table && !(ctes.has(w) && owner.parts.length === 1)) {
+          if (owner && !owner.table && !owner.opaque && !(ctes.has(w) && owner.parts.length === 1)) {
             mk("bad");
             flag(i, "table");
           } else if (owner?.table) hit(i, owner.table);
-        } else if (!idx.hasSchema(w) && !ctes.has(w)) {
+        } else if (!idx.hasSchema(w) && !ctes.has(w) && !(dialect === "oracle" && ["sys", "system", "public"].includes(w))) {
           mk("bad");
           flag(i, "schema");
         }
@@ -425,6 +459,8 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
       // qualifier = token before the dot; owner table
       const q = i - 2;
       if (!isNameAt(q)) continue;
+      // Oracle pseudo-columns of any table and of a sequence: `e.rowid`, `emp_seq.nextval`
+      if (dialect === "oracle" && (w === "rowid" || w === "nextval" || w === "currval")) continue;
       const qn = lw[q];
       let tbl: TableIdx | undefined;
       let opaque = false;
@@ -453,6 +489,10 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
     if (beforeDot) {
       // qualifier: alias, table or schema. Plain, red when it names nothing.
       const qref = byName.get(w);
+      // Oracle `seq.nextval` / `seq.currval`: the qualifier is a sequence
+      if (dialect === "oracle" && /^(nextval|currval)$/.test(lw[i + 2] ?? "") && !qref) continue;
+      // PostgreSQL / SQLite `ON CONFLICT .. DO UPDATE SET c = excluded.c`: the row proposed for insertion
+      if (w === "excluded" && !qref && lw.some((x, k) => x === "conflict" && isWordAt(k) && isWordAt(k - 1) && lw[k - 1] === "on")) continue;
       if (qref?.table) hit(i, qref.table);
       if (flagUnresolved && !role && refs.length > 0 && !anyOpaque && !byName.has(w) && !idx.hasSchema(w) && !ctes.has(w) && ["select", "with", "update", "delete", "insert"].includes(first)) {
         mk("bad");

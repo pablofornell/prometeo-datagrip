@@ -9,7 +9,7 @@ import { lex } from "../../components/editor/lexer";
 import type { ColumnMeta } from "../../api/types";
 
 const END = new Set(["where", "order", "limit", "offset", "fetch", "for", "window"]);
-const SET_OPS = new Set(["union", "intersect", "except", "with"]);
+const SET_OPS = new Set(["union", "intersect", "except", "minus", "with"]);
 
 const unquote = (s: string): string => {
   const q = s[0];

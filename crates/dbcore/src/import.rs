@@ -23,7 +23,7 @@ use crate::exec::open_stream;
 use crate::fsutil;
 use crate::manager::{cancel_target_of, interrupt, ConnectionManager};
 use crate::model::Driver;
-use crate::quote::{qualified, quote_ident, quote_literal};
+use crate::quote::{oracle_text_literal, parse_oracle_ts, qualified, quote_ident, quote_literal};
 
 /// Rows examined to infer the type of each column.
 pub const INFER_SAMPLE_ROWS: usize = 1000;
@@ -459,15 +459,20 @@ pub enum InferredType {
 pub fn sql_type(d: Driver, t: InferredType) -> &'static str {
     use InferredType::*;
     match (d, t) {
+        (Driver::Oracle, Integer) => "number(10)",
+        (Driver::Oracle, Bigint) => "number(19)",
         (_, Integer) => "integer",
         (_, Bigint) => "bigint",
+        (Driver::Oracle, Boolean) => "number(1)",
         (_, Boolean) => "boolean",
         (_, Date) => "date",
+        (Driver::Oracle, Text) => "varchar2(4000)",
         (_, Text) => "text",
         (Driver::Postgres, Double) => "double precision",
+        (Driver::Oracle, Double) => "binary_double",
         (_, Double) => "double",
         (Driver::MySql | Driver::Sqlite, Timestamp) => "datetime",
-        (Driver::Postgres, Timestamp) => "timestamp",
+        (Driver::Postgres | Driver::Oracle, Timestamp) => "timestamp",
     }
 }
 
@@ -707,7 +712,12 @@ pub enum Category {
 /// The category of a column from its declared type name (`integer`, `int4`, `numeric(10,2)`, `tinyint(1)` ...).
 pub fn category(type_name: &str) -> Category {
     let t = type_name.trim().to_ascii_lowercase();
-    if t == "bool" || t == "boolean" || t.starts_with("tinyint(1)") {
+    if t == "bool"
+        || t == "boolean"
+        || t.starts_with("tinyint(1)")
+        || t == "number(1)"
+        || t == "number(1,0)"
+    {
         return Category::Bool;
     }
     // exact names only: `point`, `int4range` or the arrays `integer[]` / `int4[]` are text
@@ -743,6 +753,8 @@ pub fn category(type_name: &str) -> Category {
             | "float8"
             | "double"
             | "number"
+            | "binary_double"
+            | "binary_float"
     ) {
         Category::Float
     } else if base == "date" {
@@ -776,14 +788,18 @@ fn to_literal(d: Driver, cat: Category, v: Option<&str>) -> std::result::Result<
             return Err(format!(
                 "'{}' contains a NUL character, which {} cannot store in text",
                 clip(&v.replace('\0', "\\0")),
-                if d == Driver::Postgres {
-                    "PostgreSQL"
-                } else {
-                    "SQLite"
+                match d {
+                    Driver::Postgres => "PostgreSQL",
+                    Driver::Oracle => "Oracle",
+                    _ => "SQLite",
                 }
             ));
         }
-        return Ok(quote_literal(d, v));
+        return Ok(if d == Driver::Oracle {
+            oracle_text_literal(v)
+        } else {
+            quote_literal(d, v)
+        });
     }
     let t = v.trim();
     if t.is_empty() {
@@ -814,6 +830,30 @@ fn to_literal(d: Driver, cat: Category, v: Option<&str>) -> std::result::Result<
                 (_, true) => "1".into(),
                 (_, false) => "0".into(),
             })
+        }
+        // an Oracle DATE also holds a time of day; the texts are converted with fixed formats, whatever NLS says
+        Category::Date if d == Driver::Oracle => {
+            match (is_date(t) || is_timestamp(t), parse_oracle_ts(t)) {
+                (true, Some(ts)) => Ok(format!(
+                    "TO_DATE('{}', 'YYYY-MM-DD HH24:MI:SS')",
+                    ts.date_text()
+                )),
+                _ => bad(),
+            }
+        }
+        Category::Timestamp if d == Driver::Oracle => {
+            match (is_date(t) || is_timestamp(t), parse_oracle_ts(t)) {
+                (true, Some(ts)) if ts.tz.is_some() => Ok(format!(
+                    "TO_TIMESTAMP_TZ('{}', '{}')",
+                    ts.timestamp_tz_text(),
+                    ts.tz_format()
+                )),
+                (true, Some(ts)) => Ok(format!(
+                    "TO_TIMESTAMP('{}', 'YYYY-MM-DD HH24:MI:SS.FF9')",
+                    ts.timestamp_text()
+                )),
+                _ => bad(),
+            }
         }
         Category::Date => {
             if is_date(t) {
@@ -978,6 +1018,27 @@ async fn run(conn: &mut Conn, sql: &str) -> Result<()> {
     Ok(())
 }
 
+/// Ends the import savepoint. Oracle has no `RELEASE SAVEPOINT`: the savepoint just stays, and the next
+/// `SAVEPOINT` of the same name moves it.
+async fn release(conn: &mut Conn, d: Driver, cancel: &CancellationToken) -> Result<()> {
+    if d == Driver::Oracle {
+        return Ok(());
+    }
+    run_c(conn, "release savepoint prometeo_import", cancel).await
+}
+
+/// `drop table if exists` (Oracle: an anonymous block that ignores the error, `IF EXISTS` is 23ai only).
+fn drop_if_exists(d: Driver, table: &str) -> String {
+    if d == Driver::Oracle {
+        format!(
+            "begin execute immediate {}; exception when others then null; end;",
+            quote_literal(d, &format!("drop table {table} purge"))
+        )
+    } else {
+        format!("drop table if exists {table}")
+    }
+}
+
 /// [`run`], abandoned with [`DbError::Cancelled`] as soon as `cancel` fires (a statement blocked on a lock does
 /// not return by itself). The connection is in an unknown state then: the caller interrupts the server and
 /// closes it.
@@ -1055,7 +1116,39 @@ impl ErrorLog {
 struct Pending {
     row: u64,
     tuple: String,
+    /// Oracle: the literal of each mapped column (a batch is a `union all`, whose branches must agree on the type).
+    parts: Vec<String>,
     values: Vec<Option<String>>,
+}
+
+/// Oracle: the `select .. from dual` branches of a batch. The branches of a `union all` must have the same type per
+/// column, but a text over 2000 bytes is a `TO_CLOB(..) || ..` expression (a CLOB) next to plain literals
+/// (`ORA-01790`): wherever one value of a text column is a CLOB, all of them become CLOBs.
+fn oracle_union_branches(rows: &[&[String]], cats: &[Category]) -> Vec<String> {
+    let is_clob = |p: &str| p.starts_with("TO_CLOB(");
+    let clob_col: Vec<bool> = cats
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            *c == Category::Text && rows.iter().any(|r| r.get(i).is_some_and(|p| is_clob(p)))
+        })
+        .collect();
+    rows.iter()
+        .map(|r| {
+            let parts: Vec<String> = r
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    if clob_col[i] && !is_clob(p) {
+                        format!("TO_CLOB({p})")
+                    } else {
+                        p.clone()
+                    }
+                })
+                .collect();
+            format!("select {} from dual", parts.join(", "))
+        })
+        .collect()
 }
 
 fn first_line(e: &DbError) -> String {
@@ -1136,30 +1229,38 @@ impl ConnectionManager {
         src.set_cancel(cancel.clone());
         let width = src.columns.len();
         let table = qualified(d, req.schema.as_deref(), &req.table);
+        // Oracle has no multi-row VALUES before 23ai: a batch is `insert .. select .. from dual union all select ..`
+        let oracle = d == Driver::Oracle;
         let head = format!(
-            "insert into {table} ({}) values ",
+            "insert into {table} ({}) {}",
             active
                 .iter()
                 .map(|c| quote_ident(d, &c.name))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            if oracle { "" } else { "values " }
         );
-        let batch_rows = req.options.batch_size.clamp(1, 5000);
+        let tuple_sep = if oracle { " union all " } else { ", " };
+        let batch_rows = req
+            .options
+            .batch_size
+            .clamp(1, if oracle { 200 } else { 5000 });
 
         let mut conn = live.new_conn().await?;
         let cancel_target = cancel_target_of(&mut conn).await?;
         let mut res = ImportResult::default();
-        // MySQL commits DDL at once, so the table is created before the transaction; PostgreSQL and SQLite create
-        // it inside, where a rollback takes it away again
-        let ddl_in_tx = d != Driver::MySql;
+        // MySQL and Oracle commit DDL at once, so the table is created before the transaction; PostgreSQL and SQLite
+        // create it inside, where a rollback takes it away again
+        let ddl_in_tx = !matches!(d, Driver::MySql | Driver::Oracle);
         if let (Some(sql), false) = (&create_sql, ddl_in_tx) {
             run(&mut conn, sql).await?;
             res.created_table = true;
         }
-        let begin = if d == Driver::MySql {
-            "start transaction"
-        } else {
-            "begin"
+        let begin = match d {
+            Driver::MySql => "start transaction",
+            // a transaction starts with its first statement; this one only makes it explicit
+            Driver::Oracle => "set transaction read write",
+            _ => "begin",
         };
         let mut log = ErrorLog {
             path: req.options.error_file.clone(),
@@ -1226,11 +1327,16 @@ impl ConnectionManager {
                         }
                         continue;
                     }
-                    let tuple = format!("({})", parts.join(", "));
+                    let tuple = if oracle {
+                        format!("select {} from dual", parts.join(", "))
+                    } else {
+                        format!("({})", parts.join(", "))
+                    };
                     bytes += tuple.len();
                     batch.push(Pending {
                         row: no,
                         tuple,
+                        parts: if oracle { parts } else { Vec::new() },
                         values: row,
                     });
                 }
@@ -1243,17 +1349,16 @@ impl ConnectionManager {
                 }
                 // ---- insert it: whole batch in a savepoint, row by row when it fails
                 run_c(&mut conn, "savepoint prometeo_import", cancel).await?;
-                let sql = format!(
-                    "{head}{}",
-                    batch
-                        .iter()
-                        .map(|p| p.tuple.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
+                let branches: Vec<String> = if oracle {
+                    let rows: Vec<&[String]> = batch.iter().map(|p| p.parts.as_slice()).collect();
+                    oracle_union_branches(&rows, &cats)
+                } else {
+                    batch.iter().map(|p| p.tuple.clone()).collect()
+                };
+                let sql = format!("{head}{}", branches.join(tuple_sep));
                 match run_c(&mut conn, &sql, cancel).await {
                     Ok(()) => {
-                        run_c(&mut conn, "release savepoint prometeo_import", cancel).await?;
+                        release(&mut conn, d, cancel).await?;
                         res.imported += batch.len() as u64;
                     }
                     Err(e) if e.is_connection_lost() || matches!(e, DbError::Cancelled) => {
@@ -1261,13 +1366,12 @@ impl ConnectionManager {
                     }
                     Err(_) => {
                         run_c(&mut conn, "rollback to savepoint prometeo_import", cancel).await?;
-                        run_c(&mut conn, "release savepoint prometeo_import", cancel).await?;
+                        release(&mut conn, d, cancel).await?;
                         for p in &batch {
                             run_c(&mut conn, "savepoint prometeo_import", cancel).await?;
                             match run_c(&mut conn, &format!("{head}{}", p.tuple), cancel).await {
                                 Ok(()) => {
-                                    run_c(&mut conn, "release savepoint prometeo_import", cancel)
-                                        .await?;
+                                    release(&mut conn, d, cancel).await?;
                                     res.imported += 1;
                                 }
                                 Err(e)
@@ -1283,8 +1387,7 @@ impl ConnectionManager {
                                         cancel,
                                     )
                                     .await?;
-                                    run_c(&mut conn, "release savepoint prometeo_import", cancel)
-                                        .await?;
+                                    release(&mut conn, d, cancel).await?;
                                     log.add(
                                         p.row,
                                         &first_line(&e),
@@ -1331,7 +1434,7 @@ impl ConnectionManager {
             if res.created_table && !ddl_in_tx {
                 let _ = tokio::time::timeout(
                     CLOSE_TIMEOUT * 2,
-                    live.pool.exec(&format!("drop table if exists {table}")),
+                    live.pool.exec(&drop_if_exists(d, &table)),
                 )
                 .await;
             }
@@ -1357,7 +1460,7 @@ impl ConnectionManager {
             let _ = run(&mut conn, "rollback").await;
             if res.created_table {
                 // MySQL commits DDL at once, the others rolled the table back already: a missing table is fine
-                let _ = run(&mut conn, &format!("drop table if exists {table}")).await;
+                let _ = run(&mut conn, &drop_if_exists(d, &table)).await;
             }
             res.rolled_back = true;
             res.imported = 0;
@@ -1636,6 +1739,75 @@ mod tests {
         // a value that could break out of the statement never reaches the SQL as a number
         assert!(to_literal(pg, Category::Int, Some("1); drop table t; --")).is_err());
         assert!(to_literal(pg, Category::Float, Some("1); drop")).is_err());
+    }
+
+    #[test]
+    fn oracle_batches_have_one_type_per_column() {
+        let big = to_literal(Driver::Oracle, Category::Text, Some(&"x".repeat(2500))).unwrap();
+        assert!(big.starts_with("TO_CLOB("));
+        let cats = [Category::Int, Category::Text, Category::Text];
+        let r1 = vec!["1".to_string(), "'short'".to_string(), "'a'".to_string()];
+        let r2 = vec!["2".to_string(), big.clone(), "NULL".to_string()];
+        let r3 = vec!["3".to_string(), "NULL".to_string(), "'b'".to_string()];
+        let b = oracle_union_branches(&[&r1, &r2, &r3], &cats);
+        assert_eq!(b[0], "select 1, TO_CLOB('short'), 'a' from dual");
+        assert_eq!(b[1], format!("select 2, {big}, NULL from dual"));
+        assert_eq!(b[2], "select 3, TO_CLOB(NULL), 'b' from dual");
+        // nothing changes without a CLOB
+        let b = oracle_union_branches(&[&r1, &r3], &cats);
+        assert_eq!(b[0], "select 1, 'short', 'a' from dual");
+    }
+
+    #[test]
+    fn oracle_literals_use_conversion_functions() {
+        let o = Driver::Oracle;
+        assert_eq!(category("NUMBER(10,2)"), Category::Float);
+        assert_eq!(category("NUMBER(1)"), Category::Bool);
+        assert_eq!(category("DATE"), Category::Date);
+        assert_eq!(category("TIMESTAMP(6) WITH TIME ZONE"), Category::Timestamp);
+        assert_eq!(category("VARCHAR2(20 CHAR)"), Category::Text);
+        assert_eq!(
+            to_literal(o, Category::Date, Some("2024-02-29 13:45:10")).unwrap(),
+            "TO_DATE('2024-02-29 13:45:10', 'YYYY-MM-DD HH24:MI:SS')"
+        );
+        assert_eq!(
+            to_literal(o, Category::Date, Some("2024-02-29")).unwrap(),
+            "TO_DATE('2024-02-29 00:00:00', 'YYYY-MM-DD HH24:MI:SS')"
+        );
+        assert_eq!(
+            to_literal(o, Category::Timestamp, Some("2024-02-29 13:45:10.25")).unwrap(),
+            "TO_TIMESTAMP('2024-02-29 13:45:10.250000000', 'YYYY-MM-DD HH24:MI:SS.FF9')"
+        );
+        assert!(to_literal(o, Category::Date, Some("29/02/2024")).is_err());
+        assert_eq!(to_literal(o, Category::Bool, Some("yes")).unwrap(), "1");
+        assert_eq!(
+            to_literal(o, Category::Text, Some("it's")).unwrap(),
+            "'it''s'"
+        );
+        assert!(to_literal(o, Category::Text, Some("a\0b")).is_err());
+        assert!(to_literal(o, Category::Text, Some(&"x".repeat(5000)))
+            .unwrap()
+            .starts_with("TO_CLOB("));
+        assert_eq!(sql_type(o, InferredType::Text), "varchar2(4000)");
+        assert_eq!(sql_type(o, InferredType::Timestamp), "timestamp");
+        assert_eq!(
+            create_table_sql(
+                o,
+                Some("DEMO"),
+                "T",
+                &[("A", "number(10)"), ("b c", "varchar2(4000)")]
+            )
+            .unwrap(),
+            "create table DEMO.T (\n    A number(10),\n    \"b c\" varchar2(4000)\n)"
+        );
+        assert_eq!(
+            drop_if_exists(o, "DEMO.T"),
+            "begin execute immediate 'drop table DEMO.T purge'; exception when others then null; end;"
+        );
+        assert_eq!(
+            drop_if_exists(Driver::Postgres, "t"),
+            "drop table if exists t"
+        );
     }
 
     #[test]

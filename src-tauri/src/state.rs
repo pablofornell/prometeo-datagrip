@@ -281,6 +281,15 @@ impl AppState {
         blocking(move || sources.duplicate(&id)).await
     }
 
+    pub async fn copy_data_source_password(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<DataSourceView, String> {
+        let (sources, from, to) = (self.sources.clone(), from.to_string(), to.to_string());
+        blocking(move || sources.copy_password(&from, &to)).await
+    }
+
     pub async fn test_connection(&self, cfg: DataSourceConfig) -> Result<TestResult, String> {
         let sources = self.sources.clone();
         let cfg = blocking(move || sources.with_stored_password(cfg)).await?;
@@ -916,6 +925,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = AppState::open(dir.path().join("config"), dir.path().join("data")).unwrap();
         (s, dir)
+    }
+
+    #[test]
+    fn errors_do_not_show_the_password_of_an_oracle_thin_url() {
+        let cfg = DataSourceConfig {
+            driver: dbcore::Driver::Oracle,
+            url_override: Some("jdbc:oracle:thin:scott/p@ss@db:1521/svc".into()),
+            ..Default::default()
+        };
+        let m = redact_for(&cfg, "cannot parse jdbc:oracle:thin:scott/p@ss@db:1521/svc");
+        assert_eq!(m, "cannot parse jdbc:oracle:thin:scott/***@db:1521/svc");
     }
 
     #[test]

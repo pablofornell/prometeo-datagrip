@@ -155,6 +155,20 @@
   color: inherit;
   cursor: default;
 }
+.dgt-export-patherr {
+  margin-top: 4px;
+  color: var(--dg-error);
+  font-size: 12px;
+  line-height: 16px;
+}
+.dgt-export-link {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--dg-link, var(--dg-accent));
+  font: inherit;
+  cursor: pointer;
+}
 .dgt-export-right {
   display: flex;
   flex: 1;

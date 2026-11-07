@@ -20,12 +20,22 @@
 //!
 //! # Cancellation
 //! PG: `pg_cancel_backend(pid)` from a side connection. MySQL: `KILL QUERY id`.
-//! SQLite: `sqlite3_interrupt`. Closing a partially read result cancels the query,
+//! SQLite: `sqlite3_interrupt`. Oracle: a flag the connection's worker thread checks between rows plus the break
+//! marker of the vendored driver for a call that is busy on the server (the statement fails with `ORA-01013`). Closing a partially read result cancels the query,
 //! except inside an open transaction (see [`crate::tx`]) where the remaining rows are drained so
 //! the transaction is not aborted. A *user* cancel inside a transaction does cancel: PostgreSQL then
 //! aborts the transaction (`57014` surfaces while the rest is drained, the session becomes `failed` and
 //! `TxStatus` is sent, so a later `COMMIT` reports `committed: false`); MySQL only rolls the statement back
 //! (error 1317), the transaction stays `active`.
+//!
+//! # Oracle
+//! Oracle has no autocommit: with `ExecOptions::auto_commit` (the console's Auto mode) every statement that
+//! succeeded is committed right after it (after one that failed the transaction is rolled back: the server undid
+//! the statement already). After PL/SQL blocks, `CALL` / `EXEC` and queries that call functions
+//! the lines written with `DBMS_OUTPUT.PUT_LINE` are drained and sent as `Message` events (before the error of a
+//! failed statement, if any). A `CREATE [OR REPLACE] PROCEDURE / FUNCTION / PACKAGE [BODY] / TRIGGER / TYPE [BODY] /
+//! VIEW` that succeeded but left the object INVALID (`ORA-24344`) is followed by an [`ExecEvent::Warning`] with the
+//! errors of `ALL_ERRORS`; a PL/SQL block or `CALL` reports 0 rows affected.
 //!
 //! # Lost connection
 //! When a statement fails because the connection is gone (see [`DbError::ConnectionLost`]) the `Error` event
@@ -74,7 +84,7 @@ pub(crate) enum Item {
     Done(u64),
 }
 
-pub(crate) type ItemStream<'a> = BoxStream<'a, std::result::Result<Item, sqlx::Error>>;
+pub(crate) type ItemStream<'a> = BoxStream<'a, Result<Item>>;
 
 /// Stream of rows (text protocol / unprepared) of a single statement on a connection.
 pub(crate) fn open_stream<'a>(conn: &'a mut Conn, sql: &'a str) -> ItemStream<'a> {
@@ -86,6 +96,7 @@ pub(crate) fn open_stream<'a>(conn: &'a mut Conn, sql: &'a str) -> ItemStream<'a
                     Either::Left(q) => Item::Done(q.rows_affected()),
                     Either::Right(row) => Item::Row(RawRow::Pg(row)),
                 })
+                .map_err(DbError::from)
             })
             .boxed(),
         Conn::My(c) => sqlx::raw_sql(sql)
@@ -95,6 +106,7 @@ pub(crate) fn open_stream<'a>(conn: &'a mut Conn, sql: &'a str) -> ItemStream<'a
                     Either::Left(q) => Item::Done(q.rows_affected()),
                     Either::Right(row) => Item::Row(RawRow::My(row)),
                 })
+                .map_err(DbError::from)
             })
             .boxed(),
         Conn::Lite(c) => sqlx::raw_sql(sql)
@@ -104,8 +116,10 @@ pub(crate) fn open_stream<'a>(conn: &'a mut Conn, sql: &'a str) -> ItemStream<'a
                     Either::Left(q) => Item::Done(q.rows_affected()),
                     Either::Right(row) => Item::Row(RawRow::Lite(row)),
                 })
+                .map_err(DbError::from)
             })
             .boxed(),
+        Conn::Ora(c) => c.stream(sql),
     }
 }
 
@@ -118,6 +132,7 @@ pub(crate) async fn conn_scalar(conn: &mut Conn, sql: &str) -> Result<Option<Str
                 RawRow::Pg(r) => crate::conn::pg_strings(r),
                 RawRow::My(r) => crate::conn::my_strings(r),
                 RawRow::Lite(r) => crate::conn::lite_strings(r),
+                RawRow::Ora(r) => crate::oracle::row_strings(r),
             };
             return Ok(v.into_iter().next().flatten());
         }
@@ -134,6 +149,7 @@ pub(crate) fn open_pool_stream<'a>(pool: &'a Pool, sql: &'a str) -> ItemStream<'
                     Either::Left(q) => Item::Done(q.rows_affected()),
                     Either::Right(row) => Item::Row(RawRow::Pg(row)),
                 })
+                .map_err(DbError::from)
             })
             .boxed(),
         Pool::My(p) => sqlx::raw_sql(sql)
@@ -143,6 +159,7 @@ pub(crate) fn open_pool_stream<'a>(pool: &'a Pool, sql: &'a str) -> ItemStream<'
                     Either::Left(q) => Item::Done(q.rows_affected()),
                     Either::Right(row) => Item::Row(RawRow::My(row)),
                 })
+                .map_err(DbError::from)
             })
             .boxed(),
         Pool::Lite(p) => sqlx::raw_sql(sql)
@@ -152,8 +169,10 @@ pub(crate) fn open_pool_stream<'a>(pool: &'a Pool, sql: &'a str) -> ItemStream<'
                     Either::Left(q) => Item::Done(q.rows_affected()),
                     Either::Right(row) => Item::Row(RawRow::Lite(row)),
                 })
+                .map_err(DbError::from)
             })
             .boxed(),
+        Pool::Ora(p) => p.stream(sql),
     }
 }
 
@@ -290,6 +309,50 @@ impl Task {
         }
     }
 
+    /// Oracle, after a statement: show what `DBMS_OUTPUT` collected and, in Auto mode (`auto_commit`), commit a
+    /// statement that succeeded (the server has no autocommit). Returns the error of the commit.
+    async fn oracle_after(
+        &mut self,
+        conn: &mut Conn,
+        idx: usize,
+        sql: &str,
+        ok: bool,
+    ) -> Option<DbError> {
+        let Conn::Ora(c) = conn else { return None };
+        if crate::oracle::may_print(sql) {
+            if let Ok(lines) = c.drain_output().await {
+                for text in lines {
+                    self.sh.send(ExecEvent::Message {
+                        index: Some(idx),
+                        text,
+                    });
+                }
+            }
+        }
+        if ok {
+            // `CREATE [OR REPLACE] PROCEDURE ...` succeeds even when the object does not compile (ORA-24344)
+            if let Ok(Some((ty, name, errors))) = crate::oracle::compile_errors(c, sql).await {
+                self.sh.send(ExecEvent::Warning {
+                    index: idx,
+                    message: format!("Warning: {ty} {name} compiled with errors"),
+                    details: errors
+                        .into_iter()
+                        .map(|(line, col, text)| format!("{line}/{col}: {}", text.trim_end()))
+                        .collect(),
+                });
+            }
+        }
+        if self.opts.auto_commit && c.in_transaction() {
+            if ok {
+                return c.commit().await.err().map(|e| e.for_driver(Driver::Oracle));
+            }
+            // the server undid the failed statement; what is left open is the transaction it started (the
+            // read-only transaction of a read-only data source), which would hold its snapshot for good
+            let _ = c.rollback().await;
+        }
+        None
+    }
+
     /// A statement (or the cleanup after it) failed with `e`, already tagged with the driver. Sends the
     /// `Error` event when `report` (or the connection is lost); returns true if the connection is gone:
     /// the session is dead then, the script must stop and the caller drops the connection.
@@ -383,9 +446,7 @@ async fn pull(stream: &mut ItemStream<'_>, sh: &Shared, st: &mut StreamState, t0
         }
         match item {
             None => return Pull::End,
-            Some(Err(e)) => {
-                return Pull::Err(DbError::from(e).for_driver(sh.session.live.driver()))
-            }
+            Some(Err(e)) => return Pull::Err(e.for_driver(sh.session.live.driver())),
             Some(Ok(Item::Done(n))) => {
                 st.block_done = true;
                 st.rows_affected = n;
@@ -407,7 +468,8 @@ async fn pull(stream: &mut ItemStream<'_>, sh: &Shared, st: &mut StreamState, t0
 async fn abort_stream(mut stream: ItemStream<'_>, sh: &Shared) -> Option<DbError> {
     let in_tx = sh.session.in_tx();
     let user = sh.token.is_cancelled();
-    let cancel = !in_tx || user;
+    // Oracle: a cancel only stops the statement, the transaction survives
+    let cancel = !in_tx || user || sh.session.live.driver() == Driver::Oracle;
     if cancel {
         sh.session.cancel_running().await;
     }
@@ -418,7 +480,7 @@ async fn abort_stream(mut stream: ItemStream<'_>, sh: &Shared) -> Option<DbError
     let mut err = None;
     while let Some(item) = stream.next().await {
         if let Err(e) = item {
-            err.get_or_insert(DbError::from(e).for_driver(sh.session.live.driver()));
+            err.get_or_insert(e.for_driver(sh.session.live.driver()));
         }
     }
     err
@@ -731,10 +793,21 @@ async fn exec_task(
                 let mut lost = false;
                 match run_statement(&mut task, conn, i, &st.text, i + 1 == n).await {
                     Ok(Flow::Next) => match task.abort_err.take() {
-                        None => {
-                            task.tx_after(Some(&mut *conn), i, &st.text, tx::Outcome::Ok)
-                                .await
-                        }
+                        None => match task.oracle_after(conn, i, &st.text, true).await {
+                            None => {
+                                task.tx_after(Some(&mut *conn), i, &st.text, tx::Outcome::Ok)
+                                    .await
+                            }
+                            // Auto mode: the commit after the statement failed
+                            Some(e) => {
+                                lost = task
+                                    .statement_failed(Some(&mut *conn), i, &st.text, &e, true)
+                                    .await;
+                                if !lost && task.opts.stop_on_error {
+                                    break;
+                                }
+                            }
+                        },
                         // the statement itself finished; closing its stream hit an error (a cancel)
                         Some(e) => {
                             lost = task
@@ -745,6 +818,9 @@ async fn exec_task(
                     Ok(Flow::Paged) => lost = sess.is_lost(),
                     Err(e) => {
                         let e = e.for_driver(sess.live.driver());
+                        if !e.is_connection_lost() {
+                            task.oracle_after(conn, i, &st.text, false).await;
+                        }
                         lost = task
                             .statement_failed(Some(&mut *conn), i, &st.text, &e, true)
                             .await;

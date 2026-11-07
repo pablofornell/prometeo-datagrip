@@ -5,7 +5,7 @@ import { EditorView } from "@codemirror/view";
 import { type Action } from "../../state/actions";
 import { exportCurrentResult } from "../output";
 import { openTableExport } from "./exportData";
-import { registerBeforeClose } from "../../state/tabs";
+import { registerBeforeClose, registerQuitGuard } from "../../state/tabs";
 import { type TableController, activeController, controllerOf, focusedController } from "./controller";
 
 const focused = () => !!focusedController();
@@ -148,8 +148,14 @@ export function tableActions(): Action[] {
  * `beforeClose` hooks; a table editor with pending changes asks Submit / Discard / Cancel here.
  */
 export function installCloseGuard(): () => void {
-  return registerBeforeClose((tab) => {
+  const offClose = registerBeforeClose((tab) => {
     const c = tab.kind === "table" ? controllerOf(tab.id) : undefined;
     return c && (c.pendingCount() > 0 || c.inTx()) ? c.confirmClose() : true;
   });
+  // quitting: pending changes are asked with everything else (open transactions are asked once, for all tabs)
+  const offQuit = registerQuitGuard((tab) => {
+    const c = tab.kind === "table" ? controllerOf(tab.id) : undefined;
+    return c && c.pendingCount() > 0 ? c.askQuit() : null;
+  });
+  return () => (offClose(), offQuit());
 }

@@ -8,10 +8,13 @@ const SVG_OK =
 const SVG_ERR =
   '<svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="currentColor"/><rect x="7.1" y="3.6" width="1.8" height="5.4" rx=".9" fill="#fff"/><circle cx="8" cy="11.4" r="1" fill="#fff"/></svg>';
 
+const SVG_WARN =
+  '<svg width="16" height="16" viewBox="0 0 16 16"><path d="M8 1.8l6.6 11.6H1.4z" fill="currentColor"/><rect x="7.1" y="5.8" width="1.8" height="4" rx=".9" fill="#fff"/><circle cx="8" cy="11.6" r="1" fill="#fff"/></svg>';
+
 const SVG_BULB =
   '<svg width="16" height="16" viewBox="0 0 16 16"><path d="M8 1.8a4.4 4.4 0 0 0-2.6 7.9c.4.3.6.7.6 1.2v.4h4v-.4c0-.5.2-.9.6-1.2A4.4 4.4 0 0 0 8 1.8z" fill="currentColor"/><rect x="6" y="12" width="4" height="1.2" rx=".6" fill="currentColor"/><rect x="6.6" y="13.7" width="2.8" height="1" rx=".5" fill="currentColor"/></svg>';
 
-type Kind = "ok" | "error" | "running" | null;
+type Kind = "ok" | "error" | "warning" | "running" | null;
 
 /** The execution icon of a line and / or the intention bulb of the caret line. */
 class StatusMarker extends GutterMarker {
@@ -32,8 +35,9 @@ class StatusMarker extends GutterMarker {
       return d;
     }
     const ok = this.kind === "ok";
-    d.className = ok ? "cm-exec-icon cm-exec-ok" : "cm-exec-icon cm-exec-err";
-    d.innerHTML = ok ? SVG_OK : SVG_ERR;
+    const warn = this.kind === "warning";
+    d.className = ok ? "cm-exec-icon cm-exec-ok" : warn ? "cm-exec-icon cm-exec-warn" : "cm-exec-icon cm-exec-err";
+    d.innerHTML = ok ? SVG_OK : warn ? SVG_WARN : SVG_ERR;
     return d;
   }
   toDOM(): HTMLElement {
@@ -53,8 +57,9 @@ class StatusMarker extends GutterMarker {
 const OK = new StatusMarker("ok");
 const ERR = new StatusMarker("error");
 const RUNNING = new StatusMarker("running");
+const WARN = new StatusMarker("warning");
 const marker = (kind: Kind, bulb: BulbKind): StatusMarker | null => {
-  if (bulb === "none") return kind === "ok" ? OK : kind === "error" ? ERR : kind === "running" ? RUNNING : null;
+  if (bulb === "none") return kind === "ok" ? OK : kind === "error" ? ERR : kind === "warning" ? WARN : kind === "running" ? RUNNING : null;
   return new StatusMarker(kind, bulb);
 };
 

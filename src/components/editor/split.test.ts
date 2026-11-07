@@ -6,6 +6,7 @@ import { splitStatements, statementAt, type Dialect } from "./split";
 const PG: Dialect = "postgres";
 const MY: Dialect = "mysql";
 const LITE: Dialect = "sqlite";
+const ORA: Dialect = "oracle";
 
 const texts = (sql: string, d: Dialect): string[] => splitStatements(sql, d).map((s) => s.text);
 
@@ -121,6 +122,57 @@ describe("splitStatements", () => {
     expect(sql.slice(s[1].start, s[1].end)).toBe("select 2");
     expect(s[1].start).toBe(15);
     expect(s[1].end).toBe(23);
+  });
+});
+
+describe("oracle", () => {
+  it("splits plain SQL on ';' and treats double quotes as identifiers", () => {
+    expect(texts(`select 'a;b', "c;d" from dual; select 2 from dual`, ORA)).toEqual([`select 'a;b', "c;d" from dual`, "select 2 from dual"]);
+    // no backticks, no backslash escapes
+    expect(texts("select 'a\\' from dual; select 2 from dual", ORA)).toEqual(["select 'a\\' from dual", "select 2 from dual"]);
+  });
+
+  it("q'[..]' alternative quoting hides ';' and quotes", () => {
+    expect(texts("select q'[it's; fine]' from dual; select 2 from dual", ORA)).toEqual(["select q'[it's; fine]' from dual", "select 2 from dual"]);
+    expect(texts("select Q'{a;b}', nq'!c;d!' from dual; select 2", ORA)).toEqual(["select Q'{a;b}', nq'!c;d!' from dual", "select 2"]);
+    // a column called q is not a q-quote
+    expect(texts("select q from t; select 'x' from dual", ORA)).toEqual(["select q from t", "select 'x' from dual"]);
+  });
+
+  it("a line with only '/' ends a PL/SQL unit; ';' inside does not", () => {
+    const proc = "create or replace procedure p is\nbegin\n  update t set a = 1;\n  commit;\nend;";
+    const t = texts(`${proc}\n/\nselect 1 from dual;\n`, ORA);
+    expect(t).toEqual([proc, "select 1 from dual"]);
+    const pkg = "create or replace package body pk as\n  procedure a is begin null; end;\nend pk;";
+    expect(texts(`${pkg}\n/\ncreate table x (a int);`, ORA)).toEqual([pkg, "create table x (a int)"]);
+    const trg = "CREATE OR REPLACE EDITIONABLE TRIGGER trg before insert on t for each row begin :new.id := 1; end;";
+    expect(texts(`${trg}\n/`, ORA)).toEqual([trg]);
+    const decl = "declare x number; begin select 1 into x from dual; end;";
+    expect(texts(`${decl}\n/\nselect 2 from dual`, ORA)).toEqual([decl, "select 2 from dual"]);
+  });
+
+  it("an anonymous BEGIN block ends at its own END; (and a '/' after it is ignored)", () => {
+    const blk = "begin\n  if 1 = 1 then null; end if;\n  for i in 1..2 loop null; end loop;\n  x := case when 1 = 1 then 1 end;\nend;";
+    expect(texts(`${blk} select 1 from dual;`, ORA)).toEqual([blk, "select 1 from dual"]);
+    expect(texts(`${blk}\n/\nselect 1 from dual;`, ORA)).toEqual([blk, "select 1 from dual"]);
+    expect(texts("begin begin null; end; null; end; select 3 from dual", ORA)).toEqual(["begin begin null; end; null; end;", "select 3 from dual"]);
+  });
+
+  it("'/' alone also ends a plain statement and is dropped after one", () => {
+    expect(texts("select 1 from dual\n/\nselect 2 from dual\n/", ORA)).toEqual(["select 1 from dual", "select 2 from dual"]);
+    expect(texts("select 1 from dual;\n/\n", ORA)).toEqual(["select 1 from dual"]);
+    // division and comments are not terminators
+    expect(texts("select 4\n/ 2 from dual;\nselect 1 from dual /* a\n/\n*/ ;", ORA)).toEqual(["select 4\n/ 2 from dual", "select 1 from dual /* a\n/\n*/"]);
+  });
+
+  it("CREATE TABLE / TYPE (not a body) with FUNCTION in its text stay plain statements", () => {
+    expect(texts("create table t (function int); select 1 from dual", ORA)).toEqual(["create table t (function int)", "select 1 from dual"]);
+    expect(texts("create type t as table of number; select 1 from dual", ORA)).toEqual(["create type t as table of number", "select 1 from dual"]);
+  });
+
+  it("does not panic on unterminated constructs", () => {
+    for (const sql of ["select q'[abc", 'select "abc', "select /* abc", "begin null;", "create procedure p is begin null"])
+      expect(splitStatements(sql, ORA), sql).toHaveLength(1);
   });
 });
 

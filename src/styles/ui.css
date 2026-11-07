@@ -43,6 +43,24 @@
   border-top: 2px solid var(--dg-icon);
   transform: rotate(-45deg) scale(1.2);
 }
+/* toolbar that collapses what does not fit into a "»" button (overflowToolbar) */
+.dg-ovf {
+  min-width: 0;
+  overflow: hidden;
+}
+.dg-ovf > [data-ovf] {
+  display: none !important;
+}
+.dg-ovf-more {
+  width: 22px;
+  height: 22px;
+  margin-left: auto;
+  color: var(--dg-text);
+  font: 14px / 1 var(--dg-font-ui, sans-serif);
+}
+.dg-ovf-more[hidden] {
+  display: none;
+}
 .dg-toolbar-sep {
   flex: none;
   width: 1px;

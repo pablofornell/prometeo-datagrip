@@ -67,7 +67,7 @@ createRoot(() => {
   createEffect(() => {
     const own = focusArea() === "explorer" ? explorerPath() : editorPath();
     const path = own.length ? own : focusArea() === "explorer" ? editorPath() : explorerPath();
-    if (path.length) setStatus("path", path);
+    setStatus("path", path); // also when empty: a removed data source must not stay in the breadcrumbs
   });
 });
 

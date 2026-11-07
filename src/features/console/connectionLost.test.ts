@@ -61,7 +61,7 @@ vi.mock("../../api/db", () => ({
     let done!: (e: unknown) => void;
     const p = new Promise((r) => (done = r));
     for (const e of answer(sid, sql)) {
-      const h = { statement: "onStatement", resultset: "onResultSet", update: "onUpdate", error: "onError", message: "onMessage", txStatus: "onTxStatus", txEnded: "onTxEnded", done: "onDone" }[e.kind];
+      const h = { statement: "onStatement", resultset: "onResultSet", update: "onUpdate", error: "onError", message: "onMessage", warning: "onWarning", txStatus: "onTxStatus", txEnded: "onTxEnded", done: "onDone" }[e.kind];
       handlers[h]?.(e);
       if (e.kind === "done") done(e);
     }

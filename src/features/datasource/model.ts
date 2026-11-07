@@ -5,6 +5,7 @@
  * Option keys written into `DataSourceConfig.options` (all values are strings):
  *   comment            free text
  *   dbms               "mariadb" when the Driver combo says MariaDB (driver stays "mysql")
+ *   oracleConnType     Oracle only: "service" (the database field is a service name, default) | "sid"
  *   auth               "none" for "No auth" (user / password are cleared)
  *   passwordSave       reserved, always "forever" (only "Forever" is supported by the backend)
  *   sslrootcert / sslcert / sslkey   paths of the CA, client certificate and client key files (both drivers; read by dbcore)
@@ -82,11 +83,13 @@ export interface Draft {
   nameAuto: boolean;
   /** JSON of the form at load / last apply (modified marker). */
   base: string;
+  /** Duplicate of a saved source: the id whose stored password the copy takes (the UI cannot read it). */
+  passwordFrom?: string | null;
   test: { state: "idle" | "running" | "done"; info?: TestInfo; lastOk?: TestInfo };
 }
 
 export const RESERVED_OPTIONS = new Set([
-  "comment", "dbms", "auth", "passwordSave", "sslmode", "create", "txMode", "sessionControl", "keepAliveSec",
+  "comment", "dbms", "oracleConnType", "auth", "passwordSave", "sslmode", "create", "txMode", "sessionControl", "keepAliveSec",
   "autoDisconnectSec", "startupScript", "showSystemSchemas", "visibleSchemas", "switchSchema", "autoSync",
   "sslrootcert", "sslcert", "sslkey",
 ]);
@@ -101,7 +104,7 @@ export function defaultForm(dbms: Dbms): Form {
     port: dbms === "sqlite" ? "" : String(info.defaultPort),
     auth: "password",
     user: "",
-    database: dbms === "postgres" ? "postgres" : "",
+    database: dbms === "postgres" ? "postgres" : dbms === "oracle" ? "XE" : "",
     file: "",
     url: "",
     color: null,
@@ -142,6 +145,7 @@ export function formFromDataSource(ds: DataSource): Form {
       f.host = p.host;
       f.port = p.port;
       f.database = p.database;
+      if (dbms === "oracle") f.options.oracleConnType = p.sid ? "sid" : "service";
     }
     if (dbms === "sqlite") f.file = sqliteFileOfUrl(f.url) ?? ds.file;
   } else if (connType === "memory") {
@@ -221,6 +225,8 @@ export function configFromForm(f: Form, id: string | null, saved?: DataSource | 
   }
   if (f.dbms === "mariadb") options.dbms = "mariadb";
   else delete options.dbms;
+  if (f.dbms === "oracle") options.oracleConnType = options.oracleConnType === "sid" ? "sid" : "service";
+  else delete options.oracleConnType;
   if (f.auth === "none") options.auth = "none";
   else delete options.auth;
   for (const k of Object.keys(options)) if (options[k] === "" && saved?.options[k] !== "") delete options[k];
@@ -258,7 +264,10 @@ export function configFromForm(f: Form, id: string | null, saved?: DataSource | 
       cfg.host = p.host;
       cfg.port = Number(p.port) || 0;
       cfg.database = p.database;
+      if (f.dbms === "oracle") options.oracleConnType = p.sid ? "sid" : "service";
     }
+    // Oracle's "URL only" keeps the User field (the URL may also carry the credentials)
+    if (f.dbms === "oracle") cfg.user = noAuth ? "" : f.user.trim() || p?.user || "";
     return cfg;
   }
   cfg.host = f.host.trim();
@@ -303,11 +312,13 @@ export function validate(f: Form, names: string[]): Problem[] {
     if (f.connType === "default" && !f.file.trim()) err("File is not specified");
     if (f.connType === "url" && !parseUrl("sqlite", f.url)) err("Invalid URL: expected jdbc:sqlite:<path>");
   } else if (f.connType === "url") {
-    if (!parseUrl(f.dbms, f.url)) err(`Invalid URL: expected jdbc:${DBMS[f.dbms].scheme}://host:port/database`);
+    if (!parseUrl(f.dbms, f.url))
+      err(f.dbms === "oracle" ? "Invalid URL: expected jdbc:oracle:thin:@//host:port/service or jdbc:oracle:thin:@host:port:SID" : `Invalid URL: expected jdbc:${DBMS[f.dbms].scheme}://host:port/database`);
   } else {
     if (!f.host.trim()) err("Host is not specified");
     if (f.port.trim() && !(/^\d+$/.test(f.port.trim()) && Number(f.port) >= 1 && Number(f.port) <= 65535))
       err("Port must be a number between 1 and 65535");
+    if (f.dbms === "oracle" && !f.database.trim()) err(f.options.oracleConnType === "sid" ? "SID is not specified" : "Service name is not specified");
   }
   const kn = (k: string) => f.options[k] !== undefined && f.options[k] !== "" && !/^\d+$/.test(f.options[k]);
   if (kn("keepAliveSec")) out.push({ tab: "options", message: "Keep-alive interval must be a number of seconds" });

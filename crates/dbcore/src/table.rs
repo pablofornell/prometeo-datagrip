@@ -9,7 +9,11 @@ use crate::exec::{conn_scalar, open_stream, query_conn, query_pool};
 use crate::introspect::{row_addr, table_columns, ColInfo};
 use crate::manager::{ConnectionManager, SessionId};
 use crate::model::*;
-use crate::quote::{hex_decode, hex_encode, qualified, quote_ident};
+use crate::oracle::{OraBind, OraConn, OraTx};
+use crate::quote::{
+    hex_decode, hex_encode, oracle_time_kind, parse_oracle_ts, qualified, quote_ident,
+    OracleTimeKind,
+};
 use crate::split::has_statement_separator;
 
 /// How the rows of a table without a primary key are addressed physically.
@@ -21,6 +25,8 @@ pub(crate) enum RowAddr {
     PgCtid,
     /// SQLite `rowid` (or the given alias when a column is called `rowid`); the locator is an integer.
     SqliteRowid(String),
+    /// Oracle `ROWID`; the locator is its 18 character text form (`ROWIDTOCHAR`).
+    OracleRowid,
 }
 
 /// Name of the hidden column `table_data` appends to select the row locator.
@@ -115,6 +121,83 @@ async fn run_stmts_lite(
     stmts: &[Stmt],
 ) -> (Vec<ChangeResult>, bool) {
     run_stmts!(c, stmts, |q, v| q.bind(v.to_string()))
+}
+
+/// The outcome of one change on Oracle: the result and whether the batch fails here.
+fn ora_outcome(i: usize, st: &Stmt, r: Result<u64>) -> (ChangeResult, bool) {
+    match r {
+        Ok(n) if st.expects_row && n != 1 => {
+            // an update / delete must touch exactly one row (like DataGrip)
+            let msg = if n == 0 {
+                "No row matched: it was changed or deleted by someone else".to_string()
+            } else {
+                format!("Unexpected update count: {n}")
+            };
+            (
+                ChangeResult {
+                    index: i,
+                    rows_affected: n,
+                    error: Some(msg),
+                },
+                true,
+            )
+        }
+        Ok(n) => (
+            ChangeResult {
+                index: i,
+                rows_affected: n,
+                error: None,
+            },
+            false,
+        ),
+        Err(e) => (
+            ChangeResult {
+                index: i,
+                rows_affected: 0,
+                error: Some(e.to_string()),
+            },
+            true,
+        ),
+    }
+}
+
+fn ora_binds(binds: &[Bind]) -> Vec<OraBind> {
+    binds
+        .iter()
+        .map(|b| match b {
+            Bind::Null => OraBind::Null,
+            Bind::Bool(v) => OraBind::Bool(*v),
+            Bind::Int(v) => OraBind::Int(*v),
+            Bind::UInt(v) => OraBind::UInt(*v),
+            Bind::Float(v) => OraBind::Float(*v),
+            Bind::Text(v) => OraBind::Text(v.clone()),
+            Bind::Bytes(v) => OraBind::Bytes(v.clone()),
+        })
+        .collect()
+}
+
+async fn run_stmts_ora_tx(tx: &mut OraTx, stmts: &[Stmt]) -> (Vec<ChangeResult>, bool) {
+    let mut results = Vec::new();
+    for (i, st) in stmts.iter().enumerate() {
+        let (res, failed) = ora_outcome(i, st, tx.execute(&st.sql, &ora_binds(&st.binds)).await);
+        results.push(res);
+        if failed {
+            return (results, true);
+        }
+    }
+    (results, false)
+}
+
+async fn run_stmts_ora_conn(c: &mut OraConn, stmts: &[Stmt]) -> (Vec<ChangeResult>, bool) {
+    let mut results = Vec::new();
+    for (i, st) in stmts.iter().enumerate() {
+        let (res, failed) = ora_outcome(i, st, c.execute(&st.sql, &ora_binds(&st.binds)).await);
+        results.push(res);
+        if failed {
+            return (results, true);
+        }
+    }
+    (results, false)
 }
 
 /// Runs one statement without reading rows on a dedicated connection.
@@ -212,6 +295,16 @@ impl ConnectionManager {
             // only MySQL binds an unsigned 64-bit integer natively
             crate::conn::Pool::My(p) => run_tx!(p, stmts, |q, v| q.bind(v)),
             crate::conn::Pool::Lite(p) => run_tx!(p, stmts, |q, v| q.bind(v.to_string())),
+            crate::conn::Pool::Ora(p) => {
+                let mut tx = p.begin().await?;
+                let (results, failed) = run_stmts_ora_tx(&mut tx, &stmts).await;
+                if failed {
+                    let _ = tx.rollback().await;
+                } else {
+                    tx.commit().await?;
+                }
+                (results, !failed)
+            }
         };
         Ok(ApplyResult {
             applied: if committed { changes.len() } else { 0 },
@@ -291,8 +384,15 @@ async fn table_data_with(
         RowAddr::None => "*".to_string(),
         RowAddr::PgCtid => format!("*, tableoid::text || ':' || ctid::text as {loc_col}"),
         RowAddr::SqliteRowid(a) => format!("*, {a} as {loc_col}"),
+        // `*` cannot be followed by more columns in Oracle unless it is qualified
+        RowAddr::OracleRowid => format!("t.*, rowidtochar(t.rowid) as {loc_col}"),
     };
-    let mut sql = format!("select {select_list} from {q}");
+    let alias = if addr == RowAddr::OracleRowid {
+        " t"
+    } else {
+        ""
+    };
+    let mut sql = format!("select {select_list} from {q}{alias}");
     if let Some(w) = req
         .where_clause
         .as_deref()
@@ -309,11 +409,19 @@ async fn table_data_with(
     {
         sql.push_str(&format!(" order by {o}"));
     }
-    sql.push_str(&format!(
-        " limit {} offset {}",
-        limit.saturating_add(1),
-        req.offset
-    ));
+    if d == Driver::Oracle {
+        sql.push_str(&format!(
+            " offset {} rows fetch next {} rows only",
+            req.offset,
+            limit.saturating_add(1)
+        ));
+    } else {
+        sql.push_str(&format!(
+            " limit {} offset {}",
+            limit.saturating_add(1),
+            req.offset
+        ));
+    }
 
     let mut rows: Vec<Vec<Cell>> = Vec::new();
     let cols = match conn.as_mut() {
@@ -425,21 +533,34 @@ async fn run_on_conn(
     } else {
         "begin"
     };
-    conn_run(conn, open).await?;
+    // Oracle has no BEGIN: the first change opens the transaction
+    if d != Driver::Oracle || in_tx {
+        conn_run(conn, open).await?;
+    }
     let (results, failed) = match conn {
         Conn::Pg(c) => run_stmts_pg(c, stmts).await,
         Conn::My(c) => run_stmts_my(c, stmts).await,
         Conn::Lite(c) => run_stmts_lite(c, stmts).await,
+        Conn::Ora(c) => run_stmts_ora_conn(c, stmts).await,
     };
+    // Oracle has no RELEASE SAVEPOINT: the savepoint just stays until the transaction ends
     if failed {
         if in_tx {
             conn_run(conn, "rollback to savepoint prometeo_apply").await?;
-            conn_run(conn, "release savepoint prometeo_apply").await?;
+            if d != Driver::Oracle {
+                conn_run(conn, "release savepoint prometeo_apply").await?;
+            }
+        } else if let Conn::Ora(c) = conn {
+            let _ = c.rollback().await;
         } else {
             let _ = conn_run(conn, "rollback").await;
         }
     } else if in_tx {
-        conn_run(conn, "release savepoint prometeo_apply").await?;
+        if d != Driver::Oracle {
+            conn_run(conn, "release savepoint prometeo_apply").await?;
+        }
+    } else if let Conn::Ora(c) = conn {
+        c.commit().await?;
     } else {
         conn_run(conn, "commit").await?;
     }
@@ -512,8 +633,11 @@ fn pg_array_literal(v: &Value) -> String {
 
 pub(crate) fn to_bind(d: Driver, v: &Value, col: &ColInfo) -> Result<Bind> {
     let pg = d == Driver::Postgres;
+    let ora = d == Driver::Oracle;
     Ok(match v {
         Value::Null => Bind::Null,
+        // Oracle (before 23ai) has no boolean: 1 / 0
+        Value::Bool(b) if ora => Bind::Int(i64::from(*b)),
         Value::Bool(b) => {
             if pg {
                 Bind::Text(b.to_string())
@@ -523,6 +647,9 @@ pub(crate) fn to_bind(d: Driver, v: &Value, col: &ColInfo) -> Result<Bind> {
         }
         Value::Number(n) => {
             if pg {
+                Bind::Text(n.to_string())
+            } else if ora && n.as_i64().is_none() {
+                // beyond i64 or fractional: the text keeps every digit of a NUMBER
                 Bind::Text(n.to_string())
             } else if let Some(i) = n.as_i64() {
                 Bind::Int(i)
@@ -625,6 +752,20 @@ fn parse_pg_locator(v: &Value) -> Result<(String, String)> {
     }
 }
 
+/// The text of an Oracle ROWID (`AAAUYtAAMAAAAC7AAA`, longer for index-organised tables).
+fn parse_oracle_rowid(v: &Value) -> Result<String> {
+    v.as_str()
+        .map(str::trim)
+        .filter(|s| {
+            s.len() >= 15
+                && s.len() <= 4000
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'*'))
+        })
+        .map(str::to_string)
+        .ok_or_else(|| DbError::InvalidArgument(format!("Invalid row locator: {v}")))
+}
+
 fn parse_rowid_locator(v: &Value) -> Result<i64> {
     match v {
         Value::Number(n) => n.as_i64(),
@@ -667,10 +808,39 @@ pub(crate) fn build_stmt(
                 }
             }
         }
+        // Oracle converts dates / timestamps with fixed formats: NLS settings must not change what a value means
+        let mut ora_wrap: Option<String> = None;
+        if d == Driver::Oracle {
+            if let (Some(kind), Value::String(text)) = (oracle_time_kind(&c.base_type), v) {
+                let ts = parse_oracle_ts(text).ok_or_else(|| {
+                    DbError::InvalidArgument(format!(
+                        "'{text}' is not a valid date or time for column {}",
+                        c.name
+                    ))
+                })?;
+                let (norm, func, fmt) = match kind {
+                    OracleTimeKind::Date => (ts.date_text(), "to_date", "YYYY-MM-DD HH24:MI:SS"),
+                    OracleTimeKind::Timestamp => (
+                        ts.timestamp_text(),
+                        "to_timestamp",
+                        "YYYY-MM-DD HH24:MI:SS.FF9",
+                    ),
+                    OracleTimeKind::TimestampTz => {
+                        (ts.timestamp_tz_text(), "to_timestamp_tz", ts.tz_format())
+                    }
+                };
+                b = Bind::Text(norm);
+                ora_wrap = Some(format!("{func}(:{{n}}, '{fmt}')"));
+            }
+        }
         binds.push(b);
         let n = binds.len();
         Ok(match d {
             Driver::Postgres => format!("cast(${n} as {})", c.base_type),
+            Driver::Oracle => match ora_wrap {
+                Some(w) => w.replace("{n}", &n.to_string()),
+                None => format!(":{n}"),
+            },
             _ => "?".to_string(),
         })
     };
@@ -724,6 +894,19 @@ pub(crate) fn build_stmt(
                     Ok(format!("{id} = {p}"))
                 }
             }
+            // an empty string is NULL in Oracle; LOBs have no `=`
+            Driver::Oracle => {
+                if v.as_str().is_some_and(str::is_empty) {
+                    return Ok(format!("{id} is null"));
+                }
+                let t = c.base_type.to_ascii_uppercase();
+                let p = ph(binds, c, v)?;
+                if matches!(t.as_str(), "CLOB" | "NCLOB" | "BLOB") {
+                    Ok(format!("dbms_lob.compare({id}, {p}) = 0"))
+                } else {
+                    Ok(format!("{id} = {p}"))
+                }
+            }
             _ => {
                 let p = ph(binds, c, v)?;
                 Ok(format!("{id} = {p}"))
@@ -749,6 +932,10 @@ pub(crate) fn build_stmt(
                     binds.push(Bind::Int(parse_rowid_locator(loc)?));
                     return Ok(format!("{alias} = ?"));
                 }
+                RowAddr::OracleRowid => {
+                    binds.push(Bind::Text(parse_oracle_rowid(loc)?));
+                    return Ok(format!("rowid = chartorowid(:{})", binds.len()));
+                }
                 RowAddr::None => {}
             }
         }
@@ -773,14 +960,18 @@ pub(crate) fn build_stmt(
                 format!("(tableoid, ctid) = (select tableoid, ctid from {q} where {key} limit 1)")
             }
             RowAddr::SqliteRowid(a) => format!("{a} = (select {a} from {q} where {key} limit 1)"),
+            RowAddr::OracleRowid => {
+                format!("rowid = (select rowid from {q} where {key} and rownum = 1)")
+            }
             RowAddr::None => key,
         })
     };
     // MySQL has no row locator: without a PK the key may match duplicates, so cap at one row
-    let limit_one = if d == Driver::MySql && !has_pk {
-        " limit 1"
-    } else {
-        ""
+    let limit_one = match d {
+        Driver::MySql if !has_pk => " limit 1",
+        // same for Oracle: a ROWNUM condition limits an UPDATE / DELETE too
+        Driver::Oracle if !has_pk && *addr == RowAddr::None => " and rownum = 1",
+        _ => "",
     };
 
     match ch.kind {
@@ -839,6 +1030,13 @@ pub(crate) fn build_stmt(
             let sql = if names.is_empty() {
                 match d {
                     Driver::MySql => format!("insert into {q} () values ()"),
+                    // no `default values` clause: name one column and give it its default
+                    Driver::Oracle => match info.first() {
+                        Some(c) => format!("insert into {q} ({}) values (default)", ident(&c.name)),
+                        None => {
+                            return Err(DbError::InvalidArgument("The table has no columns".into()))
+                        }
+                    },
                     _ => format!("insert into {q} default values"),
                 }
             } else {
@@ -1175,6 +1373,143 @@ mod tests {
         assert!(build_stmt(Driver::Sqlite, "t", &info, &RowAddr::None, &ch).is_err());
         let ch = change(ChangeKind::Delete, &[], &[]);
         assert!(build_stmt(Driver::Sqlite, "t", &info, &RowAddr::None, &ch).is_err());
+    }
+
+    fn ora_col(name: &str, ty: &str, pk: bool) -> ColInfo {
+        ColInfo {
+            name: name.into(),
+            type_name: ty.into(),
+            nullable: true,
+            is_pk: pk,
+            pk_pos: 0,
+            default: None,
+            generated: false,
+            // the dictionary's DATA_TYPE: `NUMBER` without precision, but `TIMESTAMP(6) WITH TIME ZONE` whole
+            base_type: if ty.starts_with("TIMESTAMP") {
+                ty.to_ascii_uppercase()
+            } else {
+                ty.split('(')
+                    .next()
+                    .unwrap_or(ty)
+                    .trim()
+                    .to_ascii_uppercase()
+            },
+        }
+    }
+
+    #[test]
+    fn oracle_statements_use_numbered_placeholders_and_fixed_date_formats() {
+        let info = vec![
+            ora_col("ID", "NUMBER", true),
+            ora_col("NAME", "VARCHAR2(20)", false),
+            ora_col("D", "DATE", false),
+            ora_col("TSZ", "TIMESTAMP(6) WITH TIME ZONE", false),
+            ora_col("lower", "NUMBER(1)", false),
+        ];
+        let q = "DEMO.T";
+        let ch = change(
+            ChangeKind::Update,
+            &[("ID", json!(7))],
+            &[
+                ("NAME", json!("O'Reilly")),
+                ("D", json!("2024-02-29T10:00:00")),
+                ("TSZ", json!("2024-02-29 10:00:00.5 +02:00")),
+                ("lower", json!(true)),
+            ],
+        );
+        let st = stmt(Driver::Oracle, q, &info, &RowAddr::None, &ch);
+        assert_eq!(
+            st.sql,
+            "update DEMO.T set D = to_date(:1, 'YYYY-MM-DD HH24:MI:SS'), NAME = :2, \
+             TSZ = to_timestamp_tz(:3, 'YYYY-MM-DD HH24:MI:SS.FF9 TZH:TZM'), \"lower\" = :4 where ID = :5"
+        );
+        assert_eq!(
+            st.binds,
+            vec![
+                Bind::Text("2024-02-29 10:00:00".into()),
+                Bind::Text("O'Reilly".into()),
+                Bind::Text("2024-02-29 10:00:00.500000000 +02:00".into()),
+                Bind::Int(1),
+                Bind::Int(7)
+            ]
+        );
+        assert!(st.expects_row);
+        // an unreadable date is refused, not sent
+        let bad = change(
+            ChangeKind::Update,
+            &[("ID", json!(1))],
+            &[("D", json!("tomorrow"))],
+        );
+        assert!(build_stmt(Driver::Oracle, q, &info, &RowAddr::None, &bad).is_err());
+    }
+
+    #[test]
+    fn oracle_rows_without_a_key_are_addressed_by_rowid_or_capped() {
+        let info = vec![ora_col("A", "NUMBER", false), ora_col("C", "CLOB", false)];
+        let q = "DEMO.T";
+        let ch = change(
+            ChangeKind::Delete,
+            &[("A", json!(1)), ("C", json!("x"))],
+            &[],
+        );
+        let st = stmt(Driver::Oracle, q, &info, &RowAddr::None, &ch);
+        assert_eq!(
+            st.sql,
+            "delete from DEMO.T where A = :1 and dbms_lob.compare(C, :2) = 0 and rownum = 1"
+        );
+        let st = stmt(Driver::Oracle, q, &info, &RowAddr::OracleRowid, &ch);
+        assert_eq!(
+            st.sql,
+            "delete from DEMO.T where rowid = (select rowid from DEMO.T where A = :1 and dbms_lob.compare(C, :2) = 0 and rownum = 1)"
+        );
+        // the locator wins, and must look like a ROWID
+        let mut loc = ch.clone();
+        loc.row_locator = Some(json!("AAAUYtAAMAAAAC7AAA"));
+        let st = stmt(Driver::Oracle, q, &info, &RowAddr::OracleRowid, &loc);
+        assert_eq!(st.sql, "delete from DEMO.T where rowid = chartorowid(:1)");
+        assert_eq!(st.binds, vec![Bind::Text("AAAUYtAAMAAAAC7AAA".into())]);
+        loc.row_locator = Some(json!("x'; drop table t --"));
+        assert!(build_stmt(Driver::Oracle, q, &info, &RowAddr::OracleRowid, &loc).is_err());
+        // an empty string is NULL
+        let nul = change(ChangeKind::Delete, &[("A", json!(""))], &[]);
+        assert_eq!(
+            stmt(Driver::Oracle, q, &info, &RowAddr::None, &nul).sql,
+            "delete from DEMO.T where A is null and rownum = 1"
+        );
+    }
+
+    #[test]
+    fn oracle_inserts() {
+        let info = vec![ora_col("ID", "NUMBER", true), ora_col("B", "BLOB", false)];
+        let ins = change(
+            ChangeKind::Insert,
+            &[],
+            &[
+                ("B", json!({"$bin": "cafe"})),
+                ("ID", json!({"$default": true})),
+            ],
+        );
+        let st = stmt(Driver::Oracle, "T", &info, &RowAddr::None, &ins);
+        assert_eq!(st.sql, "insert into T (B, ID) values (:1, default)");
+        assert_eq!(st.binds, vec![Bind::Bytes(vec![0xca, 0xfe])]);
+        let empty = change(ChangeKind::Insert, &[], &[]);
+        assert_eq!(
+            stmt(Driver::Oracle, "T", &info, &RowAddr::None, &empty).sql,
+            "insert into T (ID) values (default)"
+        );
+        let c = ora_col("N", "NUMBER", false);
+        assert_eq!(
+            to_bind(Driver::Oracle, &json!(true), &c).unwrap(),
+            Bind::Int(1)
+        );
+        assert_eq!(
+            to_bind(Driver::Oracle, &json!(18446744073709551615u64), &c).unwrap(),
+            Bind::Text("18446744073709551615".into())
+        );
+        assert_eq!(
+            to_bind(Driver::Oracle, &json!(2.5), &c).unwrap(),
+            Bind::Text("2.5".into())
+        );
     }
 
     #[test]

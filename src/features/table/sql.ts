@@ -3,12 +3,18 @@
  * ORDER BY <-> header sort, column-filter conditions, the pending-changes SQL preview and the mapping of
  * grid changes to dbcore `RowChange`s (with the hidden row locators of tables without a primary key).
  */
+import { ORACLE_RESERVED } from "../../components/editor/keywords";
 import type { Cell as ApiCell, ColumnMeta, Driver, ObjectRef, RowChange } from "../../api/types";
 // direct module paths: the grid barrel pulls in the Solid components (not loadable in the node test environment)
 import { classifyType, isBinaryCell, isDefaultCell, isExprCell } from "../../components/grid/format";
 import type { Cell, GridChange, SortSpec } from "../../components/grid/types";
 
 const SIMPLE_IDENT = /^[a-z_][a-z0-9_$]*$/;
+const ORACLE_IDENT = /^[A-Z][A-Z0-9_$#]*$/;
+
+/** Written without quotes: lower case (upper case, and not a reserved word, in Oracle, which folds unquoted names up). */
+const isSimple = (driver: Driver, name: string): boolean =>
+  driver === "oracle" ? ORACLE_IDENT.test(name) && !ORACLE_RESERVED.has(name.toLowerCase()) : SIMPLE_IDENT.test(name);
 
 export function quoteIdent(driver: Driver, name: string): string {
   return driver === "mysql" ? "`" + name.replace(/`/g, "``") + "`" : '"' + name.replace(/"/g, '""') + '"';
@@ -16,7 +22,7 @@ export function quoteIdent(driver: Driver, name: string): string {
 
 /** `schema.table`, both parts quoted when needed (`always`: quote every part). */
 export function qualifiedName(driver: Driver, ref: Pick<ObjectRef, "schema" | "name">, always = false): string {
-  const q = (s: string) => (always || !SIMPLE_IDENT.test(s) ? quoteIdent(driver, s) : s);
+  const q = (s: string) => (always || !isSimple(driver, s) ? quoteIdent(driver, s) : s);
   return ref.schema ? `${q(ref.schema)}.${q(ref.name)}` : q(ref.name);
 }
 
@@ -28,15 +34,24 @@ export function selectSql(driver: Driver, ref: ObjectRef, where: string, orderBy
   return sql;
 }
 
+/** `sql` limited to its first `n` rows: `limit n` (PostgreSQL, MySQL, SQLite) or `fetch first n rows only` (Oracle has no LIMIT: ORA-03047). */
+export function limitedSql(driver: Driver, sql: string, n: number): string {
+  const body = sql.replace(/[\s;]+$/, "");
+  return driver === "oracle" ? `${body} fetch first ${n} rows only` : `${body} limit ${n}`;
+}
+
 /**
  * The query behind a table editor page as DataGrip logs it: `SELECT t.* FROM sales.clients t LIMIT 501` (one more
- * row than the page, to know whether there is a next page). `all` has no LIMIT.
+ * row than the page, to know whether there is a next page). `all` has no LIMIT. Oracle pages with
+ * `OFFSET n ROWS FETCH NEXT m ROWS ONLY` (the same text `table.rs` builds).
  */
 export function tableQuerySql(driver: Driver, ref: ObjectRef, where: string, orderBy: string, pageSize: number | "all", page: number): string {
   let sql = `SELECT t.* FROM ${qualifiedName(driver, ref)} t`;
   if (where.trim()) sql += " WHERE " + where.trim();
   if (orderBy.trim()) sql += " ORDER BY " + orderBy.trim();
-  if (pageSize !== "all") {
+  if (pageSize !== "all" && driver === "oracle") {
+    sql += ` OFFSET ${page * pageSize} ROWS FETCH NEXT ${pageSize + 1} ROWS ONLY`;
+  } else if (pageSize !== "all") {
     sql += ` LIMIT ${pageSize + 1}`;
     if (page > 0) sql += ` OFFSET ${page * pageSize}`;
   }
@@ -119,9 +134,15 @@ export function literal(v: Cell, typeName: string, driver?: Driver): string {
   if (typeof v === "string") {
     if (kind === "number" && /^-?\d+(\.\d+)?([eE][-+]?\d+)?$/.test(v.trim())) return v.trim();
     if (kind === "bool" && /^(true|false)$/i.test(v.trim())) return v.trim().toLowerCase();
+    if (driver === "oracle") {
+      // a quoted string meets DATE / TIMESTAMP columns through NLS_*_FORMAT: ANSI literals do not
+      const t = v.trim();
+      if (kind === "date" && /^\d{4}-\d\d-\d\d$/.test(t)) return `date '${t}'`;
+      if ((kind === "date" || kind === "datetime") && /^\d{4}-\d\d-\d\d[ T]\d\d:\d\d(:\d\d(\.\d+)?)?(\s*[+-]\d\d:\d\d)?$/.test(t)) return `timestamp '${t.replace("T", " ")}'`;
+    }
     return quoteString(driver, v);
   }
-  if (isBinaryCell(v)) return "'\\x" + v.$bin + "'";
+  if (isBinaryCell(v)) return driver === "oracle" ? `hextoraw('${v.$bin}')` : "'\\x" + v.$bin + "'";
   return quoteString(driver, JSON.stringify(v));
 }
 
@@ -195,10 +216,10 @@ export function toRowChanges(
 
 // ---------------------------------------------------------------- preview
 
-/** The statements Submit would run, formatted like DataGrip's "Preview Pending Changes" popup. */
-export function previewSql(driver: Driver, ref: ObjectRef, columns: ColumnMeta[], changes: GridChange[]): string {
+/** The statements Submit would run (one text each, formatted like DataGrip's "Preview Pending Changes" popup). */
+export function changeStatements(driver: Driver, ref: ObjectRef, columns: ColumnMeta[], changes: GridChange[]): string[] {
   const table = qualifiedName(driver, ref);
-  const id = (s: string) => (SIMPLE_IDENT.test(s) ? s : quoteIdent(driver, s));
+  const id = (s: string) => (isSimple(driver, s) ? s : quoteIdent(driver, s));
   const typeOf = (name: string) => columns.find((c) => c.name === name)?.typeName ?? "";
   const where = (key: Record<string, Cell>) =>
     Object.entries(key)
@@ -213,5 +234,10 @@ export function previewSql(driver: Driver, ref: ObjectRef, columns: ColumnMeta[]
     else if (entries.length === 0) out.push(`INSERT INTO ${table}\nDEFAULT VALUES;`);
     else out.push(`INSERT INTO ${table} (${entries.map(([k]) => id(k)).join(", ")})\nVALUES (${entries.map(([k, v]) => literal(v, typeOf(k), driver)).join(", ")});`);
   }
-  return out.join("\n\n");
+  return out;
+}
+
+/** The statements Submit would run, formatted like DataGrip's "Preview Pending Changes" popup. */
+export function previewSql(driver: Driver, ref: ObjectRef, columns: ColumnMeta[], changes: GridChange[]): string {
+  return changeStatements(driver, ref, columns, changes).join("\n\n");
 }

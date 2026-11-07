@@ -5,6 +5,7 @@ import { type GridChange, NEW_ROW } from "../../components/grid/types";
 import {
   appendCondition,
   buildCondition,
+  limitedSql,
   orderByToSort,
   literal,
   previewSql,
@@ -127,5 +128,38 @@ describe("toRowChanges", () => {
 
   it("refuses an update whose original row is gone", () => {
     expect(() => toRowChanges([{ kind: "update", row: 0, key: {}, values: { a: 1 } }], cols)).toThrow(/no longer loaded/);
+  });
+});
+
+describe("Oracle", () => {
+  const oref: ObjectRef = { schema: "DEMO", name: "EMP", kind: "table" };
+  it("writes upper-case names bare and quotes the others", () => {
+    expect(qualifiedName("oracle", oref)).toBe("DEMO.EMP");
+    expect(qualifiedName("oracle", { schema: "DEMO", name: "Order Items" })).toBe('DEMO."Order Items"');
+    expect(qualifiedName("oracle", { schema: "DEMO", name: "USER" })).toBe('DEMO."USER"');
+    expect(selectSql("oracle", oref, "", "")).toBe('select * from "DEMO"."EMP"');
+  });
+  it("pages with OFFSET .. FETCH NEXT (one more row than the page)", () => {
+    expect(tableQuerySql("oracle", oref, "", "", 500, 0)).toBe("SELECT t.* FROM DEMO.EMP t OFFSET 0 ROWS FETCH NEXT 501 ROWS ONLY");
+    expect(tableQuerySql("oracle", oref, "SAL > 1", "ENAME", 100, 2)).toBe("SELECT t.* FROM DEMO.EMP t WHERE SAL > 1 ORDER BY ENAME OFFSET 200 ROWS FETCH NEXT 101 ROWS ONLY");
+    expect(tableQuerySql("oracle", oref, "", "", "all", 0)).toBe("SELECT t.* FROM DEMO.EMP t");
+  });
+  it("date and timestamp literals are ANSI literals; raw is hextoraw", () => {
+    expect(literal("2024-05-06", "DATE", "oracle")).toBe("date '2024-05-06'");
+    expect(literal("2024-05-06 07:08:09", "DATE", "oracle")).toBe("timestamp '2024-05-06 07:08:09'");
+    expect(literal("2024-05-06T07:08:09.5", "TIMESTAMP(6)", "oracle")).toBe("timestamp '2024-05-06 07:08:09.5'");
+    expect(literal({ $bin: "cafe", len: 2 }, "RAW", "oracle")).toBe("hextoraw('cafe')");
+    expect(literal("o'neil", "VARCHAR2", "oracle")).toBe("'o''neil'");
+  });
+});
+
+describe("limitedSql (the Export Data preview)", () => {
+  it("pages in the dialect of the data source", () => {
+    expect(limitedSql("postgres", "select * from t", 10)).toBe("select * from t limit 10");
+    expect(limitedSql("mysql", "select * from t;", 10)).toBe("select * from t limit 10");
+    expect(limitedSql("sqlite", "select * from t order by a\n", 10)).toBe("select * from t order by a limit 10");
+    // Oracle has no LIMIT (ORA-03047 at the `limit`)
+    expect(limitedSql("oracle", "SELECT * FROM DEMO.ORDERS", 10)).toBe("SELECT * FROM DEMO.ORDERS fetch first 10 rows only");
+    expect(limitedSql("oracle", "select * from t order by a;  ", 10)).toBe("select * from t order by a fetch first 10 rows only");
   });
 });

@@ -9,8 +9,11 @@
 //   * table_data / apply_changes work on generated rows kept in memory (ORDER BY and simple WHERE work);
 //   * UI state, consoles and data sources persist in localStorage.
 // `select pg_sleep(3)` runs for 3 s (cancellable). `select * from nope` fails with a PG error.
+// An Oracle data source (driver "oracle", e.g. the one added by `?oracle` in the URL) is answered from a second
+// model (ORACLE_SCHEMAS: DEMO / HR, packages, synonyms, sequences ...) with Oracle names and ORA- errors.
 
 import type { MockHandler } from "./tauri";
+import { splitStatements as splitOracle } from "../components/editor/split";
 import type {
   ApplyResult,
   Cell,
@@ -140,8 +143,13 @@ function splitRaw(sql: string): { start: number; end: number; full: number }[] {
   return out;
 }
 
-function toStatements(sql: string): Statement[] {
-  return splitRaw(sql).map((r, index) => {
+function toStatements(sql: string, driver?: string): Statement[] {
+  // Oracle: PL/SQL blocks end with a `/` line, `q'[...]'` quoting (the editor's splitter is the same logic as dbcore/split.rs)
+  const raws =
+    driver === "oracle"
+      ? splitOracle(sql, "oracle").map((s) => ({ start: s.start, end: s.end, full: s.fullEnd }))
+      : splitRaw(sql);
+  return raws.map((r, index) => {
     const pre = sql.slice(0, r.start);
     const body = sql.slice(r.start, r.end);
     return {
@@ -157,15 +165,18 @@ function toStatements(sql: string): Statement[] {
   });
 }
 
-function statementAt(sql: string, caret: number): Statement | null {
-  const raws = splitRaw(sql);
+function statementAt(sql: string, caret: number, driver?: string): Statement | null {
+  const raws =
+    driver === "oracle"
+      ? splitOracle(sql, "oracle").map((s) => ({ start: s.start, end: s.end, full: s.fullEnd }))
+      : splitRaw(sql);
   if (!raws.length) return null;
   let pick = raws.findIndex((r) => caret >= r.start && caret <= r.full);
   if (pick < 0) {
     const before = raws.filter((r) => r.full <= caret);
     pick = before.length ? raws.indexOf(before[before.length - 1]) : 0;
   }
-  return toStatements(sql)[pick] ?? null;
+  return toStatements(sql, driver)[pick] ?? null;
 }
 
 // ---------------------------------------------------------------- schema model
@@ -391,8 +402,151 @@ const SCHEMAS: Record<string, { comment?: string; tables: TableDef[]; routines: 
 };
 
 const DB_NAME = "shop";
-const findTable = (schema: string | null | undefined, name: string): TableDef | undefined =>
-  SCHEMAS[schema ?? "shop"]?.tables.find((t) => t.name === name);
+
+type SchemaMap = Record<string, { comment?: string; tables: TableDef[]; routines: RoutineDef[]; sequences: string[]; system?: boolean; packages?: { name: string; status: string }[]; synonyms?: { name: string; target: string }[] }>;
+
+// ---- Oracle model: names are upper case, no database level (schemas hang off the data source)
+
+const o = (name: string, type: string, wire: string, x: Partial<Col> = {}): Col => c(name, type, wire, x);
+const num = (name: string, type = "NUMBER", x: Partial<Col> = {}): Col => o(name, type, "NUMBER", x);
+const vc = (name: string, n: number, x: Partial<Col> = {}): Col => o(name, `VARCHAR2(${n} CHAR)`, "VARCHAR2", x);
+
+const DEMO_TABLES: TableDef[] = [
+  {
+    name: "DEPT",
+    kind: "table",
+    rows: 4,
+    comment: "Departments",
+    cols: [num("DEPTNO", "NUMBER(2,0)", { pk: true }), vc("DNAME", 14, { nullable: true }), vc("LOC", 13, { nullable: true })],
+    indexes: [{ name: "DEPT_PK", cols: "DEPTNO", unique: true, primary: true }],
+  },
+  {
+    name: "EMP",
+    kind: "table",
+    rows: 14,
+    comment: "Employees",
+    cols: [
+      num("EMPNO", "NUMBER(4,0)", { pk: true }),
+      vc("ENAME", 10, { nullable: true }),
+      vc("JOB", 9, { nullable: true }),
+      num("MGR", "NUMBER(4,0)", { nullable: true }),
+      o("HIREDATE", "DATE", "DATE", { nullable: true }),
+      num("SAL", "NUMBER(7,2)", { nullable: true, comment: "Monthly salary" }),
+      num("COMM", "NUMBER(7,2)", { nullable: true }),
+      num("DEPTNO", "NUMBER(2,0)", { nullable: true }),
+    ],
+    fks: [{ name: "EMP_DEPT_FK", cols: ["DEPTNO"], refTable: "DEPT", refCols: ["DEPTNO"] }],
+    indexes: [{ name: "EMP_PK", cols: "EMPNO", unique: true, primary: true }, { name: "EMP_DEPTNO_IX", cols: "DEPTNO" }],
+    checks: [{ name: "EMP_SAL_CK", def: "sal > 0" }],
+    triggers: [{ name: "TRG_EMP_BI", hint: "BEFORE INSERT", def: 'CREATE OR REPLACE EDITIONABLE TRIGGER "DEMO"."TRG_EMP_BI" BEFORE INSERT ON "DEMO"."EMP" FOR EACH ROW BEGIN :new.hiredate := nvl(:new.hiredate, sysdate); END;' }],
+  },
+  {
+    name: "PRODUCTS",
+    kind: "table",
+    rows: 40,
+    cols: [
+      num("ID", "NUMBER(10,0)", { pk: true, identity: "d" }),
+      vc("SKU", 20),
+      vc("NAME", 100),
+      num("PRICE", "NUMBER(10,2)", { def: "0" }),
+      o("CREATED", "TIMESTAMP(6)", "TIMESTAMP", { nullable: true, def: "SYSTIMESTAMP" }),
+      o("DESCRIPTION", "CLOB", "CLOB", { nullable: true }),
+      o("PHOTO", "BLOB", "BLOB", { nullable: true }),
+    ],
+    uniques: [{ name: "PRODUCTS_SKU_UK", cols: ["SKU"] }],
+    indexes: [{ name: "PRODUCTS_PK", cols: "ID", unique: true, primary: true }, { name: "PRODUCTS_SKU_UK", cols: "SKU", unique: true }],
+  },
+  {
+    name: "BIG_TABLE",
+    kind: "table",
+    rows: 20000,
+    cols: [num("ID", "NUMBER(10,0)", { pk: true }), num("GRP", "NUMBER(5,0)"), vc("NAME", 60), o("PAYLOAD", "VARCHAR2(4000 CHAR)", "VARCHAR2", { nullable: true })],
+    indexes: [{ name: "BIG_TABLE_PK", cols: "ID", unique: true, primary: true }],
+  },
+  {
+    name: "V_EMP_SUMMARY",
+    kind: "view",
+    rows: 14,
+    cols: [vc("ENAME", 10, { nullable: true }), vc("DNAME", 14, { nullable: true }), num("SAL", "NUMBER(7,2)", { nullable: true })],
+  },
+  {
+    name: "MV_SAL_BY_DEPT",
+    kind: "materializedView",
+    rows: 4,
+    cols: [num("DEPTNO", "NUMBER(2,0)", { nullable: true }), num("TOTAL_SAL", "NUMBER", { nullable: true })],
+  },
+];
+
+const HR_TABLES: TableDef[] = [
+  {
+    name: "DEPARTMENTS",
+    kind: "table",
+    rows: 27,
+    cols: [num("DEPARTMENT_ID", "NUMBER(4,0)", { pk: true }), vc("DEPARTMENT_NAME", 30), num("MANAGER_ID", "NUMBER(6,0)", { nullable: true }), num("LOCATION_ID", "NUMBER(4,0)", { nullable: true })],
+    indexes: [{ name: "DEPT_ID_PK", cols: "DEPARTMENT_ID", unique: true, primary: true }],
+  },
+  {
+    name: "EMPLOYEES",
+    kind: "table",
+    rows: 107,
+    cols: [
+      num("EMPLOYEE_ID", "NUMBER(6,0)", { pk: true }),
+      vc("FIRST_NAME", 20, { nullable: true }),
+      vc("LAST_NAME", 25),
+      vc("EMAIL", 25),
+      o("HIRE_DATE", "DATE", "DATE"),
+      num("SALARY", "NUMBER(8,2)", { nullable: true }),
+      num("DEPARTMENT_ID", "NUMBER(4,0)", { nullable: true }),
+    ],
+    fks: [{ name: "EMP_DEPT_FK", cols: ["DEPARTMENT_ID"], refTable: "DEPARTMENTS", refCols: ["DEPARTMENT_ID"] }],
+    uniques: [{ name: "EMP_EMAIL_UK", cols: ["EMAIL"] }],
+    indexes: [{ name: "EMP_EMP_ID_PK", cols: "EMPLOYEE_ID", unique: true, primary: true }, { name: "EMP_EMAIL_UK", cols: "EMAIL", unique: true }],
+  },
+];
+
+const ORACLE_SCHEMAS: SchemaMap = {
+  DEMO: {
+    comment: "Demo schema",
+    tables: DEMO_TABLES,
+    routines: [
+      { name: "FN_BONUS", signature: "P_EMPNO IN NUMBER", returns: "NUMBER" },
+      { name: "PRC_RAISE", signature: "P_EMPNO IN NUMBER, P_PCT IN NUMBER", returns: "", procedure: true },
+    ],
+    sequences: ["EMP_SEQ", "INVOICE_SEQ"],
+    packages: [
+      { name: "PKG_UTIL", status: "VALID" },
+      { name: "PKG_REPORTS", status: "INVALID" },
+    ],
+    synonyms: [{ name: "EMPLOYEE", target: "DEMO.EMP" }],
+  },
+  HR: { comment: "Human resources", tables: HR_TABLES, routines: [], sequences: ["EMPLOYEES_SEQ"], packages: [], synonyms: [] },
+  SYS: { system: true, tables: [{ name: "DUAL", kind: "table", rows: 1, cols: [vc("DUMMY", 1)] }], routines: [], sequences: [] },
+  SYSTEM: { system: true, tables: [], routines: [], sequences: [] },
+};
+
+interface MockModel {
+  oracle: boolean;
+  schemas: SchemaMap;
+  defaultSchema: string;
+  version: string;
+}
+const PG_MODEL: MockModel = { oracle: false, schemas: SCHEMAS, defaultSchema: "shop", version: "PostgreSQL 16.4 (mock)" };
+const ORACLE_VERSION = "Oracle Database 23ai Free Release 23.0.0.0.0 - Develop, Learn, and Run for Free (mock)";
+let M: MockModel = PG_MODEL;
+/** Selects the model that answers the following commands (by the driver of the data source). */
+function useDs(id: unknown): void {
+  const d = state.sources.find((x) => x.id === id);
+  M = d?.driver === "oracle" ? { oracle: true, schemas: ORACLE_SCHEMAS, defaultSchema: d.user.toUpperCase() || "DEMO", version: ORACLE_VERSION } : PG_MODEL;
+}
+const findTable = (schema: string | null | undefined, name: string): TableDef | undefined => {
+  const tables = M.schemas[schema ?? M.defaultSchema]?.tables;
+  return tables?.find((t) => t.name === name) ?? (M.oracle ? tables?.find((t) => t.name.toLowerCase() === name.toLowerCase()) : undefined);
+};
+/** Index of a column; Oracle folds unquoted names up, so `ename` finds `ENAME`. */
+const colIdx = (t: TableDef, name: string): number => {
+  const i = t.cols.findIndex((x) => x.name === name);
+  return i >= 0 || !M.oracle ? i : t.cols.findIndex((x) => x.name.toLowerCase() === name.toLowerCase());
+};
 
 // ---------------------------------------------------------------- tree
 
@@ -424,7 +578,88 @@ function folder(ds: string, base: string[], key: string, count: number, schema: 
   });
 }
 
+/** Oracle tree: data source > schemas > folders > objects > folders > items (no database level). */
+function introspectOracle(ds: string, path: string[], showSystem: boolean): TreeNode[] {
+  const user = (state.sources.find((x) => x.id === ds)?.user ?? "").toUpperCase();
+  const sch = (sc: string) => M.schemas[sc] ?? fail(`ORA-01435: user does not exist (${sc})`);
+  if (path.length === 0)
+    return Object.entries(M.schemas)
+      .filter(([, x]) => showSystem || !x.system)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([name, x]) => node(ds, "schema", name, x.comment ?? null, [name], true, { schema: name, system: !!x.system, default: name === user }));
+  const [sc, key, tn, sub] = path;
+  const s = sch(sc);
+  if (path.length === 1) {
+    const counts: [string, number][] = [
+      ["tables", s.tables.filter((t) => t.kind === "table").length],
+      ["views", s.tables.filter((t) => t.kind === "view").length],
+      ["materialized_views", s.tables.filter((t) => t.kind === "materializedView").length],
+      ["packages", s.packages?.length ?? 0],
+      ["routines", s.routines.length],
+      ["sequences", s.sequences.length],
+      ["synonyms", s.synonyms?.length ?? 0],
+    ];
+    return counts.filter(([, n]) => n > 0).map(([k, n]) => folder(ds, path, k, n, sc));
+  }
+  if (path.length === 2) {
+    switch (key) {
+      case "routines":
+        return s.routines.map((r) =>
+          node(ds, r.procedure ? "procedure" : "function", r.name, r.procedure ? `(${r.signature})` : `(${r.signature}): ${r.returns}`, [...path, r.name], false, { schema: sc, signature: r.signature, returns: r.returns, routineType: r.procedure ? "PROCEDURE" : "FUNCTION" }),
+        );
+      case "sequences":
+        return s.sequences.map((q) => node(ds, "sequence", q, "NUMBER", [...path, q], false, { schema: sc }));
+      case "packages":
+        return (s.packages ?? []).map((k) => node(ds, "package", k.name, k.status, [...path, k.name], false, { schema: sc, status: k.status }));
+      case "synonyms":
+        return (s.synonyms ?? []).map((y) => node(ds, "synonym", y.name, y.target, [...path, y.name], false, { schema: sc, target: y.target }));
+      default: {
+        const want = { tables: "table", views: "view", materialized_views: "materializedView" }[key] as TableDef["kind"] | undefined;
+        if (!want) return fail(`Unknown tree path: /${path.join("/")}`);
+        return s.tables
+          .filter((t) => t.kind === want)
+          .map((t) => node(ds, want, t.name, t.comment ?? null, [...path, t.name], true, { schema: sc, rowEstimate: t.rows, comment: t.comment ?? "" }));
+      }
+    }
+  }
+  const t = findTable(sc, tn) ?? fail(`Unknown tree path: /${path.join("/")}`);
+  if (path.length === 3) {
+    const items: [string, number][] =
+      key === "tables"
+        ? [["columns", t.cols.length], ["keys", (t.cols.some((x) => x.pk) ? 1 : 0) + (t.uniques?.length ?? 0)], ["foreign_keys", t.fks?.length ?? 0], ["indexes", t.indexes?.length ?? 0], ["checks", t.checks?.length ?? 0], ["triggers", t.triggers?.length ?? 0]]
+        : key === "views"
+          ? [["columns", t.cols.length]]
+          : [["columns", t.cols.length], ["indexes", t.indexes?.length ?? 0]];
+    return items.filter(([k, n]) => k === "columns" || n > 0).map(([k, n]) => folder(ds, path, k, n, sc, tn));
+  }
+  const ex = (x: Record<string, unknown>) => ({ ...x, schema: sc, table: tn });
+  const pkCols = t.cols.filter((x) => x.pk).map((x) => x.name);
+  switch (sub) {
+    case "columns":
+      return t.cols.map((col, i) =>
+        node(ds, "column", col.name, col.type, [...path, col.name], false, ex({ dataType: col.type, nullable: !!col.nullable && !col.pk, default: col.def ?? null, comment: col.comment ?? "", isPk: !!col.pk, position: i + 1 })),
+      );
+    case "keys":
+      return [
+        ...(pkCols.length ? [node(ds, "primaryKey", `${t.name}_PK`, `(${pkCols.join(", ")})`, [...path, `${t.name}_PK`], false, ex({ columns: pkCols, definition: `PRIMARY KEY (${pkCols.join(", ")})` }))] : []),
+        ...(t.uniques ?? []).map((u) => node(ds, "uniqueKey", u.name, `(${u.cols.join(", ")})`, [...path, u.name], false, ex({ columns: u.cols, definition: `UNIQUE (${u.cols.join(", ")})` }))),
+      ];
+    case "foreign_keys":
+      return (t.fks ?? []).map((f) =>
+        node(ds, "foreignKey", f.name, `(${f.cols.join(", ")}) -> ${f.refTable}(${f.refCols.join(", ")})`, [...path, f.name], false, ex({ columns: f.cols, refSchema: sc, refTable: f.refTable, refColumns: f.refCols, onDelete: "NO ACTION", onUpdate: "" })),
+      );
+    case "indexes":
+      return (t.indexes ?? []).map((i) => node(ds, "index", i.name, `(${i.cols})`, [...path, i.name], false, ex({ unique: !!i.unique, primary: !!i.primary, columns: i.cols, definition: `CREATE ${i.unique ? "UNIQUE " : ""}INDEX "${sc}"."${i.name}" ON "${sc}"."${t.name}" (${i.cols.split(", ").map((x) => `"${x}"`).join(", ")})` })));
+    case "checks":
+      return (t.checks ?? []).map((k) => node(ds, "check", k.name, k.def, [...path, k.name], false, ex({ definition: k.def })));
+    case "triggers":
+      return (t.triggers ?? []).map((g) => node(ds, "trigger", g.name, g.hint, [...path, g.name], false, ex({ definition: g.def, enabled: true })));
+  }
+  return fail(`Unknown tree path: /${path.join("/")}`);
+}
+
 function introspect(ds: string, path: string[], showSystem: boolean): TreeNode[] {
+  if (M.oracle) return introspectOracle(ds, path, showSystem);
   switch (path.length) {
     case 0:
       return [
@@ -438,7 +673,7 @@ function introspect(ds: string, path: string[], showSystem: boolean): TreeNode[]
       if (path[0] !== DB_NAME)
         fail(`Database '${path[0]}' is not the one this data source is connected to ('${DB_NAME}'). Create a data source for it.`);
       return [
-        ...Object.entries(SCHEMAS)
+        ...Object.entries(M.schemas)
           .filter(([, s]) => showSystem || !s.system)
           .sort(([a], [b]) => a.localeCompare(b, undefined, { sensitivity: "base" }))
           .map(([name, s]) => node(ds, "schema", name, s.comment ?? null, [...path, name], true, { schema: name, owner: "postgres", system: !!s.system, default: name === "public" })),
@@ -458,7 +693,7 @@ function introspect(ds: string, path: string[], showSystem: boolean): TreeNode[]
         ];
       if (path[1] === "$objects") return [{ ...folder(ds, path, "extensions", 2, ""), extra: { folder: "extensions", count: 2 } }];
       const sc = path[1];
-      const s = SCHEMAS[sc] ?? fail(`Schema ${sc} not found`);
+      const s = M.schemas[sc] ?? fail(`Schema ${sc} not found`);
       const counts: [string, number][] = [
         ["tables", s.tables.filter((t) => t.kind === "table").length],
         ["views", s.tables.filter((t) => t.kind === "view").length],
@@ -475,7 +710,7 @@ function introspect(ds: string, path: string[], showSystem: boolean): TreeNode[]
           node(ds, "extension", "pg_trgm", "1.6", [...path, "pg_trgm"], false, { version: "1.6", owner: "postgres", schema: "public", comment: "text similarity measurement and index searching based on trigrams" }),
           node(ds, "extension", "plpgsql", "1.0", [...path, "plpgsql"], false, { version: "1.0", owner: "postgres", schema: "pg_catalog", comment: "PL/pgSQL procedural language" }),
         ];
-      const s = SCHEMAS[sc] ?? fail(`Schema ${sc} not found`);
+      const s = M.schemas[sc] ?? fail(`Schema ${sc} not found`);
       if (key === "routines")
         return s.routines.map((r) =>
           node(
@@ -608,6 +843,51 @@ function tableDdl(sc: string, t: TableDef): string {
   return out;
 }
 
+/** DBMS_METADATA.GET_DDL style (SQLTERMINATOR on, PRETTY on, no storage clauses). */
+function oracleDdl(sc: string, o: ObjectRef, unqualified: boolean): string {
+  const T = (n: string) => `${unqualified ? "" : `"${sc}".`}"${n}"`;
+  const schema = M.schemas[sc] ?? fail(`ORA-31603: object "${o.name}" of type ${o.kind} not found in schema "${sc}"`);
+  switch (o.kind) {
+    case "table":
+    case "view":
+    case "materializedView": {
+      const t = findTable(sc, o.name) ?? fail(`ORA-31603: object "${o.name}" of type TABLE not found in schema "${sc}"`);
+      if (t.kind === "view") return `  CREATE OR REPLACE FORCE EDITIONABLE VIEW ${T(t.name)} ("${t.cols.map((x) => x.name).join('", "')}") AS \n  SELECT ${t.cols.map((x) => `"${x.name}"`).join(", ")}\n  FROM ${T("EMP")};`;
+      if (t.kind === "materializedView") return `  CREATE MATERIALIZED VIEW ${T(t.name)}\n  REFRESH FORCE ON DEMAND\n  AS SELECT "DEPTNO", SUM("SAL") "TOTAL_SAL" FROM ${T("EMP")} GROUP BY "DEPTNO";`;
+      const lines = t.cols.map((x) => `"${x.name}" ${x.type.replace(/\((\d+)\)/, "($1,0)")}${x.identity ? " GENERATED BY DEFAULT AS IDENTITY" : x.def ? ` DEFAULT ${x.def}` : ""}${x.nullable || x.pk ? "" : " NOT NULL ENABLE"}`);
+      const pk = t.cols.filter((x) => x.pk).map((x) => `"${x.name}"`);
+      if (pk.length) lines.push(`CONSTRAINT "${t.name}_PK" PRIMARY KEY (${pk.join(", ")})\n  USING INDEX  ENABLE`);
+      for (const u of t.uniques ?? []) lines.push(`CONSTRAINT "${u.name}" UNIQUE (${u.cols.map((x) => `"${x}"`).join(", ")})\n  USING INDEX  ENABLE`);
+      for (const k of t.checks ?? []) lines.push(`CONSTRAINT "${k.name}" CHECK (${k.def}) ENABLE`);
+      for (const f of t.fks ?? []) lines.push(`CONSTRAINT "${f.name}" FOREIGN KEY (${f.cols.map((x) => `"${x}"`).join(", ")})\n  REFERENCES ${T(f.refTable)} (${f.refCols.map((x) => `"${x}"`).join(", ")}) ENABLE`);
+      let out = `  CREATE TABLE ${T(t.name)}\n   (\t${lines.join(",\n\t ")}\n   ) ;`;
+      for (const i of t.indexes ?? []) if (!i.primary && !(t.uniques ?? []).some((u) => u.name === i.name)) out += `\n\n  CREATE ${i.unique ? "UNIQUE " : ""}INDEX ${T(i.name)} ON ${T(t.name)} (${i.cols.split(", ").map((x) => `"${x}"`).join(", ")});`;
+      if (t.comment) out += `\n\n   COMMENT ON TABLE ${T(t.name)} IS '${t.comment}';`;
+      return out;
+    }
+    case "sequence":
+      return `   CREATE SEQUENCE  ${T(o.name)}  MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1000 CACHE 20 NOORDER  NOCYCLE  NOKEEP  NOSCALE  GLOBAL ;`;
+    case "package":
+      return `  CREATE OR REPLACE EDITIONABLE PACKAGE ${T(o.name)} AS\n  FUNCTION version RETURN VARCHAR2;\n  PROCEDURE log_msg(p_text IN VARCHAR2);\nEND ${o.name.toLowerCase()};\n/\n\n  CREATE OR REPLACE EDITIONABLE PACKAGE BODY ${T(o.name)} AS\n  FUNCTION version RETURN VARCHAR2 IS BEGIN RETURN '1.0'; END;\n  PROCEDURE log_msg(p_text IN VARCHAR2) IS BEGIN DBMS_OUTPUT.PUT_LINE(p_text); END;\nEND ${o.name.toLowerCase()};\n/`;
+    case "synonym": {
+      const y = schema.synonyms?.find((x) => x.name === o.name);
+      return `  CREATE OR REPLACE EDITIONABLE SYNONYM ${T(o.name)} FOR ${y?.target ?? "DEMO.EMP"};`;
+    }
+    case "function":
+    case "procedure":
+      return o.kind === "function"
+        ? `  CREATE OR REPLACE EDITIONABLE FUNCTION ${T(o.name)} (p_empno IN NUMBER) RETURN NUMBER IS\nBEGIN\n  RETURN p_empno * 0.1;\nEND;\n/`
+        : `  CREATE OR REPLACE EDITIONABLE PROCEDURE ${T(o.name)} (p_empno IN NUMBER, p_pct IN NUMBER) IS\nBEGIN\n  UPDATE emp SET sal = sal * (1 + p_pct / 100) WHERE empno = p_empno;\nEND;\n/`;
+    case "index": {
+      const t = findTable(sc, o.table ?? "");
+      const i = t?.indexes?.find((x) => x.name === o.name);
+      return t && i ? `  CREATE ${i.unique ? "UNIQUE " : ""}INDEX ${T(i.name)} ON ${T(t.name)} (${i.cols.split(", ").map((x) => `"${x}"`).join(", ")});` : fail(`ORA-31603: object "${o.name}" of type INDEX not found in schema "${sc}"`);
+    }
+    default:
+      return `-- DDL of ${o.kind} ${o.name}`;
+  }
+}
+
 // ---------------------------------------------------------------- row generation
 
 const FIRST = ["Ada", "Linus", "Grace", "Alan", "Edsger", "Barbara", "Dennis", "Margaret", "Ken", "Radia", "Donald", "Frances"];
@@ -623,9 +903,25 @@ const tsText = (ms: number, tz: boolean) => {
 
 function genCell(t: TableDef, col: Col, i: number): Cell {
   const n = i + 1;
-  const nm = col.name;
+  const nm = col.name.toLowerCase();
   if (col.nullable && !col.pk && n % 6 === 0) return null;
   switch (col.wire) {
+    case "NUMBER":
+      if (col.pk && t.cols.filter((x) => x.pk).length === 1) return nm === "empno" ? 7369 + i * 5 : n;
+      if (/(sal|salary|price|total)/.test(nm)) return (800 + n * 137.5).toFixed(2);
+      if (nm === "comm") return n % 3 === 0 ? 300 : 0;
+      if (/(deptno|department_id)$/.test(nm)) return [10, 20, 30, 40][i % 4];
+      if (nm === "mgr") return 7369 + ((i * 3) % 14) * 5;
+      if (nm === "grp") return n % 100;
+      return (n * 37) % 1000;
+    case "DATE":
+      return tsText(BASE_TS - 9000 * 86400000 + n * 31 * 86400000, false);
+    case "TIMESTAMP":
+      return tsText(BASE_TS + n * 3600000, false);
+    case "CLOB":
+      return `Long description of item ${n}`;
+    case "BLOB":
+      return null;
     case "int4":
     case "int8":
       if (col.pk && t.cols.filter((x) => x.pk).length === 1) return n;
@@ -655,6 +951,15 @@ function genCell(t: TableDef, col: Col, i: number): Cell {
   if (nm === "sku") return `SKU-${pad(n, 4)}`;
   if (nm === "payload") return n.toString(16).padStart(8, "0").repeat(4);
   if (nm === "note") return "gift wrap";
+  if (nm === "ename") return ["SMITH", "ALLEN", "WARD", "JONES", "MARTIN", "BLAKE", "CLARK", "SCOTT", "KING", "TURNER", "ADAMS", "JAMES", "FORD", "MILLER"][i % 14];
+  if (nm === "job") return ["CLERK", "SALESMAN", "MANAGER", "ANALYST", "PRESIDENT"][i % 5];
+  if (nm === "dname") return ["ACCOUNTING", "RESEARCH", "SALES", "OPERATIONS"][i % 4];
+  if (nm === "loc") return ["NEW YORK", "DALLAS", "CHICAGO", "BOSTON"][i % 4];
+  if (nm === "department_name") return ["Administration", "Marketing", "Purchasing", "Human Resources", "Shipping", "IT", "Sales"][i % 7] + (i >= 7 ? ` ${Math.floor(i / 7)}` : "");
+  if (nm === "first_name") return FIRST[i % FIRST.length];
+  if (nm === "last_name") return LAST[(i * 5) % LAST.length];
+  if (nm === "dummy") return "X";
+  if (nm === "description") return `Description ${n}`;
   if (t.name === "customers" && nm === "name") return `${FIRST[i % FIRST.length]} ${LAST[(i * 5) % LAST.length]}`;
   if (t.name === "categories" && nm === "name") return ["Electronics", "Books", "Garden", "Laptops", "Phones"][i % 5] + (i >= 5 ? ` ${Math.floor(i / 5)}` : "");
   if (t.name === "products" && nm === "name") return `Product ${n}`;
@@ -662,6 +967,7 @@ function genCell(t: TableDef, col: Col, i: number): Cell {
   if (nm === "customer") return `${FIRST[i % FIRST.length]} ${LAST[(i * 5) % LAST.length]}`;
   if (nm === "category") return ["Electronics", "Books", "Garden", "Laptops", "Phones"][i % 5];
   if (nm === "table_schema") return "shop";
+  if (nm === "sku") return `SKU-${pad(n, 4)}`;
   if (nm === "table_name") return `table_${n}`;
   if (nm === "table_type") return "BASE TABLE";
   return `${WORDS[i % WORDS.length]}-${n}`;
@@ -699,8 +1005,8 @@ function applyWhere(t: TableDef, rows: Cell[][], where: string | null | undefine
   const preds = w.split(/\s+and\s+/i).map((p) => {
     const m = /^\(?\s*"?(\w+)"?\s*(=|<>|!=|<=|>=|<|>|not\s+ilike|not\s+like|ilike|like|is\s+not\s+null|is\s+null)\s*(.*?)\)?$/i.exec(p.trim());
     if (!m) return fail(`syntax error at or near "${p.trim().slice(0, 20)}" (mock supports: col <op> literal [and ...])`);
-    const idx = t.cols.findIndex((x) => x.name === m[1]);
-    if (idx < 0) return fail(`column "${m[1]}" does not exist`);
+    const idx = colIdx(t, m[1]);
+    if (idx < 0) return fail(`${M.oracle ? "ORA-00904: " : ""}column "${m[1]}" does not exist`);
     const op = m[2].toLowerCase().replace(/\s+/g, " ");
     let lit = m[3].trim();
     if (lit.startsWith("'") && lit.endsWith("'")) lit = lit.slice(1, -1).replace(/''/g, "'");
@@ -733,8 +1039,8 @@ function applyOrder(t: TableDef, rows: Cell[][], orderBy: string | null | undefi
   const keys = o.split(",").map((p) => {
     const m = /^"?(\w+)"?\s*(asc|desc)?(\s+nulls\s+(first|last))?$/i.exec(p.trim());
     if (!m) return fail(`syntax error at or near "${p.trim().slice(0, 20)}"`);
-    const idx = t.cols.findIndex((x) => x.name === m[1]);
-    if (idx < 0) return fail(`column "${m[1]}" does not exist`);
+    const idx = colIdx(t, m[1]);
+    if (idx < 0) return fail(`${M.oracle ? "ORA-00904: " : ""}column "${m[1]}" does not exist`);
     return { idx, dir: m[2]?.toLowerCase() === "desc" ? -1 : 1 };
   });
   return [...rows].sort((a, b) => {
@@ -782,6 +1088,28 @@ const state: MockState = {
 };
 const persistSources = () => saveJson("data-sources", state.sources);
 
+/** `?oracle` in the page URL adds an Oracle data source (the DEMO / HR schemas of ORACLE_SCHEMAS) to the mock. */
+const ORACLE_DS: DataSource = {
+  id: "ds-oracle",
+  name: "demo@localhost",
+  driver: "oracle",
+  host: "localhost",
+  port: 1521,
+  database: "FREEPDB1",
+  user: "demo",
+  hasPassword: true,
+  passwordStorage: "keyring",
+  file: "",
+  urlOverride: null,
+  options: { oracleConnType: "service" },
+  color: null,
+  readOnly: false,
+};
+if (typeof location !== "undefined" && new URLSearchParams(location.search).has("oracle") && !state.sources.some((x) => x.id === ORACLE_DS.id)) {
+  state.sources.push(ORACLE_DS);
+  persistSources();
+}
+
 const ds = (id: unknown): DataSource => state.sources.find((s) => s.id === id) ?? fail(`Unknown data source '${String(id)}'`);
 const needConn = (id: unknown) => {
   ds(id);
@@ -793,6 +1121,7 @@ const needConn = (id: unknown) => {
 /** `select current_schema()` (PG) / `select database()` (MySQL), the statements the console sends to label its schema switcher. */
 function schemaFunction(sql: string): "current_schema" | "database" | null {
   const bare = sql.replace(/\/\*[\s\S]*?\*\//g, "").replace(/--.*$/gm, "").replace(/;\s*$/, "").trim();
+  if (/^select\s+sys_context\s*\(\s*'userenv'\s*,\s*'current_schema'\s*\)\s+from\s+dual$/i.test(bare)) return "current_schema";
   const m = /^select\s+(current_schema|database)\s*\(\s*\)$/i.exec(bare);
   return m ? (m[1].toLowerCase() as "current_schema" | "database") : null;
 }
@@ -800,15 +1129,16 @@ function schemaFunction(sql: string): "current_schema" | "database" | null {
 /** The session's schema: what `SET search_path` / `USE` chose, else PG `public`, MySQL the data source's database. */
 function currentSchema(sess: { ds: string; schema?: string }): string {
   const d = ds(sess.ds);
-  return sess.schema ?? (d.driver === "postgres" ? "public" : d.database);
+  return sess.schema ?? (d.driver === "postgres" ? "public" : d.driver === "oracle" ? d.user.toUpperCase() : d.database);
 }
 
 /** `SET search_path TO "x"` / `USE x` of a statement, or null. */
 function schemaSwitch(sql: string): string | null {
   const bare = sql.replace(/\/\*[\s\S]*?\*\//g, "").replace(/;\s*$/, "").trim();
-  const m = /^(?:set\s+(?:session\s+|local\s+)?search_path\s*(?:=|to)\s*|use\s+)(?:"((?:[^"]|"")+)"|`((?:[^`]|``)+)`|([\w$]+))(?:\s*,.*)?$/is.exec(bare);
+  const m = /^(?:set\s+(?:session\s+|local\s+)?search_path\s*(?:=|to)\s*|use\s+|alter\s+session\s+set\s+current_schema\s*=\s*)(?:"((?:[^"]|"")+)"|`((?:[^`]|``)+)`|([\w$]+))(?:\s*,.*)?$/is.exec(bare);
   if (!m) return null;
-  return (m[1] ?? m[2] ?? m[3]).replace(/""|``/g, (q) => q[0]);
+  const name = (m[1] ?? m[2] ?? m[3]).replace(/""|``/g, (q) => q[0]);
+  return m[3] && /^alter\s/i.test(bare) ? name.toUpperCase() : name;
 }
 
 interface Sink {
@@ -824,12 +1154,14 @@ function parseSelect(sql: string): {
   where: string | null;
   order: string | null;
   limit: number | null;
+  offset: number;
   count: boolean;
 } {
   const flat = sql.replace(/\s+/g, " ").trim();
-  const lim = /\blimit\s+(\d+)/i.exec(flat);
-  const ord = /\border by (.+?)(?= limit\b| offset\b|$)/i.exec(flat);
-  const whr = /\bwhere (.+?)(?= order by\b| limit\b| group by\b|$)/i.exec(flat);
+  const lim = /\blimit\s+(\d+)/i.exec(flat) ?? /\bfetch\s+(?:first|next)\s+(\d+)\s+rows?\s+only\b/i.exec(flat);
+  const off = /\boffset\s+(\d+)(?:\s+rows?)?\b/i.exec(flat);
+  const ord = /\border by (.+?)(?= limit\b| offset\b| fetch\b|$)/i.exec(flat);
+  const whr = /\bwhere (.+?)(?= order by\b| limit\b| offset\b| fetch\b| group by\b|$)/i.exec(flat);
   const from = /\bfrom\s+(?:"?(\w+)"?\.)?"?(\w+)"?/i.exec(sql);
   const sel = /^\s*select\s+(.+?)\s+from\b/is.exec(sql)?.[1]?.trim();
   const out = {
@@ -837,19 +1169,41 @@ function parseSelect(sql: string): {
     where: whr?.[1] ?? null,
     order: ord?.[1] ?? null,
     limit: lim ? Number(lim[1]) : null,
+    offset: off ? Number(off[1]) : 0,
     count: !!sel && /^count\(\s*\*\s*\)(\s+as\s+\w+)?$/i.test(sel),
   } as ReturnType<typeof parseSelect>;
   if (sel && sel !== "*" && !out.count) {
     const parts = sel.split(",").map((p) => p.trim().replace(/^"?(\w+\.)?"?(\w+)"?(\s+as\s+\w+)?$/i, "$2"));
     if (parts.every((p) => /^\w+$/.test(p))) out.cols = parts;
   }
+  if (from && !from[1] && from[2].toLowerCase() === "dual") return out; // Oracle's one-row pseudo table
   if (from) {
-    const sc = from[1] ?? "shop";
-    const def = findTable(sc, from[2]);
+    const sc = from[1] ?? M.defaultSchema;
+    const def = findTable(M.oracle ? (from[1] ?? M.defaultSchema).toUpperCase() : sc, from[2]);
     if (def) out.table = { sc, def, ref: `${sc}.${def.name}` };
     else out.unknown = { name: from[1] ? `${from[1]}.${from[2]}` : from[2], offset: sql.indexOf(from[0]) + from[0].lastIndexOf(from[2]) + 1 };
   }
   return out;
+}
+
+/** The ALL_* catalog queries of the Modify Table dialog (identity / virtual columns, comments, tablespace). */
+function oracleCatalog(sql: string): { columns: ColumnMeta[]; rows: Cell[][] } | null {
+  const m = /\bfrom\s+(all_tab_identity_cols|all_tab_cols|all_col_comments|all_tables)\b/i.exec(sql);
+  if (!m) return null;
+  const tn = /table_name\s*=\s*'([^']*)'/i.exec(sql)?.[1] ?? "";
+  const sc = /owner\s*=\s*'([^']*)'/i.exec(sql)?.[1] ?? "";
+  const t = findTable(sc, tn);
+  const col = (name: string): ColumnMeta => ({ name, typeName: "VARCHAR2", nullable: true, isPk: false, tableRef: null });
+  switch (m[1].toLowerCase()) {
+    case "all_tab_identity_cols":
+      return { columns: [col("COLUMN_NAME"), col("GENERATION_TYPE")], rows: (t?.cols ?? []).filter((x) => x.identity).map((x) => [x.name, "BY DEFAULT"]) };
+    case "all_tab_cols":
+      return { columns: [col("COLUMN_NAME")], rows: [] };
+    case "all_col_comments":
+      return { columns: [col("COLUMN_NAME"), col("COMMENTS")], rows: (t?.cols ?? []).map((x) => [x.name, x.comment ?? null]) };
+    default:
+      return { columns: [col("TABLESPACE_NAME"), col("COMMENTS")], rows: t ? [["USERS", t.comment ?? null]] : [] };
+  }
 }
 
 async function runExecution(
@@ -861,12 +1215,13 @@ async function runExecution(
 ): Promise<void> {
   const ex = state.execs.get(execId)!;
   const sess = state.sessions.get(sessionId)!;
+  useDs(sess.ds);
   const t0 = performance.now();
   let execMs = 0;
   let fetchMs = 0;
   let rowsTotal = 0;
   let firstError: string | null = null;
-  const stmts = toStatements(sql);
+  const stmts = toStatements(sql, M.oracle ? "oracle" : undefined);
   const range = (s: Statement) => ({
     start: s.start, end: s.end, startChar: s.startChar, endChar: s.endChar, startUtf16: s.startUtf16, endUtf16: s.endUtf16,
   });
@@ -887,8 +1242,8 @@ async function runExecution(
       if (ex.cancelled) break;
       const q = parseSelect(st.text);
       if (q.unknown) {
-        firstError = `ERROR: relation "${q.unknown.name}" does not exist`;
-        send({ kind: "error", index: i, message: `[42P01] ${firstError}`, position: q.unknown.offset, positionUtf16: q.unknown.offset, connectionLost: false });
+        firstError = M.oracle ? "ORA-00942: table or view does not exist" : `ERROR: relation "${q.unknown.name}" does not exist`;
+        send({ kind: "error", index: i, message: M.oracle ? firstError : `[42P01] ${firstError}`, position: q.unknown.offset, positionUtf16: q.unknown.offset, connectionLost: false });
         if (opts.stopOnError) break;
         continue;
       }
@@ -898,11 +1253,12 @@ async function runExecution(
         try {
           const t = q.table.def;
           let r = applyOrder(t, applyWhere(t, allRows(t), q.where), q.order);
+          if (q.offset) r = r.slice(q.offset);
           if (q.limit != null) r = r.slice(0, q.limit);
-          const idxs = q.cols === "*" ? t.cols.map((_, k) => k) : q.cols.map((n) => t.cols.findIndex((x) => x.name === n));
+          const idxs = q.cols === "*" ? t.cols.map((_, k) => k) : q.cols.map((n) => colIdx(t, n));
           if (idxs.some((k) => k < 0)) {
             const bad = (q.cols as string[])[idxs.findIndex((k) => k < 0)];
-            throw `[42703] ERROR: column "${bad}" does not exist`;
+            throw M.oracle ? `ORA-00904: "${bad.toUpperCase()}": invalid identifier` : `[42703] ERROR: column "${bad}" does not exist`;
           }
           if (q.count) {
             columns = [{ name: "count", typeName: "int8", nullable: false, isPk: false, tableRef: null }];
@@ -918,9 +1274,13 @@ async function runExecution(
           if (opts.stopOnError) break;
           continue;
         }
+      } else if (M.oracle && oracleCatalog(st.text)) {
+        const r = oracleCatalog(st.text)!;
+        columns = r.columns;
+        rows = r.rows;
       } else if (schemaFunction(st.text)) {
         const fn = schemaFunction(st.text)!;
-        columns = [{ name: fn, typeName: fn === "database" ? "varchar" : "name", nullable: true, isPk: false, tableRef: null }];
+        columns = [{ name: M.oracle ? "SYS_CONTEXT('USERENV','CURRENT_SCHEMA')" : fn, typeName: fn === "database" ? "varchar" : "name", nullable: true, isPk: false, tableRef: null }];
         rows = [[currentSchema(sess)]];
       } else if (sleepM) {
         columns = [{ name: "pg_sleep", typeName: "void", nullable: true, isPk: false, tableRef: null }];
@@ -1052,11 +1412,12 @@ function exportText(src: Pick<ResultSet, "columns" | "rows">, o: ExportOptions):
 function queryRows(sql: string): ResultSet {
   const q = parseSelect(sql);
   if (!q.table) {
-    if (q.unknown) fail(`[42P01] ERROR: relation "${q.unknown.name}" does not exist`);
+    if (q.unknown) fail(M.oracle ? "ORA-00942: table or view does not exist" : `[42P01] ERROR: relation "${q.unknown.name}" does not exist`);
     return { columns: [{ name: "?column?", typeName: "int4", nullable: true, isPk: false, tableRef: null }], rows: [[1]], hasMore: false, totalHint: null };
   }
   const t = q.table.def;
   let rows = applyOrder(t, applyWhere(t, allRows(t), q.where), q.order);
+  if (q.offset) rows = rows.slice(q.offset);
   if (q.limit != null) rows = rows.slice(0, q.limit);
   return { columns: colMeta(t, q.table.ref), rows, hasMore: false, totalHint: null };
 }
@@ -1110,7 +1471,7 @@ const toView = (cfg: Partial<DataSourceConfig>, prev?: DataSource): DataSource =
     name: rest.name ?? prev?.name ?? "Unnamed",
     driver,
     host: rest.host ?? prev?.host ?? "localhost",
-    port: rest.port ?? prev?.port ?? (driver === "mysql" ? 3306 : 5432),
+    port: rest.port ?? prev?.port ?? (driver === "mysql" ? 3306 : driver === "oracle" ? 1521 : 5432),
     database: rest.database ?? prev?.database ?? "",
     user: rest.user ?? prev?.user ?? "",
     file: rest.file ?? prev?.file ?? "",
@@ -1214,6 +1575,13 @@ export const mockHandlers: Record<string, MockHandler> = {
     ls.remove(P + consoleKey(a.id));
     persistSources();
   }),
+  copy_data_source_password: h((a) => {
+    const to = ds(a.to);
+    const from = ds(a.from);
+    to.hasPassword = from.hasPassword;
+    persistSources();
+    return to;
+  }),
   duplicate_data_source: h((a) => {
     const src = ds(a.id);
     let name = `${src.name} 1`;
@@ -1228,15 +1596,18 @@ export const mockHandlers: Record<string, MockHandler> = {
     await sleep(350);
     if ((cfg.host ?? "localhost") !== "localhost" && cfg.host !== "127.0.0.1" && cfg.driver !== "sqlite")
       return { ok: false, serverVersion: null, message: `failed to lookup address information: Name or service not known (${cfg.host})`, elapsedMs: 350 };
+    if (cfg.password === "wrong" && cfg.driver === "oracle")
+      return { ok: false, serverVersion: null, message: "ORA-01017: invalid credential or not authorized; logon denied", elapsedMs: 351 };
     if (cfg.password === "wrong")
       return { ok: false, serverVersion: null, message: `[28P01] FATAL: password authentication failed for user "${cfg.user ?? "postgres"}"`, elapsedMs: 351 };
-    return { ok: true, serverVersion: SERVER_VERSION, message: `Succeeded. ${SERVER_VERSION}`, elapsedMs: 38, ssl: cfg.driver === "sqlite" ? null : false };
+    const version = cfg.driver === "oracle" ? ORACLE_VERSION : SERVER_VERSION;
+    return { ok: true, serverVersion: version, message: `Succeeded. ${version}`, elapsedMs: 38, ssl: cfg.driver === "sqlite" ? null : false };
   }),
   connect: h(async (a) => {
     ds(a.id);
     await sleep(250);
     state.connected.add(a.id);
-    return { serverVersion: SERVER_VERSION };
+    return { serverVersion: ds(a.id).driver === "oracle" ? ORACLE_VERSION : SERVER_VERSION };
   }),
   disconnect: h((a) => {
     state.connected.delete(a.id);
@@ -1264,14 +1635,17 @@ export const mockHandlers: Record<string, MockHandler> = {
   // ---- introspection
   introspect: h(async (a) => {
     needConn(a.dsId);
+    useDs(a.dsId);
     await sleep(40 + Math.random() * 80);
     return introspect(a.dsId, a.path, !!a.showSystem);
   }),
   get_ddl: h(async (a) => {
     needConn(a.dsId);
+    useDs(a.dsId);
     await sleep(60);
     const o = a.object as ObjectRef;
-    const sc = o.schema ?? "shop";
+    const sc = o.schema ?? M.defaultSchema;
+    if (M.oracle) return oracleDdl(sc, o, !!a.unqualified);
     switch (o.kind) {
       case "table":
       case "view":
@@ -1301,9 +1675,10 @@ export const mockHandlers: Record<string, MockHandler> = {
   }),
   schema_snapshot: h(async (a) => {
     needConn(a.dsId);
+    useDs(a.dsId);
     await sleep(80);
     const out: SnapshotObject[] = [];
-    for (const [sc, s] of Object.entries(SCHEMAS)) {
+    for (const [sc, s] of Object.entries(M.schemas)) {
       if (s.system || (a.schema && a.schema !== sc)) continue;
       for (const t of s.tables)
         out.push({ schema: sc, name: t.name, kind: t.kind, columns: t.cols.map((x) => ({ name: x.name, typeName: x.wire, isPk: !!x.pk })) });
@@ -1356,12 +1731,13 @@ export const mockHandlers: Record<string, MockHandler> = {
   explain_plan: h(async (a): Promise<ExplainPlan> => {
     const sess = state.sessions.get(a.sessionId) ?? fail(`Session '${a.sessionId}' does not exist`);
     const driver = ds(sess.ds).driver;
-    if (a.analyze && driver === "sqlite") fail("SQLite has no EXPLAIN ANALYZE");
+    useDs(sess.ds);
+    if (a.analyze && (driver === "sqlite" || driver === "oracle")) fail("SQLite has no EXPLAIN ANALYZE");
     const sql = String(a.sql).trim().replace(/;+$/, "");
     if (!sql) fail("There is no statement to explain");
     await sleep(60);
     const q = parseSelect(sql);
-    if (q.unknown) fail(`[42P01] ERROR: relation "${q.unknown.name}" does not exist`);
+    if (q.unknown) fail(M.oracle ? "ORA-00942: table or view does not exist" : `[42P01] ERROR: relation "${q.unknown.name}" does not exist`);
     const table = q.table?.def.name ?? "orders";
     const node = (operation: string, params: string, rows: number | null, total: number | null, startup: number | null, children: PlanNode[] = []): PlanNode => ({
       operation,
@@ -1377,6 +1753,13 @@ export const mockHandlers: Record<string, MockHandler> = {
       ],
       children,
     });
+    if (driver === "oracle") {
+      const full = node("TABLE ACCESS FULL", `object: ${M.defaultSchema}.${table};`, 14, 3, null);
+      full.props = [{ name: "Operation", value: "TABLE ACCESS" }, { name: "Options", value: "FULL" }, { name: "Cost", value: "3" }];
+      const stmt = node("SELECT STATEMENT", "", 14, 3, null, [full]);
+      stmt.props = [{ name: "Operation", value: "SELECT STATEMENT" }, { name: "Optimizer", value: "ALL_ROWS" }];
+      return { driver, analyze: false, sql, root: stmt, elapsedMs: 3 };
+    }
     const scan = node(driver === "sqlite" ? "Full Scan (SCAN)" : "Full Scan (Seq Scan)", `table: ${table};`, driver === "sqlite" ? null : 1020, driver === "sqlite" ? null : 20.2, driver === "sqlite" ? null : 0);
     const root = node("Select", "", null, null, null, [scan]);
     root.props = [{ name: "Operation", value: "select" }, ...(a.analyze ? [{ name: "Execution Time", value: "0.412 ms" }] : [])];
@@ -1387,9 +1770,10 @@ export const mockHandlers: Record<string, MockHandler> = {
   // ---- table data / editing
   table_data: h(async (a): Promise<ResultSet> => {
     needConn(a.dsId);
+    useDs(a.dsId);
     const o = a.table as ObjectRef;
-    const sc = o.schema ?? "shop";
-    const t = findTable(sc, o.name) ?? fail(`[42P01] ERROR: relation "${sc}.${o.name}" does not exist`);
+    const sc = o.schema ?? M.defaultSchema;
+    const t = findTable(sc, o.name) ?? fail(M.oracle ? "ORA-00942: table or view does not exist" : `[42P01] ERROR: relation "${sc}.${o.name}" does not exist`);
     const req = (a.request ?? {}) as TableDataRequest;
     await sleep(60 + Math.random() * 60);
     const limit = req.limit || 500;
@@ -1405,8 +1789,9 @@ export const mockHandlers: Record<string, MockHandler> = {
   }),
   apply_changes: h(async (a): Promise<ApplyResult> => {
     needConn(a.dsId);
+    useDs(a.dsId);
     const o = a.table as ObjectRef;
-    const t = findTable(o.schema ?? "shop", o.name) ?? fail(`Table ${o.name} not found`);
+    const t = findTable(o.schema ?? M.defaultSchema, o.name) ?? fail(`Table ${o.name} not found`);
     if (t.kind !== "table") fail(`Cannot edit ${t.kind} "${t.name}"`);
     await sleep(80);
     const rows = allRows(t);
@@ -1415,7 +1800,7 @@ export const mockHandlers: Record<string, MockHandler> = {
     const changes = a.changes as RowChange[];
     const findIdx = (key: Record<string, Cell>) => {
       const ks = Object.entries(key);
-      return work.findIndex((r) => ks.every(([k, v]) => cmp(r[t.cols.findIndex((x) => x.name === k)], v) === 0));
+      return work.findIndex((r) => ks.every(([k, v]) => cmp(r[colIdx(t, k)], v) === 0));
     };
     for (let i = 0; i < changes.length; i++) {
       const ch = changes[i];
@@ -1436,7 +1821,7 @@ export const mockHandlers: Record<string, MockHandler> = {
       const at = findIdx(ch.key ?? {});
       if (at < 0) return fail1("The row was changed or deleted by someone else (0 rows matched)");
       if (ch.kind === "delete") work.splice(at, 1);
-      else for (const [k, v] of Object.entries(ch.values ?? {})) work[at][t.cols.findIndex((x) => x.name === k)] = v;
+      else for (const [k, v] of Object.entries(ch.values ?? {})) work[at][colIdx(t, k)] = v;
       results.push({ index: i, rowsAffected: 1, error: null });
     }
     rowCache.set(t, work);
@@ -1447,7 +1832,11 @@ export const mockHandlers: Record<string, MockHandler> = {
   // ---- export (no file system in a browser: files are only counted)
   choose_export_path: h((a) => `/mock/${(a.suggestedName as string | null) ?? "export.csv"}`),
   default_export_path: h((a) => `/home/mock/${a.fileName as string}`),
-  approve_export_path: h((a) => !/\/\./.test(a.path as string) && (a.path as string).startsWith("/home/mock/")),
+  approve_export_path: h((a) =>
+    !/\/\./.test(a.path as string) && (a.path as string).startsWith("/home/mock/")
+      ? null
+      : "Only folders below your home folder (/home/mock) are accepted here.",
+  ),
   export_query: h(async (a) => {
     needConn(a.dsId);
     await sleep(100);
@@ -1473,6 +1862,7 @@ export const mockHandlers: Record<string, MockHandler> = {
   }),
   import_file: h(async (a) => {
     needConn(a.dsId);
+    useDs(a.dsId);
     const req = a.request as ImportRequest;
     const sink = a.onProgress as { onmessage?: (p: ImportProgress) => void } | undefined;
     const token = { cancelled: false };
@@ -1508,7 +1898,7 @@ export const mockHandlers: Record<string, MockHandler> = {
     mockImports.delete(a.importId as string);
     const rolledBack = token.cancelled || (req.options.abortOnError && failed.length > 0);
     if (!rolledBack && req.createTable) {
-      const sc = SCHEMAS[req.schema ?? "shop"];
+      const sc = M.schemas[req.schema ?? M.defaultSchema];
       const t: TableDef = {
         name: req.table,
         kind: "table",
@@ -1538,8 +1928,8 @@ export const mockHandlers: Record<string, MockHandler> = {
   }),
 
   // ---- splitter
-  split_statements: h((a) => toStatements(a.sql)),
-  statement_at: h((a) => statementAt(a.sql, a.caretUtf16)),
+  split_statements: h((a) => toStatements(a.sql, a.driver)),
+  statement_at: h((a) => statementAt(a.sql, a.caretUtf16, a.driver)),
 
   // ---- history
   history_list: h((a) =>

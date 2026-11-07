@@ -17,6 +17,7 @@ use sqlx::{ConnectOptions, Connection, Row};
 
 use crate::error::{connect_error, DbError, Result};
 use crate::model::{DataSourceConfig, Driver};
+use crate::oracle::{OraConn, OraOpts, OraPool};
 use crate::value::PgTypeRow;
 
 /// Pool of connections for one data source.
@@ -25,6 +26,7 @@ pub enum Pool {
     Pg(PgPool),
     My(MySqlPool),
     Lite(SqlitePool),
+    Ora(OraPool),
 }
 
 /// A dedicated, non-pooled connection (console sessions).
@@ -32,6 +34,7 @@ pub enum Conn {
     Pg(PgConnection),
     My(MySqlConnection),
     Lite(SqliteConnection),
+    Ora(OraConn),
 }
 
 #[derive(Clone)]
@@ -39,6 +42,7 @@ pub(crate) enum ConnOpts {
     Pg(PgConnectOptions),
     My(MySqlConnectOptions),
     Lite(SqliteConnectOptions),
+    Ora(OraOpts),
 }
 
 /// A connected data source.
@@ -84,6 +88,7 @@ pub(crate) async fn connect_one(opts: &ConnOpts, cfg: &DataSourceConfig) -> Resu
                 Conn::My(c)
             }
             ConnOpts::Lite(o) => Conn::Lite(o.connect().await.map_err(connect_error)?),
+            ConnOpts::Ora(o) => Conn::Ora(OraConn::connect(o, cfg).await?),
         })
     };
     match tokio::time::timeout(timeout, fut).await {
@@ -351,6 +356,7 @@ pub(crate) fn build_opts(cfg: &DataSourceConfig) -> Result<ConnOpts> {
             }
             Ok(ConnOpts::Lite(o.disable_statement_logging()))
         }
+        Driver::Oracle => Ok(ConnOpts::Ora(crate::oracle::build_opts(cfg)?)),
     }
 }
 
@@ -403,6 +409,7 @@ pub(crate) async fn open_pool(cfg: &DataSourceConfig, opts: &ConnOpts) -> Result
                 .await
                 .map_err(connect_error)?,
         ),
+        ConnOpts::Ora(o) => Pool::Ora(OraPool::open(o, cfg).await?),
     })
 }
 
@@ -412,6 +419,7 @@ impl Pool {
             Pool::Pg(_) => Driver::Postgres,
             Pool::My(_) => Driver::MySql,
             Pool::Lite(_) => Driver::Sqlite,
+            Pool::Ora(_) => Driver::Oracle,
         }
     }
 
@@ -420,6 +428,7 @@ impl Pool {
             Pool::Pg(p) => p.close().await,
             Pool::My(p) => p.close().await,
             Pool::Lite(p) => p.close().await,
+            Pool::Ora(p) => p.close().await,
         }
     }
 
@@ -429,6 +438,7 @@ impl Pool {
             Pool::Pg(p) => sqlx::raw_sql(sql).execute(p).await?.rows_affected(),
             Pool::My(p) => sqlx::raw_sql(sql).execute(p).await?.rows_affected(),
             Pool::Lite(p) => sqlx::raw_sql(sql).execute(p).await?.rows_affected(),
+            Pool::Ora(p) => p.exec(sql).await?,
         })
     }
 
@@ -454,6 +464,7 @@ impl Pool {
                 .iter()
                 .map(lite_strings)
                 .collect(),
+            Pool::Ora(p) => p.query_strings(sql).await?,
         })
     }
 }
@@ -464,15 +475,23 @@ impl Conn {
             Conn::Pg(_) => Driver::Postgres,
             Conn::My(_) => Driver::MySql,
             Conn::Lite(_) => Driver::Sqlite,
+            Conn::Ora(_) => Driver::Oracle,
         }
     }
 
     pub async fn close(self) {
-        let _ = match self {
-            Conn::Pg(c) => c.close().await,
-            Conn::My(c) => c.close().await,
-            Conn::Lite(c) => c.close().await,
-        };
+        match self {
+            Conn::Pg(c) => {
+                let _ = c.close().await;
+            }
+            Conn::My(c) => {
+                let _ = c.close().await;
+            }
+            Conn::Lite(c) => {
+                let _ = c.close().await;
+            }
+            Conn::Ora(c) => c.close().await,
+        }
     }
 }
 

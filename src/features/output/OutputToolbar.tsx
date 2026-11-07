@@ -2,7 +2,7 @@
 import { Show, type JSX } from "solid-js";
 import { GridToolbar } from "../../components/grid";
 import type { ObjectRef } from "../../api/types";
-import { ActionButton, Icon, type MenuItem, ToolbarSeparator, openMenu } from "../../components/ui";
+import { ActionButton, Icon, type MenuItem, ToolbarSeparator, openMenu, overflowToolbar } from "../../components/ui";
 import { openDdlTab } from "../table/commands";
 import { EXTRACTORS, copyResult, exportResultData, extractorMenuItems, formatLabel } from "./export";
 import { resultTable } from "../console/title";
@@ -102,7 +102,7 @@ function ResultToolbar(props: { out: ConsoleOutput; tab: ResultTab }): JSX.Eleme
 function LogToolbar(props: { out: ConsoleOutput }): JSX.Element {
   let tx!: HTMLButtonElement;
   return (
-    <div class="dg-toolbar dgo-logtb">
+    <div class="dg-toolbar dgo-logtb" ref={overflowToolbar}>
       <button ref={tx} type="button" class="dgo-tx" title="Transaction Mode" tabindex={-1} onMouseDown={(e) => e.preventDefault()} onClick={() => props.out.host?.openTxMenu(tx)}>
         Tx<i class="dgo-tx-mark" />
       </button>

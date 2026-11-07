@@ -40,17 +40,28 @@ function Ddl(props: { tab: EditorTab; active: boolean; dsId: string; objectRef: 
   const ds = () => dsInfo(props.dsId);
   const hasData = ref.kind === "table" || ref.kind === "view" || ref.kind === "materializedView";
 
+  /** A load is under way (the first DBMS_METADATA call of an Oracle session can take many seconds). */
+  const [loading, setLoading] = createSignal(true);
+  /** Only the latest load may show its result: a slow older one must not overwrite (or blank) a newer one. */
+  let seq = 0;
+
   async function load(): Promise<void> {
+    const mine = ++seq;
+    setLoading(true);
     try {
       await loadDataSources();
       await ensureConnected(props.dsId);
       const ddl = await getDdl(props.dsId, ref, true);
+      if (mine !== seq) return;
       setOriginal(ddl);
       setCurrent(ddl);
       setText(ddl);
       setError(null);
       setLoaded(true);
+      setLoading(false);
     } catch (e) {
+      if (mine !== seq) return;
+      setLoading(false);
       // the first load shows the error inside the tab (restored tabs must not raise a balloon each);
       // a failed Reload of a DDL that is already shown has no other place to report
       setError(errText(e));
@@ -128,7 +139,10 @@ function Ddl(props: { tab: EditorTab; active: boolean; dsId: string; objectRef: 
             defaultSchema={ref.schema ?? undefined}
           />
         </Show>
-        <Show when={error() && !loaded()}>
+        <Show when={loading() && !loaded()}>
+          <div class="dgd-message">Loading DDL...</div>
+        </Show>
+        <Show when={error() && !loaded() && !loading()}>
           <div class="dgd-message dgd-error">{error()}</div>
         </Show>
       </div>

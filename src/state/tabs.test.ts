@@ -1,6 +1,6 @@
 // @vitest-environment node
-import { afterEach, describe, expect, it } from "vitest";
-import { closeAllTabs, closeOtherTabs, closeTab, openTab, registerBeforeClose, setPinned, tabs, activeTabId } from "./tabs";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { closeAllTabs, confirmCloseAll, closeOtherTabs, closeTab, openTab, registerBeforeClose, registerQuitGuard, setPinned, tabs, activeTabId } from "./tabs";
 
 const open = (id: string) => openTab({ id, title: id, kind: "console" });
 const ids = () => tabs().map((t) => t.id);
@@ -54,5 +54,39 @@ describe("tab store beforeClose hook", () => {
     setPinned("a", true);
     await closeAllTabs();
     expect(ids()).toEqual(["a"]);
+  });
+});
+
+describe("confirmCloseAll (quitting the app)", () => {
+  it("asks the quit guards about every tab and closes none; a Cancel stops it and applies nothing", async () => {
+    open("a");
+    open("b");
+    open("c");
+    const asked: string[] = [];
+    const applied: string[] = [];
+    const off = registerQuitGuard((t) => (asked.push(t.id), t.id === "b" ? false : () => (applied.push(t.id), true)));
+    expect(await confirmCloseAll()).toBe(false);
+    expect(asked).toEqual(["a", "b"]);
+    expect(applied).toEqual([]);
+    expect(ids()).toEqual(["a", "b", "c"]);
+    off();
+    expect(await confirmCloseAll()).toBe(true);
+  });
+  it("everything is asked before anything is applied", async () => {
+    open("a");
+    open("b");
+    const log: string[] = [];
+    const off = registerQuitGuard((t) => (log.push(`ask ${t.id}`), () => (log.push(`apply ${t.id}`), true)));
+    expect(await confirmCloseAll()).toBe(true);
+    expect(log).toEqual(["ask a", "ask b", "apply a", "apply b"]);
+    off();
+  });
+  it("the regular close hooks are not asked", async () => {
+    open("a");
+    const hook = vi.fn(() => false);
+    const off = registerBeforeClose(hook);
+    expect(await confirmCloseAll()).toBe(true);
+    expect(hook).not.toHaveBeenCalled();
+    off();
   });
 });

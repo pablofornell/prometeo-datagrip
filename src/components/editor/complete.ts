@@ -12,7 +12,7 @@ import { type Extension, Prec } from "@codemirror/state";
 import { type EditorView, ViewPlugin, keymap } from "@codemirror/view";
 import type { MenuItem } from "../ui/Menu";
 import { docAnalysis } from "./highlight";
-import { KEYWORD_HINTS, functionsFor, keywordsFor } from "./keywords";
+import { KEYWORD_HINTS, ORACLE_RESERVED, functionsFor, keywordsFor } from "./keywords";
 import { type Token } from "./lexer";
 import type { TableIdx } from "./schemaIndex";
 import { analyzeStatement, identName, type Scope } from "./semantic";
@@ -50,6 +50,8 @@ if (typeof document !== "undefined") document.body.classList.toggle("dg-comp-no-
 
 /** Quote an identifier when it is not a plain lower-case name. */
 export function quoteIdent(name: string, d: Dialect): string {
+  // Oracle stores unquoted names in upper case
+  if (d === "oracle") return /^[A-Z][A-Z0-9_$#]*$/.test(name) && !ORACLE_RESERVED.has(name.toLowerCase()) ? name : '"' + name.replace(/"/g, '""') + '"';
   if (/^[a-z_][a-z0-9_$]*$/.test(name)) return name;
   if (d === "mysql") return "`" + name.replace(/`/g, "``") + "`";
   return '"' + name.replace(/"/g, '""') + '"';

@@ -55,6 +55,9 @@ export const deleteDataSource = (id: string): Promise<void> => invoke("delete_da
 
 export const duplicateDataSource = (id: string): Promise<DataSource> => invoke("duplicate_data_source", { id });
 
+/** The dialog's Duplicate of a saved source: `to` gets the stored password of `from` (the UI never reads it). */
+export const copyDataSourcePassword = (from: string, to: string): Promise<DataSource> => invoke("copy_data_source_password", { from, to });
+
 /** Works with an unsaved config; if `ds.id` is saved and `ds.password` is null the stored password is used. */
 export const testConnection = (ds: Partial<DataSourceConfig>): Promise<TestResult> =>
   invoke("test_connection", { ds });
@@ -122,6 +125,7 @@ export interface ExecHandlers {
   onUpdate?: (e: Extract<ExecEvent, { kind: "update" }>) => void;
   onError?: (e: Extract<ExecEvent, { kind: "error" }>) => void;
   onMessage?: (e: Extract<ExecEvent, { kind: "message" }>) => void;
+  onWarning?: (e: Extract<ExecEvent, { kind: "warning" }>) => void;
   onTxStatus?: (e: Extract<ExecEvent, { kind: "txStatus" }>) => void;
   onTxEnded?: (e: Extract<ExecEvent, { kind: "txEnded" }>) => void;
   onDone?: (e: Extract<ExecEvent, { kind: "done" }>) => void;
@@ -169,6 +173,7 @@ export async function execute(
         case "update": handlers.onUpdate?.(e); break;
         case "error": handlers.onError?.(e); break;
         case "message": handlers.onMessage?.(e); break;
+        case "warning": handlers.onWarning?.(e); break;
         case "txStatus": handlers.onTxStatus?.(e); break;
         case "txEnded": handlers.onTxEnded?.(e); break;
         case "done": handlers.onDone?.(e); break;
@@ -257,30 +262,27 @@ export const defaultExportOptions = (driver: Driver = "postgres"): ExportOptions
  * Open the native Save dialog FROM THE BACKEND and resolve with the chosen path (`null` = cancelled).
  * Only a path returned by this function is accepted by `exportQuery` / `exportResult` (once, within five
  * minutes); any other path is refused, so the webview cannot make the backend write to an arbitrary file.
- * Do NOT use the dialog plugin's `save()` for exports any more. `suggestedName` is a file name only.
+ * Do NOT use the dialog plugin's `save()` for exports any more. `suggestedName` is a file name only; `folder` (absolute, used when it exists) is where the dialog opens.
  */
-export const chooseExportPath = (suggestedName?: string, format?: ExportFormat): Promise<string | null> =>
-  invoke("choose_export_path", { suggestedName: suggestedName ?? null, format: format ?? null });
+export const chooseExportPath = (suggestedName?: string, format?: ExportFormat, folder?: string): Promise<string | null> =>
+  invoke("choose_export_path", { suggestedName: suggestedName ?? null, format: format ?? null, folder: folder ?? null });
 
-/** `<home>/<file name>`: the default "Output file" of the Export Data dialog (`null`: the home folder is unknown). */
+/** `<home>/Downloads/<file name>` (or `<home>/<file name>`): the default "Output file" of the Export Data dialog (`null`: the home folder is unknown). */
 export const defaultExportPath = (fileName: string): Promise<string | null> => invoke("default_export_path", { fileName });
 
 /**
  * Lets the backend write the typed `path` without the save dialog. Granted only for a NEW file under the home
- * folder (no hidden folders, symlinks resolved) named with the extension of `format`: resolves `false` otherwise, and the export has to go through `chooseExportPath`.
+ * folder (no hidden folders, symlinks resolved) named with the extension of `format`. Resolves `null` when
+ * approved, else the reason it is refused (show it; the export then has to go through `chooseExportPath`).
  */
-export const approveExportPath = (path: string, format?: ExportFormat): Promise<boolean> =>
+export const approveExportPath = (path: string, format?: ExportFormat): Promise<string | null> =>
   invoke("approve_export_path", { path, format: format ?? null });
 
-/**
- * The target of the Export Data dialog: `path` is exported straight away when the backend approves it, else
- * (an existing file, outside the home folder) the save dialog opens with its file name and decides.
- * Resolves the path written, or `null` when the user cancels that dialog.
- */
-export async function resolveExportPath(path: string, format: ExportFormat): Promise<string | null> {
-  if (await approveExportPath(path, format)) return path;
-  return chooseExportPath(path.split("/").pop() || undefined, format);
-}
+/** The folder part of a typed path (`/a/b/c.csv` -> `/a/b`; `null` when it has none). */
+export const exportFolder = (path: string): string | null => {
+  const i = path.lastIndexOf("/");
+  return i > 0 && path.startsWith("/") ? path.slice(0, i) : null;
+};
 
 /** `chooseExportPath` + `exportQuery`. Resolves `null` when the user cancels the dialog. */
 export async function exportQueryToFile(

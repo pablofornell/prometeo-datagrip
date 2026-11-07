@@ -57,6 +57,7 @@ export function findParams(sql: string, dialect: Dialect): ParamRef[] {
         }
         out.push({ key: `?${++ordinal}`, from: t.from, to: t.to });
       } else if (s[0] === "$") out.push({ key: s, from: t.from, to: t.to });
+      else if (dialect === "oracle" && /^:(new|old|parent)$/i.test(s)) continue; // trigger row correlation names
       else if (s[0] === ":" && /^:[A-Za-z_]/.test(s)) out.push({ key: s, from: t.from, to: t.to });
       // `@name` / `@@var` are session variables, `:1` is an array slice
       continue;

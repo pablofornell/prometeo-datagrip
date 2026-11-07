@@ -7,6 +7,7 @@ use tokio::sync::OnceCell;
 
 pub const PG_SEED: &str = include_str!("../fixtures/pg_seed.sql");
 pub const MYSQL_SEED: &str = include_str!("../fixtures/mysql_seed.sql");
+pub const ORACLE_SEED: &str = include_str!("../fixtures/oracle_seed.sql");
 
 pub fn pg_cfg() -> Option<DataSourceConfig> {
     let url = std::env::var("PROMETEO_PG_URL")
@@ -30,6 +31,30 @@ pub fn mysql_cfg() -> Option<DataSourceConfig> {
         name: "my".into(),
         driver: Driver::MySql,
         url_override: Some(url),
+        ..Default::default()
+    })
+}
+
+/// `PROMETEO_ORACLE_URL=oracle://demo:prometeo@127.0.0.1:15219/FREEPDB1` (user:password@host:port/service name).
+pub fn oracle_cfg() -> Option<DataSourceConfig> {
+    let url = std::env::var("PROMETEO_ORACLE_URL")
+        .ok()
+        .filter(|u| !u.is_empty())?;
+    let rest = url.strip_prefix("oracle://")?;
+    let (cred, target) = rest.rsplit_once('@')?;
+    let (user, password) = cred.split_once(':').unwrap_or((cred, ""));
+    let (hostport, service) = target.split_once('/')?;
+    let (host, port) = hostport.split_once(':').unwrap_or((hostport, "1521"));
+    Some(DataSourceConfig {
+        id: "ora".into(),
+        name: "ora".into(),
+        driver: Driver::Oracle,
+        host: host.into(),
+        port: port.parse().ok()?,
+        user: user.into(),
+        password: Some(password.into()),
+        database: service.into(),
+        options: [("oracleConnType".to_string(), "service".to_string())].into(),
         ..Default::default()
     })
 }
@@ -119,13 +144,16 @@ pub async fn children(mgr: &ConnectionManager, ds: &str, path: &[&str]) -> Vec<T
 
 static PG_SEEDED: OnceCell<()> = OnceCell::const_new();
 static MY_SEEDED: OnceCell<()> = OnceCell::const_new();
+static ORA_SEEDED: OnceCell<()> = OnceCell::const_new();
 
 async fn seed(cfg: &DataSourceConfig, sql: &str, probe: &str) {
     let mgr = ConnectionManager::new();
     mgr.connect(cfg).await.expect("connect for seeding");
     let sess = mgr.open_session(&cfg.id).await.unwrap();
     let ev = run(&mgr, &sess, probe).await;
-    let seeded = errors(&ev).is_empty() && first_rs(&ev).1[0][0] == 100000;
+    // Oracle hands NUMBER over as text
+    let seeded =
+        errors(&ev).is_empty() && first_rs(&ev).1[0][0].to_string().trim_matches('"') == "100000";
     if !seeded {
         eprintln!("[seed] loading fixture into {}", cfg.id);
         let ev = mgr
@@ -156,6 +184,12 @@ pub async fn seed_pg(cfg: &DataSourceConfig) {
 pub async fn seed_mysql(cfg: &DataSourceConfig) {
     MY_SEEDED
         .get_or_init(|| seed(cfg, MYSQL_SEED, "select count(*) from big_table"))
+        .await;
+}
+
+pub async fn seed_oracle(cfg: &DataSourceConfig) {
+    ORA_SEEDED
+        .get_or_init(|| seed(cfg, ORACLE_SEED, "select count(*) from big_table"))
         .await;
 }
 

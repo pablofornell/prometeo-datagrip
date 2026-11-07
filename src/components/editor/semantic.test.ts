@@ -77,6 +77,13 @@ describe("formatter", () => {
       ].join("\n"),
     );
   });
+  it("starts the main query of a CTE on its own line", () => {
+    const out = formatScript("with recursive r(n) as (select 1 union all select n+1 from r where n<5) select n from r;", "postgres");
+    expect(out).toBe(["with recursive r(n) as (", "    select 1", "    union all", "    select n + 1", "    from r", "    where n < 5", ")", "select n", "from r;"].join("\n"));
+    expect(formatScript(out, "postgres")).toBe(out);
+    expect(formatScript("with a as (select 1), b as (select 2) select * from a, b;", "postgres")).toBe(["with a as (", "    select 1", "), b as (", "    select 2", ")", "select *", "from a, b;"].join("\n"));
+    expect(formatScript("select * from (select 1 as x) s where s.x in (select 1) and s.x = 2", "postgres")).toContain(") s\nwhere s.x in (");
+  });
   it("is idempotent and keeps comments and gaps", () => {
     const src = "-- top\nSELECT a FROM t WHERE x IN (SELECT y FROM u); -- tail\n\nINSERT INTO t (a, b) VALUES (1, -2);";
     const once = formatScript(src, "postgres");

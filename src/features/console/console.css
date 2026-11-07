@@ -105,7 +105,7 @@
 .dgc-h {
   display: flex;
   flex-direction: column;
-  width: 520px;
+  width: 640px;
   height: 520px;
   max-width: calc(100vw - 40px);
   max-height: calc(100vh - 40px);
@@ -157,11 +157,6 @@
 }
 .dgc-h-row.err .dgc-h-sql {
   color: var(--dg-text-error);
-}
-.dgc-h-time {
-  flex: none;
-  color: var(--dg-text-secondary);
-  font-size: 12px;
 }
 .dgc-h-empty {
   padding: 16px 8px;

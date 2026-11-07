@@ -65,6 +65,7 @@ const real = (n: ENode | undefined): n is ENode => !!n && n.data.kind !== "loadi
 export const DRIVERS = [
   { driver: "mariadb", label: "MariaDB" },
   { driver: "mysql", label: "MySQL" },
+  { driver: "oracle", label: "Oracle" },
   { driver: "postgres", label: "PostgreSQL" },
   { driver: "sqlite", label: "SQLite" },
 ] as const;

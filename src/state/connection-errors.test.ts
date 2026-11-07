@@ -55,3 +55,14 @@ describe("isConnectionLost", () => {
     expect(isConnectionLost(null)).toBe(false);
   });
 });
+
+describe("friendlyConnectionError: Oracle", () => {
+  it("refused connection names the listener", () => {
+    expect(friendlyConnectionError(RAW, { driver: "oracle", host: "h", port: 1521 })).toBe(
+      "Connection to h:1521 refused. Check that the hostname and port are correct and that the listener is accepting TCP/IP connections.",
+    );
+  });
+  it("leaves ORA errors alone", () => {
+    expect(friendlyConnectionError("ORA-01017: invalid username/password; logon denied", { driver: "oracle", host: "h", port: 1521 })).toBe("ORA-01017: invalid username/password; logon denied");
+  });
+});

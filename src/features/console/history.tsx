@@ -21,7 +21,7 @@ function History(props: { session: ConsoleSession; onClose: () => void }): JSX.E
   const [all, setAll] = createSignal<HistoryEntry[]>([]);
   const [loaded, setLoaded] = createSignal(false);
   const [sel, setSel] = createSignal(0);
-  const [listWidth, setListWidth] = createSignal(145);
+  const [listWidth, setListWidth] = createSignal(240);
   const search = createSpeedSearch(() => setSel(items().length - 1));
   let root!: HTMLDivElement;
   let list!: HTMLDivElement;
@@ -36,8 +36,9 @@ function History(props: { session: ConsoleSession; onClose: () => void }): JSX.E
     root.focus();
     void historyList(props.session.dsId, 0, 300)
       .then((r) => {
-        // the backend answers newest first; the dialog lists the latest at the bottom
-        const rows = r.filter((e) => !isInternalSql(e.sql)).reverse();
+        // the backend answers newest first (by completion: a slow statement is recorded after a later quick one); the
+        // dialog lists by start time with the latest at the bottom (the sort is stable: ties keep the recorded order)
+        const rows = r.filter((e) => !isInternalSql(e.sql)).reverse().sort((a, b) => a.tsMs - b.tsMs);
         setAll(rows);
         setSel(rows.length - 1);
         reveal();
@@ -105,11 +106,10 @@ function History(props: { session: ConsoleSession; onClose: () => void }): JSX.E
               <Show when={items().length} fallback={<div class="dgc-h-empty">{!loaded() ? "" : search.active() ? "Nothing found" : "No query history"}</div>}>
                 <For each={items()}>
                   {(e, i) => (
-                    <div class="dgc-h-row" classList={{ sel: i() === Math.min(sel(), items().length - 1), err: !e.ok }} onClick={() => setSel(i())} onDblClick={() => paste(e)}>
+                    <div class="dgc-h-row" title={e.sql.trim()} classList={{ sel: i() === Math.min(sel(), items().length - 1), err: !e.ok }} onClick={() => setSel(i())} onDblClick={() => paste(e)}>
                       <span class="dgc-h-sql">
                         <Highlighted text={oneLine(e.sql)} query={search.query()} />
                       </span>
-                      <span class="dgc-h-time">{when(e.tsMs)}</span>
                     </div>
                   )}
                 </For>

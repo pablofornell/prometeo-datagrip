@@ -168,6 +168,13 @@ export function schemaChange(stmt: string, dialect: DataSource["driver"]): Schem
     return null;
   };
   if (dialect === "mysql") return w(0) === "use" ? { schema: name(1) } : null;
+  if (dialect === "oracle") {
+    // ALTER SESSION SET CURRENT_SCHEMA = x  (an unquoted name is upper case)
+    if (!(w(0) === "alter" && w(1) === "session" && w(2) === "set" && w(3) === "current_schema" && toks[4]?.text === "=")) return null;
+    const t = toks[5];
+    if (!t || (t.kind !== "word" && t.kind !== "qident")) return { schema: null };
+    return { schema: t.kind === "word" ? t.text.toUpperCase() : unq(t.text) };
+  }
   if (w(0) === "discard" && w(1) === "all") return { schema: null, searchPath: null };
   if (w(0) === "reset" && (w(1) === "search_path" || w(1) === "all")) return { schema: null, searchPath: null };
   if (w(0) !== "set") return null;
@@ -237,7 +244,7 @@ export async function resolveEdit(ds: DataSource, meta: ColumnMeta[], sql: strin
     const parts = tableOf(meta, sql, ds.driver);
     if (!parts) return null;
     const name = parts[parts.length - 1];
-    const sch = parts.length >= 2 ? parts[parts.length - 2] : ds.driver === "sqlite" ? "main" : (schema ?? (ds.driver === "postgres" ? "public" : ds.database));
+    const sch = parts.length >= 2 ? (ds.driver === "oracle" ? parts[parts.length - 2].toUpperCase() : parts[parts.length - 2]) : ds.driver === "sqlite" ? "main" : (schema ?? (ds.driver === "postgres" ? "public" : ds.driver === "oracle" ? ds.user.toUpperCase() : ds.database));
     if (!sch) return null;
     const base = ds.driver === "postgres" ? [ds.database, sch] : [sch];
 

@@ -31,3 +31,4 @@ export type { DialogButton, DialogProps } from "./Dialog";
 export { createSpeedSearch, matchRanges, Highlighted, SpeedSearchField } from "./SpeedSearch";
 export { Tree } from "./Tree";
 export type { TreeItem, TreeController, TreeProps } from "./Tree";
+export { overflowToolbar } from "./overflow";

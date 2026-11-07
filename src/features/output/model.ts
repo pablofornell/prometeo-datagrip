@@ -13,7 +13,7 @@ import { settings } from "../../state/settings";
 import { activeTab } from "../../state/tabs";
 import type { EditTarget } from "./edit";
 
-export type LogKind = "text" | "sql" | "error";
+export type LogKind = "text" | "sql" | "error" | "warning";
 
 export interface LogLine {
   id: number;

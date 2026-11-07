@@ -26,7 +26,7 @@ export interface EditorCtx {
   dsName: string;
   driver: Driver;
   schema: string;
-  /** Backend path of the schema node (`[db, schema]` PostgreSQL, `[schema]` MySQL / SQLite). */
+  /** Backend path of the schema node (`[db, schema]` PostgreSQL, `[schema]` MySQL / SQLite / Oracle). */
   schemaPath: string[];
 }
 
@@ -149,6 +149,11 @@ function columnOf(driver: Driver, tn: TreeNode): ColumnDef {
       c.generatedStored = g[1].toUpperCase() === "STORED";
       c.default = "";
     }
+  } else if (driver === "oracle") {
+    // identity / virtual / comments come from `oracleExtras`; DATA_DEFAULT keeps the whitespace of the DDL
+    const def = str(ex.default).trim();
+    c.default = /^null$/i.test(def) ? "" : def;
+    if (ex.generated || ex.virtual) c.generated = "?";
   } else {
     c.default = str(ex.default);
     if (ex.generated) c.generated = "?";
@@ -202,7 +207,10 @@ export function tableFromNodes(driver: Driver, schema: string, name: string, tab
         definition: locked ? def : undefined,
       });
     });
-  const checks: CheckDef[] = n.checks.map((c) => newCheck({ name: c.name, expr: driver === "mysql" ? str(c.extra.definition) : checkExpr(str(c.extra.definition)) }));
+  // Oracle lists NOT NULL as a check constraint: the column's own flag says it already
+  const notNullCheck = /^\s*(?:CHECK\s*\()?\s*"?[A-Za-z0-9_$#]+"?\s+IS\s+NOT\s+NULL\s*\)?\s*$/i;
+  const checkNodes = driver === "oracle" ? n.checks.filter((c) => !notNullCheck.test(str(c.extra.definition))) : n.checks;
+  const checks: CheckDef[] = checkNodes.map((c) => newCheck({ name: c.name, expr: driver === "mysql" ? str(c.extra.definition) : checkExpr(str(c.extra.definition)) }));
   const t: TableDef = {
     schema,
     name,
@@ -237,6 +245,7 @@ export async function loadTable(ctx: EditorCtx, name: string, tableExtra: Record
   try {
     if (ctx.driver === "postgres") await pgExtras(ctx, t);
     else if (ctx.driver === "mysql") await mysqlExtras(ctx, t);
+    else if (ctx.driver === "oracle") await oracleExtras(ctx, t);
     else await sqliteExtras(ctx, t);
   } catch {
     /* the extras are nice to have: the dialog still works without them */
@@ -271,6 +280,37 @@ async function mysqlExtras(ctx: EditorCtx, t: TableDef): Promise<void> {
   }
 }
 
+async function oracleExtras(ctx: EditorCtx, t: TableDef): Promise<void> {
+  const [sc, tn] = [literal("oracle", ctx.schema), literal("oracle", t.name)];
+  const where = `owner = ${sc} and table_name = ${tn}`;
+  const [ids, virt, cmts, tbl] = await queryRows(ctx.dsId, [
+    `select column_name, generation_type from all_tab_identity_cols where ${where}`,
+    `select column_name from all_tab_cols where ${where} and virtual_column = 'YES' and hidden_column = 'NO'`,
+    `select column_name, comments from all_col_comments where ${where}`,
+    `select t.tablespace_name, c.comments from all_tables t left join all_tab_comments c on c.owner = t.owner and c.table_name = t.table_name where t.owner = ${sc} and t.table_name = ${tn}`,
+  ]);
+  const col = (name: unknown) => t.columns.find((x) => x.name === str(name));
+  for (const r of ids) {
+    const c = col(r[0]);
+    if (!c) continue;
+    c.identity = str(r[1]).toUpperCase() === "ALWAYS" ? "ALWAYS" : "BY DEFAULT";
+    c.default = ""; // DATA_DEFAULT of an identity column is the system sequence
+  }
+  for (const r of virt) {
+    const c = col(r[0]);
+    if (c && !c.generated) c.generated = c.default || "?";
+    if (c) c.default = "";
+  }
+  for (const r of cmts) {
+    const c = col(r[0]);
+    if (c) c.comment = str(r[1]);
+  }
+  if (tbl[0]) {
+    t.tablespace = str(tbl[0][0]);
+    t.comment = str(tbl[0][1]);
+  }
+}
+
 async function sqliteExtras(ctx: EditorCtx, t: TableDef): Promise<void> {
   const [rows] = await queryRows(ctx.dsId, [
     `select type, name, sql from "${ctx.schema.replace(/"/g, '""')}".sqlite_master where tbl_name = ${literal("sqlite", t.name)} and sql is not null`,
@@ -299,6 +339,13 @@ async function sqliteExtras(ctx: EditorCtx, t: TableDef): Promise<void> {
 export async function loadTableNames(ctx: EditorCtx): Promise<string[]> {
   const nodes = await introspect(ctx.dsId, [...ctx.schemaPath, "tables"]).catch(() => []);
   return nodes.map((n) => n.name);
+}
+
+/** Columns of the primary key of a table of the schema (empty without one): the default target of a foreign key. */
+export async function loadPrimaryKeyColumns(ctx: EditorCtx, table: string): Promise<string[]> {
+  const nodes = await introspect(ctx.dsId, [...tablePath(ctx, table), "keys"]).catch(() => []);
+  const pk = nodes.find((n) => n.kind === "primaryKey");
+  return pk ? strs(pk.extra.columns) : [];
 }
 
 /** Column names of a table of the schema. */
