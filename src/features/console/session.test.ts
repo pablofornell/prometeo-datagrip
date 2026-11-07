@@ -38,6 +38,9 @@ function answer(sid: string, sql: string): ExecEvent[] {
       ev.push({ kind: "error", index: i, message: "boom", position: null, positionUtf16: null, connectionLost: false });
       if (cur === "active") set("failed");
       break;
+    } else if (w === "WARN") {
+      ev.push({ kind: "update", index: i, rowsAffected: 1 });
+      ev.push({ kind: "warning", index: i, message: "Warning: PROCEDURE P compiled with errors", details: ["3/3: PL/SQL: ORA-00904: \"NOSUCHCOL\": invalid identifier"] });
     } else if (w === "SELECT") {
       const cs = /current_schema|database\(\)/.test(st);
       ev.push({ kind: "resultset", index: i, columns: [{ name: "c", typeName: "int4", nullable: true, isPk: false, tableRef: null }], rows: cs ? [[be.schema]] : [[1]], hasMore: /\bbig_table\b/.test(st) });
@@ -75,7 +78,7 @@ vi.mock("../../api/db", () => ({
     let done!: (e: unknown) => void;
     const p = new Promise((r) => (done = r));
     for (const e of events) {
-      const h = { statement: "onStatement", resultset: "onResultSet", update: "onUpdate", error: "onError", message: "onMessage", txStatus: "onTxStatus", txEnded: "onTxEnded", done: "onDone" }[e.kind];
+      const h = { statement: "onStatement", resultset: "onResultSet", update: "onUpdate", error: "onError", message: "onMessage", warning: "onWarning", txStatus: "onTxStatus", txEnded: "onTxEnded", done: "onDone" }[e.kind];
       handlers[h]?.(e);
       if (e.kind === "done") done(e);
     }
@@ -281,6 +284,17 @@ describe("a failed statement", () => {
     await s.run(req("select 1"));
     await s.run(req("update t set a = 1"));
     expect(s.out.selected()).toBe("output");
+    expect(s.execError()).toBeNull();
+  });
+});
+
+describe("a statement that succeeds with a warning", () => {
+  it("marks it as a warning and lists the details in the log", async () => {
+    const s = mk();
+    await s.run({ sql: "warn p;", ranges: [{ from: 0, to: 6 }], source: "statement" });
+    expect(lines(s)).toContain("Warning: PROCEDURE P compiled with errors");
+    expect(lines(s).some((l) => l.startsWith("3/3: "))).toBe(true);
+    expect(s.marks().map((m) => [m.from, m.to, m.status])).toEqual([[0, 6, "warning"]]);
     expect(s.execError()).toBeNull();
   });
 });

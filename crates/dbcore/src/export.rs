@@ -95,6 +95,22 @@ fn cell_text(c: &Cell, null: &str) -> String {
     }
 }
 
+/// A float cell with no fractional part (`3.0`: SQLite REAL, PG / MySQL double). serde_json writes it as `3.0` but
+/// the grid shows `3` (a JSON number has no int / float distinction in the browser).
+fn is_integral_float(c: &Cell) -> bool {
+    matches!(c, Value::Number(n) if n.is_f64() && n.as_f64().is_some_and(|f| f.fract() == 0.0 && f.abs() < 1e15))
+}
+
+/// The cell as the grid shows it: an integral float is written without `.0`.
+fn integral_as_int(c: &Cell) -> Cell {
+    match c {
+        Value::Number(n) if is_integral_float(c) => {
+            Value::from(n.as_f64().unwrap_or_default() as i64)
+        }
+        other => other.clone(),
+    }
+}
+
 /// JSON value with binary cells replaced by `"0x..."` strings.
 fn cell_json(c: &Cell) -> Value {
     match c {
@@ -504,6 +520,13 @@ impl<W: Write> Exporter<W> {
     }
 
     fn emit(&mut self, row: &[Cell]) -> io::Result<()> {
+        let plain;
+        let row = if row.iter().any(is_integral_float) {
+            plain = row.iter().map(integral_as_int).collect::<Vec<_>>();
+            &plain[..]
+        } else {
+            row
+        };
         let with_header;
         let row = if self.row_header() {
             with_header = std::iter::once(Value::from(self.emitted + 1))
@@ -542,19 +565,19 @@ impl<W: Write> Exporter<W> {
                 writeln!(self.w, "| {} |", line.join(" | "))?;
             }
             ExportFormat::Json | ExportFormat::JsonLines => {
-                // key -> JSON text (keys sorted, as a `serde_json::Map` writes them)
-                let mut obj = std::collections::BTreeMap::new();
+                // (key, JSON text) in column order
+                let mut obj: Vec<(String, String)> = Vec::with_capacity(row.len());
                 for (i, c) in row.iter().enumerate() {
                     let mut key = self
                         .cols
                         .get(i)
                         .cloned()
                         .unwrap_or_else(|| format!("column{i}"));
-                    while obj.contains_key(&key) {
+                    while obj.iter().any(|(k, _)| *k == key) {
                         key.push('_');
                     }
                     let ty = self.src_types.get(i).map(String::as_str).unwrap_or("");
-                    obj.insert(key, json_text(c, ty));
+                    obj.push((key, json_text(c, ty)));
                 }
                 let text = format!(
                     "{{{}}}",
@@ -952,8 +975,51 @@ mod tests {
     }
 
     #[test]
+    fn integral_floats_are_written_like_the_grid_shows_them() {
+        let rs = ResultSet {
+            columns: vec![
+                ColumnMeta {
+                    name: "r".into(),
+                    type_name: "REAL".into(),
+                    nullable: true,
+                    is_pk: false,
+                    table_ref: None,
+                },
+                ColumnMeta {
+                    name: "a".into(),
+                    type_name: "REAL".into(),
+                    nullable: true,
+                    is_pk: false,
+                    table_ref: None,
+                },
+            ],
+            rows: vec![vec![json!(3.0), json!(2.5)], vec![json!(-4.0), json!(7)]],
+            ..Default::default()
+        };
+        let o = |format| ExportOptions {
+            format,
+            table_name: Some("t".into()),
+            ..Default::default()
+        };
+        let csv = export_to_string(&rs, &o(ExportFormat::Csv)).unwrap();
+        assert!(csv.contains("3,2.5") && csv.contains("-4,7"), "{csv}");
+        let j = export_to_string(&rs, &o(ExportFormat::Json)).unwrap();
+        assert!(
+            j.contains(r#"{"r":3,"a":2.5}"#) && j.contains(r#"{"r":-4,"a":7}"#),
+            "{j}"
+        );
+        let sql = export_to_string(&rs, &o(ExportFormat::SqlInsert)).unwrap();
+        assert!(sql.contains("(3, 2.5)"), "{sql}");
+    }
+
+    #[test]
     fn json() {
         let out = run(ExportFormat::Json, |_| {});
+        // keys keep the column order (not alphabetical: `name` is after `id`, `data` last)
+        assert!(
+            out.contains(r#"{"id":1,"name":"a,b \"q\"","data":"0xff00"}"#),
+            "{out}"
+        );
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
             v[0],
@@ -1018,15 +1084,15 @@ mod tests {
         let json = export_to_string(&decimals(), &o(ExportFormat::Json)).unwrap();
         // the digits are kept as they are (no float round trip); "+5" is no JSON number, so it stays a string
         assert!(
-            json.contains(r#"{"amount":1001.00,"big":9007199254740993,"label":"1001.00"}"#),
+            json.contains(r#"{"amount":1001.00,"label":"1001.00","big":9007199254740993}"#),
             "{json}"
         );
         assert!(
-            json.contains(r#"{"amount":-0.50,"big":"+5","label":"NaN"}"#),
+            json.contains(r#"{"amount":-0.50,"label":"NaN","big":"+5"}"#),
             "{json}"
         );
         assert!(
-            json.contains(r#"{"amount":"NaN","big":null,"label":"x"}"#),
+            json.contains(r#"{"amount":"NaN","label":"x","big":null}"#),
             "{json}"
         );
         assert!(serde_json::from_str::<Value>(&json).is_ok());

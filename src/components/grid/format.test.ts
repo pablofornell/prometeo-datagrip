@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseEdit, validateEdit } from "./format";
+import { columnKind, parseEdit, validateEdit } from "./format";
 
 describe("validateEdit", () => {
   it("accepts numbers and an empty text (NULL) in a numeric column", () => {
@@ -19,5 +19,14 @@ describe("validateEdit", () => {
   it("agrees with parseEdit: an accepted number parses to a number", () => {
     expect(parseEdit("42", "number")).toBe(42);
     expect(parseEdit("", "number")).toBeNull();
+  });
+});
+
+describe("columnKind", () => {
+  it("an Oracle DATE is a datetime (it has a time), any other date is a date", () => {
+    expect(columnKind("DATE", "oracle")).toBe("datetime");
+    expect(columnKind("date", "postgres")).toBe("date");
+    expect(columnKind("DATE")).toBe("date");
+    expect(columnKind("TIMESTAMP(6)", "oracle")).toBe("datetime");
   });
 });

@@ -266,6 +266,8 @@ export function configFromForm(f: Form, id: string | null, saved?: DataSource | 
       cfg.database = p.database;
       if (f.dbms === "oracle") options.oracleConnType = p.sid ? "sid" : "service";
     }
+    // Oracle's "URL only" keeps the User field (the URL may also carry the credentials)
+    if (f.dbms === "oracle") cfg.user = noAuth ? "" : f.user.trim() || p?.user || "";
     return cfg;
   }
   cfg.host = f.host.trim();

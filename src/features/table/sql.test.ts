@@ -5,6 +5,7 @@ import { type GridChange, NEW_ROW } from "../../components/grid/types";
 import {
   appendCondition,
   buildCondition,
+  limitedSql,
   orderByToSort,
   literal,
   previewSql,
@@ -149,5 +150,16 @@ describe("Oracle", () => {
     expect(literal("2024-05-06T07:08:09.5", "TIMESTAMP(6)", "oracle")).toBe("timestamp '2024-05-06 07:08:09.5'");
     expect(literal({ $bin: "cafe", len: 2 }, "RAW", "oracle")).toBe("hextoraw('cafe')");
     expect(literal("o'neil", "VARCHAR2", "oracle")).toBe("'o''neil'");
+  });
+});
+
+describe("limitedSql (the Export Data preview)", () => {
+  it("pages in the dialect of the data source", () => {
+    expect(limitedSql("postgres", "select * from t", 10)).toBe("select * from t limit 10");
+    expect(limitedSql("mysql", "select * from t;", 10)).toBe("select * from t limit 10");
+    expect(limitedSql("sqlite", "select * from t order by a\n", 10)).toBe("select * from t order by a limit 10");
+    // Oracle has no LIMIT (ORA-03047 at the `limit`)
+    expect(limitedSql("oracle", "SELECT * FROM DEMO.ORDERS", 10)).toBe("SELECT * FROM DEMO.ORDERS fetch first 10 rows only");
+    expect(limitedSql("oracle", "select * from t order by a;  ", 10)).toBe("select * from t order by a fetch first 10 rows only");
   });
 });

@@ -39,6 +39,7 @@ import { tabs, updateTab } from "../../state/tabs";
 import { theme } from "../../state/theme";
 import { dsFolders, dsGroupOf } from "../../state/ds-folders";
 import { isObjectVisible, isSchemaVisible, visibleSchemas, visibleSchemasRaw } from "../datasource/schemas";
+import { setDataSourceList } from "../table/ds";
 
 // ---------------------------------------------------------------- signals
 
@@ -227,6 +228,7 @@ export async function reloadDataSources(): Promise<void> {
   const list = sortDataSources(await listDataSources(), sortAlphabetically());
   const prev = new Map(roots().map((n) => [n.id, n]));
   setDataSources(list);
+  setDataSourceList(list);
   let changed = prev.size !== list.length;
   let relabelled = false;
   const next = list.map((ds) => {

@@ -2,7 +2,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { resetVisibleSchemasCache } from "../../state/schema-filter";
 import { configFromForm, formFromDataSource, normalizedForm, reconnectsOnApply, reconnectsOnSave, savedPart } from "./model";
-import { isSchemaVisible, parseVisibleSchemas, saveVisibleSchemas, visibleSchemas, visibleSchemasRaw } from "./schemas";
+import { isSchemaVisible, parseVisibleSchemas, saveVisibleSchemas, visibleSchemaNodes, visibleSchemas, visibleSchemasRaw } from "./schemas";
 
 const ds = (options: Record<string, string> = {}) =>
   ({ id: "d1", name: "pg", driver: "postgres", host: "localhost", port: 5432, database: "postgres", user: "u", file: "", urlOverride: null, options, color: null, readOnly: false, hasPassword: true, passwordStorage: "none" }) as never;
@@ -110,5 +110,18 @@ describe("a legacy data source that still has options.visibleSchemas", () => {
   it("a stored empty option stays as stored (not dropped, so no reconnect)", () => {
     const stored = ds({ empty: "" });
     expect(reconnectsOnApply(formFromDataSource(stored), "d1", stored)).toBe(false);
+  });
+});
+
+describe("the console's schema switcher follows the schema filter", () => {
+  const ora = { id: "o1", driver: "oracle", database: "FREEPDB1", user: "demo", options: {} } as never;
+  const node = (name: string, system = false, isDefault = false) => ({ kind: "schema", path: [name], extra: { system, default: isDefault } });
+  const all = [node("DEMO", false, true), node("SYSTEM", true), node("SYS", true)];
+  it("default view: the non-system schemas only", () => {
+    expect(visibleSchemaNodes(ora, all).map((n) => n.path[0])).toEqual(["DEMO"]);
+  });
+  it("a schema added through the picker (an Oracle-maintained one) is offered too", () => {
+    saveVisibleSchemas("o1", JSON.stringify({ paths: [["DEMO"], ["SYSTEM"]] }));
+    expect(visibleSchemaNodes(ora, all).map((n) => n.path[0])).toEqual(["DEMO", "SYSTEM"]);
   });
 });

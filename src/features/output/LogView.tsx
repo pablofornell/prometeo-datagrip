@@ -1,5 +1,5 @@
 /** The Output tab: timestamped log of the console (statement echo, row counts, errors in red). */
-import { For, Show, createEffect, type JSX } from "solid-js";
+import { For, Show, createEffect, on, onMount, type JSX } from "solid-js";
 import { ActionButton } from "../../components/ui";
 import { escapeHtml, highlightSql } from "./highlight";
 import { logTimestamp } from "./format";
@@ -47,16 +47,24 @@ export function LogView(props: { out: ConsoleOutput }): JSX.Element {
   let sc!: HTMLDivElement;
   const out = () => props.out;
 
+  // new lines (a run) and a tab shown again scroll to the end; the second pass catches the layout that follows the paint
+  const toEnd = () => {
+    sc.scrollTop = sc.scrollHeight;
+    requestAnimationFrame(() => (sc.scrollTop = sc.scrollHeight));
+  };
   createEffect(() => {
     const n = out().lines.length;
-    if (n && out().scrollToEnd()) queueMicrotask(() => (sc.scrollTop = sc.scrollHeight));
+    if (n && out().scrollToEnd()) queueMicrotask(toEnd);
   });
+  onMount(() => out().scrollToEnd() && queueMicrotask(toEnd));
+  // the pane is hidden (display: none, no height) while a result is selected: lines added then are only reached when it is shown again
+  createEffect(on([() => out().selected(), () => out().logAside()], () => out().scrollToEnd() && requestAnimationFrame(toEnd), { defer: true }));
 
   return (
     <div class="dgo-logwrap">
       <div ref={sc} class="dgo-log" classList={{ wrap: out().wrap() }} tabindex={0} data-focus-target>
         <Show when={out().lines.length} fallback={<div class="dgo-empty">Console output</div>}>
-          <For each={out().lines}>{(l) => <div class="dgo-line" classList={{ err: l.kind === "error" }} innerHTML={lineHtml(l, out().dialect)} />}</For>
+          <For each={out().lines}>{(l) => <div class="dgo-line" classList={{ err: l.kind === "error", warn: l.kind === "warning" }} innerHTML={lineHtml(l, out().dialect)} />}</For>
         </Show>
       </div>
       <div class="dgo-vtb">

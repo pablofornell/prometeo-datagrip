@@ -53,6 +53,19 @@ export function isSchemaVisible(ds: Pick<DataSource, "id" | "options" | "driver"
   return f.paths.some((p) => path.every((x, i) => p[i] === x));
 }
 
+/**
+ * The schemas of `nodes` (a level of the introspection tree, listed WITH the system ones) that the explorer shows:
+ * the ones the stored filter names, else every non-system schema. The console's schema switcher uses it, so a schema
+ * added through the schema picker (an Oracle-maintained one such as SYSTEM) is offered there too.
+ */
+export function visibleSchemaNodes<T extends { kind: string; path: string[]; extra: Record<string, any> }>(
+  ds: Pick<DataSource, "id" | "options" | "driver" | "database" | "user">,
+  nodes: readonly T[],
+): T[] {
+  const explicit = visibleSchemas(ds) !== null;
+  return nodes.filter((n) => n.kind !== "schema" || (explicit ? isSchemaVisible(ds, n.path, { isDefault: !!n.extra.default }) : !n.extra.system));
+}
+
 /** Same by schema name only (search lists, where there is no node): the paths' last element is the schema. */
 export function isSchemaNameVisible(ds: Pick<DataSource, "id" | "options" | "driver" | "database" | "user">, name: string): boolean {
   const f = parseFilter(visibleSchemasRaw(ds));

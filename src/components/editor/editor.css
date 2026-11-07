@@ -244,6 +244,9 @@
 .sql-editor .cm-exec-err {
   color: var(--dg-editor-error-stripe);
 }
+.sql-editor .cm-exec-warn {
+  color: var(--dg-editor-warning-stripe);
+}
 .sql-editor .cm-exec-running {
   color: var(--dg-icon);
 }

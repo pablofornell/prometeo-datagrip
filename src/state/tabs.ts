@@ -3,6 +3,7 @@ import { createSignal } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import { type PaneTree, type SplitDir, hasPane, leaf, leaves, oppositePane, removeLeaf, splitIds, splitLeaf } from "./panes";
 import { loadLocal, saveUiState } from "./persist";
+import { type Ask, runDecisions } from "./decisions";
 
 export type TabKind = "console" | "table" | "ddl" | "file";
 
@@ -361,12 +362,30 @@ async function mayClose(tab: EditorTab): Promise<boolean> {
   return true;
 }
 
-/** Asks the `beforeClose` hooks about every open tab without closing any (quitting the app). False when one vetoed. */
-export async function confirmCloseAll(): Promise<boolean> {
-  for (const t of [...tabsState.list]) {
-    if (!(await mayClose({ ...t }))) return false;
-  }
-  return true;
+/** What a tab wants asked when the application quits (`registerQuitGuard`); the answer is applied only if nobody cancels. */
+export type QuitGuard = (tab: EditorTab) => ReturnType<Ask>;
+
+const quitGuards = new Set<QuitGuard>();
+
+/**
+ * Registers a quit question for tabs (unsaved file, pending table changes). Unlike `beforeClose` it only asks: the
+ * returned plan is applied after every question was answered, see `runDecisions`.
+ */
+export function registerQuitGuard(guard: QuitGuard): () => void {
+  quitGuards.add(guard);
+  return () => void quitGuards.delete(guard);
+}
+
+/** The questions quitting asks about the open tabs, in tab order (nothing is closed). Run them with `runDecisions`. */
+export function quitAsks(): Ask[] {
+  const asks: Ask[] = [];
+  for (const t of [...tabsState.list]) for (const g of [...quitGuards]) asks.push(() => g({ ...t }));
+  return asks;
+}
+
+/** Quitting the app: asks every tab, applies the answers when nobody cancelled. False when the quit is off. */
+export function confirmCloseAll(): Promise<boolean> {
+  return runDecisions(quitAsks());
 }
 
 /** Removes the tab without asking (the caller already decided, or the tab's subject is gone). */

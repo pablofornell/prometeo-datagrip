@@ -34,6 +34,12 @@ export function selectSql(driver: Driver, ref: ObjectRef, where: string, orderBy
   return sql;
 }
 
+/** `sql` limited to its first `n` rows: `limit n` (PostgreSQL, MySQL, SQLite) or `fetch first n rows only` (Oracle has no LIMIT: ORA-03047). */
+export function limitedSql(driver: Driver, sql: string, n: number): string {
+  const body = sql.replace(/[\s;]+$/, "");
+  return driver === "oracle" ? `${body} fetch first ${n} rows only` : `${body} limit ${n}`;
+}
+
 /**
  * The query behind a table editor page as DataGrip logs it: `SELECT t.* FROM sales.clients t LIMIT 501` (one more
  * row than the page, to know whether there is a next page). `all` has no LIMIT. Oracle pages with

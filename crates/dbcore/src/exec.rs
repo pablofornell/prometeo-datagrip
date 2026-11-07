@@ -30,9 +30,12 @@
 //!
 //! # Oracle
 //! Oracle has no autocommit: with `ExecOptions::auto_commit` (the console's Auto mode) every statement that
-//! succeeded is committed right after it. After PL/SQL blocks, `CALL` / `EXEC` and queries that call functions
+//! succeeded is committed right after it (after one that failed the transaction is rolled back: the server undid
+//! the statement already). After PL/SQL blocks, `CALL` / `EXEC` and queries that call functions
 //! the lines written with `DBMS_OUTPUT.PUT_LINE` are drained and sent as `Message` events (before the error of a
-//! failed statement, if any).
+//! failed statement, if any). A `CREATE [OR REPLACE] PROCEDURE / FUNCTION / PACKAGE [BODY] / TRIGGER / TYPE [BODY] /
+//! VIEW` that succeeded but left the object INVALID (`ORA-24344`) is followed by an [`ExecEvent::Warning`] with the
+//! errors of `ALL_ERRORS`; a PL/SQL block or `CALL` reports 0 rows affected.
 //!
 //! # Lost connection
 //! When a statement fails because the connection is gone (see [`DbError::ConnectionLost`]) the `Error` event
@@ -326,8 +329,26 @@ impl Task {
                 }
             }
         }
-        if ok && self.opts.auto_commit && c.in_transaction() {
-            return c.commit().await.err().map(|e| e.for_driver(Driver::Oracle));
+        if ok {
+            // `CREATE [OR REPLACE] PROCEDURE ...` succeeds even when the object does not compile (ORA-24344)
+            if let Ok(Some((ty, name, errors))) = crate::oracle::compile_errors(c, sql).await {
+                self.sh.send(ExecEvent::Warning {
+                    index: idx,
+                    message: format!("Warning: {ty} {name} compiled with errors"),
+                    details: errors
+                        .into_iter()
+                        .map(|(line, col, text)| format!("{line}/{col}: {}", text.trim_end()))
+                        .collect(),
+                });
+            }
+        }
+        if self.opts.auto_commit && c.in_transaction() {
+            if ok {
+                return c.commit().await.err().map(|e| e.for_driver(Driver::Oracle));
+            }
+            // the server undid the failed statement; what is left open is the transaction it started (the
+            // read-only transaction of a read-only data source), which would hold its snapshot for good
+            let _ = c.rollback().await;
         }
         None
     }

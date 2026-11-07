@@ -12,6 +12,7 @@ import { Index, Show, createEffect, createSignal, on, onCleanup, type JSX } from
 import { Portal } from "solid-js/web";
 import { actionShortcut, getAction, isActionEnabled } from "../../state/actions";
 import { Icon } from "./Icon";
+import { anchorRect } from "./anchor-redirect";
 import { mnemonicIndex, pruneItems } from "./menu-util";
 
 export type MenuItem =
@@ -110,7 +111,7 @@ export function openMenu(rawItems: MenuItem[], opts: OpenMenuOptions = {}): void
   }
   let rect: Level["rect"];
   if (opts.anchor) {
-    const r = opts.anchor.getBoundingClientRect();
+    const r = anchorRect(opts.anchor);
     rect = { left: r.left, right: r.right, top: r.top, bottom: r.bottom };
   } else {
     const x = opts.x ?? 0;

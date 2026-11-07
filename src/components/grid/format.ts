@@ -35,6 +35,11 @@ export function classifyType(typeName: string): ColumnKind {
   return "other";
 }
 
+/** `classifyType`, for a grid of `dialect`: an Oracle DATE carries a time of day, so it is a `datetime`. */
+export function columnKind(typeName: string, dialect?: string): ColumnKind {
+  return dialect === "oracle" && typeName.trim().toLowerCase() === "date" ? "datetime" : classifyType(typeName);
+}
+
 const MAX_DISPLAY = 400;
 const WS_RE = /[\r\n\t\u2028\u2029]+/g;
 const WS_TEST = /[\r\n\t\u2028\u2029]/;

@@ -6,27 +6,26 @@
  *
  * The toolbar is clipped (`dg-ovf`); children keep their own click handlers: a menu entry clicks the hidden
  * button, whose `getBoundingClientRect()` answers with the "»" rectangle meanwhile, so popups that anchor under
- * their button open under "»".
+ * their button open under "»". Handlers that open their popup later (after an await) are covered by
+ * `redirectAnchor`: `openMenu` anchors an element without a box to the "»" button.
  */
+import { clearAnchorRedirect, redirectAnchor } from "./anchor-redirect";
 import { openMenu, type MenuItem } from "./Menu";
-import { fitCount } from "./overflow-fit";
+import { controlOf, fitCount, labelOf } from "./overflow-fit";
 
 const SEP = /(^|\s)(dg-toolbar-sep|dgg-tsep)(\s|$)/;
 const isSep = (el: Element) => SEP.test(el.getAttribute("class") ?? "");
 
-/** The label of a hidden item: its text (`Tx: Auto`), else its tooltip. */
-function labelOf(el: HTMLElement): string {
-  return ((el.textContent ?? "").replace(/\s+/g, " ").trim() || el.dataset.tip || el.getAttribute("aria-label") || "").trim();
-}
-
-function entryOf(el: HTMLElement, anchor: HTMLElement): MenuItem {
+function entryOf(item: HTMLElement, anchor: HTMLElement): MenuItem {
+  const el = controlOf(item);
   const off = el.hasAttribute("disabled") || el.getAttribute("aria-disabled") === "true" || el.classList.contains("dg-disabled");
   return {
-    label: labelOf(el) || "Action",
+    label: labelOf(item) || "Action",
     shortcut: el.dataset.tipShortcut,
     enabled: !off,
     checked: el.classList.contains("selected") || el.classList.contains("dg-selected") ? true : undefined,
     run: () => {
+      // synchronous handlers read the rectangle of the button itself; later ones go through `redirectAnchor`
       const rect = () => anchor.getBoundingClientRect();
       el.getBoundingClientRect = rect;
       try {
@@ -66,7 +65,10 @@ export function overflowToolbar(bar: HTMLElement): void {
 
   const layout = () => {
     const kids = [...bar.children].filter((c): c is HTMLElement => c instanceof HTMLElement && c !== more);
-    for (const k of kids) k.removeAttribute("data-ovf");
+    for (const k of kids) {
+      k.removeAttribute("data-ovf");
+      clearAnchorRedirect(k);
+    }
     more.hidden = true;
     if (!bar.clientWidth) return; // not shown
     const cs = getComputedStyle(bar);
@@ -80,7 +82,10 @@ export function overflowToolbar(bar: HTMLElement): void {
     const cut = kids.slice(keep);
     hiddenItems = cut.filter((_, i) => widths[keep + i] > 0);
     if (!hiddenItems.length) return;
-    for (const k of cut) k.setAttribute("data-ovf", "");
+    for (const k of cut) {
+      k.setAttribute("data-ovf", "");
+      redirectAnchor(k, more);
+    }
     more.hidden = false;
   };
 

@@ -1,8 +1,11 @@
 // @vitest-environment node
 // Valid statements of PostgreSQL / MySQL / SQLite that the inspections must not flag.
 import { describe, expect, it } from "vitest";
+import { EditorState } from "@codemirror/state";
+import { computeProblems } from "./inspect";
 import { lex } from "./lexer";
 import { SchemaIndex } from "./schemaIndex";
+import { configField, problemsField, setConfig } from "./state";
 import { analyzeStatement } from "./semantic";
 import { syntaxProblems } from "./syntax";
 import type { Dialect } from "./split";
@@ -172,6 +175,36 @@ describe("Oracle", () => {
   it("still flags unknown names", () => {
     expect(ora("select nope from t where b = 1")).toEqual(["column:nope|Unable to resolve column 'nope'"]);
     expect(ora("select 1 from nosuch").join()).toContain("Unable to resolve table 'nosuch'");
+  });
+  it("resolves synonyms and knows the data dictionary", () => {
+    const syn = new SchemaIndex(
+      {
+        schemas: [
+          {
+            name: "DEMO",
+            tables: [{ name: "PRODUCTS", kind: "table", columns: [{ name: "ID", type: "NUMBER" }, { name: "NAME", type: "VARCHAR2" }] }],
+            synonyms: [{ name: "SYN_PRODUCTS", target: ["DEMO", "PRODUCTS"] }, { name: "REMOTE_T", target: undefined }, { name: "SYN_GONE", target: ["OTHER", "GONE"] }],
+          },
+        ],
+      },
+      "DEMO",
+    );
+    const run = (sql: string) => analyzeStatement(sql, lex(sql, "oracle"), syn, "oracle").unresolved.map((u) => u.message);
+    expect(run("select * from syn_products where rownum < 3")).toEqual([]);
+    expect(run("select id, name from syn_products")).toEqual([]);
+    expect(run("select nope from syn_products")).toEqual(["Unable to resolve column 'nope'"]);
+    expect(run("select * from remote_t")).toEqual([]);
+    expect(run("select x.a from syn_gone x")).toEqual([]);
+    for (const v of ["all_objects", "user_tables", "dba_users", "v$session", "gv$sql", "sys.all_objects", "public.user_tab_columns", "dual"])
+      expect(run(`select count(*) from ${v} a, ${v} b`), v).toEqual([]);
+    expect(run("select o.owner, o.object_name from all_objects o where o.owner = 'X'")).toEqual([]);
+    expect(run("select * from nosuch")).toEqual(["Unable to resolve table 'nosuch'"]);
+    expect(run("select * from demo.nosuch")).toEqual(["Unable to resolve table 'nosuch'"]);
+  });
+  it("a / line after a PL/SQL unit is not an expression", () => {
+    const doc = "create or replace function f(p number) return number is\nbegin\n  return p * 2;\nend f;\n/\ncreate or replace procedure q is\nbegin\n  null;\nend;\n/\nselect 1 from dual;";
+    const st = EditorState.create({ doc, extensions: [configField, problemsField] }).update({ effects: setConfig.of({ dialect: "oracle", index, statementFrame: true }) }).state;
+    expect(computeProblems(st).map((p) => `${p.kind}:${doc.slice(p.from, p.to)}|${p.message}`)).toEqual([]);
   });
   it("matches upper-case catalog names case-insensitively", () => {
     const up = new SchemaIndex({ schemas: [{ name: "DEMO", tables: [{ name: "EMP", kind: "table", columns: [{ name: "EMPNO", type: "NUMBER" }] }] }] }, "DEMO");

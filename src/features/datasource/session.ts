@@ -192,10 +192,21 @@ export function createSession() {
     const d = drafts[i];
     batch(() => {
       setDrafts(i, "form", "url", text);
-      if (d.form.connType !== "default") return;
       const dbms = d.form.dbms;
+      // Oracle keeps User / Password / Service / SID fields in "URL only" mode too: the URL feeds them as it is typed
+      const follow = d.form.connType === "default" || (d.form.connType === "url" && dbms === "oracle");
+      if (!follow) return;
       const p = parseUrl(dbms, text);
       if (!p) return;
+      if (dbms === "oracle") {
+        setDrafts(i, "form", { host: p.host, port: p.port, database: p.database });
+        setOption("oracleConnType", p.sid ? "sid" : undefined);
+        if (p.user) setDrafts(i, "form", "user", p.user);
+        if (p.password) setDrafts(i, "password", { value: p.password, touched: true });
+        if (d.form.connType === "default" && (p.query || p.user)) setDrafts(i, "form", "connType", "url");
+        derive(i, { url: false });
+        return;
+      }
       if (p.query || p.user) {
         // parameters cannot be represented by the fields: keep the URL as the source of truth
         setDrafts(i, "form", "connType", "url");
@@ -203,7 +214,6 @@ export function createSession() {
       }
       if (dbms === "sqlite") setDrafts(i, "form", "file", sqliteFileOfUrl(text) ?? "");
       else setDrafts(i, "form", { host: p.host, port: p.port, database: p.database });
-      if (dbms === "oracle") setOption("oracleConnType", p.sid ? "sid" : undefined);
       derive(i, { url: false });
     });
   }
@@ -349,7 +359,7 @@ export function createSession() {
     setError(null);
     const cfg: Partial<DataSourceConfig> = { ...configFromForm(d.form, d.id, d.saved), password: passwordToSend(d) };
     // a duplicate that was not applied yet: the backend looks the password up by the id of the original
-    if (d.passwordFrom && !d.id && cfg.password == null && d.form.auth === "password" && d.form.connType !== "url") cfg.id = d.passwordFrom;
+    if (d.passwordFrom && !d.id && cfg.password == null && d.form.auth === "password" && (d.form.connType !== "url" || d.form.dbms === "oracle")) cfg.id = d.passwordFrom;
     const sslmode = d.form.options.sslmode ?? null;
     const dbms = d.form.dbms;
     const target = { driver: dbms, host: d.form.host, port: d.form.port, file: d.form.file };
@@ -384,8 +394,20 @@ export function createSession() {
     );
   }
 
+  /** The connection settings changed since the last Test Connection: its icon and DBMS info no longer describe them. */
+  function resetTest(key: string): void {
+    const j = indexOf(key);
+    if (j < 0 || drafts[j].test.state === "running") return;
+    setDrafts(j, "test", produce((x) => {
+      x.state = "idle";
+      delete x.info;
+      delete x.lastOk;
+    }));
+  }
+
   function passwordToSend(d: Draft): string | null {
-    if (d.form.connType === "url") return null; // credentials travel inside the URL
+    // PostgreSQL / MySQL: credentials travel inside the URL; Oracle's "URL only" has its own User / Password fields
+    if (d.form.connType === "url" && d.form.dbms !== "oracle") return null;
     if (d.form.auth === "none") return d.saved?.hasPassword || d.password.touched ? "" : null;
     return d.password.touched ? d.password.value : null;
   }
@@ -487,6 +509,7 @@ export function createSession() {
     removeSelected,
     duplicateSelected,
     test,
+    resetTest,
     apply,
     indexOf,
   };

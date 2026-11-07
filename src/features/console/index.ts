@@ -11,12 +11,13 @@ import { appInfo, isTauri } from "../../api/db";
 import { notify } from "../../components/ui";
 import { registerSlot } from "../../state/slots";
 import { setStatus } from "../../state/status";
-import { activeTab, confirmCloseAll, registerBeforeClose } from "../../state/tabs";
+import { runDecisions } from "../../state/decisions";
+import { activeTab, quitAsks, registerBeforeClose } from "../../state/tabs";
 import { registerConsoleActions } from "./actions";
 import { ConsoleView } from "./ConsoleView";
 import { createQuitHandler } from "./quit";
 import { focusTopDialog, showProgress } from "../table/dialogs";
-import { type TxProgress, confirmEndTransactions } from "./txguard";
+import { type TxProgress, askEndTransactions, confirmEndTransactions } from "./txguard";
 import "./console.css";
 
 export { activeSession, sessionOf } from "./registry";
@@ -32,8 +33,10 @@ registerBeforeClose((tab) => (tab.kind === "console" || tab.kind === "file" ? co
 
 /**
  * Quitting the app (window close button, Alt+F4, File > Exit) ends every session and drops unsaved work: ask first.
- * Open transactions (Commit / Roll Back / Cancel), then every tab's own close hook (pending table changes: Submit /
- * Discard / Cancel; unsaved files: Save / Don't Save / Cancel).
+ * Every question is asked first, nothing is applied until all were answered (Cancel on any of them keeps everything as
+ * it is): every tab's quit guard (pending table changes: Submit / Discard / Cancel; unsaved files: Save / Don't Save /
+ * Cancel), then the open transactions (Commit / Roll Back / Cancel). The answers are applied in that order, the
+ * transactions last. "Quit anyway" on a COMMIT that hangs quits at once: no further question, no further wait.
  *
  * Tauri destroys the window itself unless a JS close handler exists, and a handler makes the JS side responsible for
  * closing. So the handler is installed once at start; after the user's answer it is removed and the window is closed
@@ -50,6 +53,9 @@ const quitProgress: TxProgress = {
     }),
 };
 
+/** The window gets this long to close once the user has decided; then it is destroyed. */
+const QUIT_HARD_MS = 5_000;
+
 function guardQuit(): void {
   if (!isTauri()) return;
   void (async () => {
@@ -58,11 +64,13 @@ function guardQuit(): void {
       const win = getCurrentWindow();
       const un: () => void = await win.onCloseRequested(
         createQuitHandler({
-          confirm: async () => (await confirmEndTransactions({ reason: "quitting the application", progress: quitProgress })) && (await confirmCloseAll()),
+          confirm: () => runDecisions([...quitAsks(), () => askEndTransactions({ reason: "quitting the application", progress: quitProgress })]),
           focus: focusTopDialog,
           quit: async () => {
             un();
-            await win.close();
+            // hard stop: a close that does not come back (a window that never answers) must not trap the user
+            const closed = await Promise.race([win.close().then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), QUIT_HARD_MS))]);
+            if (!closed) await win.destroy();
           },
         }),
       );

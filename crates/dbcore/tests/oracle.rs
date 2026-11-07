@@ -372,7 +372,14 @@ mod dialect {
             .ddl("ora", &obj(NodeKind::Sequence, "SEQ_INVOICE"))
             .await
             .unwrap();
-        assert!(seq.contains("INCREMENT BY 5 START WITH 1000"), "{seq}");
+        // DBMS_METADATA writes the sequence's current position as START WITH,
+        // so it moves on once anything has used the sequence.
+        let start = seq
+            .split("INCREMENT BY 5 START WITH ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse::<u64>().ok());
+        assert!(start.is_some_and(|n| n >= 1000), "{seq}");
         let proc_ = mgr
             .ddl("ora", &obj(NodeKind::Procedure, "RESTOCK"))
             .await
@@ -970,6 +977,127 @@ mod dialect {
             .await
             .is_err());
         assert!(mgr.explain(&s, sql, true).await.is_err());
+        mgr.close_session(&s).await;
+    }
+
+    /// EXPLAIN PLAN writes into PLAN_TABLE: the session must end up as it was (no transaction, or the user's own).
+    #[tokio::test]
+    async fn explain_leaves_the_transaction_state_alone() {
+        let (_cfg, mgr) = setup!();
+        let s = mgr.open_session("ora").await.unwrap();
+        let auto = ExecOptions {
+            auto_commit: true,
+            ..Default::default()
+        };
+        let _ = mgr
+            .execute_collect(&s, "drop table fxb_explain purge", auto.clone())
+            .await;
+        assert_ok(
+            &mgr.execute_collect(&s, "create table fxb_explain (id number)", auto.clone())
+                .await
+                .unwrap(),
+        );
+        // idle console in Auto mode: nothing open afterwards
+        assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Idle);
+        mgr.explain(&s, "select * from fxb_explain", false)
+            .await
+            .unwrap();
+        assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Idle);
+        assert!(!mgr.session_in_transaction(&s).unwrap());
+        // a failing explain leaves nothing open either
+        assert!(mgr
+            .explain(&s, "select * from no_such_t_x", false)
+            .await
+            .is_err());
+        assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Idle);
+        // the user's open transaction is untouched: still open, its row still there
+        assert_ok(&run(&mgr, &s, "insert into fxb_explain values (7)").await);
+        assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Active);
+        mgr.explain(&s, "select * from fxb_explain where id = 7", false)
+            .await
+            .unwrap();
+        assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Active);
+        assert_eq!(
+            txt(&scalar(
+                &run(&mgr, &s, "select count(*) from fxb_explain").await
+            )),
+            "1"
+        );
+        assert_eq!(
+            txt(&scalar(
+                &run(&mgr, &s, "select count(*) from plan_table").await
+            )),
+            "0"
+        );
+        assert_ok(&run(&mgr, &s, "rollback").await);
+        assert_eq!(
+            txt(&scalar(
+                &run(&mgr, &s, "select count(*) from fxb_explain").await
+            )),
+            "0"
+        );
+        assert_ok(&run(&mgr, &s, "drop table fxb_explain purge").await);
+        mgr.close_session(&s).await;
+    }
+
+    /// A batch mixing short texts with texts over 2000 bytes (CLOB expressions) must go in as one statement.
+    #[tokio::test]
+    async fn import_batches_mixing_short_and_long_text() {
+        let (_cfg, mgr) = setup!();
+        let s = mgr.open_session("ora").await.unwrap();
+        assert_ok(&run(&mgr, &s, "begin execute immediate 'drop table fxb_imp_clob purge'; exception when others then null; end;").await);
+        assert_ok(
+            &run(
+                &mgr,
+                &s,
+                "create table fxb_imp_clob (id number, body clob, note varchar2(50))",
+            )
+            .await,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.csv");
+        let long = "x".repeat(2500);
+        std::fs::write(
+            &path,
+            format!("id,body,note\n1,short,a\n2,{long},\n3,,c\n4,\"é\",d\n"),
+        )
+        .unwrap();
+        let col = |name: &str, i: usize, ty: &str| json!({"name": name, "source": i, "type": ty});
+        let req: ImportRequest = serde_json::from_value(json!({
+            "path": path,
+            "schema": "DEMO",
+            "table": "FXB_IMP_CLOB",
+            "createTable": false,
+            "columns": [col("ID", 0, "number"), col("BODY", 1, "clob"), col("NOTE", 2, "varchar2(50)")],
+            "options": {"batchSize": 100},
+        }))
+        .unwrap();
+        let r = mgr
+            .import_file("ora", &req, &CancellationToken::new(), &|_| {})
+            .await
+            .unwrap();
+        assert_eq!((r.imported, r.failed), (4, 0), "{r:?}");
+        let ev = run(
+            &mgr,
+            &s,
+            "select id, length(body), dbms_lob.substr(body, 5, 1) from fxb_imp_clob order by id",
+        )
+        .await;
+        let (_c, rows, _) = first_rs(&ev);
+        let got: Vec<_> = rows
+            .iter()
+            .map(|r| (txt(&r[0]), txt(&r[1]), txt(&r[2])))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("1".into(), "5".into(), "short".into()),
+                ("2".into(), "2500".into(), "xxxxx".into()),
+                ("3".into(), "NULL".into(), "NULL".into()),
+                ("4".into(), "1".into(), "é".into()),
+            ]
+        );
+        assert_ok(&run(&mgr, &s, "drop table fxb_imp_clob purge").await);
         mgr.close_session(&s).await;
     }
 
@@ -1826,8 +1954,10 @@ mod runtime {
                 errors(&ev)
             );
         }
-        // session settings are fine; the session never looks like it has a transaction
+        // session settings are fine; the read-only transaction the rejected writes opened is reported (Manual
+        // mode) until it is ended
         assert_ok(&run(&mgr, &s, "alter session set current_schema = DEMO").await);
+        assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Active);
         assert_ok(&run(&mgr, &s, "commit").await);
         assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Idle);
         // still readable and unchanged after the rejected writes and the commit
@@ -1837,6 +1967,137 @@ mod runtime {
         );
         mgr.close_session(&s).await;
         assert_ok(&run_auto(&rw, &w, "drop table a_rt_ro purge").await);
+        rw.close_session(&w).await;
+    }
+
+    /// Auto mode ends the read-only transaction after each statement: later reads see what other sessions commit.
+    #[tokio::test]
+    async fn read_only_auto_mode_does_not_freeze_the_snapshot() {
+        let (cfg, _mgr) = setup!();
+        let rw = connected(&cfg).await;
+        let w = rw.open_session("ora").await.unwrap();
+        let _ = run_auto(&rw, &w, "drop table fxb_ro_snap purge").await;
+        assert_ok(&run_auto(&rw, &w, "create table fxb_ro_snap (id number)").await);
+        // a read-only transaction cannot read a table whose DDL is younger than its snapshot (ORA-01466, 1 s grain)
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let mut ro_cfg = cfg.clone();
+        ro_cfg.read_only = true;
+        let mgr = connected(&ro_cfg).await;
+        let s = mgr.open_session("ora").await.unwrap();
+        let count = |mgr: &ConnectionManager, s: &SessionId| {
+            let (mgr, s) = (mgr.clone(), s.clone());
+            async move {
+                txt(&scalar(
+                    &run_auto(&mgr, &s, "select count(*) from fxb_ro_snap").await,
+                ))
+            }
+        };
+        assert_eq!(count(&mgr, &s).await, "0");
+        // a statement that opens the read-only transaction (a block), then the other session commits
+        assert_ok(&run_auto(&mgr, &s, "begin null; end;").await);
+        assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Idle);
+        assert_ok(&run_auto(&rw, &w, "insert into fxb_ro_snap values (1)").await);
+        assert_eq!(count(&mgr, &s).await, "1");
+        // a rejected write ends its transaction too
+        let ev = run_auto(&mgr, &s, "insert into fxb_ro_snap values (2)").await;
+        assert!(errors(&ev)[0].starts_with("ORA-01456"), "{:?}", errors(&ev));
+        assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Idle);
+        assert_ok(&run_auto(&rw, &w, "insert into fxb_ro_snap values (3)").await);
+        assert_eq!(count(&mgr, &s).await, "2");
+        // Manual mode: the transaction is reported and keeps its snapshot until it ends
+        assert_ok(&run(&mgr, &s, "begin null; end;").await);
+        assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Active);
+        assert_ok(&run_auto(&rw, &w, "insert into fxb_ro_snap values (4)").await);
+        assert_eq!(
+            txt(&scalar(
+                &run(&mgr, &s, "select count(*) from fxb_ro_snap").await
+            )),
+            "2"
+        );
+        assert_ok(&run(&mgr, &s, "rollback").await);
+        assert_eq!(mgr.session_tx_status(&s).unwrap(), TxStatus::Idle);
+        assert_eq!(
+            txt(&scalar(
+                &run(&mgr, &s, "select count(*) from fxb_ro_snap").await
+            )),
+            "3"
+        );
+        mgr.close_session(&s).await;
+        assert_ok(&run_auto(&rw, &w, "drop table fxb_ro_snap purge").await);
+        rw.close_session(&w).await;
+    }
+
+    /// PL/SQL and SET TRANSACTION must not be a way out of a read-only data source.
+    #[tokio::test]
+    async fn read_only_refuses_the_bypasses() {
+        let (cfg, _mgr) = setup!();
+        let rw = connected(&cfg).await;
+        let w = rw.open_session("ora").await.unwrap();
+        let _ = run_auto(&rw, &w, "drop table fxb_ro_by purge").await;
+        let _ = run_auto(&rw, &w, "drop table fxb_ro_by2 purge").await;
+        assert_ok(&run_auto(&rw, &w, "create table fxb_ro_by (id number)").await);
+        assert_ok(&run_auto(&rw, &w, "insert into fxb_ro_by values (1)").await);
+        tokio::time::sleep(Duration::from_millis(1500)).await; // see read_only_auto_mode_does_not_freeze_the_snapshot
+
+        let mut ro_cfg = cfg.clone();
+        ro_cfg.read_only = true;
+        let mgr = connected(&ro_cfg).await;
+        let s = mgr.open_session("ora").await.unwrap();
+        for sql in [
+            "begin execute immediate 'create table fxb_ro_by2 (a number)'; end;",
+            "begin commit; delete from fxb_ro_by; commit; end;",
+            "begin rollback; delete from fxb_ro_by; end;",
+            "declare c integer := dbms_sql.open_cursor; begin null; end;",
+            "set transaction read write",
+            "set transaction isolation level serializable",
+        ] {
+            for auto in [false, true] {
+                let ev = if auto {
+                    run_auto(&mgr, &s, sql).await
+                } else {
+                    run(&mgr, &s, sql).await
+                };
+                let e = errors(&ev);
+                assert!(
+                    e.len() == 1 && e[0].starts_with("ORA-01456") && e[0].contains("read-only"),
+                    "{sql}: {e:?}"
+                );
+            }
+        }
+        // the gate was not fooled: the follow-up DML fails, nothing changed, no table appeared
+        let ev = run_auto(&mgr, &s, "delete from fxb_ro_by").await;
+        assert!(errors(&ev)[0].starts_with("ORA-01456"), "{:?}", errors(&ev));
+        assert_eq!(
+            txt(&scalar(
+                &run_auto(&rw, &w, "select count(*) from fxb_ro_by").await
+            )),
+            "1"
+        );
+        assert_eq!(
+            txt(&scalar(
+                &run_auto(
+                    &rw,
+                    &w,
+                    "select count(*) from user_tables where table_name = 'FXB_RO_BY2'"
+                )
+                .await
+            )),
+            "0"
+        );
+        // harmless blocks and SET TRANSACTION READ ONLY still work; words in strings and comments are no code
+        assert_ok(&run_auto(&mgr, &s, "set transaction read only").await);
+        assert_ok(&run_auto(&mgr, &s, "commit").await);
+        let ev = run_auto(
+            &mgr,
+            &s,
+            "begin dbms_output.put_line('commit; execute immediate'); /* rollback */ end;",
+        )
+        .await;
+        assert_ok(&ev);
+        assert_eq!(messages(&ev), ["commit; execute immediate"]);
+        mgr.close_session(&s).await;
+        assert_ok(&run_auto(&rw, &w, "drop table fxb_ro_by purge").await);
         rw.close_session(&w).await;
     }
 
@@ -1920,6 +2181,88 @@ mod runtime {
         );
         assert_ok(&run_auto(&mgr, &s, "drop procedure a_rt_p").await);
         assert_ok(&run_auto(&mgr, &s, "drop table a_rt_pl purge").await);
+        mgr.close_session(&s).await;
+    }
+
+    /// `CREATE OR REPLACE PROCEDURE` with a compile error succeeds (ORA-24344): the statement still ends with a
+    /// `Warning` event that lists the PL/SQL errors; a clean one has none. A PL/SQL block reports no row count.
+    #[tokio::test]
+    async fn invalid_stored_objects_end_with_a_warning() {
+        let (_cfg, mgr) = setup!();
+        let s = mgr.open_session("ora").await.unwrap();
+        let warnings = |ev: &[ExecEvent]| -> Vec<(usize, String, Vec<String>)> {
+            ev.iter()
+                .filter_map(|e| match e {
+                    ExecEvent::Warning {
+                        index,
+                        message,
+                        details,
+                    } => Some((*index, message.clone(), details.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let ev = run_auto(
+            &mgr,
+            &s,
+            "create or replace procedure fxk_bad as\nbegin\n  select nosuchcol into x from dual;\nend;\n/\n\
+             create or replace procedure fxk_good as\nbegin\n  null;\nend;\n/\n\
+             create or replace force view fxk_bv as select nosuchcol from dual;\n\
+             select 1 from dual",
+        )
+        .await;
+        assert_ok(&ev);
+        let w = warnings(&ev);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert_eq!(w[0].0, 0);
+        assert_eq!(w[0].1, "Warning: PROCEDURE FXK_BAD compiled with errors");
+        assert!(!w[0].2.is_empty());
+        for d in &w[0].2 {
+            let (pos, text) = d.split_once(": ").expect(d);
+            let (l, c) = pos.split_once('/').expect(d);
+            assert!(l.parse::<u32>().is_ok() && c.parse::<u32>().is_ok(), "{d}");
+            assert!(!text.is_empty());
+        }
+        assert!(
+            w[0].2
+                .iter()
+                .any(|d| d.contains("PLS-00201") || d.contains("PL/SQL")),
+            "{:?}",
+            w[0].2
+        );
+        assert_eq!(
+            (w[1].0, w[1].1.as_str()),
+            (2, "Warning: VIEW FXK_BV compiled with errors")
+        );
+        // the statement itself did succeed: an Update event, the next statements ran
+        assert_eq!(scalar(&ev), json!(1));
+        // fixing it clears the warning
+        let ev = run_auto(
+            &mgr,
+            &s,
+            "create or replace procedure fxk_bad as\nbegin\n  null;\nend;\n/",
+        )
+        .await;
+        assert_ok(&ev);
+        assert!(warnings(&ev).is_empty());
+        // an anonymous block / call reports no row count
+        let ev = run_auto(&mgr, &s, "begin null; end;\n/\ncall fxk_good()").await;
+        assert_ok(&ev);
+        let counts: Vec<u64> = ev
+            .iter()
+            .filter_map(|e| match e {
+                ExecEvent::Update { rows_affected, .. } => Some(*rows_affected),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(counts, [0, 0]);
+        for sql in [
+            "drop procedure fxk_bad",
+            "drop procedure fxk_good",
+            "drop view fxk_bv",
+        ] {
+            assert_ok(&run_auto(&mgr, &s, sql).await);
+        }
         mgr.close_session(&s).await;
     }
 

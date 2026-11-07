@@ -71,6 +71,18 @@ export function identName(text: string): string {
   return text.toLowerCase();
 }
 
+/**
+ * Oracle objects every session sees that the schema snapshot leaves out (Oracle-maintained schemas are hidden):
+ * the data dictionary and dynamic performance views (`ALL_*`, `USER_*`, `DBA_*`, `V$*`, `GV$*`) and `DUAL`, bare or
+ * qualified with `SYS` / `SYSTEM` / `PUBLIC`, which are public synonyms of them.
+ */
+const ORACLE_DICTIONARY = /^((all|user|dba|cdb)_.+|g?v\$.+|dual|dictionary|dict|dict_columns|tab|cat|col|obj|seq|syn|ind)$/;
+export function isOracleDictionaryName(parts: string[]): boolean {
+  if (parts.length === 0 || parts.length > 2) return false;
+  if (parts.length === 2 && !["sys", "system", "public"].includes(parts[0])) return false;
+  return ORACLE_DICTIONARY.test(parts[parts.length - 1]);
+}
+
 type Role = "tbl" | "sch" | "alias" | "decl" | "collist";
 
 /**
@@ -189,7 +201,10 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
           refs.push(ref);
           j = a;
         } else {
-          const ref: TableRef = { parts: nm.parts, opaque: false, table: idx.findTable(nm.parts) };
+          const table = idx.findTable(nm.parts);
+          // Oracle: a synonym whose target is not in the snapshot, a dictionary view: real objects of unknown columns
+          const known = !table && dialect === "oracle" && (!!idx.synonym(nm.parts) || isOracleDictionaryName(nm.parts));
+          const ref: TableRef = { parts: nm.parts, opaque: known, table };
           for (let q = 0; q < nm.idxs.length; q++) {
             roles[nm.idxs[q]] = q === nm.idxs.length - 1 ? "tbl" : "sch";
             tokRef.set(nm.idxs[q], ref);
@@ -409,11 +424,11 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
       if (flagUnresolved) {
         if (role === "tbl") {
           const owner = tokRef.get(i);
-          if (owner && !owner.table && !(ctes.has(w) && owner.parts.length === 1)) {
+          if (owner && !owner.table && !owner.opaque && !(ctes.has(w) && owner.parts.length === 1)) {
             mk("bad");
             flag(i, "table");
           } else if (owner?.table) hit(i, owner.table);
-        } else if (!idx.hasSchema(w) && !ctes.has(w)) {
+        } else if (!idx.hasSchema(w) && !ctes.has(w) && !(dialect === "oracle" && ["sys", "system", "public"].includes(w))) {
           mk("bad");
           flag(i, "schema");
         }

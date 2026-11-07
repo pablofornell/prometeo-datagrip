@@ -373,6 +373,15 @@ pub enum ExecEvent {
         index: Option<usize>,
         text: String,
     },
+    /// The statement succeeded but with a warning the user must see: an Oracle `CREATE [OR REPLACE]
+    /// PROCEDURE / FUNCTION / PACKAGE [BODY] / TRIGGER / TYPE [BODY] / VIEW` that left the object INVALID
+    /// (`message` is `Warning: PROCEDURE P compiled with errors`, `details` one `LINE/COL: text` per compile error).
+    /// Sent after the statement's `Update` event; the statement counts as executed but is marked as a warning.
+    Warning {
+        index: usize,
+        message: String,
+        details: Vec<String>,
+    },
     /// The transaction state of the session changed (sent right after the statement that changed
     /// it, before `Done`). Also see `ConnectionManager::session_tx_status`.
     TxStatus {

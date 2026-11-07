@@ -21,7 +21,7 @@ function History(props: { session: ConsoleSession; onClose: () => void }): JSX.E
   const [all, setAll] = createSignal<HistoryEntry[]>([]);
   const [loaded, setLoaded] = createSignal(false);
   const [sel, setSel] = createSignal(0);
-  const [listWidth, setListWidth] = createSignal(145);
+  const [listWidth, setListWidth] = createSignal(240);
   const search = createSpeedSearch(() => setSel(items().length - 1));
   let root!: HTMLDivElement;
   let list!: HTMLDivElement;

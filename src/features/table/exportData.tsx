@@ -18,10 +18,10 @@ import {
 } from "../../api/db";
 import { notify } from "../../components/ui";
 import { ensureConnected } from "../explorer";
-import { dsInfo, errText, loadDataSources, writeClipboard } from "./ds";
+import { errText, requireDriver, writeClipboard } from "./ds";
 import { mountDialog } from "./dialogs";
 import { EXPORT_FORMATS, ExportDialog, type ExportPath, type ExportTarget, exportFileBase } from "./Popups";
-import { qualifiedName, selectSql } from "./sql";
+import { limitedSql, qualifiedName, selectSql } from "./sql";
 
 const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
 const PREVIEW_ROWS = 10;
@@ -36,7 +36,7 @@ export interface ExportSource {
   options: ExportOptions;
   /** The rows of the grid (read when needed); `complete`: there are no more rows to fetch. */
   loaded?: () => { columns: ColumnMeta[]; rows: Cell[][]; complete: boolean };
-  /** The `LIMIT`ed query of the preview, when there are no loaded rows. Default: `<sql> limit 10`. */
+  /** The `LIMIT`ed query of the preview, when there are no loaded rows. Default: `<sql>` limited to 10 rows in the dialect of the data source. */
   previewSql?: string;
   /** The dialog was left with these options (the grid remembers the extractor). */
   onOptions?: (o: ExportOptions) => void;
@@ -48,7 +48,7 @@ export interface ExportSource {
 export async function exportPreview(src: ExportSource, o: ExportOptions): Promise<string> {
   const l = src.loaded?.();
   if (l) return exportToString({ columns: l.columns, rows: l.rows.slice(0, PREVIEW_ROWS) }, o);
-  return exportQueryToString(src.dsId, src.previewSql ?? `${src.sql} limit ${PREVIEW_ROWS}`, o);
+  return exportQueryToString(src.dsId, src.previewSql ?? limitedSql(await requireDriver(src.dsId), src.sql, PREVIEW_ROWS), o);
 }
 
 /** Text of the whole result in `o` (runs the query again when not every row is loaded). */
@@ -133,14 +133,14 @@ export async function exportTableQuery(
 
 /** `grid.export` with `{ dsId, objectRef }`: the Export Data dialog; exports the whole table. */
 export async function openTableExport(dsId: string, ref: ObjectRef): Promise<void> {
+  let driver: Driver;
   try {
-    await loadDataSources();
+    driver = await requireDriver(dsId);
     await ensureConnected(dsId);
   } catch (e) {
     notify({ kind: "error", title: "Cannot export the data", body: errText(e) });
     return;
   }
-  const driver = dsInfo(dsId)?.driver ?? "postgres";
   const options: ExportOptions = { ...defaultExportOptions(driver), tableName: qualifiedName(driver, ref) };
   openExportDialog({ dsId, label: qualifiedName(driver, ref), sql: selectSql(driver, ref, "", ""), options });
 }

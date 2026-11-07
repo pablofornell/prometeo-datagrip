@@ -37,7 +37,7 @@ import { measuredViewport } from "./viewport";
 import { logicalPos, logicalShift, scrollExtent, scrollPos } from "./virtualScroll";
 import {
   DEFAULT_VALUE,
-  classifyType,
+  columnKind,
   compareKeys,
   displayCell,
   displayLength,
@@ -239,7 +239,8 @@ export function DataGrid(props: DataGridProps): JSX.Element {
 
   // ---- columns ----
   const iconOf = (c: GridColumn | undefined) => iconClass(c && !c.isFk && props.fkColumns?.().has(c.name) ? { ...c, isFk: true } : c);
-  const kinds = createMemo<ColumnKind[]>(() => props.columns.map((c) => classifyType(c.typeName)));
+  // an Oracle DATE holds a time of day too: its editor offers (and keeps) the time
+  const kinds = createMemo<ColumnKind[]>(() => props.columns.map((c) => columnKind(c.typeName, props.dialect)));
   const [widths, setWidths] = createSignal<number[]>([]);
   const [order, setOrder] = createSignal<number[]>([]);
   const [hidden, setHidden] = createSignal<Set<number>>(new Set());

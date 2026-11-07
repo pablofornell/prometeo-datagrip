@@ -281,6 +281,12 @@ export type ExecEvent =
       connectionLost: boolean;
     }
   | { kind: "message"; index: number | null; text: string }
+  /**
+   * The statement succeeded with a warning (Oracle: `CREATE [OR REPLACE] PROCEDURE ...` that left the object INVALID).
+   * `message` is `Warning: PROCEDURE P compiled with errors`, `details` one `LINE/COL: text` per error. Follows the
+   * statement's `update` event; mark the statement as a warning instead of a success.
+   */
+  | { kind: "warning"; index: number; message: string; details: string[] }
   /** The session's transaction state changed (sent right after the statement that changed it, before `done`). */
   | { kind: "txStatus"; status: TxStatus }
   /**

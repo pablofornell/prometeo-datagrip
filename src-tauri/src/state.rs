@@ -928,6 +928,17 @@ mod tests {
     }
 
     #[test]
+    fn errors_do_not_show_the_password_of_an_oracle_thin_url() {
+        let cfg = DataSourceConfig {
+            driver: dbcore::Driver::Oracle,
+            url_override: Some("jdbc:oracle:thin:scott/p@ss@db:1521/svc".into()),
+            ..Default::default()
+        };
+        let m = redact_for(&cfg, "cannot parse jdbc:oracle:thin:scott/p@ss@db:1521/svc");
+        assert_eq!(m, "cannot parse jdbc:oracle:thin:scott/***@db:1521/svc");
+    }
+
+    #[test]
     fn a_cancel_before_the_import_is_remembered_and_applied() {
         let (s, _dir) = state();
         s.cancel_import("early");

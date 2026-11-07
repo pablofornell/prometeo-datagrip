@@ -103,6 +103,21 @@ export function TestBar(props: { s: Session; /** The dialog tab shown: a switch 
       { defer: true },
     ),
   );
+  // ... and what it found (the check / error icon, the DBMS info) is dropped when the connection settings change
+  // (the name, color and read-only flag do not matter to the server)
+  const connection = () => {
+    const { name: _n, color: _c, readOnly: _r, ...rest } = d().form;
+    return JSON.stringify(rest) + "\u0000" + d().password.value;
+  };
+  createEffect(
+    on(
+      () => [s.selectedKey(), connection()] as const,
+      ([key, fp], prev) => {
+        if (key && prev && prev[0] === key && prev[1] !== fp) s.resetTest(key);
+      },
+      { defer: true },
+    ),
+  );
   const onDown = (e: MouseEvent) => {
     if (open() && !(e.target as Element | null)?.closest?.(".ds-balloon, .ds-test-status, .ds-testbar a, .ds-testbar button")) setOpen(false);
   };

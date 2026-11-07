@@ -1210,22 +1210,33 @@ fn ora_type_expr(c: &str) -> String {
 }
 
 /// Columns of a table / view: name, type, nullable (`Y`/`N`), default, identity (`YES`/`NO`), virtual (`YES`/`NO`),
-/// comment, position, primary key (`Y`/`N`), raw data type, PK position.
-fn ora_columns_sql(owner: &str, table: &str) -> String {
+/// comment, position, primary key (`Y`/`N`), raw data type, PK position. (The comments are joined as a pre-filtered
+/// inline view: as a correlated sub-select per column the dictionary view costs ~0.8 s.)
+fn ora_columns_sql() -> String {
     format!(
         "select c.column_name, {ty}, c.nullable, c.data_default_vc, c.identity_column, c.virtual_column, \
-                (select cm.comments from all_col_comments cm where cm.owner = c.owner and cm.table_name = c.table_name and cm.column_name = c.column_name), \
+                cm.comments, \
                 c.column_id, \
                 case when pk.position is not null then 'Y' else 'N' end, c.data_type, pk.position \
          from all_tab_cols c \
+         left join (select column_name, comments from all_col_comments where owner = :1 and table_name = :2) cm \
+                on cm.column_name = c.column_name \
          left join (select kc.column_name, kc.position from all_constraints k \
                     join all_cons_columns kc on kc.owner = k.owner and kc.constraint_name = k.constraint_name \
-                    where k.owner = {o} and k.table_name = {t} and k.constraint_type = 'P') pk on pk.column_name = c.column_name \
-         where c.owner = {o} and c.table_name = {t} and c.hidden_column = 'NO' order by c.column_id",
+                    where k.owner = :3 and k.table_name = :4 and k.constraint_type = 'P') pk on pk.column_name = c.column_name \
+         where c.owner = :5 and c.table_name = :6 and c.hidden_column = 'NO' order by c.column_id",
         ty = ora_type_expr("c"),
-        o = ORA_LIT(owner),
-        t = ORA_LIT(table)
     )
+}
+
+/// Run the query of [`ora_columns_sql`] for `owner`.`table` (bound, so that the server parses it once).
+async fn ora_columns(pool: &Pool, owner: &str, table: &str) -> Result<Vec<Row>> {
+    let b = |v: &str| crate::oracle::OraBind::Text(v.to_string());
+    let binds = [b(owner), b(table), b(owner), b(table), b(owner), b(table)];
+    match pool {
+        Pool::Ora(p) => p.query_binds(&ora_columns_sql(), &binds).await,
+        _ => Ok(Vec::new()),
+    }
 }
 
 fn ora_trigger_hint(r: &Row, base: usize) -> String {
@@ -1575,19 +1586,22 @@ async fn ora_object_folders(pool: &Pool, ds: &str, path: &[String]) -> Result<Ve
     if !matches!(key, "tables" | "views" | "materialized_views") {
         return Err(bad_path(path));
     }
-    let rows = pool
-        .query_strings(&format!(
+    let rows = ora_q(
+        pool,
+        &format!(
             "select \
-             (select count(*) from all_tab_cols where owner = {o} and table_name = {tl} and hidden_column = 'NO'), \
-             (select count(*) from all_constraints where owner = {o} and table_name = {tl} and constraint_type in ('P', 'U')), \
-             (select count(*) from all_constraints where owner = {o} and table_name = {tl} and constraint_type = 'R'), \
-             (select count(*) from all_indexes where table_owner = {o} and table_name = {tl}), \
-             (select count(*) from all_constraints c where c.owner = {o} and c.table_name = {tl} and {chk}), \
-             (select count(*) from all_triggers where table_owner = {o} and table_name = {tl}) \
+             (select count(*) from all_tab_cols where owner = :1 and table_name = :2 and hidden_column = 'NO'), \
+             (select count(*) from all_constraints where owner = :3 and table_name = :4 and constraint_type in ('P', 'U')), \
+             (select count(*) from all_constraints where owner = :5 and table_name = :6 and constraint_type = 'R'), \
+             (select count(*) from all_indexes where table_owner = :7 and table_name = :8), \
+             (select count(*) from all_constraints c where c.owner = :9 and c.table_name = :10 and {chk}), \
+             (select count(*) from all_triggers where table_owner = :11 and table_name = :12) \
              from dual",
             chk = ORA_REAL_CHECK
-        ))
-        .await?;
+        ),
+        &[sc, t, sc, t, sc, t, sc, t, sc, t, sc, t],
+    )
+    .await?;
     let r = rows.first().ok_or_else(|| bad_path(path))?;
     let wanted: &[(&str, usize)] = match key {
         "tables" => &[
@@ -1608,9 +1622,20 @@ async fn ora_object_folders(pool: &Pool, ds: &str, path: &[String]) -> Result<Ve
         .collect())
 }
 
+/// Run a dictionary query with bind values (`:1`, `:2`, ...): see [`crate::oracle::OraPool::query_binds`].
+async fn ora_q(pool: &Pool, sql: &str, binds: &[&str]) -> Result<Vec<Row>> {
+    let binds: Vec<_> = binds
+        .iter()
+        .map(|v| crate::oracle::OraBind::Text(v.to_string()))
+        .collect();
+    match pool {
+        Pool::Ora(p) => p.query_binds(sql, &binds).await,
+        _ => Ok(Vec::new()),
+    }
+}
+
 async fn ora_object_items(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec<TreeNode>> {
     let (sc, t, sub) = (&path[0], &path[2], path[3].as_str());
-    let (o, tl) = (ORA_LIT(sc), ORA_LIT(t));
     let ex = |v: Value| -> Value {
         let mut m = v.as_object().cloned().unwrap_or_default();
         m.insert("schema".into(), json!(sc));
@@ -1619,7 +1644,7 @@ async fn ora_object_items(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec<
     };
     match sub {
         "columns" => {
-            let rows = pool.query_strings(&ora_columns_sql(sc, t)).await?;
+            let rows = ora_columns(pool, sc, t).await?;
             Ok(rows
                 .iter()
                 .map(|r| {
@@ -1640,15 +1665,16 @@ async fn ora_object_items(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec<
                 .collect())
         }
         "keys" => {
-            let rows = pool
-                .query_strings(&format!(
-                    "select c.constraint_name, c.constraint_type, \
+            let rows = ora_q(
+                pool,
+                "select c.constraint_name, c.constraint_type, \
                             (select listagg(cc.column_name, ', ') within group (order by cc.position) from all_cons_columns cc \
                                where cc.owner = c.owner and cc.constraint_name = c.constraint_name), c.status \
-                     from all_constraints c where c.owner = {o} and c.table_name = {tl} and c.constraint_type in ('P', 'U') \
-                     order by c.constraint_type, c.constraint_name"
-                ))
-                .await?;
+                     from all_constraints c where c.owner = :1 and c.table_name = :2 and c.constraint_type in ('P', 'U') \
+                     order by c.constraint_type, c.constraint_name",
+                &[sc, t],
+            )
+            .await?;
             Ok(rows
                 .iter()
                 .map(|r| {
@@ -1666,9 +1692,9 @@ async fn ora_object_items(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec<
                 .collect())
         }
         "foreign_keys" => {
-            let rows = pool
-                .query_strings(&format!(
-                    "select c.constraint_name, \
+            let rows = ora_q(
+                pool,
+                "select c.constraint_name, \
                             (select listagg(cc.column_name, ', ') within group (order by cc.position) from all_cons_columns cc \
                                where cc.owner = c.owner and cc.constraint_name = c.constraint_name), \
                             rc.owner, rc.table_name, \
@@ -1676,9 +1702,10 @@ async fn ora_object_items(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec<
                                where cc.owner = rc.owner and cc.constraint_name = rc.constraint_name), \
                             c.delete_rule, c.status \
                      from all_constraints c join all_constraints rc on rc.owner = c.r_owner and rc.constraint_name = c.r_constraint_name \
-                     where c.owner = {o} and c.table_name = {tl} and c.constraint_type = 'R' order by c.constraint_name"
-                ))
-                .await?;
+                     where c.owner = :1 and c.table_name = :2 and c.constraint_type = 'R' order by c.constraint_name",
+                &[sc, t],
+            )
+            .await?;
             Ok(rows
                 .iter()
                 .map(|r| {
@@ -1700,17 +1727,18 @@ async fn ora_object_items(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec<
                 .collect())
         }
         "indexes" => {
-            let rows = pool
-                .query_strings(&format!(
-                    "select i.index_name, i.uniqueness, i.index_type, \
+            let rows = ora_q(
+                pool,
+                "select i.index_name, i.uniqueness, i.index_type, \
                             (select listagg(ic.column_name || case when ic.descend = 'DESC' then ' DESC' else '' end, ', ') \
                                     within group (order by ic.column_position) \
                                from all_ind_columns ic where ic.index_owner = i.owner and ic.index_name = i.index_name), \
                             (select count(*) from all_constraints k where k.owner = i.table_owner and k.table_name = i.table_name \
                                 and k.index_name = i.index_name and k.constraint_type = 'P') \
-                     from all_indexes i where i.table_owner = {o} and i.table_name = {tl} order by i.index_name"
-                ))
-                .await?;
+                     from all_indexes i where i.table_owner = :1 and i.table_name = :2 order by i.index_name",
+                &[sc, t],
+            )
+            .await?;
             Ok(rows
                 .iter()
                 .map(|r| {
@@ -1727,13 +1755,16 @@ async fn ora_object_items(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec<
                 .collect())
         }
         "checks" => {
-            let rows = pool
-                .query_strings(&format!(
+            let rows = ora_q(
+                pool,
+                &format!(
                     "select c.constraint_name, c.search_condition_vc, c.status from all_constraints c \
-                     where c.owner = {o} and c.table_name = {tl} and {chk} order by c.constraint_name",
+                     where c.owner = :1 and c.table_name = :2 and {chk} order by c.constraint_name",
                     chk = ORA_REAL_CHECK
-                ))
-                .await?;
+                ),
+                &[sc, t],
+            )
+            .await?;
             Ok(rows
                 .iter()
                 .map(|r| {
@@ -1750,12 +1781,13 @@ async fn ora_object_items(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec<
                 .collect())
         }
         "triggers" => {
-            let rows = pool
-                .query_strings(&format!(
-                    "select trigger_name, trigger_type, triggering_event, status, owner from all_triggers \
-                     where table_owner = {o} and table_name = {tl} order by trigger_name"
-                ))
-                .await?;
+            let rows = ora_q(
+                pool,
+                "select trigger_name, trigger_type, triggering_event, status, owner from all_triggers \
+                     where table_owner = :1 and table_name = :2 order by trigger_name",
+                &[sc, t],
+            )
+            .await?;
             Ok(rows
                 .iter()
                 .map(|r| {
@@ -2317,7 +2349,7 @@ pub(crate) async fn table_columns(
                 Some(sc) => sc.to_string(),
                 None => ora_current_schema(pool).await?,
             };
-            let rows = pool.query_strings(&ora_columns_sql(&sc, table)).await?;
+            let rows = ora_columns(pool, &sc, table).await?;
             rows.iter()
                 .map(|r| ColInfo {
                     name: s(r, 0),
@@ -2396,14 +2428,17 @@ pub(crate) async fn row_addr(
                 Some(sc) => sc.to_string(),
                 None => ora_current_schema(&live.pool).await?,
             };
-            let rows = live
-                .pool
-                .query_strings(&format!(
-                    "select count(*) from all_tables where owner = {} and table_name = {}",
-                    quote_literal(Driver::Oracle, &sc),
-                    quote_literal(Driver::Oracle, table)
-                ))
-                .await?;
+            let rows = match &live.pool {
+                Pool::Ora(p) => {
+                    let b = |v: &str| crate::oracle::OraBind::Text(v.to_string());
+                    p.query_binds(
+                        "select count(*) from all_tables where owner = :1 and table_name = :2",
+                        &[b(&sc), b(table)],
+                    )
+                    .await?
+                }
+                _ => Vec::new(),
+            };
             Ok(if rows.first().map(|r| n(r, 0)).unwrap_or(0) > 0 {
                 RowAddr::OracleRowid
             } else {

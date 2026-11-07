@@ -1,6 +1,7 @@
 /** Registry of the mounted table editors, so actions and the close guard can reach the one that is focused. */
 import { createSignal } from "solid-js";
 import type { TxStatus } from "../../api/types";
+import type { Ask } from "../../state/decisions";
 import { activeTab } from "../../state/tabs";
 
 export interface TableController {
@@ -32,6 +33,8 @@ export interface TableController {
   exportData: () => void;
   /** Resolves true when the tab may close (nothing pending, or the user chose Submit / Discard). */
   confirmClose: () => Promise<boolean>;
+  /** Quitting: asks Submit / Discard / Cancel about the pending changes; the answer is applied by the returned plan. */
+  askQuit: () => ReturnType<Ask>;
 }
 
 const controllers = new Map<string, TableController>();

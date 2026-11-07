@@ -125,6 +125,7 @@ export interface ExecHandlers {
   onUpdate?: (e: Extract<ExecEvent, { kind: "update" }>) => void;
   onError?: (e: Extract<ExecEvent, { kind: "error" }>) => void;
   onMessage?: (e: Extract<ExecEvent, { kind: "message" }>) => void;
+  onWarning?: (e: Extract<ExecEvent, { kind: "warning" }>) => void;
   onTxStatus?: (e: Extract<ExecEvent, { kind: "txStatus" }>) => void;
   onTxEnded?: (e: Extract<ExecEvent, { kind: "txEnded" }>) => void;
   onDone?: (e: Extract<ExecEvent, { kind: "done" }>) => void;
@@ -172,6 +173,7 @@ export async function execute(
         case "update": handlers.onUpdate?.(e); break;
         case "error": handlers.onError?.(e); break;
         case "message": handlers.onMessage?.(e); break;
+        case "warning": handlers.onWarning?.(e); break;
         case "txStatus": handlers.onTxStatus?.(e); break;
         case "txEnded": handlers.onTxEnded?.(e); break;
         case "done": handlers.onDone?.(e); break;

@@ -15,7 +15,9 @@
 //!   is exact: DML opens one (there is no `BEGIN`), `COMMIT` / `ROLLBACK` / DDL end it.
 //! * **Read-only data sources**: Oracle has no read-only session. DDL / DCL is refused here, and a
 //!   `SET TRANSACTION READ ONLY` is opened before anything that could write, so the server rejects DML with
-//!   `ORA-01456`.
+//!   `ORA-01456`. What would end that transaction or escape it (`COMMIT` / `ROLLBACK` / `EXECUTE IMMEDIATE` /
+//!   `DBMS_SQL` in a PL/SQL block, `SET TRANSACTION` other than `READ ONLY`) is refused too. The transaction is
+//!   reported like any other (Auto mode ends it after the statement, Manual mode leaves it to the user).
 //! * **Keep alive**: an idle connection pings the server every `keepAlive` seconds (option, default 90, 0 = off).
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -251,7 +253,8 @@ fn parse_url(url: &str) -> Result<(String, Option<String>, Option<String>)> {
     let u = u.strip_prefix("jdbc:").unwrap_or(u);
     if let Some(rest) = u.strip_prefix("oracle:thin:") {
         // oracle:thin:[user/password]@target
-        let (cred, target) = rest.split_once('@').ok_or_else(|| {
+        // the password may hold an '@': the target starts after the last one
+        let (cred, target) = rest.rsplit_once('@').ok_or_else(|| {
             DbError::InvalidArgument("Oracle JDBC URL: expected oracle:thin:@host:port:SID".into())
         })?;
         let (user, pw) = match cred.split_once('/') {
@@ -610,6 +613,7 @@ enum Cmd {
     },
     Strings {
         sql: String,
+        binds: Vec<OraBind>,
         reply: oneshot::Sender<Result<Vec<Vec<Option<String>>>>>,
     },
     Describe {
@@ -628,6 +632,9 @@ enum Cmd {
     Ping {
         reply: oneshot::Sender<Result<()>>,
     },
+    /// Test hook: the worker panics.
+    #[cfg(test)]
+    Die,
 }
 
 /// What a statement produced, in order.
@@ -655,6 +662,116 @@ fn refused_when_read_only(sql: &str) -> bool {
         "ALTER" => !sql_words(sql, 2).get(1).is_some_and(|w| w == "SESSION"),
         _ => false,
     }
+}
+
+/// The words (upper case) of `sql` that are code: comments, string literals (also `q'[..]'`) and quoted identifiers
+/// are skipped.
+fn code_words(sql: &str) -> Vec<String> {
+    let c: Vec<char> = sql.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < c.len() {
+        let ch = c[i];
+        if ch == '-' && c.get(i + 1) == Some(&'-') {
+            while i < c.len() && c[i] != '\n' {
+                i += 1;
+            }
+        } else if ch == '/' && c.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i < c.len() && !(c[i] == '*' && c.get(i + 1) == Some(&'/')) {
+                i += 1;
+            }
+            i += 2;
+        } else if ch == '\'' {
+            i = skip_string(&c, i + 1);
+        } else if ch == '"' {
+            i += 1;
+            while i < c.len() && c[i] != '"' {
+                i += 1;
+            }
+            i += 1;
+        } else if ch.is_alphanumeric() || matches!(ch, '_' | '$' | '#') {
+            let start = i;
+            while i < c.len() && (c[i].is_alphanumeric() || matches!(c[i], '_' | '$' | '#')) {
+                i += 1;
+            }
+            let w: String = c[start..i].iter().collect::<String>().to_ascii_uppercase();
+            // q'[..]' / nq'[..]' alternative quoting
+            if (w == "Q" || w == "NQ") && c.get(i) == Some(&'\'') && i + 1 < c.len() {
+                let open = c[i + 1];
+                let close = match open {
+                    '[' => ']',
+                    '(' => ')',
+                    '{' => '}',
+                    '<' => '>',
+                    o => o,
+                };
+                i += 2;
+                while i < c.len() && !(c[i] == close && c.get(i + 1) == Some(&'\'')) {
+                    i += 1;
+                }
+                i += 2;
+            } else {
+                out.push(w);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Index after the string literal whose body starts at `i` (`''` is an escaped quote).
+fn skip_string(c: &[char], mut i: usize) -> usize {
+    while i < c.len() {
+        if c[i] == '\'' {
+            if c.get(i + 1) == Some(&'\'') {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Why a read-only data source must not run this statement even though the server would accept it: it would end
+/// the read-only transaction or escape from it (`SET TRANSACTION READ WRITE`, a PL/SQL block that commits, rolls
+/// back, runs dynamic SQL / DDL ...).
+fn read_only_violation(sql: &str) -> Option<&'static str> {
+    let w = code_words(sql);
+    let first = w.first().map(String::as_str).unwrap_or("");
+    if first == "SET" && w.get(1).map(String::as_str) == Some("TRANSACTION") {
+        let ro = w.get(2).map(String::as_str) == Some("READ")
+            && w.get(3).map(String::as_str) == Some("ONLY");
+        return (!ro).then_some("SET TRANSACTION other than READ ONLY");
+    }
+    let block = matches!(first, "BEGIN" | "DECLARE" | "CALL" | "EXEC" | "EXECUTE")
+        || sql.trim_start().starts_with("<<");
+    if !block {
+        return None;
+    }
+    for (i, word) in w.iter().enumerate() {
+        let hit = match word.as_str() {
+            "COMMIT" | "ROLLBACK" => Some("COMMIT / ROLLBACK in a PL/SQL block"),
+            "IMMEDIATE" if i > 0 && w[i - 1] == "EXECUTE" => {
+                Some("EXECUTE IMMEDIATE in a PL/SQL block")
+            }
+            "DBMS_SQL" | "DBMS_JOB" | "DBMS_SCHEDULER" | "EXEC_DDL_STATEMENT" => {
+                Some("dynamic SQL / jobs (DBMS_SQL, DBMS_JOB, DBMS_SCHEDULER) in a PL/SQL block")
+            }
+            "AUTONOMOUS_TRANSACTION" => Some("an autonomous transaction in a PL/SQL block"),
+            "TRANSACTION" if i > 0 && w[i - 1] == "SET" => {
+                Some("SET TRANSACTION in a PL/SQL block")
+            }
+            _ => None,
+        };
+        if hit.is_some() {
+            return hit;
+        }
+    }
+    None
 }
 
 fn sql_words(sql: &str, n: usize) -> Vec<String> {
@@ -700,8 +817,10 @@ if :1 is not null and lengthb(:1) + lengthb(l) + 1 > 30000 then :2 := l; exit; e
 :1 := :1 || l || chr(10); end loop; end;";
 
 impl Worker {
+    /// Publish whether the server says a transaction is open (the read-only transaction of a read-only data source
+    /// included: it holds a snapshot until it is ended, so Auto mode ends it and Manual mode shows it).
     fn track(&self) {
-        let open = !self.read_only && self.conn.in_transaction().unwrap_or(false);
+        let open = self.conn.in_transaction().unwrap_or(false);
         self.in_tx.store(open, Ordering::SeqCst);
     }
 
@@ -724,6 +843,12 @@ impl Worker {
                 "may not perform insert/delete/update operation inside a READ ONLY transaction (the data source is read-only)",
             ));
         }
+        if let Some(why) = read_only_violation(sql) {
+            return Err(ora_error(
+                1456,
+                &format!("the data source is read-only: {why} is not allowed"),
+            ));
+        }
         if may_write(sql) && !self.conn.in_transaction().unwrap_or(false) {
             self.conn
                 .execute("set transaction read only", &[])
@@ -739,7 +864,8 @@ impl Worker {
         binds: &[OraBind],
         sink: &mut dyn FnMut(Out) -> bool,
     ) -> Result<()> {
-        self.cancel.store(false, Ordering::SeqCst);
+        // the cancel flag is cleared when the command is queued ([`OraConn::queue`]), not here: a Stop pressed while
+        // the command waits for the worker must still stop it
         let r = self
             .gate(sql)
             .and_then(|_| self.run_inner(sql, binds, sink));
@@ -790,7 +916,12 @@ impl Worker {
         } else {
             let mut stmt = stmt;
             let res = stmt.execute(&refs).map_err(|e| self.map(e, Some(sql)))?;
-            sink(Out::Done(res.rows_affected()));
+            // a PL/SQL block / call reports "1 row" (the OCI convention), which is no row count of anything
+            let n = match first_keyword(sql).as_str() {
+                "BEGIN" | "DECLARE" | "CALL" | "EXEC" | "EXECUTE" => 0,
+                _ => res.rows_affected(),
+            };
+            sink(Out::Done(n));
         }
         Ok(())
     }
@@ -858,6 +989,16 @@ impl Worker {
     }
 }
 
+/// Marks the connection dead when the worker thread ends for whatever reason (a panic included), so a pool never
+/// hands out a connection nobody serves.
+struct AliveGuard(Arc<AtomicBool>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 fn worker_main(
     opts: OraOpts,
     enable_output: bool,
@@ -867,6 +1008,7 @@ fn worker_main(
     cancel: OraCancel,
     ready: oneshot::Sender<Result<()>>,
 ) {
+    let _alive_guard = AliveGuard(alive.clone());
     let connected = (|| {
         let config = odb::Config::default()
             .set_connect_string(&opts.connect_string)
@@ -955,9 +1097,9 @@ fn worker_main(
                 }
                 let _ = reply.send(r.map(|_| n));
             }
-            Cmd::Strings { sql, reply } => {
+            Cmd::Strings { sql, binds, reply } => {
                 let mut rows = Vec::new();
-                let r = w.run(&sql, &[], &mut |o| {
+                let r = w.run(&sql, &binds, &mut |o| {
                     if let Out::Row(r) = o {
                         rows.push(row_strings(&r));
                     }
@@ -981,6 +1123,8 @@ fn worker_main(
                 let r = w.conn.ping().map_err(|e| w.map(e, None));
                 let _ = reply.send(r);
             }
+            #[cfg(test)]
+            Cmd::Die => panic!("test: the Oracle worker dies"),
         }
     }
     let _ = w.conn.close();
@@ -1035,10 +1179,23 @@ impl OraConn {
         self.alive.load(Ordering::SeqCst)
     }
 
+    /// The worker is gone (its channel is closed): the connection is dead for good.
+    fn gone(&self) -> DbError {
+        self.alive.store(false, Ordering::SeqCst);
+        worker_gone()
+    }
+
+    /// Hand a command to the worker. A Stop pressed before this point belonged to an earlier command, one pressed
+    /// after it must find the flag set when the worker gets to the command: so the flag is cleared here.
+    fn queue(&self, cmd: Cmd) -> Result<()> {
+        self.cancel.flag.store(false, Ordering::SeqCst);
+        self.tx.send(cmd).map_err(|_| self.gone())
+    }
+
     async fn call<T>(&self, make: impl FnOnce(oneshot::Sender<T>) -> Cmd) -> Result<T> {
         let (tx, rx) = oneshot::channel();
-        self.tx.send(make(tx)).map_err(|_| worker_gone())?;
-        rx.await.map_err(|_| worker_gone())
+        self.queue(make(tx))?;
+        rx.await.map_err(|_| self.gone())
     }
 
     /// Columns of a statement without running it (empty when unknown).
@@ -1056,8 +1213,8 @@ impl OraConn {
             sql: sql.to_string(),
             out: out.clone(),
         };
-        if self.tx.send(cmd).is_err() {
-            let _ = out.try_send(Err(worker_gone()));
+        if let Err(e) = self.queue(cmd) {
+            let _ = out.try_send(Err(e));
         }
         rx
     }
@@ -1065,8 +1222,14 @@ impl OraConn {
     /// Stream the items of one statement (rows, then the rows-affected count).
     pub(crate) fn stream(&mut self, sql: &str) -> crate::exec::ItemStream<'_> {
         let rx = self.start_stream(sql);
-        futures_util::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
+        let alive = self.alive.clone();
+        futures_util::stream::unfold((rx, false), move |(mut rx, mut ended)| {
+            let alive = alive.clone();
+            async move {
+                next_item(&mut rx, &mut ended, &alive)
+                    .await
+                    .map(|item| (item, (rx, ended)))
+            }
         })
         .boxed()
     }
@@ -1092,8 +1255,22 @@ impl OraConn {
     }
 
     async fn strings(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
-        let sql = sql.to_string();
-        self.call(|reply| Cmd::Strings { sql, reply }).await?
+        self.strings_with(sql, &[]).await
+    }
+
+    async fn strings_with(&self, sql: &str, binds: &[OraBind]) -> Result<Vec<Vec<Option<String>>>> {
+        let (sql, binds) = (sql.to_string(), binds.to_vec());
+        self.call(|reply| Cmd::Strings { sql, binds, reply })
+            .await?
+    }
+
+    /// [`OraPool::query_binds`] on this connection.
+    pub(crate) async fn query_binds(
+        &mut self,
+        sql: &str,
+        binds: &[OraBind],
+    ) -> Result<Vec<Vec<Option<String>>>> {
+        self.strings_with(sql, binds).await
     }
 
     pub async fn commit(&mut self) -> Result<()> {
@@ -1117,6 +1294,29 @@ impl OraConn {
     pub async fn close(self) {}
 }
 
+/// The next item of a statement's stream. A stream that closes before its `Done` / an error means the worker died
+/// under the statement: that is an error (and the connection is dead), not an empty result.
+async fn next_item(
+    rx: &mut mpsc::Receiver<Result<Item>>,
+    ended: &mut bool,
+    alive: &AtomicBool,
+) -> Option<Result<Item>> {
+    match rx.recv().await {
+        Some(item) => {
+            if matches!(item, Ok(Item::Done(_)) | Err(_)) {
+                *ended = true;
+            }
+            Some(item)
+        }
+        None if *ended => None,
+        None => {
+            *ended = true;
+            alive.store(false, Ordering::SeqCst);
+            Some(Err(worker_gone()))
+        }
+    }
+}
+
 /// Should the console look for `DBMS_OUTPUT` after this statement? (A round trip, so only where output can
 /// appear: PL/SQL, `CALL` / `EXEC`, or a query that calls something.)
 pub(crate) fn may_print(sql: &str) -> bool {
@@ -1126,6 +1326,160 @@ pub(crate) fn may_print(sql: &str) -> bool {
         "" => false,
         _ => sql.to_ascii_lowercase().contains("dbms_output"),
     }
+}
+
+/// The stored object a `CREATE [OR REPLACE] PROCEDURE / FUNCTION / PACKAGE [BODY] / TRIGGER / TYPE [BODY] / VIEW`
+/// statement defines: `(type as ALL_ERRORS names it, owner if written, name)`. Oracle reports such a statement as
+/// a success even when the object is INVALID (`ORA-24344`, success with compilation error): the errors are in
+/// `ALL_ERRORS`.
+pub(crate) fn compiled_object(sql: &str) -> Option<(String, Option<String>, String)> {
+    let mut rest = sql.trim_start();
+    // leading comments
+    loop {
+        if let Some(r) = rest.strip_prefix("--") {
+            rest = r.split_once('\n').map(|x| x.1).unwrap_or("").trim_start();
+        } else if let Some(r) = rest.strip_prefix("/*") {
+            rest = r.split_once("*/").map(|x| x.1).unwrap_or("").trim_start();
+        } else {
+            break;
+        }
+    }
+    // words (upper-cased) and quoted identifiers (kept), `.` as its own token
+    let mut toks: Vec<(String, bool)> = Vec::new();
+    let mut it = rest.char_indices().peekable();
+    while let Some(&(i, c)) = it.peek() {
+        if toks.len() >= 12 {
+            break;
+        }
+        if c.is_whitespace() {
+            it.next();
+        } else if c == '"' {
+            it.next();
+            let mut name = String::new();
+            for (_, ch) in it.by_ref() {
+                if ch == '"' {
+                    break;
+                }
+                name.push(ch);
+            }
+            toks.push((name, true));
+        } else if c == '.' {
+            it.next();
+            toks.push((".".into(), false));
+        } else if c.is_alphanumeric() || matches!(c, '_' | '$' | '#') {
+            let mut end = i;
+            while let Some(&(j, ch)) = it.peek() {
+                if ch.is_alphanumeric() || matches!(ch, '_' | '$' | '#') {
+                    end = j + ch.len_utf8();
+                    it.next();
+                } else {
+                    break;
+                }
+            }
+            toks.push((rest[i..end].to_ascii_uppercase(), false));
+        } else {
+            break;
+        }
+    }
+    let word = |k: usize, w: &str| toks.get(k).is_some_and(|t| !t.1 && t.0 == w);
+    if !word(0, "CREATE") {
+        return None;
+    }
+    let mut k = 1;
+    if word(k, "OR") && word(k + 1, "REPLACE") {
+        k += 2;
+    }
+    while [
+        "EDITIONABLE",
+        "NONEDITIONABLE",
+        "FORCE",
+        "NOFORCE",
+        "EDITIONING",
+    ]
+    .iter()
+    .any(|w| word(k, w))
+    {
+        k += 1;
+    }
+    let ty = match toks.get(k).filter(|t| !t.1).map(|t| t.0.as_str())? {
+        t @ ("PROCEDURE" | "FUNCTION" | "TRIGGER" | "VIEW") => t.to_string(),
+        t @ ("PACKAGE" | "TYPE") => {
+            if word(k + 1, "BODY") {
+                k += 1;
+                format!("{t} BODY")
+            } else {
+                t.to_string()
+            }
+        }
+        _ => return None,
+    };
+    k += 1;
+    let (name, _) = toks.get(k)?.clone();
+    if name == "." {
+        return None;
+    }
+    if toks.get(k + 1).is_some_and(|t| !t.1 && t.0 == ".") {
+        let (obj, _) = toks.get(k + 2)?.clone();
+        return Some((ty, Some(name), obj));
+    }
+    Some((ty, None, name))
+}
+
+/// The compile errors Oracle recorded for the object a `CREATE` statement just defined (see [`compiled_object`]),
+/// as `(line, column, text)`; empty when it compiled cleanly or `sql` defines no stored object.
+pub(crate) async fn compile_errors(
+    conn: &mut OraConn,
+    sql: &str,
+) -> Result<Option<(String, String, Vec<(i64, i64, String)>)>> {
+    let Some((ty, owner, name)) = compiled_object(sql) else {
+        return Ok(None);
+    };
+    let mut binds = Vec::new();
+    let owner_cond = match &owner {
+        Some(o) => {
+            binds.push(OraBind::Text(o.clone()));
+            "owner = :1"
+        }
+        None => "owner = sys_context('USERENV', 'CURRENT_SCHEMA')",
+    };
+    binds.push(OraBind::Text(name.clone()));
+    binds.push(OraBind::Text(ty.clone()));
+    let n = binds.len();
+    let rows = conn
+        .query_binds(
+            &format!(
+                "select line, position, text from all_errors where {owner_cond} and name = :{} and type = :{n} \
+                 and attribute = 'ERROR' order by sequence",
+                n - 1
+            ),
+            &binds,
+        )
+        .await?;
+    let errors: Vec<(i64, i64, String)> = rows
+        .into_iter()
+        .map(|r| {
+            let num = |i: usize| {
+                r.get(i)
+                    .cloned()
+                    .flatten()
+                    .and_then(|v| v.trim().parse::<i64>().ok())
+                    .unwrap_or(0)
+            };
+            (
+                num(0),
+                num(1),
+                r.get(2).cloned().flatten().unwrap_or_default(),
+            )
+        })
+        .collect();
+    if errors.is_empty() {
+        return Ok(None);
+    }
+    let shown = match owner {
+        Some(o) => format!("{o}.{name}"),
+        None => name,
+    };
+    Ok(Some((ty, shown, errors)))
 }
 
 // ------------------------------------------------------------------ pool
@@ -1218,32 +1572,51 @@ impl OraPool {
     }
 
     pub(crate) async fn describe(&self, sql: &str) -> Vec<ColumnMeta> {
-        match self.acquire().await {
-            Ok(p) => {
+        let r = self
+            .with_conn(|p| async move {
                 let sql = sql.to_string();
-                match p.conn().call(|reply| Cmd::Describe { sql, reply }).await {
-                    Ok(cols) => metas_of(&cols),
-                    Err(_) => Vec::new(),
-                }
-            }
-            Err(_) => Vec::new(),
-        }
+                p.conn().call(|reply| Cmd::Describe { sql, reply }).await
+            })
+            .await;
+        r.map(|cols| metas_of(&cols)).unwrap_or_default()
     }
 
-    /// Stream the items of one statement on a pooled connection.
+    /// Stream the items of one statement on a pooled connection. When a reused connection turns out dead before
+    /// the first item, the statement runs once more on another one.
     pub(crate) fn stream<'a>(&'a self, sql: &'a str) -> crate::exec::ItemStream<'a> {
         enum St<'a> {
             Init(&'a OraPool, &'a str),
-            Run(PoolStream),
+            Run(PoolStream<'a>),
             Done,
         }
         /// Cancels the statement when the reader goes away before the end.
-        struct PoolStream {
+        struct PoolStream<'a> {
+            pool: &'a OraPool,
+            sql: &'a str,
             rx: mpsc::Receiver<Result<Item>>,
             pooled: Pooled,
+            /// The channel delivered `Done` / an error (or the worker died).
+            ended: bool,
+            /// Something was handed to the reader.
+            yielded: bool,
+            retried: bool,
             finished: bool,
         }
-        impl Drop for PoolStream {
+        impl<'a> PoolStream<'a> {
+            fn new(pool: &'a OraPool, sql: &'a str, pooled: Pooled, retried: bool) -> Self {
+                PoolStream {
+                    pool,
+                    sql,
+                    rx: pooled.conn().start_stream(sql),
+                    pooled,
+                    ended: false,
+                    yielded: false,
+                    retried,
+                    finished: false,
+                }
+            }
+        }
+        impl Drop for PoolStream<'_> {
             fn drop(&mut self) {
                 if !self.finished {
                     self.pooled.conn().cancel.cancel();
@@ -1254,20 +1627,36 @@ impl OraPool {
             let mut ps = match st {
                 St::Init(pool, sql) => match pool.acquire().await {
                     Err(e) => return Some((Err(e), St::Done)),
-                    Ok(pooled) => PoolStream {
-                        rx: pooled.conn().start_stream(sql),
-                        pooled,
-                        finished: false,
-                    },
+                    Ok(pooled) => PoolStream::new(pool, sql, pooled, false),
                 },
                 St::Run(ps) => ps,
                 St::Done => return None,
             };
-            match ps.rx.recv().await {
-                Some(item) => Some((item, St::Run(ps))),
-                None => {
-                    ps.finished = true;
-                    None
+            loop {
+                let item = next_item(&mut ps.rx, &mut ps.ended, &ps.pooled.conn().alive).await;
+                match item {
+                    Some(Err(e))
+                        if !ps.yielded
+                            && !ps.retried
+                            && ps.pooled.reused
+                            && e.is_connection_lost() =>
+                    {
+                        let (pool, sql) = (ps.pool, ps.sql);
+                        ps.finished = true;
+                        drop(ps);
+                        match pool.acquire().await {
+                            Err(e) => return Some((Err(e), St::Done)),
+                            Ok(pooled) => ps = PoolStream::new(pool, sql, pooled, true),
+                        }
+                    }
+                    Some(item) => {
+                        ps.yielded = true;
+                        return Some((item, St::Run(ps)));
+                    }
+                    None => {
+                        ps.finished = true;
+                        return None;
+                    }
                 }
             }
         })
@@ -1298,6 +1687,18 @@ impl OraPool {
             .await
     }
 
+    /// [`query_strings`](Self::query_strings) with positional binds (`:1`, `:2`, ...). The dictionary queries of the
+    /// hot paths use them: the server hard-parses a query text it has not seen (~0.8 s for `ALL_TAB_COLS`), so a
+    /// table name inside the text would make every first visit of a table slow.
+    pub async fn query_binds(
+        &self,
+        sql: &str,
+        binds: &[OraBind],
+    ) -> Result<Vec<Vec<Option<String>>>> {
+        self.with_conn(|p| async move { p.conn().strings_with(sql, binds).await })
+            .await
+    }
+
     /// Run `sql` with positional binds (`:1`, `:2`, ...; [`OraBind::Null`] is NULL) on a pooled connection and
     /// commit.
     pub async fn exec_binds(&self, sql: &str, binds: &[OraBind]) -> Result<u64> {
@@ -1306,9 +1707,15 @@ impl OraPool {
     }
 
     pub async fn begin(&self) -> Result<OraTx> {
-        Ok(OraTx {
-            pooled: self.acquire().await?,
-        })
+        let mut pooled = self.acquire().await?;
+        // a connection that sat in the pool may have died meanwhile: find out now, not at the first statement
+        if pooled.reused {
+            let ping = pooled.conn().call(|reply| Cmd::Ping { reply }).await;
+            if !matches!(ping, Ok(Ok(()))) {
+                pooled = self.acquire().await?;
+            }
+        }
+        Ok(OraTx { pooled })
     }
 
     pub async fn close(&self) {
@@ -1349,6 +1756,47 @@ impl OraTx {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
+
+    #[test]
+    fn compiled_object_names_the_created_stored_object() {
+        let o = |s: &str| compiled_object(s);
+        let some = |t: &str, ow: Option<&str>, n: &str| {
+            Some((t.to_string(), ow.map(str::to_string), n.to_string()))
+        };
+        assert_eq!(
+            o("create or replace procedure qa_p as begin null; end;"),
+            some("PROCEDURE", None, "QA_P")
+        );
+        assert_eq!(
+            o("-- c\n  CREATE FUNCTION demo.f(x number) return number is begin return 1; end;"),
+            some("FUNCTION", Some("DEMO"), "F")
+        );
+        assert_eq!(
+            o("create or replace package body \"Pk\" as end;"),
+            some("PACKAGE BODY", None, "Pk")
+        );
+        assert_eq!(
+            o("create or replace editionable package pk as end;"),
+            some("PACKAGE", None, "PK")
+        );
+        assert_eq!(
+            o("create or replace type body t as end;"),
+            some("TYPE BODY", None, "T")
+        );
+        assert_eq!(
+            o("create or replace force view v as select 1 x from dual"),
+            some("VIEW", None, "V")
+        );
+        assert_eq!(
+            o("create or replace trigger trg before insert on t begin null; end;"),
+            some("TRIGGER", None, "TRG")
+        );
+        assert_eq!(o("create table t (a number)"), None);
+        assert_eq!(o("create index i on t (a)"), None);
+        assert_eq!(o("select 1 from dual"), None);
+        assert_eq!(o("create or replace procedure"), None);
+    }
 
     #[test]
     fn numbers_become_json_numbers_only_when_lossless() {
@@ -1415,6 +1863,13 @@ mod tests {
             ),
             ("h:1599/PDB", "u", "tiger")
         );
+        // an '@' inside the password: the target starts after the last one, nothing of the password reaches it
+        c.url_override = Some("jdbc:oracle:thin:scott/p@ss@h:1521/PDB".into());
+        let o = build_opts(&c).unwrap();
+        assert_eq!(
+            (o.connect_string.as_str(), o.password.as_str()),
+            ("h:1521/PDB", "p@ss")
+        );
         c.url_override = Some("oracle://scott@h/ORCL?sid=1".into());
         assert!(build_opts(&c)
             .unwrap()
@@ -1462,6 +1917,61 @@ mod tests {
     }
 
     #[test]
+    fn read_only_refuses_what_escapes_the_read_only_transaction() {
+        let bad = |sql: &str| read_only_violation(sql).is_some();
+        // SET TRANSACTION: only READ ONLY
+        assert!(bad("set transaction read write"));
+        assert!(bad("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"));
+        assert!(bad("/* x */ set\n transaction read write name 'x'"));
+        assert!(!bad("set transaction read only"));
+        assert!(!bad("SET TRANSACTION READ ONLY NAME 'q'"));
+        assert!(!bad("set role all"));
+        // PL/SQL blocks
+        assert!(bad(
+            "begin execute immediate 'create table t (a int)'; end;"
+        ));
+        assert!(bad("begin\n  execute\n  immediate 'drop table t';\nend;"));
+        assert!(bad("begin commit; delete from t; end;"));
+        assert!(bad("declare n number; begin n := 1; ROLLBACK; end;"));
+        assert!(bad("begin dbms_sql.execute(1); end;"));
+        assert!(bad("begin sys.dbms_scheduler.create_job('j'); end;"));
+        assert!(bad("<<l>> begin set transaction read write; end;"));
+        assert!(bad(
+            "declare pragma autonomous_transaction; begin null; end;"
+        ));
+        assert!(bad("call dbms_utility.exec_ddl_statement('drop table t')"));
+        // text and comments are not code
+        assert!(!bad(
+            "begin dbms_output.put_line('commit; execute immediate'); end;"
+        ));
+        assert!(!bad("begin -- commit\n null; /* rollback */ end;"));
+        assert!(!bad("begin dbms_output.put_line(q'[it's a commit]'); end;"));
+        assert!(!bad("begin dbms_output.put_line(nq'{rollback}'); end;"));
+        assert!(!bad("begin null; end; -- execute immediate"));
+        assert!(!bad("begin select 1 into :x from \"COMMIT\"; end;"));
+        assert!(!bad("begin update t set a = 1; end;"));
+        // statements that are not blocks are the server's business
+        assert!(!bad("select 'commit' from dual"));
+        assert!(!bad("insert into t values (1)"));
+        let w = code_words(
+            "select 'a''b commit', q'#x# commit#', \"rollback\" -- x\n from /* y */ t_1$",
+        );
+        assert_eq!(w, ["SELECT", "FROM", "T_1$"]);
+    }
+
+    #[test]
+    fn a_worker_that_ends_marks_the_connection_dead() {
+        let alive = Arc::new(AtomicBool::new(true));
+        let a = alive.clone();
+        let t = std::thread::spawn(move || {
+            let _g = AliveGuard(a);
+            panic!("worker dies");
+        });
+        assert!(t.join().is_err());
+        assert!(!alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn positions_count_code_points() {
         assert_eq!(position_of("select x from t", 7), 8);
         assert_eq!(position_of("sélect x", 7), 7);
@@ -1474,5 +1984,96 @@ mod tests {
         assert!(may_print("select f(1) from dual"));
         assert!(!may_print("select 1 from dual"));
         assert!(!may_print("create table t (a int)"));
+    }
+
+    // ---- against the server (PROMETEO_ORACLE_URL); skipped without it
+
+    fn env_opts() -> Option<OraOpts> {
+        let url = std::env::var("PROMETEO_ORACLE_URL").ok()?;
+        build_opts(&DataSourceConfig {
+            driver: Driver::Oracle,
+            url_override: Some(url),
+            ..Default::default()
+        })
+        .ok()
+    }
+
+    #[tokio::test]
+    async fn a_stop_pressed_while_a_command_is_queued_stops_it() {
+        let Some(opts) = env_opts() else { return };
+        let conn = OraConn::open(&opts, false).await.unwrap();
+        // the first statement keeps the worker busy: it waits for a reader of its rows
+        let rx_a = conn.start_stream("select level from dual connect by level <= 1000000");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut rx_b = conn.start_stream("select 1 from dual");
+        conn.cancel_handle().cancel();
+        drop(rx_a);
+        let first = rx_b.recv().await.expect("the worker answers");
+        let err = first.err().expect("the queued statement was stopped");
+        assert!(err.to_string().contains("ORA-01013"), "{err}");
+        // the next command starts clean
+        let mut rx_c = conn.start_stream("select 1 from dual");
+        assert!(rx_c.recv().await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_dead_worker_is_replaced_on_every_pool_path() {
+        let Some(opts) = env_opts() else { return };
+        let pool = OraPool::open(&opts, &DataSourceConfig::default())
+            .await
+            .unwrap();
+        // makes the idle connections look alive although their worker thread is gone (the race the retry covers)
+        async fn kill_idle(pool: &OraPool) {
+            let conns: Vec<OraConn> = std::mem::take(&mut *pool.inner.idle.lock().unwrap());
+            for c in &conns {
+                c.tx.send(Cmd::Die).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            for c in &conns {
+                assert!(
+                    !c.is_alive(),
+                    "the worker's guard marks the connection dead"
+                );
+                c.alive.store(true, Ordering::SeqCst);
+            }
+            pool.inner.idle.lock().unwrap().extend(conns);
+        }
+        assert_eq!(
+            pool.query_strings("select 1 from dual")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        kill_idle(&pool).await;
+        assert_eq!(
+            pool.query_strings("select 2 from dual")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        kill_idle(&pool).await;
+        assert_eq!(pool.describe("select 3 x from dual").await.len(), 1);
+        kill_idle(&pool).await;
+        let items: Vec<_> = pool.stream("select 4 from dual").collect().await;
+        assert!(
+            items.iter().all(|i| i.is_ok()) && items.len() == 2,
+            "{}",
+            items.len()
+        );
+        kill_idle(&pool).await;
+        let mut tx = pool.begin().await.unwrap();
+        assert_eq!(tx.execute("select 5 from dual", &[]).await.unwrap(), 1);
+        tx.rollback().await.unwrap();
+        kill_idle(&pool).await;
+        pool.exec("select 6 from dual").await.unwrap();
+        // a dead connection is not put back into the pool
+        let conns: Vec<OraConn> = std::mem::take(&mut *pool.inner.idle.lock().unwrap());
+        conns[0].tx.send(Cmd::Die).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        pool.inner.idle.lock().unwrap().extend(conns);
+        let p = pool.acquire().await.unwrap();
+        assert!(p.conn().is_alive() && !p.reused);
     }
 }

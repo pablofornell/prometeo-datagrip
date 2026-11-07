@@ -27,6 +27,7 @@ import { type MenuItem, notify, openMenu } from "../../components/ui";
 import { showToolWindow } from "../../state/layout";
 import { settings } from "../../state/settings";
 import { activateTab, activeTab } from "../../state/tabs";
+import { visibleSchemaNodes } from "../datasource/schemas";
 import { autoSyncAfter, ensureConnected } from "../explorer";
 import {
   INTERNAL_MARK,
@@ -627,7 +628,7 @@ export class ConsoleSession implements OutputHost {
     const staleTabs = out.results().filter((r) => r.id !== o.replace?.id);
     for (const r of staleTabs) r.detach(undefined, true);
 
-    const mark = (status: "ok" | "error", ms: number) => {
+    const mark = (status: "ok" | "error" | "warning", ms: number) => {
       if (!cur || !req.ranges.length) return;
       const r = this.editorStatement(cur.from, cur.to);
       const keep = this.currentMarks().filter((m) => !(m.from < r.to && m.to > r.from) && m.from !== r.from);
@@ -721,7 +722,7 @@ export class ConsoleSession implements OutputHost {
         }
         const ms = nowMs() - (cur?.t0 ?? t00);
         const sql = cur?.sql ?? req.sql;
-        const count = reportsCount(sql);
+        const count = reportsCount(sql, this.driver);
         const id = out.log("text", count ? rowsAffected(e.rowsAffected, ms) : completedIn(ms));
         recs.push({ lineId: id, kind: count ? "update" : "done", n: e.rowsAffected, ms });
         mark("ok", ms);
@@ -743,6 +744,12 @@ export class ConsoleSession implements OutputHost {
         }
       },
       onMessage: (e) => void out.log("text", e.text),
+      onWarning: (e) => {
+        // succeeded, but the object is INVALID (Oracle): the check mark becomes a warning, the errors go to the log
+        out.log("warning", e.message);
+        for (const d of e.details) out.log("warning", d);
+        mark("warning", nowMs() - (cur?.t0 ?? t00));
+      },
       onTxStatus: (e) => this.setTxStatus(e.status),
       onTxEnded: (e) => {
         const kind = classifyTxEnd(cur?.sql ?? null, e);
@@ -1080,7 +1087,7 @@ export class ConsoleSession implements OutputHost {
       let items: MenuItem[];
       if (this.driver === "postgres") {
         const dbs = (await introspect(this.ds.id, [])).filter(isNamespace);
-        const schemas = (await introspect(this.ds.id, [this.ds.database])).filter(isNamespace);
+        const schemas = visibleSchemaNodes(this.ds, await introspect(this.ds.id, [this.ds.database], true)).filter(isNamespace);
         items = dbs.map<MenuItem>((d) =>
           d.name === this.ds.database
             ? {
@@ -1091,7 +1098,7 @@ export class ConsoleSession implements OutputHost {
         );
         items.push({ type: "separator" }, { type: "hint", label: "Connect to database (Enter)" });
       } else {
-        const list = (await introspect(this.ds.id, [])).filter(isNamespace);
+        const list = visibleSchemaNodes(this.ds, await introspect(this.ds.id, [], true)).filter(isNamespace);
         items = list.map<MenuItem>((s) => ({ label: s.name, icon: "dg/schema", checked: s.name === cur, run: () => void this.switchSchema(s.name) }));
       }
       if (anchor instanceof HTMLElement) openMenu(items, { anchor, minWidth: 230 });

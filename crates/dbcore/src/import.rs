@@ -1116,7 +1116,39 @@ impl ErrorLog {
 struct Pending {
     row: u64,
     tuple: String,
+    /// Oracle: the literal of each mapped column (a batch is a `union all`, whose branches must agree on the type).
+    parts: Vec<String>,
     values: Vec<Option<String>>,
+}
+
+/// Oracle: the `select .. from dual` branches of a batch. The branches of a `union all` must have the same type per
+/// column, but a text over 2000 bytes is a `TO_CLOB(..) || ..` expression (a CLOB) next to plain literals
+/// (`ORA-01790`): wherever one value of a text column is a CLOB, all of them become CLOBs.
+fn oracle_union_branches(rows: &[&[String]], cats: &[Category]) -> Vec<String> {
+    let is_clob = |p: &str| p.starts_with("TO_CLOB(");
+    let clob_col: Vec<bool> = cats
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            *c == Category::Text && rows.iter().any(|r| r.get(i).is_some_and(|p| is_clob(p)))
+        })
+        .collect();
+    rows.iter()
+        .map(|r| {
+            let parts: Vec<String> = r
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    if clob_col[i] && !is_clob(p) {
+                        format!("TO_CLOB({p})")
+                    } else {
+                        p.clone()
+                    }
+                })
+                .collect();
+            format!("select {} from dual", parts.join(", "))
+        })
+        .collect()
 }
 
 fn first_line(e: &DbError) -> String {
@@ -1304,6 +1336,7 @@ impl ConnectionManager {
                     batch.push(Pending {
                         row: no,
                         tuple,
+                        parts: if oracle { parts } else { Vec::new() },
                         values: row,
                     });
                 }
@@ -1316,14 +1349,13 @@ impl ConnectionManager {
                 }
                 // ---- insert it: whole batch in a savepoint, row by row when it fails
                 run_c(&mut conn, "savepoint prometeo_import", cancel).await?;
-                let sql = format!(
-                    "{head}{}",
-                    batch
-                        .iter()
-                        .map(|p| p.tuple.as_str())
-                        .collect::<Vec<_>>()
-                        .join(tuple_sep)
-                );
+                let branches: Vec<String> = if oracle {
+                    let rows: Vec<&[String]> = batch.iter().map(|p| p.parts.as_slice()).collect();
+                    oracle_union_branches(&rows, &cats)
+                } else {
+                    batch.iter().map(|p| p.tuple.clone()).collect()
+                };
+                let sql = format!("{head}{}", branches.join(tuple_sep));
                 match run_c(&mut conn, &sql, cancel).await {
                     Ok(()) => {
                         release(&mut conn, d, cancel).await?;
@@ -1707,6 +1739,23 @@ mod tests {
         // a value that could break out of the statement never reaches the SQL as a number
         assert!(to_literal(pg, Category::Int, Some("1); drop table t; --")).is_err());
         assert!(to_literal(pg, Category::Float, Some("1); drop")).is_err());
+    }
+
+    #[test]
+    fn oracle_batches_have_one_type_per_column() {
+        let big = to_literal(Driver::Oracle, Category::Text, Some(&"x".repeat(2500))).unwrap();
+        assert!(big.starts_with("TO_CLOB("));
+        let cats = [Category::Int, Category::Text, Category::Text];
+        let r1 = vec!["1".to_string(), "'short'".to_string(), "'a'".to_string()];
+        let r2 = vec!["2".to_string(), big.clone(), "NULL".to_string()];
+        let r3 = vec!["3".to_string(), "NULL".to_string(), "'b'".to_string()];
+        let b = oracle_union_branches(&[&r1, &r2, &r3], &cats);
+        assert_eq!(b[0], "select 1, TO_CLOB('short'), 'a' from dual");
+        assert_eq!(b[1], format!("select 2, {big}, NULL from dual"));
+        assert_eq!(b[2], "select 3, TO_CLOB(NULL), 'b' from dual");
+        // nothing changes without a CLOB
+        let b = oracle_union_branches(&[&r1, &r3], &cats);
+        assert_eq!(b[0], "select 1, 'short', 'a' from dual");
     }
 
     #[test]

@@ -34,7 +34,7 @@ export {
   connected as connectedDataSourceIds,
   ensureConnected,
 } from "./core";
-export { schemaSnapshotFor, loadSchemaSnapshot } from "./schema";
+export { schemaSnapshotFor, loadSchemaSnapshot, synonymsFor } from "./schema";
 export { openTable as openTableTab, openDdl as openDdlTab, openDdlRef, openTableRef, newConsole, jumpToConsole, openConsoleTab } from "./commands";
 export { showQuickDocRef, type QuickDocTarget } from "./QuickDoc";
 export { autoSyncAfter } from "./autosync";
@@ -83,15 +83,15 @@ function start(): void {
         if (t.color !== color) updateTab(t.id, { color });
       }
     });
-    // the breadcrumb follows the active tab (table / DDL tabs; consoles push their own path)
+    // the breadcrumb follows the active tab (table / DDL tabs; consoles push their own path) and the data source's name
     createEffect(
       on(
-        activeTabId,
-        () => {
+        () => [activeTabId(), dataSources().map((d) => d.name).join("\u0000")],
+        ([tabId], prev) => {
           const path = crumbsOfTab(activeTab());
           if (path) setEditorPath(path);
           // a tab was activated: the editor is the context now (DataGrip's breadcrumbs follow the focused component)
-          if (activeTabId()) setFocusArea("editor");
+          if (tabId && tabId !== prev?.[0]) setFocusArea("editor");
         },
         { defer: true },
       ),

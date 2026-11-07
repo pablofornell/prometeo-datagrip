@@ -278,20 +278,42 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
     return ok;
   }
 
+  const askPending = (n: number) => {
+    activateTab(props.tab.id);
+    return ask({
+      title: "Uncommitted Changes",
+      message: `'${props.tab.title}' has ${plural(n, "uncommitted change")}. Submit them to the database before closing?`,
+      choices: [
+        { label: "Submit", value: "submit", primary: true },
+        { label: "Discard", value: "discard" },
+        { label: "Cancel", value: "cancel" },
+      ],
+      cancel: "cancel",
+    });
+  };
+
+  /**
+   * Quitting: only the question about the pending changes; nothing is sent until every prompt of the quit was answered.
+   * A transaction that was open before is ended by the quit's own transaction question; one that Submit opens (Tx:
+   * Manual) is asked after the submit.
+   */
+  async function askQuit(): Promise<false | null | (() => Promise<boolean>)> {
+    const n = pending();
+    if (n === 0) return null;
+    const a = await askPending(n);
+    if (a === "cancel") return false;
+    if (a !== "submit") return null;
+    const hadTx = inTx();
+    return async () => {
+      if (!(await submitNow())) return false;
+      return hadTx || confirmEndTransactions({ tabId: props.tab.id, reason: "closing the editor" });
+    };
+  }
+
   async function confirmClose(): Promise<boolean> {
     const n = pending();
     if (n > 0) {
-      activateTab(props.tab.id);
-      const a = await ask({
-        title: "Uncommitted Changes",
-        message: `'${props.tab.title}' has ${plural(n, "uncommitted change")}. Submit them to the database before closing?`,
-        choices: [
-          { label: "Submit", value: "submit", primary: true },
-          { label: "Discard", value: "discard" },
-          { label: "Cancel", value: "cancel" },
-        ],
-        cancel: "cancel",
-      });
+      const a = await askPending(n);
       if (a === "cancel") return false;
       if (a === "submit" && !(await submitNow())) return false;
     }
@@ -460,6 +482,7 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
       prevPage,
       openDdl,
       confirmClose,
+      askQuit,
       txMode,
       inTx,
       txStatus,

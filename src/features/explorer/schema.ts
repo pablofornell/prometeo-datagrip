@@ -77,6 +77,80 @@ export function invalidateSnapshots(dsId: string): void {
   for (const e of entries.values()) if (e.dsId === dsId && e.get() !== undefined) void load(e);
   const x = extrasEntries.get(dsId);
   if (x && x.get() !== undefined) void loadExtras(dsId);
+  const y = synonymEntries.get(dsId);
+  if (y && y.get() !== undefined) void loadSynonyms(dsId);
+}
+
+// ---------------------------------------------------------------- Oracle synonyms (the editor resolves them like their targets)
+
+/** A synonym of `schema`; `target` is `[schema, name]` (none for a database link). */
+export interface SnapshotSynonym {
+  schema: string;
+  name: string;
+  target?: string[];
+}
+
+interface SynonymEntry {
+  get: Accessor<SnapshotSynonym[] | undefined>;
+  set: Setter<SnapshotSynonym[] | undefined>;
+  loading?: Promise<void>;
+  failedAt?: number;
+}
+const synonymEntries = new Map<string, SynonymEntry>();
+
+async function buildSynonyms(dsId: string): Promise<SnapshotSynonym[]> {
+  await ensureConnected(dsId);
+  const wanted = new Set((await loadSchemaSnapshot(dsId)).map((o) => o.schema));
+  const out: SnapshotSynonym[] = [];
+  await Promise.all(
+    (await rawIntrospect(dsId, [], true).catch(() => []))
+      .filter((n) => n.kind === "schema" && wanted.has(n.name))
+      .map(async (schema) => {
+        const folder = (await rawIntrospect(dsId, schema.path, false).catch(() => [])).find((f) => f.extra.folder === "synonyms");
+        if (!folder) return;
+        for (const n of await rawIntrospect(dsId, folder.path, false).catch(() => [])) {
+          const name = n.extra.targetName as string | undefined;
+          const owner = (n.extra.targetSchema as string | null | undefined) ?? schema.name;
+          out.push({ schema: schema.name, name: n.name, target: n.extra.dbLink || !name ? undefined : [owner, name] });
+        }
+      }),
+  );
+  return out;
+}
+
+function loadSynonyms(dsId: string): Promise<void> {
+  let e = synonymEntries.get(dsId);
+  if (!e) {
+    const [get, set] = createSignal<SnapshotSynonym[] | undefined>(undefined);
+    synonymEntries.set(dsId, (e = { get, set }));
+  }
+  if (e.loading) return e.loading;
+  const entry = e;
+  entry.loading = buildSynonyms(dsId)
+    .then((x) => {
+      entry.failedAt = undefined;
+      entry.set(x);
+    })
+    .catch(() => {
+      entry.failedAt = Date.now();
+    })
+    .finally(() => {
+      entry.loading = undefined;
+    });
+  return entry.loading;
+}
+
+/** Synonyms of an Oracle data source's schemas, for the editor's inspections. Reactive; `[]` until loaded (other DBMSs: always `[]`). */
+export function synonymsFor(dsId: string): SnapshotSynonym[] {
+  if (dsOf(dsId)?.driver !== "oracle") return [];
+  let e = synonymEntries.get(dsId);
+  if (!e) {
+    void loadSynonyms(dsId);
+    e = synonymEntries.get(dsId)!;
+  }
+  const v = e.get();
+  if (v === undefined && !e.loading && e.failedAt !== undefined && Date.now() - e.failedAt > RETRY_MS) void loadSynonyms(dsId);
+  return v ?? [];
 }
 
 // ---------------------------------------------------------------- sequences and routines (completion extras)

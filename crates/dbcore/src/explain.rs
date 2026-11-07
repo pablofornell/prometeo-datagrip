@@ -670,6 +670,9 @@ fn cell_doc(c: &Cell) -> Value {
     }
 }
 
+/// Savepoint that marks the user's transaction before `EXPLAIN PLAN` writes into `PLAN_TABLE`.
+const EXPLAIN_SAVEPOINT: &str = "prometeo_explain";
+
 impl ConnectionManager {
     /// Explain the first statement of `sql` on the session. `analyze` actually runs it (not available on SQLite).
     pub async fn explain(
@@ -749,9 +752,10 @@ impl ConnectionManager {
         })
     }
 
-    /// Oracle: `EXPLAIN PLAN` writes into the session's `PLAN_TABLE` (a private temporary table), which is read and
-    /// emptied of this statement's rows again. `PLAN_TABLE` is a plain table in a few old setups: the delete keeps it
-    /// from filling up there too.
+    /// Oracle: `EXPLAIN PLAN` writes into the session's `PLAN_TABLE` (a private temporary table) and so opens a
+    /// transaction. The rows are read and then undone again, leaving the session as it was: with no transaction open
+    /// before, a `ROLLBACK`; with one, a rollback to a savepoint taken first (the user's own work stays). This also
+    /// keeps `PLAN_TABLE` from filling up where it is a plain table.
     async fn explain_oracle(
         &self,
         session: &SessionId,
@@ -777,6 +781,10 @@ impl ConnectionManager {
             )
             .await
         };
+        let had_tx = self.session_in_transaction(session)?;
+        if had_tx {
+            run(format!("savepoint {EXPLAIN_SAVEPOINT}")).await?;
+        }
         let mut elapsed_ms = 0;
         let mut rows: Vec<Vec<Cell>> = Vec::new();
         let mut failure: Option<String> = None;
@@ -801,9 +809,11 @@ impl ConnectionManager {
                 break;
             }
         }
-        let _ = run(format!(
-            "delete from plan_table where statement_id = '{id}'"
-        ))
+        let _ = run(if had_tx {
+            format!("rollback to savepoint {EXPLAIN_SAVEPOINT}")
+        } else {
+            "rollback".to_string()
+        })
         .await;
         if let Some(m) = failure {
             return Err(DbError::InvalidArgument(m));

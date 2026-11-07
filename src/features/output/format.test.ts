@@ -28,6 +28,9 @@ describe("output log wording", () => {
     expect(firstKeyword("-- x\n  /* y */ (select 1)")).toBe("SELECT");
     expect(reportsCount("create table t(a int)")).toBe(false);
     expect(reportsCount("update t set a=1")).toBe(true);
+    expect(reportsCount("declare x number; begin null; end;", "oracle")).toBe(false);
+    expect(reportsCount("call p(1)", "oracle")).toBe(false);
+    expect(reportsCount("call p(1)", "mysql")).toBe(true);
   });
   it("names results by the leading comment", () => {
     expect(leadingComment("-- Top customers by revenue\nSELECT 1")).toBe("Top customers by revenue");

@@ -11,3 +11,17 @@ export function fitCount(widths: number[], gap: number, avail: number, btn: numb
   while (n > 0 && used(n) + btn > avail) n--;
   return n;
 }
+
+/**
+ * The control a toolbar child stands for: itself, or the first button inside a wrapper (`<span class="dgc-run">`
+ * holding the run button), whose title / state / click are the ones that count.
+ */
+export function controlOf(el: HTMLElement): HTMLElement {
+  return el.tagName === "BUTTON" ? el : (el.querySelector<HTMLElement>("button") ?? el);
+}
+
+/** The label of a hidden item: its text (`Tx: Auto`), else its tooltip. */
+export function labelOf(el: HTMLElement): string {
+  const c = controlOf(el);
+  return ((c.textContent ?? "").replace(/\s+/g, " ").trim() || c.dataset.tip || c.getAttribute("aria-label") || c.getAttribute("title") || "").trim();
+}

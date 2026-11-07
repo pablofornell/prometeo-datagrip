@@ -115,13 +115,29 @@ export function GeneralTab(props: { s: Session }) {
         </div>
       </Show>
 
-      {/* ---- PostgreSQL / MySQL */}
-      <Show when={!isSqlite() && f().connType === "default"}>
-        <Row label="Host:" class="ds-row-main">
-          <TextField value={f().host} onInput={(v) => s.setField("host", v)} frameClass="ds-fill" />
-          <span class="ds-sublabel">Port:</span>
-          <TextField value={f().port} onInput={(v) => s.setField("port", v)} frameClass="ds-port" />
+      {/* ---- URL only */}
+      <Show when={f().connType === "url"}>
+        <Row label="URL:" class="ds-row-main">
+          <TextField value={f().url} onInput={(v) => s.setUrl(v)} error={urlInvalid()} frameClass="ds-fill" />
         </Row>
+        <div class="ds-hint ds-hint-url">
+          {isSqlite()
+            ? "jdbc:sqlite:<path to the database file>"
+            : isOracle()
+              ? "jdbc:oracle:thin:user/password@//host:port/service  or  jdbc:oracle:thin:user/password@host:port:SID"
+              : `Include the credentials in the URL: jdbc:${DBMS[dbms()].scheme}://host:port/database?user=name&password=secret`}
+        </div>
+      </Show>
+
+      {/* ---- PostgreSQL / MySQL / Oracle (Oracle's "URL only" keeps the authentication fields) */}
+      <Show when={!isSqlite() && (f().connType === "default" || (isOracle() && f().connType === "url"))}>
+        <Show when={f().connType === "default"}>
+          <Row label="Host:" class="ds-row-main">
+            <TextField value={f().host} onInput={(v) => s.setField("host", v)} frameClass="ds-fill" />
+            <span class="ds-sublabel">Port:</span>
+            <TextField value={f().port} onInput={(v) => s.setField("port", v)} frameClass="ds-port" />
+          </Row>
+        </Show>
         <Row label="Authentication:" class="ds-row-auth">
           <ComboBox
             value={f().auth}
@@ -154,23 +170,11 @@ export function GeneralTab(props: { s: Session }) {
             </button>
           </Row>
         </Show>
-        <Row label={isOracle() ? (oraType() === "sid" ? "SID:" : "Service:") : "Database:"} class="ds-row-db">
-          <EditableCombo value={f().database} onInput={(v) => s.setField("database", v)} suggestions={dbSuggestions} />
-        </Row>
-      </Show>
-
-      {/* ---- URL only */}
-      <Show when={f().connType === "url"}>
-        <Row label="URL:" class="ds-row-main">
-          <TextField value={f().url} onInput={(v) => s.setUrl(v)} error={urlInvalid()} frameClass="ds-fill" />
-        </Row>
-        <div class="ds-hint ds-hint-url">
-          {isSqlite()
-            ? "jdbc:sqlite:<path to the database file>"
-            : isOracle()
-              ? "jdbc:oracle:thin:user/password@//host:port/service  or  jdbc:oracle:thin:user/password@host:port:SID"
-              : `Include the credentials in the URL: jdbc:${DBMS[dbms()].scheme}://host:port/database?user=name&password=secret`}
-        </div>
+        <Show when={f().connType === "default"}>
+          <Row label={isOracle() ? (oraType() === "sid" ? "SID:" : "Service:") : "Database:"} class="ds-row-db">
+            <EditableCombo value={f().database} onInput={(v) => s.setField("database", v)} suggestions={dbSuggestions} />
+          </Row>
+        </Show>
       </Show>
 
       {/* ---- derived URL */}

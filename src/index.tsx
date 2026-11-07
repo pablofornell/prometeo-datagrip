@@ -10,8 +10,10 @@ import "./styles/app.css";
 import "./styles/ui.css";
 import "./styles/shell.css";
 import "./theme/appearance.css";
+import { installNativeMenuGuard } from "./state/nativeMenu";
 import { initTheme } from "./state/theme";
 
+installNativeMenuGuard(import.meta.env.PROD); // no webview menu ("Reload") on a dialog backdrop or any plain area
 initTheme(); // sets <html data-theme> before the first paint
 import "./features";
 
