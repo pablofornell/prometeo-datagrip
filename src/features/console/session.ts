@@ -67,9 +67,13 @@ export type TxMode = "auto" | "manual";
 /** `default`: the server's own level (nothing is set on the session). */
 export type Isolation = "default" | "read uncommitted" | "read committed" | "repeatable read" | "serializable";
 
-/** The isolation levels of the Tx menu; Read Uncommitted only exists on MySQL (PostgreSQL runs it as Read Committed). */
+/** The isolation levels of the Tx menu; Read Uncommitted only exists on MySQL (PostgreSQL runs it as Read Committed), Oracle has two. */
 export const isolationLevels = (driver: DataSource["driver"]): Isolation[] =>
-  driver === "mysql" ? ["default", "read uncommitted", "read committed", "repeatable read", "serializable"] : ["default", "read committed", "repeatable read", "serializable"];
+  driver === "mysql"
+    ? ["default", "read uncommitted", "read committed", "repeatable read", "serializable"]
+    : driver === "oracle"
+      ? ["default", "read committed", "serializable"]
+      : ["default", "read committed", "repeatable read", "serializable"];
 const isolationLabel = (i: Isolation): string => (i === "default" ? "Database Default" : cap(i));
 const cap = (s: string): string => s.replace(/\b\w/g, (c) => c.toUpperCase());
 const errText = (e: unknown): string => String((e as Error)?.message ?? e).replace(/^Error:\s*/, "");
@@ -191,7 +195,7 @@ export class ConsoleSession implements OutputHost {
     this.inTx = () => this.txStatus() !== "idle";
     // the schema chosen last time shows at once; it is applied to the session when that opens (`ensureSession`)
     [this.schema, this.setSchema] = sig<string | null>(
-      ds.driver === "sqlite" ? "main" : (savedSchema(ds.id, consoleName) ?? (ds.driver === "mysql" ? ds.database || null : null)),
+      ds.driver === "sqlite" ? "main" : (savedSchema(ds.id, consoleName) ?? (ds.driver === "mysql" ? ds.database || null : ds.driver === "oracle" ? ds.user.toUpperCase() || null : null)),
     );
     [this.marks, this.setMarks] = sig<ExecMark[]>([]);
     [this.errors, this.setErrors] = sig<EditorError[]>([]);
@@ -242,6 +246,8 @@ export class ConsoleSession implements OutputHost {
   }
 
   private isolationSql(i: Isolation): string {
+    // Oracle: the level of the transactions that follow; its default is READ COMMITTED
+    if (this.driver === "oracle") return `ALTER SESSION SET ISOLATION_LEVEL = ${i === "serializable" ? "SERIALIZABLE" : "READ COMMITTED"}`;
     if (i === "default") return this.driver === "postgres" ? "RESET default_transaction_isolation" : "SET SESSION transaction_isolation = DEFAULT";
     const lvl = i.toUpperCase();
     return this.driver === "postgres" ? `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ${lvl}` : `SET SESSION TRANSACTION ISOLATION LEVEL ${lvl}`;
@@ -327,7 +333,10 @@ export class ConsoleSession implements OutputHost {
       return "main";
     }
     try {
-      const ev = await this.silent(sid, this.driver === "postgres" ? "select current_schema()" : "select database()");
+      const ev = await this.silent(
+        sid,
+        this.driver === "postgres" ? "select current_schema()" : this.driver === "oracle" ? "select sys_context('USERENV', 'CURRENT_SCHEMA') from dual" : "select database()",
+      );
       const rs = ev.find((e) => e.kind === "resultset");
       const v = rs && rs.kind === "resultset" ? rs.rows[0]?.[0] : null;
       if (typeof v === "string") {
@@ -341,6 +350,7 @@ export class ConsoleSession implements OutputHost {
   }
 
   private useSchemaSql(name: string): string {
+    if (this.driver === "oracle") return `ALTER SESSION SET CURRENT_SCHEMA = "${name.replace(/"/g, '""')}"`;
     const q = this.driver === "postgres" ? `"${name.replace(/"/g, '""')}"` : `\`${name.replace(/`/g, "``")}\``;
     return this.driver === "postgres" ? `SET search_path TO ${q}` : `USE ${q}`;
   }
@@ -442,7 +452,7 @@ export class ConsoleSession implements OutputHost {
       notify({ kind: "info", title: "Nothing to explain", body: "Put the caret in a statement." });
       return;
     }
-    if (analyze && this.driver === "sqlite") return;
+    if (analyze && (this.driver === "sqlite" || this.driver === "oracle")) return;
     out.setRunning(true);
     this.explaining = true;
     this.setExecError(null);
@@ -553,7 +563,7 @@ export class ConsoleSession implements OutputHost {
 
   private async startExecute(sid: string, sql: string, o: RunOptions, handlers: ExecHandlers) {
     const size = o.pageSize ?? this.pageSize();
-    const options = { maxRows: size === "all" ? ALL_FIRST_CHUNK : size, keepOpenSecs: 600 };
+    const options = { maxRows: size === "all" ? ALL_FIRST_CHUNK : size, keepOpenSecs: 600, ...(this.driver === "oracle" && this.txMode() === "auto" ? { autoCommit: true } : {}) };
     return execute(sid, sql, handlers, options);
   }
 
@@ -765,7 +775,8 @@ export class ConsoleSession implements OutputHost {
       if (this.txMode() === "manual") {
         const st = await sessionTxStatus(sid);
         this.setTxStatus(st);
-        if (st === "idle") await this.silent(sid, this.driver === "mysql" ? "START TRANSACTION" : "BEGIN");
+        // Oracle has no BEGIN: the transaction starts with the first DML statement
+        if (st === "idle" && this.driver !== "oracle") await this.silent(sid, this.driver === "mysql" ? "START TRANSACTION" : "BEGIN");
       }
       return sid;
     };

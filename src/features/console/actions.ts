@@ -51,7 +51,7 @@ export function registerConsoleActions(): () => void {
       id: "sql.explainAnalyse",
       title: "Explain Analyse",
       icon: "explain-plan",
-      enabled: () => !!activeSession() && !activeSession()!.out.running() && activeSession()!.driver !== "sqlite",
+      enabled: () => !!activeSession() && !activeSession()!.out.running() && activeSession()!.driver !== "sqlite" && activeSession()!.driver !== "oracle",
       run: () => void activeSession()?.explain(true),
     },
     {

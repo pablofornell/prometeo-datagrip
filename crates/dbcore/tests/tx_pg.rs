@@ -492,6 +492,7 @@ async fn cancel_inside_a_transaction_marks_it_failed() {
         max_rows: 100,
         stop_on_error: true,
         keep_open_secs: 600,
+        ..Default::default()
     };
     assert_ok(
         &mgr.execute_collect(
@@ -801,6 +802,7 @@ async fn lost_connection_while_paging() {
         max_rows: 10,
         stop_on_error: true,
         keep_open_secs: 600,
+        ..Default::default()
     };
     assert_ok(&mgr.execute_collect(&s, "begin", o.clone()).await.unwrap());
     let pid = scalar(&run(&mgr, &s, "select pg_backend_pid()").await);

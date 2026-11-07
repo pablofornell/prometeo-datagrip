@@ -27,7 +27,7 @@ export function ConsoleToolbar(props: { session: ConsoleSession; /** Shown left 
         title="Explain Plan"
         dropdown
         disabled={s().out.running()}
-        onClick={() => openMenu([{ action: "sql.explainPlan" }, ...(s().driver === "sqlite" ? [] : [{ action: "sql.explainAnalyse" }])], { anchor: explainBtn })}
+        onClick={() => openMenu([{ action: "sql.explainPlan" }, ...(s().driver === "sqlite" || s().driver === "oracle" ? [] : [{ action: "sql.explainAnalyse" }])], { anchor: explainBtn })}
       />
       <ToolbarSeparator />
       <ActionButton action="sql.history" icon="history" title="Browse Query History" />

@@ -7,6 +7,7 @@ import { For, type JSX, Show, createResource, onCleanup, onMount } from "solid-j
 import { render } from "solid-js/web";
 import { type ObjectRef, type TreeNode, getDdl } from "../../api/db";
 import { highlightSql } from "../../components/editor";
+import type { Dialect } from "../../components/editor/split";
 import { openTableRef } from "./commands";
 import { dsName, dsOf, ensureConnected, rawIntrospect } from "./core";
 import { type ENode, TABLE_CHILD, referenceOf } from "./model";
@@ -27,6 +28,8 @@ const KIND_TITLE: Record<string, string> = {
   check: "Check constraint",
   trigger: "Trigger",
   sequence: "Sequence",
+  package: "Package",
+  synonym: "Synonym",
   function: "Function",
   procedure: "Procedure",
   routine: "Routine",
@@ -62,7 +65,7 @@ export async function docOf(n: ENode): Promise<Doc> {
       const ds = dsOf(d.dsId);
       doc.where = "";
       if (ds) {
-        add("DBMS", ds.options.dbms === "mariadb" ? "MariaDB" : { postgres: "PostgreSQL", mysql: "MySQL", sqlite: "SQLite" }[ds.driver]);
+        add("DBMS", ds.options.dbms === "mariadb" ? "MariaDB" : { postgres: "PostgreSQL", mysql: "MySQL", sqlite: "SQLite", oracle: "Oracle" }[ds.driver]);
         add("Host", ds.driver === "sqlite" ? undefined : `${ds.host}:${ds.port}`);
         add("Database", ds.database);
         add("File", ds.file);
@@ -99,6 +102,12 @@ export async function docOf(n: ENode): Promise<Doc> {
       break;
     case "sequence":
       add("Type", n.hint);
+      break;
+    case "package":
+      add("Status", n.hint);
+      break;
+    case "synonym":
+      add("Target", n.hint);
       break;
     case "role":
       doc.comment = str(ex.comment);
@@ -294,7 +303,7 @@ function Ddl(props: { text: string; dialect: string }): JSX.Element {
     const text = layoutCreate(props.text);
     const out: JSX.Element[] = [];
     let at = 0;
-    for (const m of highlightSql(text, props.dialect as "postgres" | "mysql" | "sqlite")) {
+    for (const m of highlightSql(text, props.dialect as Dialect)) {
       if (m.from < at || m.to <= m.from) continue;
       if (m.from > at) out.push(text.slice(at, m.from));
       out.push(<span class={`cm-sql-${m.cls}`}>{text.slice(m.from, m.to)}</span>);

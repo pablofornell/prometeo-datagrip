@@ -425,6 +425,8 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
       // qualifier = token before the dot; owner table
       const q = i - 2;
       if (!isNameAt(q)) continue;
+      // Oracle pseudo-columns of any table and of a sequence: `e.rowid`, `emp_seq.nextval`
+      if (dialect === "oracle" && (w === "rowid" || w === "nextval" || w === "currval")) continue;
       const qn = lw[q];
       let tbl: TableIdx | undefined;
       let opaque = false;
@@ -453,6 +455,8 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
     if (beforeDot) {
       // qualifier: alias, table or schema. Plain, red when it names nothing.
       const qref = byName.get(w);
+      // Oracle `seq.nextval` / `seq.currval`: the qualifier is a sequence
+      if (dialect === "oracle" && /^(nextval|currval)$/.test(lw[i + 2] ?? "") && !qref) continue;
       if (qref?.table) hit(i, qref.table);
       if (flagUnresolved && !role && refs.length > 0 && !anyOpaque && !byName.has(w) && !idx.hasSchema(w) && !ctes.has(w) && ["select", "with", "update", "delete", "insert"].includes(first)) {
         mk("bad");

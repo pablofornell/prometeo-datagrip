@@ -27,7 +27,7 @@ export function SshSslTab(props: { s: Session }) {
   const f = () => s.current()!.form;
   const info = () => DBMS[f().dbms];
   const sslOn = () => f().options.sslmode !== undefined;
-  const canSsl = () => f().dbms !== "sqlite" && f().connType !== "url";
+  const canSsl = () => f().dbms !== "sqlite" && f().dbms !== "oracle" && f().connType !== "url";
 
   return (
     <div class="ds-form ds-ssh">
@@ -83,9 +83,11 @@ export function SshSslTab(props: { s: Session }) {
       <div class="ds-hint ds-hint-ssl">
         {f().dbms === "sqlite"
           ? "SSL does not apply to SQLite"
-          : f().connType === "url"
-            ? "In URL only mode set the SSL parameters in the URL"
-            : "The CA file is used by the Verify modes; the client files only when the server asks for a certificate"}
+          : f().dbms === "oracle"
+            ? "SSL (TCPS) is not supported for Oracle yet"
+            : f().connType === "url"
+              ? "In URL only mode set the SSL parameters in the URL"
+              : "The CA file is used by the Verify modes; the client files only when the server asks for a certificate"}
       </div>
     </div>
   );

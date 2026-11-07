@@ -13,9 +13,13 @@
  * - MySQL: backticks, `#` and `-- ` comments, backslash escapes, `DELIMITER xx` lines,
  *   `BEGIN .. END` bodies of `CREATE PROCEDURE/FUNCTION/TRIGGER/EVENT`;
  * - SQLite: backticks, `[bracket]` identifiers, `CREATE TRIGGER .. BEGIN .. END;` bodies.
+ * - Oracle: `q'[..]'` alternative quoting, no backticks / backslash escapes; PL/SQL units (`DECLARE`/`BEGIN` blocks,
+ *   `CREATE [OR REPLACE] PROCEDURE/FUNCTION/PACKAGE [BODY]/TRIGGER/TYPE BODY`) are not ended by `;` but by a line that
+ *   holds only `/` (an anonymous block that starts with `BEGIN` also ends at its closing `END;`). A line with only `/`
+ *   also ends a plain statement and is ignored after one.
  */
 
-export type Dialect = "postgres" | "mysql" | "sqlite";
+export type Dialect = "postgres" | "mysql" | "sqlite" | "oracle";
 
 export interface Statement {
   index: number;
@@ -38,6 +42,22 @@ const isAlpha = (c: number): boolean => (c >= 0x41 && c <= 0x5a) || (c >= 0x61 &
 const isDigit = (c: number): boolean => c >= 0x30 && c <= 0x39;
 const isIdentStart = (c: number): boolean => isAlpha(c) || c === 0x5f || c >= 0x80;
 const isIdent = (c: number): boolean => isAlpha(c) || isDigit(c) || c === 0x5f || c === 0x24 || c >= 0x80;
+
+/**
+ * Oracle alternative quoting: `i` points at the `q` / `Q` / `nq` / `NQ` that precedes `'<d>`. Returns the index after the
+ * closing `<d>'` (or the end of `s`), or `null` when it is not a q-quote. `[ ( { <` close with `] ) } >`.
+ */
+export function skipQQuote(s: string, i: number): number | null {
+  let j = i;
+  if ((s.charCodeAt(j) | 0x20) === 0x6e) j += 1; // n
+  if ((s.charCodeAt(j) | 0x20) !== 0x71 || s.charCodeAt(j + 1) !== 0x27) return null; // q'
+  if (i > 0 && (isIdent(s.charCodeAt(i - 1)) || s.charCodeAt(i - 1) === 0x27)) return null;
+  const open = s[j + 2];
+  if (open === undefined || /\s/.test(open)) return null;
+  const close = { "[": "]", "(": ")", "{": "}", "<": ">" }[open] ?? open;
+  const k = s.indexOf(close + "'", j + 3);
+  return k < 0 ? s.length : k + 2;
+}
 
 const Q_SINGLE = 0x27;
 const Q_DOUBLE = 0x22;
@@ -137,6 +157,15 @@ class Scanner {
   }
 }
 
+/** `CREATE [OR REPLACE] [EDITIONABLE|NONEDITIONABLE] PROCEDURE | FUNCTION | PACKAGE | TRIGGER | TYPE BODY`. */
+function isOraclePlsqlCreate(words: string[]): boolean {
+  let k = 1;
+  while (k < words.length && ["OR", "REPLACE", "EDITIONABLE", "NONEDITIONABLE"].includes(words[k])) k += 1;
+  const w = words[k];
+  if (w === "TYPE") return words[k + 1] === "BODY";
+  return w === "PROCEDURE" || w === "FUNCTION" || w === "PACKAGE" || w === "TRIGGER";
+}
+
 function splitRaw(sql: string, d: Dialect): Raw[] {
   const n = sql.length;
   const sc = new Scanner(sql, d);
@@ -148,6 +177,20 @@ function splitRaw(sql: string, d: Dialect): Raw[] {
   let compound = false; // statement is a CREATE of something with a BEGIN..END body
   let depth = 0;
   let prevWord = "";
+  // Oracle: the statement is a PL/SQL unit (ended by a `/` line, not by `;`)
+  let plsql = false;
+  // Oracle: anonymous `BEGIN` block whose outermost END was seen; the next `;` ends it
+  let blockClosed = false;
+  const lineIsSlash = (at: number): number => {
+    // index after the line when `at` is a `/` that is alone on its line, else -1
+    if (sql.charCodeAt(at) !== 0x2f) return -1;
+    let a = at - 1;
+    while (a >= 0 && sql.charCodeAt(a) !== 0x0a && isWs(sql.charCodeAt(a))) a -= 1;
+    if (a >= 0 && sql.charCodeAt(a) !== 0x0a) return -1;
+    let b = at + 1;
+    while (b < n && sql.charCodeAt(b) !== 0x0a && isWs(sql.charCodeAt(b))) b += 1;
+    return b >= n || sql.charCodeAt(b) === 0x0a ? b : -1;
+  };
 
   const finish = (end: number, full: number): void => {
     if (start !== null) {
@@ -160,6 +203,8 @@ function splitRaw(sql: string, d: Dialect): Raw[] {
     compound = false;
     depth = 0;
     prevWord = "";
+    plsql = false;
+    blockClosed = false;
   };
 
   while (i < n) {
@@ -172,6 +217,23 @@ function splitRaw(sql: string, d: Dialect): Raw[] {
     if (ce !== null) {
       i = ce;
       continue;
+    }
+    if (d === "oracle") {
+      const le = lineIsSlash(i);
+      if (le >= 0) {
+        finish(i, le); // a no-op after a statement that `;` already ended
+        i = le;
+        continue;
+      }
+      if (c === 0x3b && plsql) {
+        if (blockClosed) {
+          finish(i + 1, i + 1);
+          i += 1;
+        } else {
+          i += 1;
+        }
+        continue;
+      }
     }
     // statement terminator
     if (sql.startsWith(sc.delimiter, i) && !(depth > 0 && sc.delimiter === ";")) {
@@ -205,7 +267,7 @@ function splitRaw(sql: string, d: Dialect): Raw[] {
       i = sc.skipQuoted(i, Q_SINGLE, backslash);
     } else if (c === Q_DOUBLE) {
       i = sc.skipQuoted(i, Q_DOUBLE, d === "mysql");
-    } else if (c === Q_BACKTICK && d !== "postgres") {
+    } else if (c === Q_BACKTICK && d !== "postgres" && d !== "oracle") {
       i = sc.skipQuoted(i, Q_BACKTICK, false);
     } else if (c === 0x5b && d === "sqlite") {
       while (i < n && sql.charCodeAt(i) !== 0x5d) i += 1;
@@ -232,9 +294,28 @@ function splitRaw(sql: string, d: Dialect): Raw[] {
       } else {
         i += 1;
       }
+    } else if (d === "oracle" && isIdentStart(c) && skipQQuote(sql, i) !== null) {
+      i = skipQQuote(sql, i)!;
     } else if (isIdentStart(c)) {
       const [w, e] = sc.wordAt(i);
       const upper = w.toUpperCase();
+      if (d === "oracle") {
+        if (firstWords.length < 12) firstWords.push(upper);
+        if (firstWords.length === 1 && (upper === "BEGIN" || upper === "DECLARE")) plsql = true;
+        else if (!plsql && firstWords[0] === "CREATE") plsql = isOraclePlsqlCreate(firstWords);
+        if (plsql && firstWords[0] === "BEGIN") {
+          // anonymous block without DECLARE: nesting is tracked, so it ends at its own END; (no `/` needed)
+          if (upper === "BEGIN" || upper === "CASE") depth += 1;
+          else if (upper === "END" && depth > 0) {
+            const next = sc.peekWord(e);
+            if (next !== "IF" && next !== "LOOP") depth -= 1;
+            if (depth === 0) blockClosed = true;
+          }
+        }
+        prevWord = upper;
+        i = e;
+        continue;
+      }
       if (firstWords.length < 12) {
         firstWords.push(upper);
         if (!compound && firstWords[0] === "CREATE") {

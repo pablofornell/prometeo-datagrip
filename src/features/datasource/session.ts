@@ -196,13 +196,14 @@ export function createSession() {
       const dbms = d.form.dbms;
       const p = parseUrl(dbms, text);
       if (!p) return;
-      if (p.query) {
+      if (p.query || p.user) {
         // parameters cannot be represented by the fields: keep the URL as the source of truth
         setDrafts(i, "form", "connType", "url");
         return;
       }
       if (dbms === "sqlite") setDrafts(i, "form", "file", sqliteFileOfUrl(text) ?? "");
       else setDrafts(i, "form", { host: p.host, port: p.port, database: p.database });
+      if (dbms === "oracle") setOption("oracleConnType", p.sid ? "sid" : undefined);
       derive(i, { url: false });
     });
   }
@@ -218,6 +219,21 @@ export function createSession() {
       else if (t === "default") derive(i);
       else if (d.form.connType === "memory") setDrafts(i, "form", "url", buildUrl(d.form.dbms, d.form));
       derive(i, { url: false });
+    });
+  }
+
+  /** Oracle's "Connection type" combo: Service name / SID (the default fields) or URL only. */
+  function setOracleConnType(t: "service" | "sid" | "url") {
+    const i = indexOf(selectedKey());
+    if (i < 0) return;
+    batch(() => {
+      if (t === "url") {
+        setDrafts(i, "form", "connType", "url");
+        return;
+      }
+      setDrafts(i, "form", "connType", "default");
+      setOption("oracleConnType", t === "sid" ? "sid" : undefined);
+      derive(i);
     });
   }
 
@@ -239,12 +255,15 @@ export function createSession() {
         if (f.connType === "memory") patch.connType = "default";
         if (dbms === "postgres" && !f.database) patch.database = "postgres";
         if (old.id === "postgres" && f.database === "postgres") patch.database = "";
+        if (old.id === "oracle" || dbms === "oracle") patch.database = dbms === "postgres" ? "postgres" : dbms === "oracle" ? "XE" : "";
       }
       setDrafts(i, "form", patch);
       const mode = f.options.sslmode;
       if (mode && !info.sslModes.some((m) => m.value === mode)) setDrafts(i, "form", "options", "sslmode", undefined as never);
       if (dbms === "sqlite") setDrafts(i, "form", "options", "sslmode", undefined as never);
       if (dbms !== "sqlite") setDrafts(i, "form", "options", "create", undefined as never);
+      if (dbms !== "oracle") setDrafts(i, "form", "options", "oracleConnType", undefined as never);
+      if (dbms === "oracle") setDrafts(i, "form", "auth", "password");
       if (d.form.connType === "url") setDrafts(i, "form", "url", buildUrl(dbms, d.form));
       derive(i);
       setDrafts(i, "test", { state: "idle" });
@@ -261,6 +280,7 @@ export function createSession() {
       if (prefill.database !== undefined) form.database = prefill.database;
       if (prefill.user) form.user = prefill.user;
       if (prefill.file) form.file = prefill.file;
+      if (prefill.oracleConnType === "sid") form.options.oracleConnType = "sid";
       form.url = buildUrl(dbms, form);
     }
     const taken = drafts.map((d) => d.form.name);
@@ -455,6 +475,7 @@ export function createSession() {
     setPassword,
     setUrl,
     setConnType,
+    setOracleConnType,
     setDbms,
     addNew,
     removeSelected,

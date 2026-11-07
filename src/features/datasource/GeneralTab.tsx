@@ -40,6 +40,8 @@ export function GeneralTab(props: { s: Session }) {
   const f = () => d().form;
   const dbms = () => f().dbms;
   const isSqlite = () => dbms() === "sqlite";
+  const isOracle = () => dbms() === "oracle";
+  const oraType = (): "service" | "sid" | "url" => (f().connType === "url" ? "url" : f().options.oracleConnType === "sid" ? "sid" : "service");
   const urlInvalid = () => f().connType !== "memory" && !parseUrl(dbms(), f().url);
 
   const connTypes = () =>
@@ -55,6 +57,7 @@ export function GeneralTab(props: { s: Session }) {
         ];
 
   const dbSuggestions = async (): Promise<string[]> => {
+    if (isOracle()) return [];
     const saved = d().id && !s.isModified(d());
     if (saved) return listDatabases(d().id!);
     return dbms() === "postgres" ? ["postgres"] : [];
@@ -78,7 +81,20 @@ export function GeneralTab(props: { s: Session }) {
       </Row>
 
       <Row label="Connection type:" class="ds-row-conntype">
-        <Segmented options={connTypes()} value={f().connType} onChange={(v) => s.setConnType(v)} />
+        <Show
+          when={isOracle()}
+          fallback={<Segmented options={connTypes()} value={f().connType} onChange={(v) => s.setConnType(v)} />}
+        >
+          <Segmented
+            options={[
+              { value: "service" as const, label: "Service name" },
+              { value: "sid" as const, label: "SID" },
+              { value: "url" as const, label: "URL only" },
+            ]}
+            value={oraType()}
+            onChange={(v) => s.setOracleConnType(v)}
+          />
+        </Show>
       </Row>
 
       {/* ---- SQLite */}
@@ -111,7 +127,7 @@ export function GeneralTab(props: { s: Session }) {
             value={f().auth}
             options={[
               { value: "password", label: "User & Password" },
-              { value: "none", label: "No auth" },
+              ...(isOracle() ? [] : [{ value: "none", label: "No auth" }]),
             ]}
             onChange={(v) => s.setField("auth", v as "password" | "none")}
           />
@@ -138,7 +154,7 @@ export function GeneralTab(props: { s: Session }) {
             </button>
           </Row>
         </Show>
-        <Row label="Database:" class="ds-row-db">
+        <Row label={isOracle() ? (oraType() === "sid" ? "SID:" : "Service:") : "Database:"} class="ds-row-db">
           <EditableCombo value={f().database} onInput={(v) => s.setField("database", v)} suggestions={dbSuggestions} />
         </Row>
       </Show>
@@ -151,7 +167,9 @@ export function GeneralTab(props: { s: Session }) {
         <div class="ds-hint ds-hint-url">
           {isSqlite()
             ? "jdbc:sqlite:<path to the database file>"
-            : `Include the credentials in the URL: jdbc:${DBMS[dbms()].scheme}://host:port/database?user=name&password=secret`}
+            : isOracle()
+              ? "jdbc:oracle:thin:user/password@//host:port/service  or  jdbc:oracle:thin:user/password@host:port:SID"
+              : `Include the credentials in the URL: jdbc:${DBMS[dbms()].scheme}://host:port/database?user=name&password=secret`}
         </div>
       </Show>
 

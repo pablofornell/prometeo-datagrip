@@ -27,6 +27,7 @@ export function SchemasTab(props: { s: Session }) {
     setErr(null);
     const driver = d().form.dbms;
     const dbName = d().form.database;
+    const user = d().form.user;
     try {
       const tree = await withConnection(id, async () => {
         const items = (nodes: TreeNode[]): SchemaItem[] =>
@@ -36,7 +37,7 @@ export function SchemasTab(props: { s: Session }) {
               path: n.path,
               name: n.name,
               system: !!n.extra.system,
-              isDefault: driver === "postgres" ? !!n.extra.default : driver === "sqlite" ? n.name === "main" : n.name === dbName,
+              isDefault: driver === "postgres" ? !!n.extra.default : driver === "sqlite" ? n.name === "main" : driver === "oracle" ? n.name === user.toUpperCase() : n.name === dbName,
             }))
             .sort(byName);
         const top = await introspect(id, [], true);

@@ -101,3 +101,14 @@ describe("import model", () => {
     expect(resultMessage({ ...result, rolledBack: true, failed: 1, errors: [{ row: 3, message: "x" }] }, "t").kind).toBe("error");
   });
 });
+
+describe("Oracle import types", () => {
+  it("maps the inferred types and names a new table with upper-case names", () => {
+    expect(sqlTypeFor("oracle", "integer")).toBe("number(10)");
+    expect(sqlTypeFor("oracle", "bigint")).toBe("number(19)");
+    expect(sqlTypeFor("oracle", "double")).toBe("binary_double");
+    expect(sqlTypeFor("oracle", "text")).toBe("varchar2(4000)");
+    expect(sqlTypeFor("oracle", "timestamp")).toBe("timestamp");
+    expect(newRows("oracle", [{ name: "id", inferredType: "integer" }])).toEqual([{ name: "ID", type: "number(10)", from: "auto" }]);
+  });
+});

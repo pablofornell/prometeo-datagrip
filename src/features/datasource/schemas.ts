@@ -34,15 +34,15 @@ export function visibleSchemas(ds: Pick<DataSource, "id" | "options">): string[]
 }
 
 /** The schema a data source starts in, as far as the data source itself tells (PostgreSQL's is `public` unless the server says otherwise). */
-const defaultSchemaName = (ds: Pick<DataSource, "driver" | "database">): string =>
-  ds.driver === "sqlite" ? "main" : ds.driver === "mysql" ? ds.database : "public";
+export const defaultSchemaName = (ds: Pick<DataSource, "driver" | "database" | "user">): string =>
+  ds.driver === "sqlite" ? "main" : ds.driver === "mysql" ? ds.database : ds.driver === "oracle" ? ds.user.toUpperCase() : "public";
 
 /**
  * Is the schema node at `path` (PG: [db, schema], MySQL: [schema], SQLite: [schema]) visible?
  * A database path of PG ([db]) is visible when any of its schemas is. `info` (the node's name and whether it is the
  * default schema) is only needed for the patterns and the `Default schema` row.
  */
-export function isSchemaVisible(ds: Pick<DataSource, "id" | "options" | "driver" | "database">, path: string[], info?: { isDefault?: boolean }): boolean {
+export function isSchemaVisible(ds: Pick<DataSource, "id" | "options" | "driver" | "database" | "user">, path: string[], info?: { isDefault?: boolean }): boolean {
   const f = parseFilter(visibleSchemasRaw(ds));
   if (!f) return true;
   const name = path[path.length - 1];
@@ -54,7 +54,7 @@ export function isSchemaVisible(ds: Pick<DataSource, "id" | "options" | "driver"
 }
 
 /** Same by schema name only (search lists, where there is no node): the paths' last element is the schema. */
-export function isSchemaNameVisible(ds: Pick<DataSource, "id" | "options" | "driver" | "database">, name: string): boolean {
+export function isSchemaNameVisible(ds: Pick<DataSource, "id" | "options" | "driver" | "database" | "user">, name: string): boolean {
   const f = parseFilter(visibleSchemasRaw(ds));
   if (!f) return true;
   const verdict = patternVerdict(name, f.patterns);

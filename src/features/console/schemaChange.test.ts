@@ -33,3 +33,13 @@ describe("schemaChange: only a statement that STARTS with SET search_path / SET 
     expect(schemaChange("set search_path to pg_temp", "postgres")).toEqual({ schema: null, searchPath: "pg_temp" });
   });
 });
+
+describe("schemaChange: Oracle ALTER SESSION SET CURRENT_SCHEMA", () => {
+  it("reads the schema (unquoted names are upper case)", () => {
+    expect(schemaChange("alter session set current_schema = hr", "oracle")).toEqual({ schema: "HR" });
+    expect(schemaChange('ALTER SESSION SET CURRENT_SCHEMA = "Mixed"', "oracle")).toEqual({ schema: "Mixed" });
+    expect(schemaChange("alter session set nls_date_format = 'YYYY'", "oracle")).toBeNull();
+    expect(schemaChange("update t set a = 1", "oracle")).toBeNull();
+    expect(schemaChange("use hr", "oracle")).toBeNull();
+  });
+});

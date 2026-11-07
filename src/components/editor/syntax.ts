@@ -71,8 +71,9 @@ export function syntaxProblems(text: string, toks: Token[]): SyntaxProblem[] {
       if (isP(i - 1, "(") || isP(i - 1, ",") || (isW(i - 1) && lw[i - 1] === "select")) add(i, `<expression> expected, got ','`);
       else missing(i, "<expression>");
     } else if (sig[i].kind === "punct" && OPERATORS.has(raw[i])) {
-      // `ORDER BY a USING <`: the operator names a sort order, it has no operands
-      if (!(isW(i - 1) && lw[i - 1] === "using")) missing(i, "<expression>");
+      // `ORDER BY a USING <`: the operator names a sort order, it has no operands; Oracle's outer join `a.x = b.x (+)`
+      const outerJoin = raw[i] === "+" && isP(i - 1, "(") && isP(i + 1, ")");
+      if (!(isW(i - 1) && lw[i - 1] === "using") && !outerJoin) missing(i, "<expression>");
     } else if (isP(i, "*") && i > 0 && (sig[i - 1].kind !== "punct" || isP(i - 1, ")")) && !(isW(i - 1) && HEAD.has(lw[i - 1])) && !closesDistinctOn(i - 1)) {
       missing(i, "<expression>");
     } else if (isW(i)) {

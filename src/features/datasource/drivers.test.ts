@@ -27,6 +27,21 @@ describe("jdbc-like urls", () => {
     expect(fromSqlxUrl("sqlite", "sqlite:/tmp/a.db")).toBe("jdbc:sqlite:/tmp/a.db");
   });
 
+  it("handles Oracle thin urls", () => {
+    expect(buildUrl("oracle", { host: "localhost", port: "1521", database: "FREEPDB1", file: "", options: {} })).toBe("jdbc:oracle:thin:@//localhost:1521/FREEPDB1");
+    expect(buildUrl("oracle", { host: "localhost", port: "1521", database: "XE", file: "", options: { oracleConnType: "sid" } })).toBe("jdbc:oracle:thin:@localhost:1521:XE");
+    expect(parseUrl("oracle", "jdbc:oracle:thin:@//h:1522/svc")).toEqual({ host: "h", port: "1522", database: "svc", query: "", sid: false });
+    expect(parseUrl("oracle", "jdbc:oracle:thin:@h:1521:ORCL")).toEqual({ host: "h", port: "1521", database: "ORCL", query: "", sid: true });
+    expect(parseUrl("oracle", "jdbc:oracle:thin:@h:1521/svc")).toMatchObject({ database: "svc", sid: false });
+    expect(parseUrl("oracle", "jdbc:oracle:thin:u/p@//h/svc")).toMatchObject({ user: "u", password: "p", host: "h" });
+    expect(parseUrl("oracle", "jdbc:postgresql://h/d")).toBeNull();
+    expect(toSqlxUrl("oracle", "jdbc:oracle:thin:@//h:1521/svc")).toBe("oracle://h:1521/svc");
+    expect(toSqlxUrl("oracle", "jdbc:oracle:thin:@h:1521:XE")).toBe("oracle://h:1521/XE?sid=1");
+    expect(toSqlxUrl("oracle", "jdbc:oracle:thin:me/p%40ss@//h/svc")).toBe("oracle://me:p%2540ss@h/svc");
+    expect(fromSqlxUrl("oracle", "oracle://h:1521/svc")).toBe("jdbc:oracle:thin:@//h:1521/svc");
+    expect(fromSqlxUrl("oracle", "oracle://me:pw@h:1521/XE?sid=1")).toBe("jdbc:oracle:thin:me/pw@h:1521:XE");
+  });
+
   it("recognises in-memory sqlite", () => {
     expect(isMemoryUrl("sqlite::memory:")).toBe(true);
     expect(isMemoryUrl("sqlite:/tmp/a.db")).toBe(false);

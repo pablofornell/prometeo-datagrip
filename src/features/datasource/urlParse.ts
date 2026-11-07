@@ -1,9 +1,10 @@
 /**
  * "Data Source from URL": turns a pasted connection URL or file path into the fields of a new data source.
  * Understands `jdbc:postgresql://host:port/db`, `postgres://user:password@host/db?user=..&password=..`,
- * `mysql://`, `mariadb://`, `jdbc:sqlite:path`, `sqlite:path` / `file:path` and plain paths of SQLite files.
+ * `mysql://`, `mariadb://`, `jdbc:oracle:thin:@//host:port/service`, `jdbc:oracle:thin:@host:port:SID`,
+ * `oracle://user:password@host:port/service[?sid=1]`, `jdbc:sqlite:path`, `sqlite:path` / `file:path` and plain paths of SQLite files.
  */
-import type { Dbms } from "./drivers";
+import { type Dbms, parseUrl } from "./drivers";
 
 export interface UrlPrefill {
   dbms: Dbms;
@@ -13,6 +14,8 @@ export interface UrlPrefill {
   user?: string;
   password?: string;
   file?: string;
+  /** Oracle: the database field is a "service" name or a "sid". */
+  oracleConnType?: "service" | "sid";
 }
 
 const SQLITE_FILE = /\.(db|db3|sqlite|sqlite3|s3db)$/i;
@@ -26,10 +29,18 @@ export function parseDataSourceUrl(text: string): UrlPrefill | null {
     return file && !/^:memory:?$/i.test(file) ? { dbms: "sqlite", file: /^\/\/?[A-Za-z]:/.test(file) ? file.replace(/^\/+/, "") : file } : null;
   }
   if (/^(?:\/|~|\.{1,2}\/|[A-Za-z]:[\\/])/.test(t) && SQLITE_FILE.test(t)) return { dbms: "sqlite", file: t };
-  const m = /^(postgresql|postgres|pgsql|mysql|mariadb):\/\/(.*)$/i.exec(t);
+  if (/^oracle:thin:/i.test(t)) {
+    const p = parseUrl("oracle", "jdbc:" + t);
+    if (!p) return null;
+    const out: UrlPrefill = { dbms: "oracle", host: p.host, port: p.port, database: p.database, oracleConnType: p.sid ? "sid" : "service" };
+    if (p.user) out.user = p.user;
+    if (p.password) out.password = p.password;
+    return out;
+  }
+  const m = /^(postgresql|postgres|pgsql|mysql|mariadb|oracle):\/\/(.*)$/i.exec(t);
   if (!m) return null;
   const scheme = m[1].toLowerCase();
-  const dbms: Dbms = scheme === "mysql" ? "mysql" : scheme === "mariadb" ? "mariadb" : "postgres";
+  const dbms: Dbms = scheme === "mysql" ? "mysql" : scheme === "mariadb" ? "mariadb" : scheme === "oracle" ? "oracle" : "postgres";
   t = m[2];
   const q = t.indexOf("?");
   const params = new URLSearchParams(q >= 0 ? t.slice(q + 1) : "");
@@ -48,6 +59,7 @@ export function parseDataSourceUrl(text: string): UrlPrefill | null {
   const password = params.get("password") ?? (p !== undefined ? safeDecode(p) : undefined);
   if (user) out.user = user;
   if (password) out.password = password;
+  if (dbms === "oracle") out.oracleConnType = ["1", "true"].includes(params.get("sid") ?? "") ? "sid" : "service";
   return out;
 }
 

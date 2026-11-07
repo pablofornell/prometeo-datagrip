@@ -24,9 +24,14 @@ MYSQL_CONTAINER ?= prometeo-mysql
 MYSQL_IMAGE     ?= mysql:8
 MYSQL_PORT      ?= 33069
 MYSQL_PASSWORD  ?= prometeo
+ORACLE_CONTAINER ?= prometeo-oracle
+ORACLE_IMAGE     ?= gvenzl/oracle-free:23-slim-faststart
+ORACLE_PORT      ?= 15219
+ORACLE_PASSWORD  ?= prometeo
 
 DB_ENV := PROMETEO_PG_URL=postgres://postgres:$(PG_PASSWORD)@127.0.0.1:$(PG_PORT)/postgres \
           PROMETEO_MYSQL_URL=mysql://root:$(MYSQL_PASSWORD)@127.0.0.1:$(MYSQL_PORT)/demo \
+          PROMETEO_ORACLE_URL=oracle://demo:$(ORACLE_PASSWORD)@127.0.0.1:$(ORACLE_PORT)/FREEPDB1 \
           PROMETEO_NO_KEYRING=1
 
 .PHONY: help install dev build bundle run \
@@ -65,7 +70,7 @@ test-ui: ## Run the frontend tests (vitest)
 test-rust: ## Run the Rust tests; database tests skip without the DB env
 	PROMETEO_NO_KEYRING=1 $(CARGO) test --workspace
 
-test-rust-db: db-up ## Run the Rust tests against the PostgreSQL and MySQL containers
+test-rust-db: db-up ## Run the Rust tests against the PostgreSQL, MySQL and Oracle containers
 	$(DB_ENV) $(CARGO) test --workspace --no-fail-fast
 
 test-all: test-ui test-rust-db ## Run every test, including the database integration tests
@@ -93,7 +98,7 @@ ci: lint test-all ## Everything a CI run does: lint, all tests with databases, f
 
 ## ---- Test databases (Docker) ----
 
-db-up: ## Start the PostgreSQL and MySQL test containers (and wait until ready)
+db-up: ## Start the PostgreSQL, MySQL and Oracle test containers (and wait until ready)
 	@set -euo pipefail; \
 	start() { \
 	  name=$$1; shift; \
@@ -103,23 +108,27 @@ db-up: ## Start the PostgreSQL and MySQL test containers (and wait until ready)
 	}; \
 	start $(PG_CONTAINER) -e POSTGRES_PASSWORD=$(PG_PASSWORD) -p $(PG_PORT):5432 $(PG_IMAGE); \
 	start $(MYSQL_CONTAINER) -e MYSQL_ROOT_PASSWORD=$(MYSQL_PASSWORD) -e MYSQL_DATABASE=demo -p $(MYSQL_PORT):3306 $(MYSQL_IMAGE); \
+	start $(ORACLE_CONTAINER) -e ORACLE_PASSWORD=$(ORACLE_PASSWORD) -e APP_USER=demo -e APP_USER_PASSWORD=$(ORACLE_PASSWORD) -p $(ORACLE_PORT):1521 $(ORACLE_IMAGE); \
 	echo "[db] waiting for PostgreSQL"; \
 	for i in $$(seq 1 60); do docker exec $(PG_CONTAINER) pg_isready -U postgres -q && break; sleep 1; done; \
 	docker exec $(PG_CONTAINER) pg_isready -U postgres -q || { echo "[db] PostgreSQL is not ready"; exit 1; }; \
 	echo "[db] waiting for MySQL"; \
 	for i in $$(seq 1 90); do docker exec $(MYSQL_CONTAINER) mysqladmin ping -uroot -p$(MYSQL_PASSWORD) --silent >/dev/null 2>&1 && break; sleep 1; done; \
 	docker exec $(MYSQL_CONTAINER) mysqladmin ping -uroot -p$(MYSQL_PASSWORD) --silent >/dev/null 2>&1 || { echo "[db] MySQL is not ready"; exit 1; }; \
-	echo "[db] ready: PostgreSQL 127.0.0.1:$(PG_PORT), MySQL 127.0.0.1:$(MYSQL_PORT)"
+	echo "[db] waiting for Oracle (the first start takes a few minutes)"; \
+	for i in $$(seq 1 300); do docker logs $(ORACLE_CONTAINER) 2>&1 | grep -q "DATABASE IS READY TO USE!" && break; sleep 2; done; \
+	docker logs $(ORACLE_CONTAINER) 2>&1 | grep -q "DATABASE IS READY TO USE!" || { echo "[db] Oracle is not ready"; exit 1; }; \
+	echo "[db] ready: PostgreSQL 127.0.0.1:$(PG_PORT), MySQL 127.0.0.1:$(MYSQL_PORT), Oracle 127.0.0.1:$(ORACLE_PORT)/FREEPDB1"
 
 db-down: ## Stop the test containers (data is kept)
-	-docker stop $(PG_CONTAINER) $(MYSQL_CONTAINER)
+	-docker stop $(PG_CONTAINER) $(MYSQL_CONTAINER) $(ORACLE_CONTAINER)
 
 db-reset: ## Remove the test containers and their data, then start new ones
-	-docker rm -f $(PG_CONTAINER) $(MYSQL_CONTAINER)
+	-docker rm -f $(PG_CONTAINER) $(MYSQL_CONTAINER) $(ORACLE_CONTAINER)
 	$(MAKE) db-up
 
 db-status: ## Show the state of the test containers
-	@docker ps -a --filter name=$(PG_CONTAINER) --filter name=$(MYSQL_CONTAINER) --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+	@docker ps -a --filter name=$(PG_CONTAINER) --filter name=$(MYSQL_CONTAINER) --filter name=$(ORACLE_CONTAINER) --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
 
 ## ---- Cleanup ----
 

@@ -6,6 +6,7 @@ license.workspace = true
 description = "Database core for Prometeo DataGrip: connections, introspection, execution, editing, DDL, export"
 
 [dependencies]
+oracledb = { path = "../../vendor/oracledb" }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "sqlite"] }
 libsqlite3-sys = "0.30"
 tokio = { workspace = true }

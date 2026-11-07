@@ -68,6 +68,8 @@ impl fmt::Display for ServerError {
                     None => write!(f, "[{}] {}", self.code, self.message),
                 }
             }
+            // the message already starts with the `ORA-NNNNN: ` code
+            Driver::Oracle => f.write_str(&self.message),
         }
     }
 }
@@ -105,6 +107,9 @@ impl fmt::Display for ConnectionLost {
                 f.write_str("Communications link failure: the connection to the server was lost.")?
             }
             (None, Some(Driver::Sqlite)) => f.write_str("The database connection is closed.")?,
+            (None, Some(Driver::Oracle)) => {
+                f.write_str("The connection to the database was lost.")?
+            }
             (None, _) => f.write_str("An I/O error occurred while sending to the backend.")?,
         }
         if self.server.is_none() && !self.cause.is_empty() {
@@ -261,6 +266,9 @@ fn known_codes_end_connection(s: &ServerError) -> bool {
             matches!(s.native_code, Some(2006 | 2013 | 1927 | 1053 | 4031)) || s.code == "08S01"
         }
         Driver::Sqlite => false,
+        Driver::Oracle => {
+            matches!(s.native_code, Some(c) if crate::oracle::ends_connection(c))
+        }
     }
 }
 

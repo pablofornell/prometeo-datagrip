@@ -622,7 +622,7 @@ async fn probe_sqlite(conn: &mut Conn) -> Option<TxStatus> {
 pub(crate) async fn probe(conn: &mut Conn) -> Option<TxStatus> {
     match conn {
         Conn::Lite(_) => probe_sqlite(conn).await,
-        Conn::My(_) | Conn::Pg(_) => None,
+        Conn::My(_) | Conn::Pg(_) | Conn::Ora(_) => None,
     }
 }
 

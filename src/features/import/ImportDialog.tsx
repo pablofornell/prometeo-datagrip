@@ -96,7 +96,7 @@ export function ImportDialog(props: ImportDialogProps): JSX.Element {
   const [dirty, setDirty] = createSignal(false);
 
   const [schema, setSchema] = createSignal<string | null>(props.schema ?? props.schemas[0] ?? null);
-  const [tableName, setTableName] = createSignal(props.table ?? tableNameForFile(props.source.name));
+  const [tableName, setTableName] = createSignal(props.table ?? (props.driver === "oracle" ? tableNameForFile(props.source.name).toUpperCase() : tableNameForFile(props.source.name)));
   const [rows, setRows] = createSignal<MapRow[]>([]);
   const [writeErrors, setWriteErrors] = createSignal(true);
   const [errorFile, setErrorFile] = createSignal(props.source.defaultErrorFile);

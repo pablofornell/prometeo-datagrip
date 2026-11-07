@@ -8,7 +8,9 @@
 //! * MySQL: backticks, `#` and `-- ` comments, backslash escapes, `DELIMITER xx` lines,
 //!   `BEGIN .. END` bodies of `CREATE [DEFINER = ..] PROCEDURE/FUNCTION/TRIGGER/EVENT` (a
 //!   column called `begin` or `event` is not a body);
-//! * SQLite: backticks, `[bracket]` identifiers, `CREATE TRIGGER .. BEGIN .. END;` bodies.
+//! * SQLite: backticks, `[bracket]` identifiers, `CREATE TRIGGER .. BEGIN .. END;` bodies;
+//! * Oracle: `q'[..]'` literals, PL/SQL blocks and `CREATE PROCEDURE | FUNCTION | PACKAGE | TRIGGER | TYPE` units end
+//!   with a line holding only `/` (their `;` belong to them), plain statements end at `;` or `/`.
 //!
 //! Offsets are reported as byte offsets, `char` (Unicode scalar) offsets and UTF-16 code
 //! unit offsets (what CodeMirror / JavaScript use).
@@ -170,7 +172,7 @@ fn create_is_compound(words: &[String], d: Driver) -> Option<bool> {
             }
             kind => {
                 let kinds: &[&str] = match d {
-                    Driver::Sqlite => &["TRIGGER"],
+                    Driver::Sqlite | Driver::Oracle => &["TRIGGER"],
                     Driver::MySql => &["PROCEDURE", "FUNCTION", "TRIGGER", "EVENT"],
                     Driver::Postgres => &["FUNCTION", "PROCEDURE"],
                 };
@@ -301,6 +303,9 @@ impl<'a> Scanner<'a> {
 }
 
 fn split_raw(sql: &str, d: Driver) -> Vec<Raw> {
+    if d == Driver::Oracle {
+        return split_oracle(sql);
+    }
     let b = sql.as_bytes();
     let n = b.len();
     let mut sc = Scanner {
@@ -404,7 +409,7 @@ fn split_raw(sql: &str, d: Driver) -> Vec<Raw> {
                             && (b[i - 1] == b'E' || b[i - 1] == b'e')
                             && (i < 2 || !is_ident(b[i - 2]))
                     }
-                    Driver::Sqlite => false,
+                    Driver::Sqlite | Driver::Oracle => false,
                 };
                 i = sc.skip_quoted(i, b'\'', backslash);
             }
@@ -501,6 +506,276 @@ fn split_raw(sql: &str, d: Driver) -> Vec<Raw> {
             _ => {
                 i += 1;
             }
+        }
+    }
+    finish!(n, n);
+    out
+}
+
+// ------------------------------------------------------------------ Oracle
+
+impl Scanner<'_> {
+    /// An alternative-quoting literal `q'[..]'` / `nq'{..}'` starting at `i` (which points at the `q` or `n`):
+    /// the index after its closing quote (EOF when unterminated), `None` when `i` does not start one.
+    pub(crate) fn oracle_q_quote_end(&self, i: usize) -> Option<usize> {
+        let b = self.b;
+        let n = b.len();
+        let mut j = i;
+        if j < n && b[j].eq_ignore_ascii_case(&b'n') {
+            j += 1;
+        }
+        if !(j + 2 < n && b[j].eq_ignore_ascii_case(&b'q') && b[j + 1] == b'\'') {
+            return None;
+        }
+        let open = b[j + 2];
+        if open.is_ascii_whitespace() {
+            return None;
+        }
+        let close = match open {
+            b'[' => b']',
+            b'{' => b'}',
+            b'(' => b')',
+            b'<' => b'>',
+            c => c,
+        };
+        let mut k = j + 3;
+        while k + 1 < n {
+            if b[k] == close && b[k + 1] == b'\'' {
+                return Some(k + 2);
+            }
+            k += 1;
+        }
+        Some(n)
+    }
+
+    /// Is the `/` at `i` alone on its line (the SQL*Plus terminator of a PL/SQL unit)? Returns the index of the end
+    /// of that line.
+    fn slash_line_end(&self, i: usize) -> Option<usize> {
+        let b = self.b;
+        let mut j = i;
+        while j > 0 && matches!(b[j - 1], b' ' | b'\t') {
+            j -= 1;
+        }
+        if j > 0 && b[j - 1] != b'\n' {
+            return None;
+        }
+        let mut k = i + 1;
+        while k < b.len() && matches!(b[k], b' ' | b'\t' | b'\r') {
+            k += 1;
+        }
+        if k < b.len() && b[k] != b'\n' {
+            return None;
+        }
+        Some(k)
+    }
+}
+
+/// Words after which a PL/SQL unit goes on at depth 0 (`END;` of a local subprogram, then more declarations).
+const ORACLE_CONTINUES: [&str; 7] = [
+    "BEGIN",
+    "PROCEDURE",
+    "FUNCTION",
+    "PRAGMA",
+    "CURSOR",
+    "SUBTYPE",
+    "TYPE",
+];
+
+/// What a statement is, from its first words: `Some(true)` = PL/SQL unit (ends at a `/` line, its `;` stay), `Some(false)`
+/// = plain SQL, `None` = not known yet. The second flag: only a `/` line (or the end of the text) ends it.
+fn oracle_unit(words: &[String]) -> Option<(bool, bool)> {
+    match words.first().map(String::as_str)? {
+        "BEGIN" | "DECLARE" => Some((true, false)),
+        "CREATE" => {
+            let mut i = 1;
+            while i < words.len() {
+                match words[i].as_str() {
+                    "OR" | "REPLACE" | "NO" | "FORCE" | "EDITIONABLE" | "NONEDITIONABLE" => i += 1,
+                    "FUNCTION" | "PROCEDURE" | "TRIGGER" => return Some((true, false)),
+                    "PACKAGE" => {
+                        // the body has subprograms and variables in any order: only `/` can end it
+                        return match words.get(i + 1).map(String::as_str) {
+                            Some("BODY") => Some((true, true)),
+                            Some(_) => Some((true, false)),
+                            None => None,
+                        };
+                    }
+                    "TYPE" => {
+                        return match words.get(i + 1) {
+                            Some(_) if words.iter().any(|w| w == "BODY") => Some((true, true)),
+                            Some(_) if words.iter().any(|w| w == "OBJECT" || w == "UNDER") => {
+                                Some((true, true))
+                            }
+                            Some(_) if words.len() > i + 3 => Some((false, false)),
+                            _ => None,
+                        };
+                    }
+                    _ => return Some((false, false)),
+                }
+            }
+            None
+        }
+        _ => Some((false, false)),
+    }
+}
+
+/// Oracle: `;` ends a SQL statement (and is not part of it); PL/SQL units (`BEGIN`/`DECLARE` blocks and
+/// `CREATE [OR REPLACE] PROCEDURE | FUNCTION | PACKAGE [BODY] | TRIGGER | TYPE [BODY]`) end at a line holding only `/`,
+/// keep their `;`, and also end after the `END ...;` that closes their outermost block when nothing that continues
+/// the unit follows. A `/` line also ends plain SQL (SQL*Plus). Strings, `q'[..]'` literals, quoted identifiers and
+/// comments hide terminators.
+fn split_oracle(sql: &str) -> Vec<Raw> {
+    let b = sql.as_bytes();
+    let n = b.len();
+    let sc = Scanner {
+        b,
+        d: Driver::Oracle,
+        delimiter: vec![b';'],
+    };
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut start: Option<usize> = None;
+    let mut words: Vec<String> = Vec::new();
+    let mut unit: Option<(bool, bool)> = None;
+    let mut depth = 0i32;
+    let mut pending_end = false;
+    let mut prev_word = String::new();
+
+    macro_rules! finish {
+        ($end:expr, $full:expr) => {{
+            if let Some(s) = start.take() {
+                let mut e: usize = $end;
+                while e > s && b[e - 1].is_ascii_whitespace() {
+                    e -= 1;
+                }
+                out.push(Raw {
+                    start: s,
+                    end: e,
+                    full_end: $full,
+                });
+            }
+            words.clear();
+            unit = None;
+            depth = 0;
+            pending_end = false;
+            prev_word.clear();
+            let _ = (&unit, &depth, &pending_end);
+        }};
+    }
+
+    while i < n {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if let Some(e) = sc.comment_end(i, start.is_none()) {
+            i = e;
+            continue;
+        }
+        if c == b'/' {
+            if let Some(eol) = sc.slash_line_end(i) {
+                finish!(i, eol);
+                i = eol;
+                continue;
+            }
+        }
+        if c == b';' {
+            match unit {
+                Some((true, slash_only)) if !(pending_end && !slash_only) => {
+                    // a `;` inside a PL/SQL unit
+                    i += 1;
+                }
+                Some((true, _)) => {
+                    // `END ...;` of the outermost block: the unit ends here unless more of it follows
+                    let mut j = i + 1;
+                    loop {
+                        while j < n && b[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        if j >= n {
+                            break;
+                        }
+                        match sc.comment_end(j, false) {
+                            Some(e) => j = e,
+                            None => break,
+                        }
+                    }
+                    if j < n && b[j] == b'/' {
+                        if let Some(eol) = sc.slash_line_end(j) {
+                            finish!(i + 1, eol);
+                            i = eol;
+                            continue;
+                        }
+                    }
+                    let next = sc.peek_word(j);
+                    if next
+                        .as_deref()
+                        .is_some_and(|w| ORACLE_CONTINUES.contains(&w))
+                    {
+                        pending_end = false;
+                        i += 1;
+                    } else {
+                        finish!(i + 1, i + 1);
+                        i += 1;
+                    }
+                }
+                _ => {
+                    finish!(i, i + 1);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if start.is_none() {
+            start = Some(i);
+        }
+        match c {
+            b'\'' => i = sc.skip_quoted(i, b'\'', false),
+            b'"' => i = sc.skip_quoted(i, b'"', false),
+            _ if is_ident_start(c) => {
+                if let Some(e) = sc.oracle_q_quote_end(i) {
+                    i = e;
+                    continue;
+                }
+                let (w, e) = sc.word_at(i);
+                let upper = String::from_utf8_lossy(w).to_ascii_uppercase();
+                let glued = i > 0 && matches!(b[i - 1], b'$' | b'.' | b'#' | b':');
+                if words.len() < 12 && !glued {
+                    words.push(upper.clone());
+                    if unit.is_none() {
+                        unit = oracle_unit(&words);
+                        if unit.is_none() && words.len() >= 12 {
+                            unit = Some((false, false));
+                        }
+                    }
+                }
+                if matches!(unit, Some((true, _))) && !glued {
+                    match upper.as_str() {
+                        "BEGIN" => {
+                            depth += 1;
+                            pending_end = false;
+                        }
+                        "CASE" if prev_word != "END" => depth += 1,
+                        "END" => match sc.peek_word(e).as_deref() {
+                            Some("IF") | Some("LOOP") => {}
+                            Some("CASE") => depth = (depth - 1).max(0),
+                            _ => {
+                                if depth > 0 {
+                                    depth -= 1;
+                                }
+                                if depth == 0 {
+                                    pending_end = true;
+                                }
+                            }
+                        },
+                        _ => {}
+                    }
+                }
+                prev_word = upper;
+                i = e;
+            }
+            _ => i += 1,
         }
     }
     finish!(n, n);
@@ -630,6 +905,137 @@ mod tests {
     }
 
     #[test]
+    fn oracle_semicolon_and_slash() {
+        let o = Driver::Oracle;
+        assert_eq!(
+            texts("select 1 from dual; select 2 from dual", o),
+            vec!["select 1 from dual", "select 2 from dual"]
+        );
+        // a `/` inside a line is a division; alone on a line it ends the statement
+        assert_eq!(texts("select 4 / 2 from dual; select 1", o).len(), 2);
+        assert_eq!(
+            texts("select 1 from dual\n/\nselect 2 from dual\n/\n", o),
+            vec!["select 1 from dual", "select 2 from dual"]
+        );
+        // a `/` line after a `;` statement runs nothing
+        assert_eq!(
+            texts("select 1 from dual;\n/\nselect 2 from dual", o).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn oracle_quotes_and_comments() {
+        let o = Driver::Oracle;
+        assert_eq!(
+            texts(
+                "select q'[it's; fine]', q'!a;b!', nq'{x;}' from dual; select 2 from dual",
+                o
+            ),
+            vec![
+                "select q'[it's; fine]', q'!a;b!', nq'{x;}' from dual",
+                "select 2 from dual"
+            ]
+        );
+        assert_eq!(
+            texts(
+                "select 'a;b', \"c;d\", 'it''s;' from dual; -- x; y\nselect 2 /* ; */ from dual",
+                o
+            )
+            .len(),
+            2
+        );
+        // backslash and backtick mean nothing, a block comment does not nest
+        assert_eq!(texts("select 'a\\' from dual; select 2", o).len(), 2);
+        assert_eq!(texts("select /* a /* b */ 1; select 2", o).len(), 2);
+        // a variable called q is not a quote
+        assert_eq!(texts("select q from t; select 2", o).len(), 2);
+    }
+
+    #[test]
+    fn oracle_plsql_blocks_keep_their_semicolons() {
+        let o = Driver::Oracle;
+        let t = texts(
+            "begin\n  null;\n  dbms_output.put_line('x');\nend;\n/\nselect 1 from dual",
+            o,
+        );
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert_eq!(t[0], "begin\n  null;\n  dbms_output.put_line('x');\nend;");
+        // without the `/`: the block ends after its END;
+        let t = texts("begin null; end; select 1 from dual; select 2 from dual", o);
+        assert_eq!(
+            t,
+            vec![
+                "begin null; end;",
+                "select 1 from dual",
+                "select 2 from dual"
+            ]
+        );
+        // IF / LOOP / CASE inside
+        let sql = "declare v number; begin if v is null then v := case when 1 = 1 then 1 else 2 end; end if; \
+                   for i in 1..3 loop v := v + i; end loop; case v when 1 then null; else null; end case; end; select 3 from dual";
+        let t = texts(sql, o);
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert!(t[0].ends_with("end case; end;"), "{t:?}");
+        // nested block, labels, exception section
+        let t = texts(
+            "begin begin null; exception when others then null; end; end;\nselect 1 from dual",
+            o,
+        );
+        assert_eq!(t.len(), 2, "{t:?}");
+    }
+
+    #[test]
+    fn oracle_create_units() {
+        let o = Driver::Oracle;
+        let proc_ = "create or replace procedure p(a in number) is\n  v number;\nbegin\n  v := a;\n  insert into t values (v);\nend p;";
+        let t = texts(&format!("{proc_}\n/\nselect 1 from dual"), o);
+        assert_eq!(t, vec![proc_, "select 1 from dual"]);
+        // no `/`: still ends at the END of the unit
+        let t = texts(&format!("{proc_}\nselect 1 from dual;"), o);
+        assert_eq!(t, vec![proc_, "select 1 from dual"]);
+        // a local subprogram's END does not end the unit
+        let local = "create function f return number is\n  function g return number is begin return 1; end g;\nbegin\n  return g;\nend f;";
+        assert_eq!(texts(&format!("{local}\n/"), o), vec![local]);
+        assert_eq!(texts(&format!("{local}\nselect 1 from dual"), o).len(), 2);
+        // triggers
+        let trg = "create or replace trigger trg before update on t for each row\nbegin\n  :new.x := 1;\nend;";
+        assert_eq!(texts(&format!("{trg}\n/\nselect 1 from dual"), o).len(), 2);
+        assert_eq!(
+            texts(&format!("create or replace editionable {}", &trg[18..]), o).len(),
+            1
+        );
+        // a package spec ends at its END; a body needs the `/`
+        let spec =
+            "create or replace package pk is\n  function f return number;\n  procedure p;\nend pk;";
+        assert_eq!(
+            texts(&format!("{spec}\nselect 1 from dual"), o),
+            vec![spec, "select 1 from dual"]
+        );
+        let body = "create or replace package body pk is\n  function f return number is begin return 1; end f;\n  v number;\n  procedure p is begin null; end p;\nbegin\n  v := 1;\nend pk;";
+        let t = texts(
+            &format!("{body}\n/\nselect 1 from dual;\nselect 2 from dual"),
+            o,
+        );
+        assert_eq!(t, vec![body, "select 1 from dual", "select 2 from dual"]);
+        // everything else CREATE is plain SQL, even with words like BEGIN as column names
+        let t = texts("create table t (begin number, \"end\" number); create type ty as table of number; create index i on t (begin)", o);
+        assert_eq!(t.len(), 3, "{t:?}");
+        let t = texts(
+            "create or replace type ty as object (a number);\n/\nselect 1 from dual",
+            o,
+        );
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert!(t[0].ends_with("(a number);"), "{t:?}");
+        // the caret picks the unit it is in
+        let sql = format!("select 1 from dual;\n{proc_}\n/\nselect 3 from dual");
+        let at = sql.find("insert").unwrap();
+        assert_eq!(statement_at(&sql, at, o).unwrap().text, proc_);
+        assert!(has_statement_separator("a = 1; drop table t", o));
+        assert!(!has_statement_separator("a = 'x;y' and b = q'[;]'", o));
+    }
+
+    #[test]
     fn sqlite_brackets_and_backticks() {
         let t = texts("select [a;b], `c;d` from t; select 2", Driver::Sqlite);
         assert_eq!(t, vec!["select [a;b], `c;d` from t", "select 2"]);
@@ -645,7 +1051,12 @@ mod tests {
             "select $a$ x",
             "select `a",
         ] {
-            for d in [Driver::Postgres, Driver::MySql, Driver::Sqlite] {
+            for d in [
+                Driver::Postgres,
+                Driver::MySql,
+                Driver::Sqlite,
+                Driver::Oracle,
+            ] {
                 let s = split_statements(sql, d);
                 assert_eq!(s.len(), 1, "{sql} {d:?}");
             }
@@ -835,7 +1246,12 @@ mod tests {
             let sql: String = (0..len)
                 .map(|_| TOKENS[(next() % TOKENS.len() as u64) as usize])
                 .collect();
-            for d in [Driver::Postgres, Driver::MySql, Driver::Sqlite] {
+            for d in [
+                Driver::Postgres,
+                Driver::MySql,
+                Driver::Sqlite,
+                Driver::Oracle,
+            ] {
                 let stmts = split_statements(&sql, d);
                 for s in &stmts {
                     assert_eq!(&sql[s.start..s.end], s.text);

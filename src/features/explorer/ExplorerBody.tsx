@@ -40,7 +40,7 @@ function activate(n: ENode, via: "enter" | "f4" | "dblclick"): boolean {
     else void openTable(d);
     return true;
   }
-  if (d.kind === "sequence" || d.kind === "function" || d.kind === "procedure" || d.kind === "routine") {
+  if (d.kind === "sequence" || d.kind === "package" || d.kind === "synonym" || d.kind === "function" || d.kind === "procedure" || d.kind === "routine") {
     void openDdl(d);
     return true;
   }
@@ -161,7 +161,7 @@ function renderLabel(item: ENode, query: string): JSX.Element {
   );
 }
 
-const EMPTY_STATE_DBMS = ["postgres", "mysql", "mariadb", "sqlite"] as const;
+const EMPTY_STATE_DBMS = ["postgres", "mysql", "mariadb", "oracle", "sqlite"] as const;
 
 /** Empty state (no data sources): one button per supported DBMS. */
 function EmptyState(): JSX.Element {

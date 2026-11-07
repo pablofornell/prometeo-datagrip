@@ -10,22 +10,30 @@ const CASE: Record<Dbms, string> = {
   postgres: "plain=lower, delimited=exact",
   mysql: "plain=exact, delimited=exact",
   mariadb: "plain=exact, delimited=exact",
+  oracle: "plain=upper, delimited=exact",
   sqlite: "plain=mixed, delimited=mixed",
 };
 
-const SQLX_VERSION = "0.8";
+/** "Driver:" line of the balloon: the library behind each DBMS (`DBMS[x].library` has the full text of the Drivers page). */
+const DRIVER_LINE: Record<Dbms, string> = {
+  postgres: "sqlx PostgreSQL (ver. 0.8)",
+  mysql: "sqlx MySQL (ver. 0.8)",
+  mariadb: "sqlx MariaDB (ver. 0.8)",
+  sqlite: "sqlx SQLite (ver. 0.8)",
+  oracle: "Oracle thin driver (oracledb)",
+};
 
 /** `["DBMS: PostgreSQL (ver. 16.15 (Debian ...))", "Case sensitivity: ...", "Driver: ..."]`. */
 function infoLines(t: TestInfo): string[] {
   const out: string[] = [];
   if (t.version) {
-    const m = /^(PostgreSQL|MySQL|MariaDB|SQLite)\s+(.*)$/s.exec(t.version);
+    const m = /^(PostgreSQL|MySQL|MariaDB|SQLite|Oracle)\s+(.*)$/s.exec(t.version);
     out.push(`DBMS: ${m ? m[1] : DBMS[t.dbms].label}${m ? ` (ver. ${m[2]})` : ""}`);
   } else {
     out.push(`DBMS: ${DBMS[t.dbms].label}`);
   }
   out.push(`Case sensitivity: ${CASE[t.dbms]}`);
-  out.push(`Driver: sqlx ${DBMS[t.dbms].label} (ver. ${SQLX_VERSION})`);
+  out.push(`Driver: ${DRIVER_LINE[t.dbms]}`);
   return out;
 }
 

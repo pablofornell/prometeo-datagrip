@@ -21,7 +21,8 @@ export interface ObjectDef {
 
 export function newObject(kind: ObjectKind, schema: string, driver: Driver): ObjectDef {
   const name = { view: "view_name", materializedView: "view_name", sequence: "sequence_name", schema: driver === "mysql" ? "database_name" : "schema_name" }[kind];
-  return { kind, schema: kind === "schema" ? "" : schema, name, comment: "", query: "", start: "", increment: "", minValue: "", maxValue: "", cycle: false };
+  // Oracle folds unquoted names to upper case: the placeholder is already one
+  return { kind, schema: kind === "schema" ? "" : schema, name: driver === "oracle" ? name.toUpperCase() : name, comment: "", query: "", start: "", increment: "", minValue: "", maxValue: "", cycle: false };
 }
 
 export const OBJECT_TITLE: Record<ObjectKind, (d: Driver) => string> = {
@@ -31,7 +32,7 @@ export const OBJECT_TITLE: Record<ObjectKind, (d: Driver) => string> = {
   schema: (d) => (d === "mysql" ? "Database" : "Schema"),
 };
 
-const plan = (statements: string[], d: Driver): Plan => ({ pre: [], statements, post: [], transactional: d !== "mysql", warnings: [] });
+const plan = (statements: string[], d: Driver): Plan => ({ pre: [], statements, post: [], transactional: d !== "mysql" && d !== "oracle", warnings: [] });
 
 export function validateObject(o: ObjectDef): string[] {
   const out: string[] = [];
@@ -49,6 +50,7 @@ export function createObjectPlan(d: Driver, o: ObjectDef): Plan {
     case "view":
       st.push(`create view ${name} as\n${o.query.trim().replace(/;\s*$/, "")};`);
       if (d === "postgres" && o.comment) st.push(`comment on view ${name} is ${literal(d, o.comment)};`);
+      if (d === "oracle" && o.comment) st.push(`comment on table ${name} is ${literal(d, o.comment)};`);
       break;
     case "materializedView":
       st.push(`create materialized view ${name} as\n${o.query.trim().replace(/;\s*$/, "")};`);
@@ -62,7 +64,7 @@ export function createObjectPlan(d: Driver, o: ObjectDef): Plan {
       if (o.start.trim()) parts.push(`    start with ${o.start.trim()}`);
       if (o.cycle) parts.push("    cycle");
       st.push(parts.join("\n") + ";");
-      if (o.comment) st.push(`comment on sequence ${name} is ${literal(d, o.comment)};`);
+      if (o.comment && d !== "oracle") st.push(`comment on sequence ${name} is ${literal(d, o.comment)};`);
       break;
     }
     case "schema":

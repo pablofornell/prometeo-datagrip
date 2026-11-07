@@ -4,7 +4,7 @@
  *   createTablePlan(driver, table)            `create table ...` + indexes + comments
  *   alterTablePlan(driver, loaded, edited)    the `alter table ...` statements of the difference
  *
- * PostgreSQL and MySQL alter in place. SQLite cannot alter most things: the plan is then the table rebuild
+ * PostgreSQL, MySQL and Oracle alter in place (Oracle: `add (...)`, `modify (...)`, `rename column`; its DDL commits by itself). SQLite cannot alter most things: the plan is then the table rebuild
  * (create `<t>_dg_tmp`, copy, drop, rename, recreate indexes and triggers) with the pragmas around it.
  */
 import {
@@ -25,7 +25,7 @@ export interface Plan {
   statements: string[];
   /** Run after the transaction, also when it failed. */
   post: string[];
-  /** PostgreSQL and SQLite run the statements in one transaction (MySQL DDL commits by itself). */
+  /** PostgreSQL and SQLite run the statements in one transaction (MySQL and Oracle DDL commits by itself). */
   transactional: boolean;
   warnings: string[];
   /** The change cannot be made: the dialog refuses OK and shows this. */
@@ -39,7 +39,8 @@ export const planIsEmpty = (p: Plan): boolean => p.statements.length === 0;
 // ---------------------------------------------------------------- quoting
 
 export function ident(d: Driver, name: string): string {
-  const simple = d === "postgres" ? /^[a-z_][a-z0-9_$]*$/ : /^[A-Za-z_][A-Za-z0-9_$]*$/;
+  // Oracle folds unquoted names to upper case: only those are written bare
+  const simple = d === "postgres" ? /^[a-z_][a-z0-9_$]*$/ : d === "oracle" ? /^[A-Z][A-Z0-9_$#]*$/ : /^[A-Za-z_][A-Za-z0-9_$]*$/;
   if (simple.test(name) && !isKeyword(d, name)) return name;
   return d === "mysql" ? "`" + name.replace(/`/g, "``") + "`" : '"' + name.replace(/"/g, '""') + '"';
 }
@@ -57,7 +58,7 @@ export function literal(d: Driver, s: string): string {
 
 /** A column / index entry: a plain name is quoted, an expression stays as it is. */
 function entry(d: Driver, s: string): string {
-  return /^[A-Za-z_][A-Za-z0-9_$]*$/.test(s) ? ident(d, s) : s;
+  return (d === "oracle" ? /^[A-Za-z_][A-Za-z0-9_$#]*$/ : /^[A-Za-z_][A-Za-z0-9_$]*$/).test(s) ? ident(d, s) : s;
 }
 const cols = (d: Driver, list: string[]): string => list.map((c) => entry(d, c)).join(", ");
 
@@ -117,6 +118,12 @@ function columnType(d: Driver, c: ColumnDef, o: ColOpts = {}): string {
     else if (c.identity) parts.push(`generated ${c.identity.toLowerCase()} as identity`);
     if (c.default.trim() && !c.generated) parts.push(`default ${c.default.trim()}`);
     if (c.notNull) parts.push("not null");
+  } else if (d === "oracle") {
+    // DEFAULT, then the identity / virtual clause, then NOT NULL
+    if (c.generated) parts.push(`generated always as (${c.generated}) virtual`);
+    else if (c.identity) parts.push(`generated ${c.identity.toLowerCase()} as identity`);
+    else if (c.default.trim()) parts.push(`default ${c.default.trim()}`);
+    if (c.notNull) parts.push("not null");
   } else if (d === "mysql") {
     if (o.redefine && c.collation && c.collation !== o.tableCollation) parts.push(`collate ${c.collation}`);
     if (c.generated) parts.push(`as (${c.generated}) ${c.generatedStored ? "stored" : "virtual"}`);
@@ -145,6 +152,11 @@ function keyClause(d: Driver, k: KeyDef): string {
 function fkClause(d: Driver, f: FkDef): string {
   const target = d === "sqlite" ? ident(d, f.refTable) : qualified(d, f.refSchema, f.refTable);
   let s = `${named(d, f.name)}foreign key (${cols(d, f.columns)}) references ${target} (${cols(d, f.refColumns)})`;
+  if (d === "oracle") {
+    // Oracle knows ON DELETE CASCADE | SET NULL only
+    if (/^(CASCADE|SET NULL)$/i.test(f.onDelete)) s += ` on delete ${f.onDelete.toLowerCase()}`;
+    return s;
+  }
   if (action(f.onUpdate)) s += ` on update ${action(f.onUpdate)}`;
   if (action(f.onDelete)) s += ` on delete ${action(f.onDelete)}`;
   return s;
@@ -155,7 +167,8 @@ const checkClause = (d: Driver, c: CheckDef): string => `${named(d, c.name)}chec
 function indexStmt(d: Driver, t: TableDef, i: IndexDef): string {
   if (i.locked && i.definition) return i.definition.trim().replace(/;?$/, ";");
   const using = d === "postgres" && i.method && i.method !== "btree" ? ` using ${i.method}` : "";
-  return `create ${i.unique ? "unique " : ""}index ${ident(d, i.name)} on ${qualified(d, t.schema, t.name)}${using} (${cols(d, i.columns)});`;
+  const name = d === "oracle" ? qualified(d, t.schema, i.name) : ident(d, i.name);
+  return `create ${i.unique ? "unique " : ""}index ${name} on ${qualified(d, t.schema, t.name)}${using} (${cols(d, i.columns)});`;
 }
 
 // ---------------------------------------------------------------- validation
@@ -210,7 +223,7 @@ function createTableStatement(d: Driver, t: TableDef): string {
   for (const c of t.checks) if (c.expr.trim()) lines.push(checkClause(d, c));
   let s = `create table ${T}\n(\n${lines.map((l) => "    " + l).join(",\n")}${lines.length ? "\n" : ""})`;
   if (d === "mysql" && t.comment) s += ` comment = ${literal(d, t.comment)}`;
-  if (d === "postgres" && t.tablespace) s += ` tablespace ${ident(d, t.tablespace)}`;
+  if ((d === "postgres" || d === "oracle") && t.tablespace) s += ` tablespace ${ident(d, t.tablespace)}`;
   if (d === "sqlite" && t.sqliteOptions) s += ` ${t.sqliteOptions}`;
   return s + ";";
 }
@@ -223,8 +236,11 @@ export function createTablePlan(d: Driver, t: TableDef): Plan {
     if (t.comment) st.push(`comment on table ${T} is ${literal(d, t.comment)};`);
     for (const c of t.columns) if (c.comment && c.name.trim()) st.push(`comment on column ${T}.${ident(d, c.name)} is ${literal(d, c.comment)};`);
     if (t.owner) st.push(`alter table ${T} owner to ${ident(d, t.owner)};`);
+  } else if (d === "oracle") {
+    if (t.comment) st.push(`comment on table ${T} is ${literal(d, t.comment)};`);
+    for (const c of t.columns) if (c.comment && c.name.trim()) st.push(`comment on column ${T}.${ident(d, c.name)} is ${literal(d, c.comment)};`);
   }
-  return { pre: [], statements: st, post: [], transactional: d !== "mysql", warnings: [] };
+  return { pre: [], statements: st, post: [], transactional: d !== "mysql" && d !== "oracle", warnings: [] };
 }
 
 // ---------------------------------------------------------------- alter
@@ -324,6 +340,7 @@ export function alterTablePlan(d: Driver, orig: TableDef, cur: TableDef): Plan {
   const diff = diffTables(orig, cur);
   if (d === "postgres") return pgAlter(orig, cur, diff);
   if (d === "mysql") return myAlter(orig, cur, diff);
+  if (d === "oracle") return oraAlter(orig, cur, diff);
   return liteAlter(orig, cur, diff);
 }
 
@@ -369,6 +386,50 @@ function pgAlter(orig: TableDef, cur: TableDef, df: Diff): Plan {
   if (orig.owner !== cur.owner && cur.owner) out.push(`alter table ${T} owner to ${ident(d, cur.owner)};`);
   if (orig.tablespace !== cur.tablespace && cur.tablespace) out.push(`alter table ${T} set tablespace ${ident(d, cur.tablespace)};`);
   return { pre: [], statements: out, post: [], transactional: true, warnings: [] };
+}
+
+// ---- Oracle
+
+function oraAlter(orig: TableDef, cur: TableDef, df: Diff): Plan {
+  const d: Driver = "oracle";
+  const out: string[] = [];
+  let T = qualified(d, orig.schema, orig.name);
+  if (orig.name !== cur.name) {
+    out.push(`alter table ${T} rename to ${ident(d, cur.name)};`);
+    T = qualified(d, cur.schema, cur.name);
+  }
+  const dropConstraint = (name: string) => out.push(`alter table ${T} drop constraint ${ident(d, name)};`);
+  for (const f of [...df.fks.dropped, ...df.fks.changed.map((x) => x.o)]) dropConstraint(f.name);
+  for (const c of [...df.checks.dropped, ...df.checks.changed.map((x) => x.o)]) dropConstraint(c.name);
+  for (const k of [...df.keys.dropped, ...df.keys.changed.map((x) => x.o)]) dropConstraint(k.name);
+  for (const i of [...df.indexes.dropped, ...df.indexes.changed.map((x) => x.o)]) out.push(`drop index ${qualified(d, orig.schema, i.name)};`);
+  for (const c of df.droppedCols) out.push(`alter table ${T} drop column ${ident(d, c.name)};`);
+  for (const { o, c } of df.keptCols) if (o.name !== c.name) out.push(`alter table ${T} rename column ${ident(d, o.name)} to ${ident(d, c.name)};`);
+  // MODIFY states only what changes: NOT NULL on a NOT NULL column (or NULL on a nullable one) is an error
+  const modify: string[] = [];
+  for (const { o, c } of df.keptCols) {
+    const N = ident(d, c.name);
+    const spec: string[] = [];
+    if (norm(o.type) !== norm(c.type)) spec.push(c.type.trim());
+    if (!c.generated && !c.identity && norm(o.default) !== norm(c.default)) spec.push(c.default.trim() ? `default ${c.default.trim()}` : "default null");
+    if (o.notNull !== c.notNull) spec.push(c.notNull ? "not null" : "null");
+    if (spec.length) modify.push(`${N} ${spec.join(" ")}`);
+    if (o.identity !== c.identity) modify.push(`${N} ${c.identity ? `generated ${c.identity.toLowerCase()} as identity` : "drop identity"}`);
+  }
+  if (modify.length) out.push(`alter table ${T} modify (${modify.join(", ")});`);
+  const added = df.addedCols.filter((c) => c.name.trim());
+  if (added.length) out.push(`alter table ${T} add (${added.map((c) => `${ident(d, c.name)} ${columnType(d, c)}`.trim()).join(", ")});`);
+  for (const k of [...df.keys.changed.map((x) => x.c), ...df.keys.added]) if (k.columns.length) out.push(`alter table ${T} add ${keyClause(d, k)};`);
+  for (const f of [...df.fks.changed.map((x) => x.c), ...df.fks.added]) if (f.columns.length && f.refTable) out.push(`alter table ${T} add ${fkClause(d, f)};`);
+  for (const c of [...df.checks.changed.map((x) => x.c), ...df.checks.added]) if (c.expr.trim()) out.push(`alter table ${T} add ${checkClause(d, c)};`);
+  for (const i of [...df.indexes.changed.map((x) => x.c), ...df.indexes.added]) if (i.name.trim() && i.columns.length) out.push(indexStmt(d, cur, i));
+  for (const { o, c } of [...df.keys.renamed, ...df.fks.renamed, ...df.checks.renamed]) out.push(`alter table ${T} rename constraint ${ident(d, o.name)} to ${ident(d, c.name)};`);
+  for (const { o, c } of df.indexes.renamed) out.push(`alter index ${qualified(d, orig.schema, o.name)} rename to ${ident(d, c.name)};`);
+  if (orig.comment !== cur.comment) out.push(`comment on table ${T} is ${literal(d, cur.comment)};`);
+  for (const { o, c } of df.keptCols) if (o.comment !== c.comment) out.push(`comment on column ${T}.${ident(d, c.name)} is ${literal(d, c.comment)};`);
+  for (const c of df.addedCols) if (c.comment && c.name.trim()) out.push(`comment on column ${T}.${ident(d, c.name)} is ${literal(d, c.comment)};`);
+  // DDL commits by itself: there is no transaction to roll back when a statement fails
+  return { pre: [], statements: out, post: [], transactional: false, warnings: [] };
 }
 
 // ---- MySQL

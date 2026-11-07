@@ -31,6 +31,7 @@ export function friendlyConnectionError(raw: string, t: ConnectionTarget): strin
     if (NO_FILE.test(msg)) return `Cannot open the database file${t.file ? ` '${t.file}'` : ""}. Check that the path is correct and that the file is accessible.`;
   } else {
     if (REFUSED.test(msg)) {
+      if (driver === "oracle") return `Connection to ${hostPort(t)} refused. Check that the hostname and port are correct and that the listener is accepting TCP/IP connections.`;
       return driver === "postgres"
         ? `Connection to ${hostPort(t)} refused. Check that the hostname and port are correct and that the postmaster is accepting TCP/IP connections.`
         : `Connection to ${hostPort(t)} refused. Check that the hostname and port are correct and that the MySQL server is accepting TCP/IP connections.`;

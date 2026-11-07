@@ -21,6 +21,7 @@ pub enum Driver {
     #[serde(rename = "mysql")]
     MySql,
     Sqlite,
+    Oracle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -55,6 +56,10 @@ pub enum NodeKind {
     Table,
     View,
     MaterializedView,
+    /// Oracle package.
+    Package,
+    /// Oracle synonym.
+    Synonym,
     Column,
     PrimaryKey,
     ForeignKey,
@@ -255,6 +260,10 @@ pub struct ExecOptions {
     /// "result set is closed".
     #[serde(default = "default_keep_open_secs")]
     pub keep_open_secs: u64,
+    /// Oracle only (the server has no autocommit): commit after every statement that succeeded, like
+    /// the console's Auto transaction mode. `false` (the default) keeps the transaction open (Manual mode).
+    #[serde(default)]
+    pub auto_commit: bool,
 }
 
 fn default_keep_open_secs() -> u64 {
@@ -267,6 +276,7 @@ impl Default for ExecOptions {
             max_rows: 500,
             stop_on_error: true,
             keep_open_secs: default_keep_open_secs(),
+            auto_commit: false,
         }
     }
 }

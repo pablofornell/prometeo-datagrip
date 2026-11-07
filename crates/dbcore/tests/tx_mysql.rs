@@ -546,6 +546,7 @@ async fn cancel_inside_a_transaction_keeps_it_active() {
         max_rows: 100,
         stop_on_error: true,
         keep_open_secs: 600,
+        ..Default::default()
     };
     assert_ok(
         &mgr.execute_collect(

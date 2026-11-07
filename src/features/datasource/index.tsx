@@ -23,7 +23,7 @@ export interface OpenDataSourceDialogOptions {
   /** Data source (backend id) to select. */
   selectId?: string;
   /** Start with a new, unsaved data source of this driver selected. */
-  newDriver?: "postgres" | "mysql" | "sqlite" | "mariadb";
+  newDriver?: Dbms;
   /** Fields of the new data source (Data Source from URL). */
   prefill?: UrlPrefill;
   /** Open on the Drivers page. */

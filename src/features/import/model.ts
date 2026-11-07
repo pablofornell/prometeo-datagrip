@@ -30,6 +30,10 @@ export function formatLabel(f: ImportFormat): string {
 
 /** The SQL type a new column of an inferred type gets (same table as `sql_type` in crates/dbcore/src/import.rs). */
 export function sqlTypeFor(d: Driver, t: InferredType): string {
+  if (d === "oracle") {
+    // same table as `sql_type` in crates/dbcore/src/import.rs
+    return { integer: "number(10)", bigint: "number(19)", boolean: "number(1)", date: "date", text: "varchar2(4000)", double: "binary_double", timestamp: "timestamp" }[t];
+  }
   switch (t) {
     case "double":
       return d === "postgres" ? "double precision" : "double";
@@ -45,6 +49,7 @@ export const TYPE_CHOICES: Record<Driver, string[]> = {
   postgres: ["text", "integer", "bigint", "double precision", "numeric", "boolean", "date", "timestamp", "timestamptz", "varchar(255)", "uuid", "jsonb"],
   mysql: ["text", "int", "bigint", "double", "decimal(18,4)", "boolean", "date", "datetime", "varchar(255)", "json"],
   sqlite: ["text", "integer", "double", "numeric", "boolean", "date", "datetime", "blob"],
+  oracle: ["varchar2(4000)", "number(10)", "number(19)", "number", "number(18,4)", "binary_double", "number(1)", "date", "timestamp", "varchar2(255)", "clob", "blob"],
 };
 
 // ---------------------------------------------------------------- names
@@ -92,7 +97,8 @@ export function existingRows(columns: { name: string; type: string }[]): MapRow[
 
 /** Rows for a new table: one column per file column (`auto` reads the file column at the same position). */
 export function newRows(d: Driver, file: { name: string; inferredType: InferredType }[]): MapRow[] {
-  return file.map((c) => ({ name: c.name, type: sqlTypeFor(d, c.inferredType), from: "auto" }));
+  // Oracle folds unquoted names up: a new table gets upper-case names (a quoted lower-case name is a pain to query)
+  return file.map((c) => ({ name: d === "oracle" ? c.name.toUpperCase() : c.name, type: sqlTypeFor(d, c.inferredType), from: "auto" }));
 }
 
 /** The file column a row reads (`null` = none), resolving `auto`. */

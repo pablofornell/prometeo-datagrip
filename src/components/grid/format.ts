@@ -28,9 +28,10 @@ export function classifyType(typeName: string): ColumnKind {
   if (t === "date") return "date";
   if (t.startsWith("time")) return "time";
   if (t.startsWith("interval")) return "other";
+  if (/^binary_(float|double)\b/.test(t)) return "number"; // Oracle
   if (/^(bytea|blob|tinyblob|mediumblob|longblob|binary|varbinary|image|raw)\b/.test(t)) return "binary";
   if (NUMBER_RE.test(t)) return "number";
-  if (/^(char|varchar|nvarchar|nchar|text|tinytext|mediumtext|longtext|string|citext|name|clob|character|bpchar|enum)/.test(t)) return "text";
+  if (/^(char|varchar|nvarchar|nchar|text|tinytext|mediumtext|longtext|string|citext|name|clob|nclob|character|bpchar|enum|rowid|urowid)/.test(t) || /^long\b(?! raw)/.test(t)) return "text";
   return "other";
 }
 

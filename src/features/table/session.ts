@@ -99,6 +99,8 @@ export async function control(sessionId: string, sql: string): Promise<TxReport>
 export async function ensureTransaction(sessionId: string, driver: Driver): Promise<TxStatus> {
   const st = await sessionTxStatus(sessionId);
   if (st !== "idle") return st;
+  // Oracle has no BEGIN: a transaction starts with the first statement (the backend tracks it)
+  if (driver === "oracle") return "idle";
   const r = await control(sessionId, driver === "mysql" ? "START TRANSACTION" : "BEGIN");
   return r.status ?? "active";
 }

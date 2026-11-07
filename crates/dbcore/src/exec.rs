@@ -74,7 +74,7 @@ pub(crate) enum Item {
     Done(u64),
 }
 
-pub(crate) type ItemStream<'a> = BoxStream<'a, std::result::Result<Item, sqlx::Error>>;
+pub(crate) type ItemStream<'a> = BoxStream<'a, Result<Item>>;
 
 /// Stream of rows (text protocol / unprepared) of a single statement on a connection.
 pub(crate) fn open_stream<'a>(conn: &'a mut Conn, sql: &'a str) -> ItemStream<'a> {
@@ -86,6 +86,7 @@ pub(crate) fn open_stream<'a>(conn: &'a mut Conn, sql: &'a str) -> ItemStream<'a
                     Either::Left(q) => Item::Done(q.rows_affected()),
                     Either::Right(row) => Item::Row(RawRow::Pg(row)),
                 })
+                .map_err(DbError::from)
             })
             .boxed(),
         Conn::My(c) => sqlx::raw_sql(sql)
@@ -95,6 +96,7 @@ pub(crate) fn open_stream<'a>(conn: &'a mut Conn, sql: &'a str) -> ItemStream<'a
                     Either::Left(q) => Item::Done(q.rows_affected()),
                     Either::Right(row) => Item::Row(RawRow::My(row)),
                 })
+                .map_err(DbError::from)
             })
             .boxed(),
         Conn::Lite(c) => sqlx::raw_sql(sql)
@@ -104,8 +106,10 @@ pub(crate) fn open_stream<'a>(conn: &'a mut Conn, sql: &'a str) -> ItemStream<'a
                     Either::Left(q) => Item::Done(q.rows_affected()),
                     Either::Right(row) => Item::Row(RawRow::Lite(row)),
                 })
+                .map_err(DbError::from)
             })
             .boxed(),
+        Conn::Ora(c) => c.stream(sql),
     }
 }
 
@@ -118,6 +122,7 @@ pub(crate) async fn conn_scalar(conn: &mut Conn, sql: &str) -> Result<Option<Str
                 RawRow::Pg(r) => crate::conn::pg_strings(r),
                 RawRow::My(r) => crate::conn::my_strings(r),
                 RawRow::Lite(r) => crate::conn::lite_strings(r),
+                RawRow::Ora(r) => crate::oracle::row_strings(r),
             };
             return Ok(v.into_iter().next().flatten());
         }
@@ -134,6 +139,7 @@ pub(crate) fn open_pool_stream<'a>(pool: &'a Pool, sql: &'a str) -> ItemStream<'
                     Either::Left(q) => Item::Done(q.rows_affected()),
                     Either::Right(row) => Item::Row(RawRow::Pg(row)),
                 })
+                .map_err(DbError::from)
             })
             .boxed(),
         Pool::My(p) => sqlx::raw_sql(sql)
@@ -143,6 +149,7 @@ pub(crate) fn open_pool_stream<'a>(pool: &'a Pool, sql: &'a str) -> ItemStream<'
                     Either::Left(q) => Item::Done(q.rows_affected()),
                     Either::Right(row) => Item::Row(RawRow::My(row)),
                 })
+                .map_err(DbError::from)
             })
             .boxed(),
         Pool::Lite(p) => sqlx::raw_sql(sql)
@@ -152,8 +159,10 @@ pub(crate) fn open_pool_stream<'a>(pool: &'a Pool, sql: &'a str) -> ItemStream<'
                     Either::Left(q) => Item::Done(q.rows_affected()),
                     Either::Right(row) => Item::Row(RawRow::Lite(row)),
                 })
+                .map_err(DbError::from)
             })
             .boxed(),
+        Pool::Ora(p) => p.stream(sql),
     }
 }
 
@@ -383,9 +392,7 @@ async fn pull(stream: &mut ItemStream<'_>, sh: &Shared, st: &mut StreamState, t0
         }
         match item {
             None => return Pull::End,
-            Some(Err(e)) => {
-                return Pull::Err(DbError::from(e).for_driver(sh.session.live.driver()))
-            }
+            Some(Err(e)) => return Pull::Err(e.for_driver(sh.session.live.driver())),
             Some(Ok(Item::Done(n))) => {
                 st.block_done = true;
                 st.rows_affected = n;
@@ -418,7 +425,7 @@ async fn abort_stream(mut stream: ItemStream<'_>, sh: &Shared) -> Option<DbError
     let mut err = None;
     while let Some(item) = stream.next().await {
         if let Err(e) = item {
-            err.get_or_insert(DbError::from(e).for_driver(sh.session.live.driver()));
+            err.get_or_insert(e.for_driver(sh.session.live.driver()));
         }
     }
     err

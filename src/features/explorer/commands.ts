@@ -274,6 +274,42 @@ export function dropSqlOf(d: NodeData): string | null {
   const qt = ex.table ? qn(ex.table) : "";
   const pg = d.driver === "postgres";
   const my = d.driver === "mysql";
+  if (d.driver === "oracle") {
+    const alterT = (what: string) => `ALTER TABLE ${qt} ${what}`;
+    switch (d.kind) {
+      case "table":
+        return `DROP TABLE ${qn(d.name)}`;
+      case "view":
+        return `DROP VIEW ${qn(d.name)}`;
+      case "materializedView":
+        return `DROP MATERIALIZED VIEW ${qn(d.name)}`;
+      case "sequence":
+        return `DROP SEQUENCE ${qn(d.name)}`;
+      case "package":
+        return `DROP PACKAGE ${qn(d.name)}`;
+      case "synonym":
+        return `DROP SYNONYM ${qn(d.name)}`;
+      case "function":
+        return `DROP FUNCTION ${qn(d.name)}`;
+      case "procedure":
+        return `DROP PROCEDURE ${qn(d.name)}`;
+      case "routine":
+        return `DROP ${ex.routineType === "PROCEDURE" ? "PROCEDURE" : "FUNCTION"} ${qn(d.name)}`;
+      case "index":
+        return `DROP INDEX ${qn(d.name)}`;
+      case "trigger":
+        return `DROP TRIGGER ${qn(d.name)}`;
+      case "column":
+        return alterT(`DROP COLUMN ${q(d.name)}`);
+      case "primaryKey":
+      case "uniqueKey":
+      case "foreignKey":
+      case "check":
+        return alterT(`DROP CONSTRAINT ${q(d.name)}`);
+      default:
+        return null; // a schema is a user: creating and dropping it is an administrator's job
+    }
+  }
   switch (d.kind) {
     case "table":
       return `DROP TABLE ${qn(d.name)}`;
@@ -314,6 +350,8 @@ const KIND_WORD: Partial<Record<NodeData["kind"], string>> = {
   table: "table",
   view: "view",
   materializedView: "materialized view",
+  package: "package",
+  synonym: "synonym",
   sequence: "sequence",
   function: "function",
   procedure: "procedure",
@@ -508,7 +546,7 @@ export function newDataSourceFromUrl(): void {
     width: 520,
     accept: (v) => {
       const p = parseDataSourceUrl(v);
-      if (!p) return v.trim() ? "Unsupported URL. Use jdbc:postgresql://host:port/db, mysql://..., or the path of a SQLite file." : "URL is empty";
+      if (!p) return v.trim() ? "Unsupported URL. Use jdbc:postgresql://host:port/db, mysql://..., jdbc:oracle:thin:@//host:port/service, or the path of a SQLite file." : "URL is empty";
       void runAction("db.newDataSourceFromUrl", p);
       return null;
     },

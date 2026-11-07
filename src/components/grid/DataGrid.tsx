@@ -147,7 +147,7 @@ export interface DataGridProps {
   /** `Export Table to Clipboard` of the cell menu; omitted = no entry. */
   onExportToClipboard?: () => void;
   /** SQL dialect, for the expressions offered by `Set SQL Expression`. */
-  dialect?: "postgres" | "mysql" | "sqlite";
+  dialect?: "postgres" | "mysql" | "sqlite" | "oracle";
   /** Extra scroll room below the last row (the floating paging pill). */
   bottomPad?: number;
   /** Names of the columns that hold a foreign key (their icon shows the key); read reactively, no grid reset. */
@@ -1608,6 +1608,11 @@ export function DataGrid(props: DataGridProps): JSX.Element {
   function expressionChoices(ci: number): string[] {
     const k = kinds()[ci];
     const lite = props.dialect === "sqlite";
+    if (props.dialect === "oracle") {
+      if (k === "datetime") return ["systimestamp", "sysdate", "current_timestamp"];
+      if (k === "date") return ["sysdate", "current_date"];
+      return [];
+    }
     if (k === "datetime") return lite ? ["current_timestamp"] : ["now()", "current_timestamp"];
     if (k === "date") return lite ? ["current_date"] : ["current_date", "now()"];
     if (k === "time") return ["current_time"];

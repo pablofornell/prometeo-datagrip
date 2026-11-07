@@ -19,7 +19,7 @@ export interface ColumnDef {
   /** Generation expression (generated column); empty = a plain column. */
   generated: string;
   generatedStored: boolean;
-  /** PostgreSQL identity column. */
+  /** PostgreSQL / Oracle identity column. */
   identity: "" | "ALWAYS" | "BY DEFAULT";
   /** MySQL `auto_increment`, SQLite `autoincrement` (of a single-column integer primary key). */
   autoIncrement: boolean;
@@ -281,6 +281,33 @@ export const TYPES: Record<Driver, string[]> = {
     "year",
   ],
   sqlite: ["blob", "boolean", "date", "datetime", "integer", "numeric", "real", "text", "varchar"],
+  oracle: [
+    "BINARY_DOUBLE",
+    "BINARY_FLOAT",
+    "BLOB",
+    "BOOLEAN",
+    "CHAR",
+    "CLOB",
+    "DATE",
+    "FLOAT",
+    "INTERVAL DAY TO SECOND",
+    "INTERVAL YEAR TO MONTH",
+    "JSON",
+    "LONG",
+    "LONG RAW",
+    "NCHAR",
+    "NCLOB",
+    "NUMBER",
+    "NVARCHAR2",
+    "RAW",
+    "ROWID",
+    "TIMESTAMP",
+    "TIMESTAMP WITH LOCAL TIME ZONE",
+    "TIMESTAMP WITH TIME ZONE",
+    "UROWID",
+    "VARCHAR2",
+    "XMLTYPE",
+  ],
 };
 
 export const PG_INDEX_METHODS = ["btree", "hash", "gist", "spgist", "gin", "brin"];

@@ -49,3 +49,15 @@ describe("renameSqlOf", () => {
     expect(canRenameNode(node("sqlite", "view", "v"))).toBe(false);
   });
 });
+
+describe("Oracle", () => {
+  it("renames tables, columns, indexes and constraints; views and sequences only rename in the own schema (not offered)", () => {
+    expect(renameSqlOf(node("oracle", "table", "EMP", { schema: "DEMO" }), "STAFF")).toBe('ALTER TABLE "DEMO"."EMP" RENAME TO "STAFF"');
+    expect(renameSqlOf(node("oracle", "column", "ENAME", { schema: "DEMO", table: "EMP" }), "NAME")).toBe('ALTER TABLE "DEMO"."EMP" RENAME COLUMN "ENAME" TO "NAME"');
+    expect(renameSqlOf(node("oracle", "index", "EMP_IX", { schema: "DEMO" }), "EMP_IX2")).toBe('ALTER INDEX "DEMO"."EMP_IX" RENAME TO "EMP_IX2"');
+    expect(renameSqlOf(node("oracle", "foreignKey", "EMP_FK", { schema: "DEMO", table: "EMP" }), "EMP_FK2")).toBe('ALTER TABLE "DEMO"."EMP" RENAME CONSTRAINT "EMP_FK" TO "EMP_FK2"');
+    expect(renameSqlOf(node("oracle", "view", "V", { schema: "DEMO" }), "W")).toBeNull();
+    expect(renameSqlOf(node("oracle", "sequence", "S", { schema: "DEMO" }), "T")).toBeNull();
+    expect(renameSqlOf(node("oracle", "schema", "DEMO"), "X")).toBeNull();
+  });
+});

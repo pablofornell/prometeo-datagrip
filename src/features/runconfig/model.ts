@@ -70,6 +70,7 @@ export function targetParts(ds: { name: string; database?: string }, t: RunTarge
 export function initSql(driver: Driver, schema: string | undefined): string[] {
   if (!schema || driver === "sqlite") return [];
   const q = (s: string, c: string) => c + s.replaceAll(c, c + c) + c;
+  if (driver === "oracle") return [`ALTER SESSION SET CURRENT_SCHEMA = ${q(schema, '"')}`];
   return [driver === "postgres" ? `SET search_path TO ${q(schema, '"')}` : `USE ${q(schema, "`")}`];
 }
 

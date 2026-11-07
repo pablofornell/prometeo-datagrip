@@ -10,7 +10,10 @@ use crate::error::Result;
 use crate::exec::query_pool;
 use crate::manager::ConnectionManager;
 use crate::model::*;
-use crate::quote::{quote_ident, quote_literal};
+use crate::quote::{
+    oracle_raw_literal, oracle_text_literal, oracle_time_kind, oracle_time_literal, quote_ident,
+    quote_literal,
+};
 use crate::value::describe_columns_pool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +123,28 @@ fn pg_array_element(c: &Cell) -> String {
     }
 }
 
+/// [`sql_literal`] for a value of a column of declared type `ty`: Oracle writes dates, timestamps and long text with
+/// conversion functions, the others only look at the value.
+fn sql_literal_typed(d: Driver, c: &Cell, ty: &str) -> String {
+    if d != Driver::Oracle {
+        return sql_literal(d, c);
+    }
+    match c {
+        Value::String(s) => {
+            if let Some(l) = oracle_time_kind(ty).and_then(|k| oracle_time_literal(k, s)) {
+                l
+            } else if ty.to_ascii_uppercase().starts_with("NUMBER")
+                && s.trim().parse::<f64>().is_ok_and(f64::is_finite)
+            {
+                s.trim().to_string()
+            } else {
+                oracle_text_literal(s)
+            }
+        }
+        _ => sql_literal(d, c),
+    }
+}
+
 fn sql_literal(d: Driver, c: &Cell) -> String {
     match c {
         // PG arrays arrive as JSON arrays: write them back as an array literal ('{1,2}')
@@ -130,14 +155,17 @@ fn sql_literal(d: Driver, c: &Cell) -> String {
             _ => if *b { "1" } else { "0" }.into(),
         },
         Value::Number(n) => n.to_string(),
+        Value::String(s) if d == Driver::Oracle => oracle_text_literal(s),
         Value::String(s) => quote_literal(d, s),
         Value::Object(m) if m.contains_key("$bin") => {
             let hex = m["$bin"].as_str().unwrap_or("");
             match d {
                 Driver::Postgres => format!("'\\x{hex}'::bytea"),
+                Driver::Oracle => oracle_raw_literal(hex),
                 _ => format!("X'{hex}'"),
             }
         }
+        other if d == Driver::Oracle => oracle_text_literal(&other.to_string()),
         other => quote_literal(d, &other.to_string()),
     }
 }
@@ -160,6 +188,8 @@ pub struct Exporter<W: Write> {
     held: Vec<Vec<Cell>>,
     /// Primary key flag of each column of the result (SQL UPDATE / WHERE key).
     src_pk: Vec<bool>,
+    /// Declared type of each column of the result (literals of dates and the like).
+    src_types: Vec<String>,
     /// Text rows of the `Pretty` table (needs every row to align the columns).
     text_rows: Vec<Vec<String>>,
 }
@@ -177,6 +207,7 @@ impl<W: Write> Exporter<W> {
             batch: Vec::new(),
             held: Vec::new(),
             src_pk: Vec::new(),
+            src_types: Vec::new(),
             text_rows: Vec::new(),
         }
     }
@@ -232,12 +263,21 @@ impl<W: Write> Exporter<W> {
         }
     }
 
+    /// The SQL literal of cell `c` of column `i` of the result.
+    fn lit(&self, i: usize, c: &Cell) -> String {
+        sql_literal_typed(
+            self.o.dialect,
+            c,
+            self.src_types.get(i).map(String::as_str).unwrap_or(""),
+        )
+    }
+
     /// `"col" = literal` (`is null` for NULL).
     fn eq_pred(&self, i: usize, row: &[Cell]) -> String {
         let col = quote_ident(self.o.dialect, &self.src_cols[i]);
         match row.get(i) {
             None | Some(Value::Null) => format!("{col} is null"),
-            Some(c) => format!("{col} = {}", sql_literal(self.o.dialect, c)),
+            Some(c) => format!("{col} = {}", self.lit(i, c)),
         }
     }
 
@@ -285,6 +325,7 @@ impl<W: Write> Exporter<W> {
     pub fn begin(&mut self, columns: &[ColumnMeta]) -> io::Result<()> {
         self.src_cols = columns.iter().map(|c| c.name.clone()).collect();
         self.src_pk = columns.iter().map(|c| c.is_pk).collect();
+        self.src_types = columns.iter().map(|c| c.type_name.clone()).collect();
         self.began = true;
         if self.o.transpose {
             return Ok(());
@@ -441,7 +482,7 @@ impl<W: Write> Exporter<W> {
                             "{} = {}",
                             quote_ident(self.o.dialect, &self.src_cols[i]),
                             row.get(i)
-                                .map(|c| sql_literal(self.o.dialect, c))
+                                .map(|c| self.lit(i, c))
                                 .unwrap_or_else(|| "NULL".into())
                         )
                     })
@@ -460,7 +501,7 @@ impl<W: Write> Exporter<W> {
                 if key.len() == 1 {
                     // one key column: a single `in (...)` list, written by `finish`
                     let c = row.get(key[0]).cloned().unwrap_or(Value::Null);
-                    self.batch.push(sql_literal(self.o.dialect, &c));
+                    self.batch.push(self.lit(key[0], &c));
                 } else {
                     let preds: Vec<String> = key.iter().map(|&i| self.eq_pred(i, row)).collect();
                     write!(
@@ -520,8 +561,11 @@ impl<W: Write> Exporter<W> {
                 self.text_rows.push(line);
             }
             ExportFormat::SqlInsert => {
-                let vals: Vec<String> =
-                    row.iter().map(|c| sql_literal(self.o.dialect, c)).collect();
+                let vals: Vec<String> = row
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| self.lit(i, c))
+                    .collect();
                 self.batch.push(format!("({})", vals.join(", ")));
                 if self.batch.len() >= self.o.rows_per_insert.max(1) {
                     self.flush_batch()?;
@@ -541,13 +585,27 @@ impl<W: Write> Exporter<W> {
             .iter()
             .map(|c| quote_ident(self.o.dialect, c))
             .collect();
-        writeln!(
-            self.w,
-            "insert into {} ({}) values {};",
-            self.table(),
-            cols.join(", "),
-            self.batch.join(",\n    ")
-        )?;
+        if self.o.dialect == Driver::Oracle && self.batch.len() > 1 {
+            // no multi-row VALUES before 23ai: one `insert all` with a target per row
+            let into = format!("into {} ({}) values ", self.table(), cols.join(", "));
+            writeln!(
+                self.w,
+                "insert all\n    {}\nselect 1 from dual;",
+                self.batch
+                    .iter()
+                    .map(|t| format!("{into}{t}"))
+                    .collect::<Vec<_>>()
+                    .join("\n    ")
+            )?;
+        } else {
+            writeln!(
+                self.w,
+                "insert into {} ({}) values {};",
+                self.table(),
+                cols.join(", "),
+                self.batch.join(",\n    ")
+            )?;
+        }
         self.batch.clear();
         Ok(())
     }
@@ -852,6 +910,97 @@ mod tests {
     }
 
     /// A result with a primary key column (`id`), for the key based formats.
+    #[test]
+    fn sql_insert_oracle() {
+        let col = |n: &str, t: &str, pk: bool| ColumnMeta {
+            name: n.into(),
+            type_name: t.into(),
+            nullable: true,
+            is_pk: pk,
+            table_ref: None,
+        };
+        let rs = ResultSet {
+            columns: vec![
+                col("ID", "NUMBER", true),
+                col("name", "VARCHAR2(20)", false),
+                col("D", "DATE", false),
+                col("TS", "TIMESTAMP(6)", false),
+                col("TZ", "TIMESTAMP(6) WITH TIME ZONE", false),
+                col("B", "BLOB", false),
+                col("N", "NUMBER(30,10)", false),
+            ],
+            rows: vec![
+                vec![
+                    json!("1"),
+                    json!("it's"),
+                    json!("2024-02-29 13:45:10"),
+                    json!("2024-02-29 13:45:10.5"),
+                    json!("2024-02-29 13:45:10.5 +02:00"),
+                    json!({"$bin": "cafe"}),
+                    json!("12345678901234567890.1234567890"),
+                ],
+                vec![
+                    json!(2),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    json!(true),
+                ],
+            ],
+            has_more: false,
+            total_hint: None,
+            row_locators: None,
+        };
+        let opts = |n: usize| ExportOptions {
+            format: ExportFormat::SqlInsert,
+            dialect: Driver::Oracle,
+            table_name: Some("DEMO.T".into()),
+            rows_per_insert: n,
+            ..Default::default()
+        };
+        let one = export_to_string(&rs, &opts(1)).unwrap();
+        assert_eq!(
+            one.lines().next().unwrap(),
+            "insert into DEMO.T (ID, \"name\", D, TS, TZ, B, N) values (1, 'it''s', \
+             TO_DATE('2024-02-29 13:45:10', 'YYYY-MM-DD HH24:MI:SS'), \
+             TO_TIMESTAMP('2024-02-29 13:45:10.500000000', 'YYYY-MM-DD HH24:MI:SS.FF9'), \
+             TO_TIMESTAMP_TZ('2024-02-29 13:45:10.500000000 +02:00', 'YYYY-MM-DD HH24:MI:SS.FF9 TZH:TZM'), \
+             HEXTORAW('cafe'), 12345678901234567890.1234567890);"
+        );
+        assert!(
+            one.contains("values (2, NULL, NULL, NULL, NULL, NULL, 1);"),
+            "{one}"
+        );
+        // no multi-row VALUES: one `insert all`
+        let all = export_to_string(&rs, &opts(10)).unwrap();
+        assert!(
+            all.starts_with("insert all\n    into DEMO.T (ID, "),
+            "{all}"
+        );
+        assert!(all.ends_with("select 1 from dual;\n"), "{all}");
+        assert_eq!(all.matches("\n    into DEMO.T").count(), 2, "{all}");
+        assert_eq!(all.matches("into DEMO.T").count(), 2, "{all}");
+        // update / where use the same literals
+        let upd = export_to_string(
+            &rs,
+            &ExportOptions {
+                format: ExportFormat::SqlUpdate,
+                ..opts(1)
+            },
+        )
+        .unwrap();
+        assert!(
+            upd.starts_with("update DEMO.T set \"name\" = 'it''s', D = TO_DATE("),
+            "{upd}"
+        );
+        assert!(
+            upd.lines().next().unwrap().ends_with("where ID = 1;"),
+            "{upd}"
+        );
+    }
+
     fn rs_pk() -> ResultSet {
         let mut r = rs();
         r.columns[0].is_pk = true;

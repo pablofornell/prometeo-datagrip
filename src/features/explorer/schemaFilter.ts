@@ -18,7 +18,7 @@ export interface SchemaGroup {
 
 /** Every schema the server lists (system ones included), grouped by database for PostgreSQL, alphabetical. */
 export async function loadSchemaGroups(ds: DataSource): Promise<SchemaGroup[]> {
-  const isDefault = (n: TreeNode) => (ds.driver === "postgres" ? !!n.extra.default : ds.driver === "sqlite" ? n.name === "main" : n.name === ds.database);
+  const isDefault = (n: TreeNode) => (ds.driver === "postgres" ? !!n.extra.default : ds.driver === "sqlite" ? n.name === "main" : ds.driver === "oracle" ? n.name === ds.user.toUpperCase() : n.name === ds.database);
   const toItems = (nodes: TreeNode[]): SchemaItem[] =>
     nodes
       .filter((n) => n.kind === "schema")

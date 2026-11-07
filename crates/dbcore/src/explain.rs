@@ -1,7 +1,8 @@
 //! Explain Plan / Explain Analyse: runs `EXPLAIN` on a console session and returns the plan as a tree.
 //!
 //! PostgreSQL: `EXPLAIN (FORMAT JSON)` / `EXPLAIN (ANALYZE, FORMAT JSON)`. MySQL: `EXPLAIN FORMAT=JSON` and, for
-//! the analysed plan (only available as text there), `EXPLAIN ANALYZE`. SQLite: `EXPLAIN QUERY PLAN`.
+//! the analysed plan (only available as text there), `EXPLAIN ANALYZE`. SQLite: `EXPLAIN QUERY PLAN`. Oracle:
+//! `EXPLAIN PLAN SET STATEMENT_ID = .. FOR`, then the rows of `PLAN_TABLE` (deleted again).
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -508,6 +509,157 @@ fn sqlite_params(rest: &str) -> String {
     out
 }
 
+// ---------------------------------------------------------------- Oracle
+
+/// `PLAN_TABLE` rows as the `select` of [`ORA_PLAN_SQL`] returns them (all text).
+const ORA_PLAN_COLS: &str = "to_char(id), to_char(parent_id), operation, options, object_owner, object_name, object_type, \
+    to_char(cost), to_char(cardinality), to_char(bytes), to_char(time), access_predicates, filter_predicates, \
+    partition_start, partition_stop, to_char(cpu_cost), to_char(io_cost), object_alias";
+
+struct OraRow {
+    id: i64,
+    parent: Option<i64>,
+    cells: Vec<Option<String>>,
+}
+
+fn ora_text(c: &Cell) -> Option<String> {
+    match c {
+        Value::Null => None,
+        Value::String(s) => Some(s.clone()),
+        other => Some(other.to_string()),
+    }
+}
+
+fn ora_num(v: &Option<String>) -> Option<f64> {
+    v.as_deref().and_then(|s| s.trim().parse().ok())
+}
+
+/// The `PLAN_TABLE` rows of one explained statement as a tree: the row with id 0 (`SELECT STATEMENT`, ...) becomes the
+/// root, its cost and the like its properties.
+fn parse_oracle(rows: &[Vec<Cell>], sql: &str) -> Result<PlanNode> {
+    let raws: Vec<OraRow> = rows
+        .iter()
+        .map(|r| {
+            let cells: Vec<Option<String>> = r.iter().map(ora_text).collect();
+            OraRow {
+                id: ora_num(&cells.first().cloned().flatten()).unwrap_or(0.0) as i64,
+                parent: cells
+                    .get(1)
+                    .cloned()
+                    .flatten()
+                    .and_then(|s| s.trim().parse().ok()),
+                cells,
+            }
+        })
+        .collect();
+    let cell = |r: &OraRow, i: usize| -> Option<String> {
+        r.cells
+            .get(i)
+            .cloned()
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
+    };
+    fn build(
+        raws: &[OraRow],
+        parent: i64,
+        cell: &dyn Fn(&OraRow, usize) -> Option<String>,
+    ) -> Vec<PlanNode> {
+        raws.iter()
+            .filter(|r| r.parent == Some(parent))
+            .map(|r| {
+                let op = cell(r, 2).unwrap_or_default();
+                let options = cell(r, 3);
+                let operation = match &options {
+                    Some(o) => format!("{op} {o}"),
+                    None => op.clone(),
+                };
+                let owner = cell(r, 4);
+                let name = cell(r, 5);
+                let otype = cell(r, 6);
+                let mut params = Vec::new();
+                if let Some(nm) = &name {
+                    let full = match &owner {
+                        Some(o) => format!("{o}.{nm}"),
+                        None => nm.clone(),
+                    };
+                    let label = if otype.as_deref().is_some_and(|t| t.starts_with("INDEX")) {
+                        "index"
+                    } else {
+                        "table"
+                    };
+                    params.push(format!("{label}: {full};"));
+                }
+                if let Some(a) = cell(r, 11) {
+                    params.push(format!("access: {a};"));
+                }
+                if let Some(f) = cell(r, 12) {
+                    params.push(format!("filter: {f};"));
+                }
+                let mut props = vec![prop("Operation", op)];
+                let mut raw = Vec::new();
+                for (label, i) in [
+                    ("Options", 3),
+                    ("Object owner", 4),
+                    ("Object name", 5),
+                    ("Object type", 6),
+                    ("Cost", 7),
+                    ("Cardinality", 8),
+                    ("Bytes", 9),
+                    ("Time (s)", 10),
+                    ("Access predicates", 11),
+                    ("Filter predicates", 12),
+                    ("Partition start", 13),
+                    ("Partition stop", 14),
+                    ("CPU cost", 15),
+                    ("IO cost", 16),
+                    ("Object alias", 17),
+                ] {
+                    if let Some(v) = cell(r, i) {
+                        props.push(prop(label, v.clone()));
+                        raw.push(format!("{label} = {v}"));
+                    }
+                }
+                PlanNode {
+                    operation,
+                    params: params.join(" "),
+                    rows: ora_num(&cell(r, 8)),
+                    total_cost: ora_num(&cell(r, 7)),
+                    startup_cost: None,
+                    raw: raw.join(";"),
+                    props,
+                    children: build(raws, r.id, cell),
+                }
+            })
+            .collect()
+    }
+    let Some(root_row) = raws.iter().find(|r| r.parent.is_none()) else {
+        return Err(DbError::InvalidArgument(
+            "The server returned no plan".into(),
+        ));
+    };
+    let top = build(&raws, root_row.id, &cell);
+    if top.is_empty() {
+        return Err(DbError::InvalidArgument(
+            "The server returned no plan".into(),
+        ));
+    }
+    let mut props = Vec::new();
+    for (label, i) in [
+        ("Cost", 7),
+        ("Cardinality", 8),
+        ("Bytes", 9),
+        ("Time (s)", 10),
+    ] {
+        if let Some(v) = cell(root_row, i) {
+            props.push(prop(label, v));
+        }
+    }
+    let mut root = root_node(statement_kind(sql), top, props);
+    root.total_cost = ora_num(&cell(root_row, 7));
+    root.rows = ora_num(&cell(root_row, 8));
+    Ok(root)
+}
+
 // ---------------------------------------------------------------- entry point
 
 /// The cell as JSON: a JSON text column arrives as a string.
@@ -535,12 +687,16 @@ impl ConnectionManager {
         if analyze && driver == Driver::Sqlite {
             return Err(DbError::Unsupported("SQLite has no EXPLAIN ANALYZE".into()));
         }
+        if driver == Driver::Oracle {
+            return self.explain_oracle(session, &stmt, analyze).await;
+        }
         let wrapped = match (driver, analyze) {
             (Driver::Postgres, false) => format!("EXPLAIN (FORMAT JSON) {stmt}"),
             (Driver::Postgres, true) => format!("EXPLAIN (ANALYZE, FORMAT JSON) {stmt}"),
             (Driver::MySql, false) => format!("EXPLAIN FORMAT=JSON {stmt}"),
             (Driver::MySql, true) => format!("EXPLAIN ANALYZE {stmt}"),
             (Driver::Sqlite, _) => format!("EXPLAIN QUERY PLAN {stmt}"),
+            (Driver::Oracle, _) => unreachable!("explained by explain_oracle"),
         };
         let events = self
             .execute_collect(
@@ -550,6 +706,7 @@ impl ConnectionManager {
                     max_rows: 10_000,
                     stop_on_error: true,
                     keep_open_secs: 1,
+                    auto_commit: false,
                 },
             )
             .await?;
@@ -581,11 +738,81 @@ impl ConnectionManager {
                 parse_mysql_tree(&text, &stmt)?
             }
             (Driver::Sqlite, _) => parse_sqlite(&rows, &stmt)?,
+            (Driver::Oracle, _) => unreachable!("explained by explain_oracle"),
         };
         Ok(ExplainPlan {
             driver,
             analyze,
             sql: stmt,
+            root,
+            elapsed_ms,
+        })
+    }
+
+    /// Oracle: `EXPLAIN PLAN` writes into the session's `PLAN_TABLE` (a private temporary table), which is read and
+    /// emptied of this statement's rows again. `PLAN_TABLE` is a plain table in a few old setups: the delete keeps it
+    /// from filling up there too.
+    async fn explain_oracle(
+        &self,
+        session: &SessionId,
+        stmt: &str,
+        analyze: bool,
+    ) -> Result<ExplainPlan> {
+        if analyze {
+            return Err(DbError::Unsupported(
+                "Oracle has no EXPLAIN ANALYZE; use Explain Plan".into(),
+            ));
+        }
+        let id = format!("PRM{}", &uuid::Uuid::new_v4().simple().to_string()[..12]).to_uppercase();
+        let run = |sql: String| async move {
+            self.execute_collect(
+                session,
+                &sql,
+                ExecOptions {
+                    max_rows: 10_000,
+                    stop_on_error: true,
+                    keep_open_secs: 1,
+                    auto_commit: false,
+                },
+            )
+            .await
+        };
+        let mut elapsed_ms = 0;
+        let mut rows: Vec<Vec<Cell>> = Vec::new();
+        let mut failure: Option<String> = None;
+        for (i, sql) in [
+            format!("explain plan set statement_id = '{id}' for {stmt}"),
+            format!(
+                "select {ORA_PLAN_COLS} from plan_table where statement_id = '{id}' order by id"
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for e in run(sql).await? {
+                match e {
+                    ExecEvent::ResultSet { rows: r, .. } => rows = r,
+                    ExecEvent::Error { message, .. } => failure = Some(message),
+                    ExecEvent::Done { elapsed_ms: ms, .. } if i == 0 => elapsed_ms = ms,
+                    _ => {}
+                }
+            }
+            if failure.is_some() {
+                break;
+            }
+        }
+        let _ = run(format!(
+            "delete from plan_table where statement_id = '{id}'"
+        ))
+        .await;
+        if let Some(m) = failure {
+            return Err(DbError::InvalidArgument(m));
+        }
+        let root = parse_oracle(&rows, stmt)?;
+        Ok(ExplainPlan {
+            driver: Driver::Oracle,
+            analyze: false,
+            sql: stmt.to_string(),
             root,
             elapsed_ms,
         })
@@ -657,6 +884,65 @@ mod tests {
         assert_eq!(nl.children[0].operation, "Table scan");
         assert_eq!(nl.children[0].params, "table: o;");
         assert_eq!(nl.children[1].rows, Some(1.0));
+    }
+
+    #[test]
+    fn oracle_plan_tree() {
+        let row = |id: &str,
+                   parent: Option<&str>,
+                   op: &str,
+                   opt: Option<&str>,
+                   name: Option<&str>,
+                   cost: &str,
+                   card: &str| {
+            vec![
+                json!(id),
+                parent.map(|p| json!(p)).unwrap_or(Value::Null),
+                json!(op),
+                opt.map(|o| json!(o)).unwrap_or(Value::Null),
+                name.map(|_| json!("DEMO")).unwrap_or(Value::Null),
+                name.map(|n| json!(n)).unwrap_or(Value::Null),
+                name.map(|_| json!("TABLE")).unwrap_or(Value::Null),
+                json!(cost),
+                json!(card),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]
+        };
+        let rows = vec![
+            row("0", None, "SELECT STATEMENT", None, None, "7", "7"),
+            row("1", Some("0"), "HASH JOIN", None, None, "6", "7"),
+            row(
+                "2",
+                Some("1"),
+                "TABLE ACCESS",
+                Some("FULL"),
+                Some("ORDERS"),
+                "3",
+                "7",
+            ),
+            row(
+                "3",
+                Some("1"),
+                "TABLE ACCESS",
+                Some("FULL"),
+                Some("CUSTOMERS"),
+                "3",
+                "10",
+            ),
+        ];
+        let root = parse_oracle(&rows, "select 1").unwrap();
+        assert_eq!(root.operation, "Select");
+        assert_eq!(root.total_cost, Some(7.0));
+        let join = &root.children[0];
+        assert_eq!(join.operation, "HASH JOIN");
+        assert_eq!(join.children.len(), 2);
+        assert_eq!(join.children[0].operation, "TABLE ACCESS FULL");
+        assert_eq!(join.children[0].params, "table: DEMO.ORDERS;");
+        assert_eq!(join.children[1].rows, Some(10.0));
+        assert!(parse_oracle(&[], "select 1").is_err());
     }
 
     #[test]

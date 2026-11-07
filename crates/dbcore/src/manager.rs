@@ -45,6 +45,7 @@ pub(crate) enum CancelTarget {
     My(u64),
     /// Raw `sqlite3*` as usize; `None` once the connection is closed.
     Lite(Arc<Mutex<Option<usize>>>),
+    Ora(crate::oracle::OraCancel),
 }
 
 pub(crate) enum ExecCmd {
@@ -116,6 +117,7 @@ pub(crate) async fn cancel_target_of(conn: &mut Conn) -> Result<CancelTarget> {
             let ptr = h.as_raw_handle().as_ptr() as usize;
             CancelTarget::Lite(Arc::new(Mutex::new(Some(ptr))))
         }
+        Conn::Ora(c) => CancelTarget::Ora(c.cancel_handle()),
     })
 }
 
@@ -137,6 +139,7 @@ pub(crate) async fn interrupt(pool: &Pool, target: &CancelTarget) {
                 unsafe { libsqlite3_sys::sqlite3_interrupt(ptr as *mut libsqlite3_sys::sqlite3) };
             }
         }
+        CancelTarget::Ora(h) => h.cancel(),
     }
 }
 
@@ -225,8 +228,10 @@ impl Session {
         drop(lost);
         self.set_tx_status(TxStatus::Idle);
         self.tables_locked.store(false, Ordering::Relaxed);
-        if let CancelTarget::Lite(h) = &self.cancel_target() {
-            *h.lock().unwrap() = None;
+        match &self.cancel_target() {
+            CancelTarget::Lite(h) => *h.lock().unwrap() = None,
+            CancelTarget::Ora(h) => h.detach(),
+            _ => {}
         }
         *self.cancel.lock().unwrap() = CancelTarget::None;
         Some(had_tx)
@@ -309,6 +314,7 @@ async fn probe(cfg: &DataSourceConfig, opts: &ConnOpts) -> Result<(String, Optio
         Driver::Postgres => "show server_version",
         Driver::MySql => "select version()",
         Driver::Sqlite => "select sqlite_version()",
+        Driver::Oracle => crate::oracle::VERSION_SQL,
     };
     let v = conn_scalar(&mut conn, q).await;
     let driver = conn.driver();
@@ -318,7 +324,7 @@ async fn probe(cfg: &DataSourceConfig, opts: &ConnOpts) -> Result<(String, Optio
         Driver::MySql => Some(
             "select if(coalesce((select variable_value from performance_schema.session_status where variable_name = 'Ssl_cipher'), '') = '', 'false', 'true')",
         ),
-        Driver::Sqlite => None,
+        Driver::Sqlite | Driver::Oracle => None,
     };
     let ssl = match ssl_sql {
         Some(sql) => conn_scalar(&mut conn, sql)
@@ -336,6 +342,7 @@ async fn probe(cfg: &DataSourceConfig, opts: &ConnOpts) -> Result<(String, Optio
             Driver::MySql if v.to_lowercase().contains("mariadb") => format!("MariaDB {v}"),
             Driver::MySql => format!("MySQL {v}"),
             Driver::Sqlite => format!("SQLite {v}"),
+            Driver::Oracle => crate::oracle::version_label(&v),
         },
         ssl,
     ))
@@ -513,8 +520,10 @@ impl ConnectionManager {
             }
             if let Some(e) = failed {
                 let conn = guard.take();
-                if let CancelTarget::Lite(h) = &session.cancel_target() {
-                    *h.lock().unwrap() = None;
+                match &session.cancel_target() {
+                    CancelTarget::Lite(h) => *h.lock().unwrap() = None,
+                    CancelTarget::Ora(h) => h.detach(),
+                    _ => {}
                 }
                 if let Some(c) = conn {
                     c.close().await;
@@ -541,8 +550,10 @@ impl ConnectionManager {
         }
         // waits for a running execution task to release the connection
         let conn = sess.conn.lock().await.take();
-        if let CancelTarget::Lite(h) = &sess.cancel_target() {
-            *h.lock().unwrap() = None;
+        match &sess.cancel_target() {
+            CancelTarget::Lite(h) => *h.lock().unwrap() = None,
+            CancelTarget::Ora(h) => h.detach(),
+            _ => {}
         }
         if let Some(c) = conn {
             c.close().await;

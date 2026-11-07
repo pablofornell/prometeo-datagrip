@@ -46,12 +46,13 @@ export function contextOf(n: ENode | undefined): EditorCtx | undefined {
   if (d.kind === "dataSource" || d.kind === "database") {
     if (ds.driver === "sqlite") return fromSchema(["main"], "main");
     if (ds.driver === "mysql") return fromSchema([ds.database], ds.database);
+    if (ds.driver === "oracle") return fromSchema([ds.user.toUpperCase()], ds.user.toUpperCase());
     return fromSchema([d.kind === "database" ? d.name : ds.database || "postgres", "public"], "public");
   }
   if (d.kind === "schema") return fromSchema(d.path, d.name);
   const t = tableAncestor(n);
   if (t) return fromSchema(t.data.path.slice(0, -2), String(t.data.extra.schema ?? ""));
-  if (d.kind === "folder" || d.kind === "sequence" || d.kind === "routine" || d.kind === "function" || d.kind === "procedure") {
+  if (d.kind === "folder" || d.kind === "sequence" || d.kind === "package" || d.kind === "synonym" || d.kind === "routine" || d.kind === "function" || d.kind === "procedure") {
     return fromSchema(d.path.slice(0, d.kind === "folder" ? -1 : -2), String(d.extra.schema ?? ""));
   }
   return undefined;
@@ -119,8 +120,10 @@ export function newObjectTypes(n: ENode | undefined): { label: string; kind: "ta
   const ctx = contextOf(n);
   if (!ctx) return [];
   const out: { label: string; kind: "table" | ObjectKind; icon: string }[] = [{ label: "Table", kind: "table", icon: "dg/table" }];
-  if (ctx.driver === "postgres") out.push({ label: "Materialized View", kind: "materializedView", icon: "dg/materialized-view" });
+  if (ctx.driver === "postgres" || ctx.driver === "oracle") out.push({ label: "Materialized View", kind: "materializedView", icon: "dg/materialized-view" });
   out.push({ label: "View", kind: "view", icon: "data-schema" });
+  // a schema of Oracle is a user: only an administrator creates it
+  if (ctx.driver === "oracle") out.push({ label: "Sequence", kind: "sequence", icon: "dg/sequence" });
   if (ctx.driver === "postgres") out.push({ label: "Sequence", kind: "sequence", icon: "dg/sequence" }, { label: "Schema", kind: "schema", icon: "dg/schema" });
   if (ctx.driver === "mysql") out.push({ label: "Database", kind: "schema", icon: "dg/database" });
   return out;

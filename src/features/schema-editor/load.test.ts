@@ -131,3 +131,20 @@ describe("objects", () => {
     expect(alterSchemaPlan("postgres", o, { ...o, name: "b", comment: "c" }).statements).toEqual(["alter schema a rename to b;", "comment on schema b is 'c';"]);
   });
 });
+
+describe("tableFromNodes: Oracle", () => {
+  it("leaves out the NOT NULL checks, keeps real ones, reads ON DELETE and the default", () => {
+    const col = (name: string, type: string, extra: Record<string, unknown>) => node("column", name, type, { dataType: type, ...extra });
+    const t = tableFromNodes("oracle", "DEMO", "EMP", {}, {
+      columns: [col("ID", "NUMBER(10)", { nullable: false }), col("NAME", "VARCHAR2(100 CHAR)", { nullable: true, default: " 'n/a' \n" }), col("X", "NUMBER", { nullable: true, default: "NULL " })],
+      keys: [node("primaryKey", "EMP_PK", null, { columns: ["ID"] })],
+      fks: [node("foreignKey", "EMP_FK", null, { columns: ["ID"], refSchema: "DEMO", refTable: "DEPT", refColumns: ["ID"], onDelete: "cascade", onUpdate: "" })],
+      indexes: [],
+      checks: [node("check", "SYS_C001", null, { definition: '"ID" IS NOT NULL' }), node("check", "EMP_CK", null, { definition: "length(NAME) > 1" })],
+    });
+    expect(t.checks.map((c) => [c.name, c.expr])).toEqual([["EMP_CK", "length(NAME) > 1"]]);
+    expect(t.columns.map((c) => [c.name, c.notNull, c.default])).toEqual([["ID", true, ""], ["NAME", false, "'n/a'"], ["X", false, ""]]);
+    expect(t.fks[0].onDelete).toBe("CASCADE");
+    expect(t.fks[0].onUpdate).toBe("NO ACTION");
+  });
+});

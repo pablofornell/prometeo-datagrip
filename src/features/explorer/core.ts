@@ -282,7 +282,7 @@ export function markDisconnected(dsId: string): void {
 
 // ---------------------------------------------------------------- background task of the loads
 
-const DRIVER_LABEL: Record<string, string> = { postgres: "PostgreSQL", mysql: "MySQL", mariadb: "MariaDB", sqlite: "SQLite" };
+const DRIVER_LABEL: Record<string, string> = { postgres: "PostgreSQL", mysql: "MySQL", mariadb: "MariaDB", oracle: "Oracle", sqlite: "SQLite" };
 const driverLabel = (dsId: string): string => {
   const d = dsOf(dsId)?.driver;
   return (d && DRIVER_LABEL[d]) || d || "database";

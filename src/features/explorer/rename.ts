@@ -19,6 +19,28 @@ export function renameSqlOf(d: NodeData, newName: string): string | null {
   const pg = d.driver === "postgres";
   const my = d.driver === "mysql";
   const to = q(newName);
+  if (d.driver === "oracle") {
+    // RENAME of views and sequences only works in the user's own schema: not offered
+    switch (d.kind) {
+      case "table":
+        return `ALTER TABLE ${qn(d.name)} RENAME TO ${to}`;
+      case "materializedView":
+        return `ALTER MATERIALIZED VIEW ${qn(d.name)} RENAME TO ${to}`;
+      case "column":
+        return `ALTER TABLE ${qt} RENAME COLUMN ${q(d.name)} TO ${to}`;
+      case "index":
+        return `ALTER INDEX ${qn(d.name)} RENAME TO ${to}`;
+      case "trigger":
+        return `ALTER TRIGGER ${qn(d.name)} RENAME TO ${to}`;
+      case "primaryKey":
+      case "uniqueKey":
+      case "foreignKey":
+      case "check":
+        return `ALTER TABLE ${qt} RENAME CONSTRAINT ${q(d.name)} TO ${to}`;
+      default:
+        return null;
+    }
+  }
   switch (d.kind) {
     case "table":
       return my ? `RENAME TABLE ${qn(d.name)} TO ${qn(newName)}` : `ALTER TABLE ${qn(d.name)} RENAME TO ${to}`;

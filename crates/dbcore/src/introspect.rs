@@ -7,9 +7,11 @@
 //!   `[db, schema, folder, object, subfolder]` columns / keys / indexes / ...
 //! * MySQL / SQLite: same without the leading database element (MySQL schema = database,
 //!   SQLite schema = `main`, `temp` or an attached database).
+//! * Oracle: like MySQL; the schemas are the users that own objects (`ALL_USERS`), the folders also include
+//!   `packages` (whose children are the package's subprograms), `triggers` and `synonyms`.
 //!
-//! Folder keys: `tables views materialized_views routines sequences` (schema level) and
-//! `columns keys foreign_keys indexes checks triggers` (object level). Folder hints are
+//! Folder keys: `tables views materialized_views routines sequences` (schema level; Oracle adds `packages triggers
+//! synonyms`) and `columns keys foreign_keys indexes checks triggers` (object level). Folder hints are
 //! the object counts (`"5"`), shown by the UI next to the folder name like DataGrip.
 
 use serde_json::{json, Value};
@@ -22,7 +24,8 @@ use crate::quote::{quote_ident, quote_literal};
 
 #[derive(Debug, Clone, Default)]
 pub struct IntrospectOptions {
-    /// Show `pg_catalog` / `information_schema` (PG), system databases (MySQL), `temp` (SQLite).
+    /// Show `pg_catalog` / `information_schema` (PG), system databases (MySQL), `temp` (SQLite), the schemas Oracle
+    /// maintains itself (`SYS`, `SYSTEM`, ...).
     pub show_system: bool,
 }
 
@@ -156,6 +159,7 @@ impl ConnectionManager {
             Driver::Postgres => pg_children(&live, ds_id, path, opts).await,
             Driver::MySql => my_children(&live, ds_id, path, opts).await,
             Driver::Sqlite => lite_children(&live, ds_id, path, opts).await,
+            Driver::Oracle => ora_children(&live, ds_id, path, opts).await,
         }
     }
 
@@ -1149,6 +1153,633 @@ async fn my_object_items(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec<T
     }
 }
 
+// ================================================================= Oracle
+
+const ORA_LIT: fn(&str) -> String = |v| quote_literal(Driver::Oracle, v);
+
+/// Folders of an Oracle schema, in tree order: `(key, kind)` of the objects they hold.
+const ORA_FOLDERS: [&str; 8] = [
+    "tables",
+    "views",
+    "materialized_views",
+    "sequences",
+    "routines",
+    "packages",
+    "triggers",
+    "synonyms",
+];
+
+/// `NOT NULL` constraints are columns' business, not entries of the `checks` folder.
+const ORA_REAL_CHECK: &str = "c.constraint_type = 'C' and not regexp_like(c.search_condition_vc, '^\"[^\"]+\" IS NOT NULL$')";
+
+/// `SYS_CONTEXT('USERENV','CURRENT_SCHEMA')`: where unqualified names resolve.
+pub(crate) async fn ora_current_schema(pool: &Pool) -> Result<String> {
+    Ok(pool
+        .query_strings("select sys_context('USERENV', 'CURRENT_SCHEMA') from dual")
+        .await?
+        .first()
+        .map(|r| s(r, 0))
+        .unwrap_or_default())
+}
+
+/// Tables that are not the storage of a materialized view or a nested / overflow / dropped one.
+fn ora_table_filter(alias: &str) -> String {
+    format!(
+        "{a}.nested = 'NO' and {a}.dropped = 'NO' and {a}.iot_name is null and {a}.secondary = 'N' \
+         and not exists (select 1 from all_mviews mv where mv.owner = {a}.owner and mv.mview_name = {a}.table_name)",
+        a = alias
+    )
+}
+
+/// SQL expression: the type of column alias `c` (a row of `all_tab_cols`) as DataGrip writes it.
+fn ora_type_expr(c: &str) -> String {
+    format!(
+        "case \
+           when {c}.data_type in ('VARCHAR2', 'CHAR') then {c}.data_type || '(' || {c}.char_length || case when {c}.char_used = 'C' then ' CHAR' else '' end || ')' \
+           when {c}.data_type in ('NVARCHAR2', 'NCHAR') then {c}.data_type || '(' || {c}.char_length || ')' \
+           when {c}.data_type = 'NUMBER' then case \
+                when {c}.data_precision is null and {c}.data_scale is null then 'NUMBER' \
+                when {c}.data_precision is null then 'NUMBER(*,' || {c}.data_scale || ')' \
+                when nvl({c}.data_scale, 0) = 0 then 'NUMBER(' || {c}.data_precision || ')' \
+                else 'NUMBER(' || {c}.data_precision || ',' || {c}.data_scale || ')' end \
+           when {c}.data_type = 'FLOAT' then 'FLOAT(' || {c}.data_precision || ')' \
+           when {c}.data_type in ('RAW', 'UROWID') then {c}.data_type || '(' || {c}.data_length || ')' \
+           when {c}.data_type_owner is not null then {c}.data_type_owner || '.' || {c}.data_type \
+           else {c}.data_type end"
+    )
+}
+
+/// Columns of a table / view: name, type, nullable (`Y`/`N`), default, identity (`YES`/`NO`), virtual (`YES`/`NO`),
+/// comment, position, primary key (`Y`/`N`), raw data type, PK position.
+fn ora_columns_sql(owner: &str, table: &str) -> String {
+    format!(
+        "select c.column_name, {ty}, c.nullable, c.data_default_vc, c.identity_column, c.virtual_column, \
+                (select cm.comments from all_col_comments cm where cm.owner = c.owner and cm.table_name = c.table_name and cm.column_name = c.column_name), \
+                c.column_id, \
+                case when pk.position is not null then 'Y' else 'N' end, c.data_type, pk.position \
+         from all_tab_cols c \
+         left join (select kc.column_name, kc.position from all_constraints k \
+                    join all_cons_columns kc on kc.owner = k.owner and kc.constraint_name = k.constraint_name \
+                    where k.owner = {o} and k.table_name = {t} and k.constraint_type = 'P') pk on pk.column_name = c.column_name \
+         where c.owner = {o} and c.table_name = {t} and c.hidden_column = 'NO' order by c.column_id",
+        ty = ora_type_expr("c"),
+        o = ORA_LIT(owner),
+        t = ORA_LIT(table)
+    )
+}
+
+fn ora_trigger_hint(r: &Row, base: usize) -> String {
+    // trigger_type: `BEFORE EACH ROW`, `AFTER STATEMENT`, `INSTEAD OF`, `COMPOUND`
+    let ty = s(r, base);
+    let ev = s(r, base + 1);
+    format!("{ty} {ev}").trim().to_string()
+}
+
+async fn ora_children(
+    live: &Live,
+    ds: &str,
+    path: &[String],
+    opts: &IntrospectOptions,
+) -> Result<Vec<TreeNode>> {
+    let pool = &live.pool;
+    match path.len() {
+        0 => {
+            let cur = ora_current_schema(pool).await?;
+            let sys = if opts.show_system {
+                ""
+            } else {
+                " and u.oracle_maintained = 'N'"
+            };
+            let rows = pool
+                .query_strings(&format!(
+                    "select u.username, u.oracle_maintained from all_users u \
+                     where (u.username = {cur} or exists (select 1 from all_objects o where o.owner = u.username)){sys} \
+                     order by case when u.username = {cur} then 0 else 1 end, lower(u.username), u.username",
+                    cur = ORA_LIT(&cur)
+                ))
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    mk(
+                        ds,
+                        NodeKind::Schema,
+                        &s(r, 0),
+                        None,
+                        vec![s(r, 0)],
+                        true,
+                        json!({ "schema": s(r, 0), "system": s(r, 1) == "Y", "default": s(r, 0) == cur }),
+                    )
+                })
+                .collect())
+        }
+        1 => {
+            let o = ORA_LIT(&path[0]);
+            let rows = pool
+                .query_strings(&format!(
+                    "select \
+                     (select count(*) from all_tables t where t.owner = {o} and {tf}), \
+                     (select count(*) from all_views where owner = {o}), \
+                     (select count(*) from all_mviews where owner = {o}), \
+                     (select count(*) from all_sequences where sequence_owner = {o} and sequence_name not like 'ISEQ$$\\_%' escape '\\'), \
+                     (select count(*) from all_objects where owner = {o} and object_type in ('PROCEDURE', 'FUNCTION')), \
+                     (select count(*) from all_objects where owner = {o} and object_type = 'PACKAGE'), \
+                     (select count(*) from all_triggers where owner = {o}), \
+                     (select count(*) from all_synonyms where owner = {o}) \
+                     from dual",
+                    tf = ora_table_filter("t")
+                ))
+                .await?;
+            let r = rows.first().cloned().unwrap_or_default();
+            Ok(ORA_FOLDERS
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| n(&r, *i) > 0)
+                .map(|(i, k)| folder(ds, path, k, n(&r, i), Some(&path[0]), None))
+                .collect())
+        }
+        2 => ora_objects(pool, ds, path).await,
+        3 => ora_object_folders(pool, ds, path).await,
+        4 => ora_object_items(pool, ds, path).await,
+        _ => Err(bad_path(path)),
+    }
+}
+
+async fn ora_objects(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec<TreeNode>> {
+    let sc = &path[0];
+    let o = ORA_LIT(sc);
+    let ex_sc = |v: Value| -> Value {
+        let mut m = v.as_object().cloned().unwrap_or_default();
+        m.insert("schema".into(), json!(sc));
+        Value::Object(m)
+    };
+    match path[1].as_str() {
+        "tables" => {
+            let rows = pool
+                .query_strings(&format!(
+                    "select t.table_name, tc.comments, t.num_rows, t.temporary, t.partitioned, t.tablespace_name \
+                     from all_tables t left join all_tab_comments tc on tc.owner = t.owner and tc.table_name = t.table_name \
+                     where t.owner = {o} and {tf} order by t.table_name",
+                    tf = ora_table_filter("t")
+                ))
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    mk(
+                        ds,
+                        NodeKind::Table,
+                        &s(r, 0),
+                        nonempty(s(r, 1)),
+                        child_path(path, &s(r, 0)),
+                        true,
+                        ex_sc(json!({
+                            "comment": s(r, 1), "rowEstimate": so(r, 2).and_then(|v| v.parse::<i64>().ok()),
+                            "temporary": s(r, 3) == "Y", "partitioned": s(r, 4) == "YES", "tablespace": s(r, 5)
+                        })),
+                    )
+                })
+                .collect())
+        }
+        "views" => {
+            let rows = pool
+                .query_strings(&format!(
+                    "select v.view_name, tc.comments from all_views v \
+                     left join all_tab_comments tc on tc.owner = v.owner and tc.table_name = v.view_name \
+                     where v.owner = {o} order by v.view_name"
+                ))
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    mk(
+                        ds,
+                        NodeKind::View,
+                        &s(r, 0),
+                        nonempty(s(r, 1)),
+                        child_path(path, &s(r, 0)),
+                        true,
+                        ex_sc(json!({ "comment": s(r, 1) })),
+                    )
+                })
+                .collect())
+        }
+        "materialized_views" => {
+            let rows = pool
+                .query_strings(&format!(
+                    "select m.mview_name, tc.comments, m.refresh_mode, m.refresh_method from all_mviews m \
+                     left join all_mview_comments tc on tc.owner = m.owner and tc.mview_name = m.mview_name \
+                     where m.owner = {o} order by m.mview_name"
+                ))
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    mk(
+                        ds,
+                        NodeKind::MaterializedView,
+                        &s(r, 0),
+                        nonempty(s(r, 1)),
+                        child_path(path, &s(r, 0)),
+                        true,
+                        ex_sc(json!({ "comment": s(r, 1), "refreshMode": s(r, 2), "refreshMethod": s(r, 3) })),
+                    )
+                })
+                .collect())
+        }
+        "sequences" => {
+            let rows = pool
+                .query_strings(&format!(
+                    "select sequence_name, min_value, max_value, increment_by, cache_size, cycle_flag, order_flag, last_number \
+                     from all_sequences where sequence_owner = {o} and sequence_name not like 'ISEQ$$\\_%' escape '\\' \
+                     order by sequence_name"
+                ))
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    mk(
+                        ds,
+                        NodeKind::Sequence,
+                        &s(r, 0),
+                        Some(format!("by {}", s(r, 3))),
+                        child_path(path, &s(r, 0)),
+                        false,
+                        ex_sc(json!({
+                            "minValue": s(r, 1), "maxValue": s(r, 2), "incrementBy": s(r, 3), "cacheSize": s(r, 4),
+                            "cycle": s(r, 5) == "Y", "ordered": s(r, 6) == "Y", "lastNumber": s(r, 7)
+                        })),
+                    )
+                })
+                .collect())
+        }
+        "routines" => {
+            let rows = pool
+                .query_strings(&format!(
+                    "select ob.object_name, ob.object_type, ob.status, \
+                            (select listagg(a.argument_name || ' ' || a.data_type, ', ') within group (order by a.position) \
+                               from all_arguments a where a.object_id = ob.object_id and a.package_name is null \
+                                and a.data_level = 0 and a.position > 0), \
+                            (select max(a.data_type) from all_arguments a where a.object_id = ob.object_id and a.package_name is null \
+                                and a.data_level = 0 and a.position = 0) \
+                     from all_objects ob where ob.owner = {o} and ob.object_type in ('PROCEDURE', 'FUNCTION') \
+                     order by ob.object_name"
+                ))
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    let proc_ = s(r, 1) == "PROCEDURE";
+                    let hint = if proc_ {
+                        format!("({})", s(r, 3))
+                    } else {
+                        format!("({}): {}", s(r, 3), s(r, 4))
+                    };
+                    mk(
+                        ds,
+                        if proc_ { NodeKind::Procedure } else { NodeKind::Function },
+                        &s(r, 0),
+                        Some(hint),
+                        child_path(path, &s(r, 0)),
+                        false,
+                        ex_sc(json!({ "signature": s(r, 3), "returns": s(r, 4), "valid": s(r, 2) == "VALID" })),
+                    )
+                })
+                .collect())
+        }
+        "packages" => {
+            let rows = pool
+                .query_strings(&format!(
+                    "select object_name, status from all_objects where owner = {o} and object_type = 'PACKAGE' order by object_name"
+                ))
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    mk(
+                        ds,
+                        NodeKind::Package,
+                        &s(r, 0),
+                        None,
+                        child_path(path, &s(r, 0)),
+                        true,
+                        ex_sc(json!({ "valid": s(r, 1) == "VALID" })),
+                    )
+                })
+                .collect())
+        }
+        "triggers" => {
+            let rows = pool
+                .query_strings(&format!(
+                    "select trigger_name, trigger_type, triggering_event, table_name, status from all_triggers \
+                     where owner = {o} order by trigger_name"
+                ))
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    mk(
+                        ds,
+                        NodeKind::Trigger,
+                        &s(r, 0),
+                        Some(ora_trigger_hint(r, 1)),
+                        child_path(path, &s(r, 0)),
+                        false,
+                        ex_sc(json!({ "table": so(r, 3), "enabled": s(r, 4) == "ENABLED" })),
+                    )
+                })
+                .collect())
+        }
+        "synonyms" => {
+            let rows = pool
+                .query_strings(&format!(
+                    "select synonym_name, table_owner, table_name, db_link from all_synonyms where owner = {o} order by synonym_name"
+                ))
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    let mut target = match so(r, 1) {
+                        Some(ow) => format!("{ow}.{}", s(r, 2)),
+                        None => s(r, 2),
+                    };
+                    if let Some(l) = so(r, 3) {
+                        target.push_str(&format!("@{l}"));
+                    }
+                    mk(
+                        ds,
+                        NodeKind::Synonym,
+                        &s(r, 0),
+                        Some(format!("-> {target}")),
+                        child_path(path, &s(r, 0)),
+                        false,
+                        ex_sc(json!({ "targetSchema": so(r, 1), "targetName": s(r, 2), "dbLink": so(r, 3) })),
+                    )
+                })
+                .collect())
+        }
+        _ => Err(bad_path(path)),
+    }
+}
+
+async fn ora_object_folders(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec<TreeNode>> {
+    let (sc, key, t) = (&path[0], path[1].as_str(), &path[2]);
+    let (o, tl) = (ORA_LIT(sc), ORA_LIT(t));
+    if key == "packages" {
+        // the members of a package are leaves right below it
+        let rows = pool
+            .query_strings(&format!(
+                "select p.procedure_name, p.overload, \
+                        (select max(a.data_type) from all_arguments a where a.owner = p.owner and a.package_name = p.object_name \
+                            and a.object_name = p.procedure_name and nvl(a.overload, '-') = nvl(p.overload, '-') \
+                            and a.position = 0 and a.data_level = 0), \
+                        (select listagg(a.argument_name || ' ' || a.data_type, ', ') within group (order by a.position) \
+                           from all_arguments a where a.owner = p.owner and a.package_name = p.object_name \
+                            and a.object_name = p.procedure_name and nvl(a.overload, '-') = nvl(p.overload, '-') \
+                            and a.position > 0 and a.data_level = 0) \
+                 from all_procedures p where p.owner = {o} and p.object_name = {tl} and p.procedure_name is not null \
+                 order by p.subprogram_id"
+            ))
+            .await?;
+        return Ok(rows
+            .iter()
+            .map(|r| {
+                let func = so(r, 2).is_some();
+                let sig = s(r, 3);
+                let hint = if func {
+                    format!("({sig}): {}", s(r, 2))
+                } else {
+                    format!("({sig})")
+                };
+                let id = match so(r, 1) {
+                    Some(ov) => format!("{}#{ov}", s(r, 0)),
+                    None => s(r, 0),
+                };
+                mk(
+                    ds,
+                    if func {
+                        NodeKind::Function
+                    } else {
+                        NodeKind::Procedure
+                    },
+                    &s(r, 0),
+                    Some(hint),
+                    child_path(path, &id),
+                    false,
+                    // `table` is the parent object: the DDL of a member is the one of its package
+                    json!({ "schema": sc, "table": t, "package": t, "signature": sig, "returns": so(r, 2) }),
+                )
+            })
+            .collect());
+    }
+    if !matches!(key, "tables" | "views" | "materialized_views") {
+        return Err(bad_path(path));
+    }
+    let rows = pool
+        .query_strings(&format!(
+            "select \
+             (select count(*) from all_tab_cols where owner = {o} and table_name = {tl} and hidden_column = 'NO'), \
+             (select count(*) from all_constraints where owner = {o} and table_name = {tl} and constraint_type in ('P', 'U')), \
+             (select count(*) from all_constraints where owner = {o} and table_name = {tl} and constraint_type = 'R'), \
+             (select count(*) from all_indexes where table_owner = {o} and table_name = {tl}), \
+             (select count(*) from all_constraints c where c.owner = {o} and c.table_name = {tl} and {chk}), \
+             (select count(*) from all_triggers where table_owner = {o} and table_name = {tl}) \
+             from dual",
+            chk = ORA_REAL_CHECK
+        ))
+        .await?;
+    let r = rows.first().ok_or_else(|| bad_path(path))?;
+    let wanted: &[(&str, usize)] = match key {
+        "tables" => &[
+            ("columns", 0),
+            ("keys", 1),
+            ("foreign_keys", 2),
+            ("indexes", 3),
+            ("checks", 4),
+            ("triggers", 5),
+        ],
+        "views" => &[("columns", 0), ("triggers", 5)],
+        _ => &[("columns", 0), ("indexes", 3)],
+    };
+    Ok(wanted
+        .iter()
+        .filter(|(k, i)| *k == "columns" || n(r, *i) > 0)
+        .map(|(k, i)| folder(ds, path, k, n(r, *i), Some(sc), Some(t)))
+        .collect())
+}
+
+async fn ora_object_items(pool: &Pool, ds: &str, path: &[String]) -> Result<Vec<TreeNode>> {
+    let (sc, t, sub) = (&path[0], &path[2], path[3].as_str());
+    let (o, tl) = (ORA_LIT(sc), ORA_LIT(t));
+    let ex = |v: Value| -> Value {
+        let mut m = v.as_object().cloned().unwrap_or_default();
+        m.insert("schema".into(), json!(sc));
+        m.insert("table".into(), json!(t));
+        Value::Object(m)
+    };
+    match sub {
+        "columns" => {
+            let rows = pool.query_strings(&ora_columns_sql(sc, t)).await?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    mk(
+                        ds,
+                        NodeKind::Column,
+                        &s(r, 0),
+                        Some(s(r, 1)),
+                        child_path(path, &s(r, 0)),
+                        false,
+                        ex(json!({
+                            "dataType": s(r, 1), "nullable": s(r, 2) == "Y", "default": nonempty(s(r, 3).trim().to_string()),
+                            "identity": s(r, 4) == "YES", "generated": s(r, 5) == "YES",
+                            "comment": s(r, 6), "isPk": s(r, 8) == "Y", "position": n(r, 7)
+                        })),
+                    )
+                })
+                .collect())
+        }
+        "keys" => {
+            let rows = pool
+                .query_strings(&format!(
+                    "select c.constraint_name, c.constraint_type, \
+                            (select listagg(cc.column_name, ', ') within group (order by cc.position) from all_cons_columns cc \
+                               where cc.owner = c.owner and cc.constraint_name = c.constraint_name), c.status \
+                     from all_constraints c where c.owner = {o} and c.table_name = {tl} and c.constraint_type in ('P', 'U') \
+                     order by c.constraint_type, c.constraint_name"
+                ))
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    let pk = s(r, 1) == "P";
+                    mk(
+                        ds,
+                        if pk { NodeKind::PrimaryKey } else { NodeKind::UniqueKey },
+                        &s(r, 0),
+                        Some(format!("({})", s(r, 2))),
+                        child_path(path, &s(r, 0)),
+                        false,
+                        ex(json!({ "columns": s(r, 2).split(", ").collect::<Vec<_>>(), "enabled": s(r, 3) == "ENABLED" })),
+                    )
+                })
+                .collect())
+        }
+        "foreign_keys" => {
+            let rows = pool
+                .query_strings(&format!(
+                    "select c.constraint_name, \
+                            (select listagg(cc.column_name, ', ') within group (order by cc.position) from all_cons_columns cc \
+                               where cc.owner = c.owner and cc.constraint_name = c.constraint_name), \
+                            rc.owner, rc.table_name, \
+                            (select listagg(cc.column_name, ', ') within group (order by cc.position) from all_cons_columns cc \
+                               where cc.owner = rc.owner and cc.constraint_name = rc.constraint_name), \
+                            c.delete_rule, c.status \
+                     from all_constraints c join all_constraints rc on rc.owner = c.r_owner and rc.constraint_name = c.r_constraint_name \
+                     where c.owner = {o} and c.table_name = {tl} and c.constraint_type = 'R' order by c.constraint_name"
+                ))
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    mk(
+                        ds,
+                        NodeKind::ForeignKey,
+                        &s(r, 0),
+                        Some(format!("({}) -> {}({})", s(r, 1), s(r, 3), s(r, 4))),
+                        child_path(path, &s(r, 0)),
+                        false,
+                        ex(json!({
+                            "columns": s(r, 1).split(", ").collect::<Vec<_>>(),
+                            "refSchema": s(r, 2), "refTable": s(r, 3),
+                            "refColumns": s(r, 4).split(", ").collect::<Vec<_>>(),
+                            "onDelete": s(r, 5), "enabled": s(r, 6) == "ENABLED"
+                        })),
+                    )
+                })
+                .collect())
+        }
+        "indexes" => {
+            let rows = pool
+                .query_strings(&format!(
+                    "select i.index_name, i.uniqueness, i.index_type, \
+                            (select listagg(ic.column_name || case when ic.descend = 'DESC' then ' DESC' else '' end, ', ') \
+                                    within group (order by ic.column_position) \
+                               from all_ind_columns ic where ic.index_owner = i.owner and ic.index_name = i.index_name), \
+                            (select count(*) from all_constraints k where k.owner = i.table_owner and k.table_name = i.table_name \
+                                and k.index_name = i.index_name and k.constraint_type = 'P') \
+                     from all_indexes i where i.table_owner = {o} and i.table_name = {tl} order by i.index_name"
+                ))
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    mk(
+                        ds,
+                        NodeKind::Index,
+                        &s(r, 0),
+                        Some(format!("({})", s(r, 3))),
+                        child_path(path, &s(r, 0)),
+                        false,
+                        ex(json!({ "unique": s(r, 1) == "UNIQUE", "primary": n(r, 4) > 0, "method": s(r, 2), "columns": s(r, 3) })),
+                    )
+                })
+                .collect())
+        }
+        "checks" => {
+            let rows = pool
+                .query_strings(&format!(
+                    "select c.constraint_name, c.search_condition_vc, c.status from all_constraints c \
+                     where c.owner = {o} and c.table_name = {tl} and {chk} order by c.constraint_name",
+                    chk = ORA_REAL_CHECK
+                ))
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    mk(
+                        ds,
+                        NodeKind::Check,
+                        &s(r, 0),
+                        Some(s(r, 1)),
+                        child_path(path, &s(r, 0)),
+                        false,
+                        ex(json!({ "definition": s(r, 1), "enabled": s(r, 2) == "ENABLED" })),
+                    )
+                })
+                .collect())
+        }
+        "triggers" => {
+            let rows = pool
+                .query_strings(&format!(
+                    "select trigger_name, trigger_type, triggering_event, status, owner from all_triggers \
+                     where table_owner = {o} and table_name = {tl} order by trigger_name"
+                ))
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    let mut e = ex(json!({ "enabled": s(r, 3) == "ENABLED" }));
+                    // the trigger may live in another schema than its table
+                    if let Some(m) = e.as_object_mut() {
+                        m.insert("schema".into(), json!(s(r, 4)));
+                    }
+                    mk(
+                        ds,
+                        NodeKind::Trigger,
+                        &s(r, 0),
+                        Some(ora_trigger_hint(r, 1)),
+                        child_path(path, &s(r, 0)),
+                        false,
+                        e,
+                    )
+                })
+                .collect())
+        }
+        _ => Err(bad_path(path)),
+    }
+}
+
 // ================================================================ SQLite
 
 fn lq(v: &str) -> String {
@@ -1681,6 +2312,25 @@ pub(crate) async fn table_columns(
                 .collect()
         }
         Driver::Sqlite => lite_columns(pool, schema.unwrap_or("main"), table).await?,
+        Driver::Oracle => {
+            let sc = match schema {
+                Some(sc) => sc.to_string(),
+                None => ora_current_schema(pool).await?,
+            };
+            let rows = pool.query_strings(&ora_columns_sql(&sc, table)).await?;
+            rows.iter()
+                .map(|r| ColInfo {
+                    name: s(r, 0),
+                    type_name: s(r, 1),
+                    nullable: s(r, 2) == "Y",
+                    is_pk: s(r, 8) == "Y",
+                    pk_pos: n(r, 10),
+                    default: nonempty(s(r, 3).trim().to_string()),
+                    generated: s(r, 4) == "YES" || s(r, 5) == "YES",
+                    base_type: s(r, 9).to_ascii_uppercase(),
+                })
+                .collect()
+        }
     };
     if cols.is_empty() {
         return Err(DbError::NotFound(format!("Table {} not found", table)));
@@ -1740,6 +2390,26 @@ pub(crate) async fn row_addr(
                 .unwrap_or(RowAddr::None))
         }
         Driver::MySql => Ok(RowAddr::None),
+        Driver::Oracle => {
+            // ordinary tables (and the storage of materialized views) have a ROWID, views do not
+            let sc = match schema {
+                Some(sc) => sc.to_string(),
+                None => ora_current_schema(&live.pool).await?,
+            };
+            let rows = live
+                .pool
+                .query_strings(&format!(
+                    "select count(*) from all_tables where owner = {} and table_name = {}",
+                    quote_literal(Driver::Oracle, &sc),
+                    quote_literal(Driver::Oracle, table)
+                ))
+                .await?;
+            Ok(if rows.first().map(|r| n(r, 0)).unwrap_or(0) > 0 {
+                RowAddr::OracleRowid
+            } else {
+                RowAddr::None
+            })
+        }
     }
 }
 
@@ -1818,6 +2488,44 @@ async fn snapshot(live: &Live, schema: Option<&str>) -> Result<Vec<SnapshotObjec
                     name,
                     type_name: s(&r, 4),
                     is_pk: s(&r, 5) == "PRI",
+                });
+                push(s(&r, 0), s(&r, 1), kind, col);
+            }
+        }
+        Driver::Oracle => {
+            let filter = match schema {
+                Some(sc) => format!("o.owner = {}", quote_literal(Driver::Oracle, sc)),
+                None => "o.owner in (select username from all_users where oracle_maintained = 'N')"
+                    .into(),
+            };
+            let rows = pool
+                .query_strings(&format!(
+                    "select o.owner, o.object_name, o.object_type, c.column_name, {ty}, \
+                            case when pk.column_name is not null then 'Y' else 'N' end \
+                     from all_objects o \
+                     left join all_tab_cols c on c.owner = o.owner and c.table_name = o.object_name and c.hidden_column = 'NO' \
+                     left join (select k.owner, k.table_name, kc.column_name from all_constraints k \
+                                join all_cons_columns kc on kc.owner = k.owner and kc.constraint_name = k.constraint_name \
+                                where k.constraint_type = 'P') pk \
+                       on pk.owner = c.owner and pk.table_name = c.table_name and pk.column_name = c.column_name \
+                     where o.object_type in ('TABLE', 'VIEW', 'MATERIALIZED VIEW') and {filter} \
+                       and not (o.object_type = 'TABLE' and (o.generated = 'Y' or exists \
+                           (select 1 from all_mviews mv where mv.owner = o.owner and mv.mview_name = o.object_name))) \
+                       and o.object_name not like 'BIN$%' \
+                     order by o.owner, o.object_name, o.object_type, c.column_id",
+                    ty = ora_type_expr("c")
+                ))
+                .await?;
+            for r in rows {
+                let kind = match s(&r, 2).as_str() {
+                    "VIEW" => NodeKind::View,
+                    "MATERIALIZED VIEW" => NodeKind::MaterializedView,
+                    _ => NodeKind::Table,
+                };
+                let col = so(&r, 3).map(|name| SnapshotColumn {
+                    name,
+                    type_name: s(&r, 4),
+                    is_pk: s(&r, 5) == "Y",
                 });
                 push(s(&r, 0), s(&r, 1), kind, col);
             }

@@ -82,7 +82,7 @@ export async function openImport(t: ImportTarget): Promise<void> {
     if (!source) return;
     const schemas = await loadSchemas(t.dsId, driver === "postgres");
     const names = schemas.map((s) => s.name);
-    const usual = driver === "postgres" ? "public" : "main";
+    const usual = driver === "postgres" ? "public" : driver === "oracle" ? (ds?.user ?? "").toUpperCase() : "main";
     const schema = t.schema && names.includes(t.schema) ? t.schema : names.includes(usual) ? usual : (names[0] ?? null);
     const cache = new Map<string, Promise<TableInfo[]>>();
     const loadTables = (s: string | null): Promise<TableInfo[]> => {

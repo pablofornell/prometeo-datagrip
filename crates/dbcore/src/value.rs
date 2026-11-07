@@ -512,6 +512,7 @@ pub(crate) enum RawRow {
     Pg(PgRow),
     My(MySqlRow),
     Lite(SqliteRow),
+    Ora(crate::oracle::OraRow),
 }
 
 /// Converts raw rows of one result set to cells; built from the first row.
@@ -523,6 +524,7 @@ pub(crate) enum RowDecoder {
     Pg(Arc<Vec<PgKind>>, DecodeOpts, Vec<(String, u32)>),
     My(Arc<Vec<MyKind>>, DecodeOpts, Vec<(String, String)>),
     Lite(DecodeOpts, Vec<String>),
+    Ora(DecodeOpts, Vec<(String, String)>),
 }
 
 impl RowDecoder {
@@ -591,6 +593,22 @@ impl RowDecoder {
                 let sig = r.columns().iter().map(|c| c.name().to_string()).collect();
                 Ok((RowDecoder::Lite(opts, sig), metas))
             }
+            RawRow::Ora(r) => {
+                let metas = r
+                    .cols
+                    .iter()
+                    .map(|c| ColumnMeta {
+                        nullable: c.nullable,
+                        ..meta(&c.name, c.type_name.clone())
+                    })
+                    .collect();
+                let sig = r
+                    .cols
+                    .iter()
+                    .map(|c| (c.name.clone(), c.type_name.clone()))
+                    .collect();
+                Ok((RowDecoder::Ora(opts, sig), metas))
+            }
         }
     }
 
@@ -616,6 +634,13 @@ impl RowDecoder {
             (RowDecoder::Lite(_, sig), RawRow::Lite(r)) => {
                 let cols = r.columns();
                 cols.len() == sig.len() && cols.iter().zip(sig).all(|(c, n)| c.name() == n)
+            }
+            (RowDecoder::Ora(_, sig), RawRow::Ora(r)) => {
+                r.cols.len() == sig.len()
+                    && r.cols
+                        .iter()
+                        .zip(sig)
+                        .all(|(c, (n, t))| &c.name == n && &c.type_name == t)
             }
             _ => false,
         }
@@ -643,6 +668,7 @@ impl RowDecoder {
             (RowDecoder::Lite(opts, _), RawRow::Lite(r)) => {
                 (0..r.len()).map(|i| lite_cell(r, i, *opts)).collect()
             }
+            (RowDecoder::Ora(opts, _), RawRow::Ora(r)) => crate::oracle::row_cells(r, *opts),
             _ => Vec::new(),
         }
     }
@@ -689,6 +715,8 @@ pub(crate) async fn describe_columns(live: &Live, conn: &mut Conn, sql: &str) ->
             .await
             .map(|d| conv(d.columns()))
             .unwrap_or_default(),
+        // the cursor of an Oracle statement knows its columns: nothing to ask
+        Conn::Ora(c) => c.describe(sql).await,
     }
 }
 
@@ -715,6 +743,7 @@ pub(crate) async fn describe_columns_pool(pool: &crate::conn::Pool, sql: &str) -
             .await
             .map(|d| conv(d.columns()))
             .unwrap_or_default(),
+        crate::conn::Pool::Ora(p) => p.describe(sql).await,
     }
 }
 

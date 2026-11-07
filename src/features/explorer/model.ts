@@ -52,6 +52,8 @@ export const FOLDER_OF_KIND: Partial<Record<NodeKind, string>> = {
   function: "routines",
   procedure: "routines",
   sequence: "sequences",
+  package: "packages",
+  synonym: "synonyms",
   column: "columns",
   primaryKey: "keys",
   uniqueKey: "keys",
@@ -80,6 +82,8 @@ const NODE_ICON: Partial<Record<ExplorerKind, string>> = {
   function: "dg/function",
   procedure: "dg/procedure",
   sequence: "dg/sequence",
+  package: "dg/package",
+  synonym: LOCAL + "synonym",
   role: "dg/role",
   tablespace: "dg/database",
   extension: "dg/package",
@@ -229,6 +233,8 @@ export function objectRefOf(d: NodeData): ObjectRef | null {
     case "view":
     case "materializedView":
     case "sequence":
+    case "package":
+    case "synonym":
       return { schema: ex.schema ?? null, name: d.name, kind: d.kind };
     case "routine":
     case "function":
@@ -261,6 +267,8 @@ export function ddlRefOf(d: NodeData): ObjectRef | null {
   if (t) return t;
   switch (d.kind) {
     case "sequence":
+    case "package":
+    case "synonym":
     case "routine":
     case "function":
     case "procedure":

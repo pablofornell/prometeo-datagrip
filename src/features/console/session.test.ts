@@ -288,6 +288,7 @@ describe("Tx isolation", () => {
   it("lists Database Default first, and Read Uncommitted only for MySQL", () => {
     expect(isolationLevels("postgres")).toEqual(["default", "read committed", "repeatable read", "serializable"]);
     expect(isolationLevels("mysql")[1]).toBe("read uncommitted");
+    expect(isolationLevels("oracle")).toEqual(["default", "read committed", "serializable"]);
     expect(isolationLevels("sqlite")).not.toContain("read uncommitted");
   });
   it("a new console sets nothing; going back to the default resets the session", async () => {
