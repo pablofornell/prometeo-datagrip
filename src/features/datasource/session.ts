@@ -6,7 +6,7 @@ import { confirmEndTransactions } from "../console/txguard";
 import { batch, createMemo, createSignal } from "solid-js";
 import { createStore, produce, unwrap } from "solid-js/store";
 import { friendlyConnectionError } from "../../state/connection-errors";
-import { deleteDataSource, listDataSources, saveDataSource, testConnection } from "../../api/db";
+import { copyDataSourcePassword, deleteDataSource, listDataSources, saveDataSource, testConnection } from "../../api/db";
 import type { DataSource, DataSourceConfig } from "../../api/db";
 import { forgetVisibleSchemas } from "../../state/schema-filter";
 import { forgetDsGroup } from "../../state/ds-folders";
@@ -322,8 +322,9 @@ export function createSession() {
     copy.saved = null;
     copy.nameAuto = false;
     copy.form.name = uniqueName(d.form.name, drafts.map((x) => x.form.name));
-    // the stored password cannot be read back: a copy of a saved source starts without one
+    // the stored password cannot be read back: a copy of a saved source takes it over on the backend when applied
     copy.password = d.password.touched ? { ...d.password } : { value: "", touched: false };
+    copy.passwordFrom = d.password.touched ? null : (d.passwordFrom ?? (d.saved?.hasPassword ? d.id : null));
     copy.base = snapshot(copy.form);
     copy.test = { state: "idle" };
     const at = indexOf(d.key) + 1;
@@ -347,6 +348,8 @@ export function createSession() {
     }
     setError(null);
     const cfg: Partial<DataSourceConfig> = { ...configFromForm(d.form, d.id, d.saved), password: passwordToSend(d) };
+    // a duplicate that was not applied yet: the backend looks the password up by the id of the original
+    if (d.passwordFrom && !d.id && cfg.password == null && d.form.auth === "password" && d.form.connType !== "url") cfg.id = d.passwordFrom;
     const sslmode = d.form.options.sslmode ?? null;
     const dbms = d.form.dbms;
     const target = { driver: dbms, host: d.form.host, port: d.form.port, file: d.form.file };
@@ -428,6 +431,9 @@ export function createSession() {
         } else {
           const cfg = { ...configFromForm(d.form, d.id, d.saved), password: passwordToSend(d) } as Partial<DataSourceConfig> & { name: string };
           saved = await saveDataSource(cfg);
+          if (wasNew && d.passwordFrom && cfg.password == null && d.form.auth === "password" && d.form.connType !== "url") {
+            saved = await copyDataSourcePassword(d.passwordFrom, saved.id).catch(() => saved);
+          }
         }
         saveVisibleSchemas(saved.id, d.form.options.visibleSchemas);
         if (wasNew) created.push(saved.id);

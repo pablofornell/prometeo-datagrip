@@ -347,7 +347,7 @@ export function DataSourceDialog(props: DialogProps) {
                   <AdvancedTab s={s} />
                 </Show>
               </div>
-              <TestBar s={s} />
+              <TestBar s={s} tab={tab()} />
             </Show>
           </div>
         </Show>

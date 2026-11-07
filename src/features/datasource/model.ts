@@ -83,6 +83,8 @@ export interface Draft {
   nameAuto: boolean;
   /** JSON of the form at load / last apply (modified marker). */
   base: string;
+  /** Duplicate of a saved source: the id whose stored password the copy takes (the UI cannot read it). */
+  passwordFrom?: string | null;
   test: { state: "idle" | "running" | "done"; info?: TestInfo; lastOk?: TestInfo };
 }
 

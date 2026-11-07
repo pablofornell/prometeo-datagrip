@@ -11,12 +11,12 @@ import { appInfo, isTauri } from "../../api/db";
 import { notify } from "../../components/ui";
 import { registerSlot } from "../../state/slots";
 import { setStatus } from "../../state/status";
-import { activeTab, registerBeforeClose } from "../../state/tabs";
+import { activeTab, confirmCloseAll, registerBeforeClose } from "../../state/tabs";
 import { registerConsoleActions } from "./actions";
 import { ConsoleView } from "./ConsoleView";
 import { createQuitHandler } from "./quit";
 import { focusTopDialog, showProgress } from "../table/dialogs";
-import { type TxProgress, confirmEndTransactions, openTransactions } from "./txguard";
+import { type TxProgress, confirmEndTransactions } from "./txguard";
 import "./console.css";
 
 export { activeSession, sessionOf } from "./registry";
@@ -31,12 +31,13 @@ registerSlot("editor.view.console", ConsoleView);
 registerBeforeClose((tab) => (tab.kind === "console" || tab.kind === "file" ? confirmEndTransactions({ tabId: tab.id, reason: "closing the console" }) : true));
 
 /**
- * Quitting the app (window close button, Alt+F4) ends every session: ask about open transactions first.
+ * Quitting the app (window close button, Alt+F4, File > Exit) ends every session and drops unsaved work: ask first.
+ * Open transactions (Commit / Roll Back / Cancel), then every tab's own close hook (pending table changes: Submit /
+ * Discard / Cancel; unsaved files: Save / Don't Save / Cancel).
  *
- * Tauri destroys the window itself unless a JS close handler exists, and a handler makes the JS side responsible
- * for `destroy()` (a permission this app does not grant). So the handler only exists WHILE a transaction is open;
- * the native close path is untouched the rest of the time, and after the user's answer the handler is removed and the
- * window is closed natively.
+ * Tauri destroys the window itself unless a JS close handler exists, and a handler makes the JS side responsible for
+ * closing. So the handler is installed once at start; after the user's answer it is removed and the window is closed
+ * natively (a request while the prompt is open never quits, see ./quit).
  */
 /** The wait dialog of the COMMIT / ROLLBACK the user chose while quitting (Quit anyway after `STUCK_AFTER_MS`). */
 const quitProgress: TxProgress = {
@@ -51,39 +52,24 @@ const quitProgress: TxProgress = {
 
 function guardQuit(): void {
   if (!isTauri()) return;
-  let unlisten: (() => void) | undefined;
-  let installing = false;
-  const install = async () => {
-    installing = true;
+  void (async () => {
     try {
       const { getCurrentWindow } = await import("@tauri-apps/api/window");
       const win = getCurrentWindow();
       const un: () => void = await win.onCloseRequested(
         createQuitHandler({
-          confirm: () => confirmEndTransactions({ reason: "quitting the application", progress: quitProgress }),
+          confirm: async () => (await confirmEndTransactions({ reason: "quitting the application", progress: quitProgress })) && (await confirmCloseAll()),
           focus: focusTopDialog,
           quit: async () => {
             un();
-            unlisten = undefined;
             await win.close();
           },
         }),
       );
-      unlisten = un;
-      if (openTransactions({}).length === 0) (un(), (unlisten = undefined)); // ended while the handler was being installed
     } catch {
       /* no window API: quitting is not guarded */
-    } finally {
-      installing = false;
     }
-  };
-  createRoot(() => {
-    createEffect(() => {
-      const open = openTransactions({}).length > 0; // reactive: consoles and table editors
-      if (open && !unlisten && !installing) void install();
-      else if (!open && unlisten) (unlisten(), (unlisten = undefined));
-    });
-  });
+  })();
 }
 guardQuit();
 

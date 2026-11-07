@@ -94,6 +94,17 @@ export function editText(v: Cell): string {
 
 const NUM_LITERAL = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
 
+/**
+ * Why `text` cannot be saved in a column of `kind` (`null`: fine). Only numeric columns are checked: an empty
+ * text is NULL, anything else must be a number (a blank text is not silently NULL).
+ */
+export function validateEdit(text: string, kind: ColumnKind): string | null {
+  if (kind !== "number" || text === "") return null;
+  const t = text.trim();
+  if (NUM_LITERAL.test(t) || /^[+-]?(nan|infinity)$/i.test(t)) return null;
+  return t === "" ? "A number is expected (clear the field to set NULL)" : `"${t}" is not a valid number`;
+}
+
 /** Parses text typed in an editor into a cell value for the given column kind. */
 export function parseEdit(text: string, kind: ColumnKind): Cell {
   if (kind === "text" || kind === "other") return text;

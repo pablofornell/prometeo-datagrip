@@ -341,6 +341,13 @@ export async function loadTableNames(ctx: EditorCtx): Promise<string[]> {
   return nodes.map((n) => n.name);
 }
 
+/** Columns of the primary key of a table of the schema (empty without one): the default target of a foreign key. */
+export async function loadPrimaryKeyColumns(ctx: EditorCtx, table: string): Promise<string[]> {
+  const nodes = await introspect(ctx.dsId, [...tablePath(ctx, table), "keys"]).catch(() => []);
+  const pk = nodes.find((n) => n.kind === "primaryKey");
+  return pk ? strs(pk.extra.columns) : [];
+}
+
 /** Column names of a table of the schema. */
 export async function loadColumnNames(ctx: EditorCtx, table: string): Promise<string[]> {
   const nodes = await introspect(ctx.dsId, [...tablePath(ctx, table), "columns"]).catch(() => []);

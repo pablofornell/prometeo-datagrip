@@ -19,7 +19,7 @@ import {
   openSession,
   sessionTxStatus,
 } from "../../api/db";
-import type { ColumnMeta } from "../../api/types";
+import type { ColumnMeta, TreeNode } from "../../api/types";
 import { type EditorError, type ExecMark, type ExecuteRequest, type SqlEditorHandle, splitStatements } from "../../components/editor";
 import { errorsField, execMarksField } from "../../components/editor/state";
 import type { GridChange, PageSize } from "../../components/grid";
@@ -39,11 +39,11 @@ import {
   summary,
   underlinePosition,
 } from "../output/format";
-import { CONNECTION_LOST_LOG, CONNECTION_LOST_TX_LOG, isConnectionLost } from "../../state/connection-errors";
+import { CONNECTION_LOST_LOG, CONNECTION_LOST_TX_LOG, friendlyConnectionError, isConnectionLost } from "../../state/connection-errors";
 import { saveSchema, saveSearchPath, savedSchema, savedSearchPath } from "./schemaPref";
 import { qualifiedTitle, resultTable } from "./title";
 import { type SchemaChange, resolveEdit, schemaChange } from "./editable";
-import { keyedChanges } from "../output/edit";
+import { keyedChanges, logSubmitted } from "../output/edit";
 import { ALL_FIRST_CHUNK, ConsoleOutput, type OutputHost, ResultTab, createOutput, defaultPageSize, removeOutput } from "../output/model";
 import { askChoice } from "../table/dialogs";
 import {
@@ -58,7 +58,7 @@ import {
   isSessionLost,
   txReport,
 } from "../table/session";
-import { previewSql, toRowChanges } from "../table/sql";
+import { changeStatements, previewSql, toRowChanges } from "../table/sql";
 import { confirmEndTransactions } from "./txguard";
 import { findParams, loadValues, paramList, saveValues, substitute } from "./params";
 import { askParams } from "./paramsDialog";
@@ -76,6 +76,8 @@ export const isolationLevels = (driver: DataSource["driver"]): Isolation[] =>
       : ["default", "read committed", "repeatable read", "serializable"];
 const isolationLabel = (i: Isolation): string => (i === "default" ? "Database Default" : cap(i));
 const cap = (s: string): string => s.replace(/\b\w/g, (c) => c.toUpperCase());
+/** A database / schema node of the tree, not a `Server Objects` / `Database Objects` group (those are no schemas to switch to). */
+export const isNamespace = (n: TreeNode): boolean => n.kind !== "folder" && !n.extra.group;
 const errText = (e: unknown): string => String((e as Error)?.message ?? e).replace(/^Error:\s*/, "");
 
 /** What the user changed in the session with their own statements; a new session does not have it. */
@@ -812,7 +814,16 @@ export class ConsoleSession implements OutputHost {
     } catch (e) {
       rejectHandle(e);
       launchFailed = true;
-      out.log("error", errText(e));
+      // the data source is unreachable (or the session could not be opened): DataGrip's wording, like Test Connection,
+      // and the statement that did not run gets the red mark of a failed one
+      const msg = friendlyConnectionError(errText(e), { driver: this.ds.driver, host: this.ds.host, port: this.ds.port, file: this.ds.file });
+      this.setExecError(msg);
+      out.log("error", msg);
+      if (req.ranges.length) {
+        const r = this.editorStatement(req.ranges[0].from, req.ranges[0].to);
+        this.setMarks([...this.currentMarks().filter((m) => !(m.from < r.to && m.to > r.from) && m.from !== r.from), { from: r.from, to: r.to, status: "error" }]);
+        this.setErrors([...this.currentErrors().filter((x) => x.statementFrom !== r.from), { statementFrom: r.from, statementTo: r.to, message: msg.split("\n")[0] }]);
+      }
     }
     clearInterval(tick);
     stopPending();
@@ -914,7 +925,9 @@ export class ConsoleSession implements OutputHost {
     };
     tab.setApplying(true);
     try {
-      const rowChanges = toRowChanges(keyedChanges(edit, tab.meta, tab.rows, changes), []);
+      const keyed = keyedChanges(edit, tab.meta, tab.rows, changes);
+      const rowChanges = toRowChanges(keyed, []);
+      const t0 = performance.now();
       let res;
       if (this.txMode() === "manual") {
         const sid = await this.ensureSession();
@@ -928,7 +941,14 @@ export class ConsoleSession implements OutputHost {
       } else {
         res = await applyChanges(this.ds.id, edit.table, rowChanges);
       }
-      if (!res.committed) return fail(res.results.find((r) => r.error)?.error ?? "The transaction was rolled back.");
+      const bad = res.results.find((r) => r.error)?.error ?? (res.committed ? null : "The transaction was rolled back.");
+      logSubmitted(
+        (k, t, p) => this.out.log(k, t, p),
+        this.prompt(),
+        changeStatements(this.driver, edit.table, tab.meta, keyed),
+        bad ? { error: bad } : { rowsAffected: res.results.reduce((n, r) => n + (r.rowsAffected || 0), 0), ms: Math.round(performance.now() - t0) },
+      );
+      if (bad) return fail(bad);
     } catch (e) {
       if (isSessionLost(e)) {
         this.sessionLost();
@@ -1059,8 +1079,8 @@ export class ConsoleSession implements OutputHost {
       const cur = this.schema();
       let items: MenuItem[];
       if (this.driver === "postgres") {
-        const dbs = await introspect(this.ds.id, []);
-        const schemas = await introspect(this.ds.id, [this.ds.database]);
+        const dbs = (await introspect(this.ds.id, [])).filter(isNamespace);
+        const schemas = (await introspect(this.ds.id, [this.ds.database])).filter(isNamespace);
         items = dbs.map<MenuItem>((d) =>
           d.name === this.ds.database
             ? {
@@ -1071,7 +1091,7 @@ export class ConsoleSession implements OutputHost {
         );
         items.push({ type: "separator" }, { type: "hint", label: "Connect to database (Enter)" });
       } else {
-        const list = await introspect(this.ds.id, []);
+        const list = (await introspect(this.ds.id, [])).filter(isNamespace);
         items = list.map<MenuItem>((s) => ({ label: s.name, icon: "dg/schema", checked: s.name === cur, run: () => void this.switchSchema(s.name) }));
       }
       if (anchor instanceof HTMLElement) openMenu(items, { anchor, minWidth: 230 });

@@ -158,11 +158,6 @@
 .dgc-h-row.err .dgc-h-sql {
   color: var(--dg-text-error);
 }
-.dgc-h-time {
-  flex: none;
-  color: var(--dg-text-secondary);
-  font-size: 12px;
-}
 .dgc-h-empty {
   padding: 16px 8px;
   color: var(--dg-text-secondary);

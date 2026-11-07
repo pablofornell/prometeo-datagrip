@@ -281,6 +281,15 @@ impl AppState {
         blocking(move || sources.duplicate(&id)).await
     }
 
+    pub async fn copy_data_source_password(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<DataSourceView, String> {
+        let (sources, from, to) = (self.sources.clone(), from.to_string(), to.to_string());
+        blocking(move || sources.copy_password(&from, &to)).await
+    }
+
     pub async fn test_connection(&self, cfg: DataSourceConfig) -> Result<TestResult, String> {
         let sources = self.sources.clone();
         let cfg = blocking(move || sources.with_stored_password(cfg)).await?;

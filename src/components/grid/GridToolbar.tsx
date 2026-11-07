@@ -7,6 +7,7 @@
  */
 import { Show, createSignal, type JSX } from "solid-js";
 import { tip } from "../ui/Tooltip";
+import { overflowToolbar } from "../ui/overflow";
 import { GridMenu, type MenuItem } from "./GridMenu";
 import type { ViewMode } from "./types";
 import "./grid.css";
@@ -164,7 +165,7 @@ export function GridToolbar(props: GridToolbarProps): JSX.Element {
   };
 
   return (
-    <div class="dgg-tb" role="toolbar">
+    <div class="dgg-tb" role="toolbar" ref={overflowToolbar}>
       <Btn icon="table" title={mode() === "table" ? "Switch to Text" : "Switch to Table"} selected={mode() === "table"} onClick={() => props.onViewModeChange?.(mode() === "table" ? "text" : "table")} />
       <Sep />
       <Btn icon="reload" title="Reload Page" shortcut="Ctrl+F5" onClick={props.onReload} />

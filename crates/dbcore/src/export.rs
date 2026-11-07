@@ -103,6 +103,97 @@ fn cell_json(c: &Cell) -> Value {
     }
 }
 
+/// Is `ty` a number type whose values a driver may deliver as text (exact decimals, big integers)?
+fn is_numeric_type(ty: &str) -> bool {
+    let ty = ty.trim().to_ascii_lowercase();
+    let base = ty
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or("");
+    matches!(
+        base,
+        "numeric"
+            | "decimal"
+            | "dec"
+            | "fixed"
+            | "number"
+            | "bigint"
+            | "int8"
+            | "int"
+            | "integer"
+            | "int4"
+            | "int2"
+            | "smallint"
+            | "mediumint"
+            | "tinyint"
+            | "float"
+            | "float4"
+            | "float8"
+            | "double"
+            | "real"
+    )
+}
+
+/// The text of a number cell that arrived as a string (`'1001.00'` of a DECIMAL column) when it can stand as a
+/// numeric literal as it is (no precision lost by going through a float).
+fn numeric_text<'a>(c: &'a Cell, ty: &str) -> Option<&'a str> {
+    let Value::String(s) = c else {
+        return None;
+    };
+    let t = s.trim();
+    (is_numeric_type(ty)
+        && t.bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'e' | b'E'))
+        && t.parse::<f64>().is_ok_and(f64::is_finite))
+    .then_some(t)
+}
+
+/// `t` is written the way JSON writes numbers (`-?int[.frac][e[+-]exp]`).
+fn is_json_number(t: &str) -> bool {
+    let b = t.as_bytes();
+    let digits = |mut i: usize| {
+        let from = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        (i, i > from)
+    };
+    let mut i = usize::from(b.first() == Some(&b'-'));
+    match b.get(i) {
+        Some(b'0') => i += 1,
+        Some(b'1'..=b'9') => i = digits(i).0,
+        _ => return false,
+    }
+    if b.get(i) == Some(&b'.') {
+        let (j, ok) = digits(i + 1);
+        if !ok {
+            return false;
+        }
+        i = j;
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(b.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        let (j, ok) = digits(i);
+        if !ok {
+            return false;
+        }
+        i = j;
+    }
+    i == b.len()
+}
+
+/// The JSON text of cell `c` of a column of declared type `ty`: a number cell that arrived as a string is written
+/// as a JSON number with its digits unchanged.
+fn json_text(c: &Cell, ty: &str) -> String {
+    match numeric_text(c, ty) {
+        Some(t) if is_json_number(t) => t.to_string(),
+        _ => cell_json(c).to_string(),
+    }
+}
+
 /// One element (or nested array) of a PG array literal `{..}`.
 fn pg_array_element(c: &Cell) -> String {
     let quote = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
@@ -126,6 +217,10 @@ fn pg_array_element(c: &Cell) -> String {
 /// [`sql_literal`] for a value of a column of declared type `ty`: Oracle writes dates, timestamps and long text with
 /// conversion functions, the others only look at the value.
 fn sql_literal_typed(d: Driver, c: &Cell, ty: &str) -> String {
+    // a DECIMAL / BIGINT that arrived as text is a number, not a string
+    if let Some(t) = numeric_text(c, ty) {
+        return t.to_string();
+    }
     if d != Driver::Oracle {
         return sql_literal(d, c);
     }
@@ -447,7 +542,8 @@ impl<W: Write> Exporter<W> {
                 writeln!(self.w, "| {} |", line.join(" | "))?;
             }
             ExportFormat::Json | ExportFormat::JsonLines => {
-                let mut obj = serde_json::Map::new();
+                // key -> JSON text (keys sorted, as a `serde_json::Map` writes them)
+                let mut obj = std::collections::BTreeMap::new();
                 for (i, c) in row.iter().enumerate() {
                     let mut key = self
                         .cols
@@ -457,14 +553,24 @@ impl<W: Write> Exporter<W> {
                     while obj.contains_key(&key) {
                         key.push('_');
                     }
-                    obj.insert(key, cell_json(c));
+                    let ty = self.src_types.get(i).map(String::as_str).unwrap_or("");
+                    obj.insert(key, json_text(c, ty));
                 }
+                let text = format!(
+                    "{{{}}}",
+                    obj.iter()
+                        .map(|(k, v)| format!("{}:{v}", Value::String(k.clone())))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
                 if self.o.format == ExportFormat::JsonLines {
-                    serde_json::to_writer(&mut self.w, &Value::Object(obj))?;
-                    writeln!(self.w)?;
+                    writeln!(self.w, "{text}")?;
                 } else {
-                    write!(self.w, "{}\n  ", if self.emitted == 0 { "" } else { "," })?;
-                    serde_json::to_writer(&mut self.w, &Value::Object(obj))?;
+                    write!(
+                        self.w,
+                        "{}\n  {text}",
+                        if self.emitted == 0 { "" } else { "," }
+                    )?;
                 }
             }
             ExportFormat::SqlUpdate => {
@@ -864,6 +970,66 @@ mod tests {
         )
         .unwrap();
         assert_eq!(serde_json::from_str::<Value>(&empty).unwrap(), json!([]));
+    }
+
+    /// A DECIMAL column of the result: values arrive as strings (`"1001.00"`) but are numbers.
+    fn decimals() -> ResultSet {
+        let col = |n: &str, t: &str| ColumnMeta {
+            name: n.into(),
+            type_name: t.into(),
+            nullable: true,
+            is_pk: false,
+            table_ref: None,
+        };
+        ResultSet {
+            columns: vec![
+                col("amount", "NUMERIC(10,2)"),
+                col("label", "text"),
+                col("big", "bigint"),
+            ],
+            rows: vec![
+                vec![
+                    json!("1001.00"),
+                    json!("1001.00"),
+                    json!("9007199254740993"),
+                ],
+                vec![json!("-0.50"), json!("NaN"), json!("+5")],
+                vec![json!("NaN"), json!("x"), Value::Null],
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn decimals_are_numbers_in_sql_and_json() {
+        let o = |format| ExportOptions {
+            format,
+            table_name: Some("t".into()),
+            ..Default::default()
+        };
+        let sql = export_to_string(&decimals(), &o(ExportFormat::SqlInsert)).unwrap();
+        assert!(
+            sql.contains("values (1001.00, '1001.00', 9007199254740993)"),
+            "{sql}"
+        );
+        assert!(sql.contains("(-0.50, 'NaN', +5)"), "{sql}");
+        // NaN is not a literal number: it stays a string
+        assert!(sql.contains("('NaN', 'x', NULL)"), "{sql}");
+        let json = export_to_string(&decimals(), &o(ExportFormat::Json)).unwrap();
+        // the digits are kept as they are (no float round trip); "+5" is no JSON number, so it stays a string
+        assert!(
+            json.contains(r#"{"amount":1001.00,"big":9007199254740993,"label":"1001.00"}"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#"{"amount":-0.50,"big":"+5","label":"NaN"}"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#"{"amount":"NaN","big":null,"label":"x"}"#),
+            "{json}"
+        );
+        assert!(serde_json::from_str::<Value>(&json).is_ok());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it } from "vitest";
-import { closeAllTabs, closeOtherTabs, closeTab, openTab, registerBeforeClose, setPinned, tabs, activeTabId } from "./tabs";
+import { closeAllTabs, confirmCloseAll, closeOtherTabs, closeTab, openTab, registerBeforeClose, setPinned, tabs, activeTabId } from "./tabs";
 
 const open = (id: string) => openTab({ id, title: id, kind: "console" });
 const ids = () => tabs().map((t) => t.id);
@@ -56,3 +56,19 @@ describe("tab store beforeClose hook", () => {
     expect(ids()).toEqual(["a"]);
   });
 });
+
+describe("confirmCloseAll (quitting the app)", () => {
+  it("asks the hooks about every tab and closes none; a veto stops it", async () => {
+    open("a");
+    open("b");
+    open("c");
+    const asked: string[] = [];
+    const off = registerBeforeClose((t) => (asked.push(t.id), t.id !== "b"));
+    expect(await confirmCloseAll()).toBe(false);
+    expect(asked).toEqual(["a", "b"]);
+    expect(ids()).toEqual(["a", "b", "c"]);
+    off();
+    expect(await confirmCloseAll()).toBe(true);
+  });
+});
+

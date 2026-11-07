@@ -210,8 +210,8 @@ export function toRowChanges(
 
 // ---------------------------------------------------------------- preview
 
-/** The statements Submit would run, formatted like DataGrip's "Preview Pending Changes" popup. */
-export function previewSql(driver: Driver, ref: ObjectRef, columns: ColumnMeta[], changes: GridChange[]): string {
+/** The statements Submit would run (one text each, formatted like DataGrip's "Preview Pending Changes" popup). */
+export function changeStatements(driver: Driver, ref: ObjectRef, columns: ColumnMeta[], changes: GridChange[]): string[] {
   const table = qualifiedName(driver, ref);
   const id = (s: string) => (isSimple(driver, s) ? s : quoteIdent(driver, s));
   const typeOf = (name: string) => columns.find((c) => c.name === name)?.typeName ?? "";
@@ -228,5 +228,10 @@ export function previewSql(driver: Driver, ref: ObjectRef, columns: ColumnMeta[]
     else if (entries.length === 0) out.push(`INSERT INTO ${table}\nDEFAULT VALUES;`);
     else out.push(`INSERT INTO ${table} (${entries.map(([k]) => id(k)).join(", ")})\nVALUES (${entries.map(([k, v]) => literal(v, typeOf(k), driver)).join(", ")});`);
   }
-  return out.join("\n\n");
+  return out;
+}
+
+/** The statements Submit would run, formatted like DataGrip's "Preview Pending Changes" popup. */
+export function previewSql(driver: Driver, ref: ObjectRef, columns: ColumnMeta[], changes: GridChange[]): string {
+  return changeStatements(driver, ref, columns, changes).join("\n\n");
 }

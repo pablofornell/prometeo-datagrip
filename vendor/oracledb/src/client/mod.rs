@@ -236,7 +236,6 @@ impl Client {
                         continue;
                     }
                     constants::PACKET_TYPE_MARKER => {
-                        println!("DBG marker branch");
                         if let Ok(mut state) = self.break_state.lock() {
                             state.sent = false;
                         }
@@ -247,7 +246,7 @@ impl Client {
                             .map_err(|_| self.unrecoverable_error())?;
                         return Ok((packet, false));
                     }
-                    t => { if t != 6 { println!("DBG packet type {t}"); } return Ok((packet, true)) }
+                    _ => return Ok((packet, true)),
                 },
                 Err(err) => {
                     if err.is_call_timeout_exceeded() {
@@ -325,11 +324,9 @@ impl Client {
     /// caller. Note that some databases return multiple reset markers so
     /// these are also accommodated.
     fn reset(&mut self, mut reset_received: bool) -> Result<Packet, Error> {
-        println!("DBG reset start already={reset_received}");
         self.send_marker(constants::MARKER_TYPE_RESET)?;
         loop {
             let packet = self.transport.receive_packet()?;
-            println!("DBG reset got type={} marker={}", packet.packet_type, packet.has_reset_marker());
             if packet.has_reset_marker() {
                 reset_received = true;
             } else if reset_received {

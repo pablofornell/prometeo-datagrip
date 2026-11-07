@@ -1,4 +1,4 @@
-import { Show, createSignal, onCleanup } from "solid-js";
+import { Show, createEffect, createSignal, on, onCleanup } from "solid-js";
 import { isTauri } from "../../api/db";
 import { Icon } from "../../components/ui";
 import { DBMS, type Dbms } from "./drivers";
@@ -72,7 +72,7 @@ async function copyText(text: string) {
 }
 
 /** Bottom bar of the right pane: "Test Connection" link, result icon, driver / version text and the result balloon. */
-export function TestBar(props: { s: Session }) {
+export function TestBar(props: { s: Session; /** The dialog tab shown: a switch closes the balloon. */ tab?: string }) {
   const s = props.s;
   const d = () => s.current()!;
   const t = () => d().test;
@@ -94,6 +94,20 @@ export function TestBar(props: { s: Session }) {
   };
   window.addEventListener("keydown", onKey, true);
   onCleanup(() => window.removeEventListener("keydown", onKey, true));
+
+  // the result describes the settings it was run with: an edit, another tab / data source or a click elsewhere closes it
+  createEffect(
+    on(
+      () => [props.tab, s.selectedKey(), JSON.stringify(d().form), d().password.value] as const,
+      () => setOpen(false),
+      { defer: true },
+    ),
+  );
+  const onDown = (e: MouseEvent) => {
+    if (open() && !(e.target as Element | null)?.closest?.(".ds-balloon, .ds-test-status, .ds-testbar a, .ds-testbar button")) setOpen(false);
+  };
+  document.addEventListener("mousedown", onDown, true);
+  onCleanup(() => document.removeEventListener("mousedown", onDown, true));
 
   const status = () => {
     const x = t().info ?? t().lastOk;

@@ -14,7 +14,7 @@ import {
   exportResult,
   exportToString,
   isTauri,
-  resolveExportPath,
+  approveExportPath,
 } from "../../api/db";
 import { notify } from "../../components/ui";
 import { ensureConnected } from "../explorer";
@@ -83,9 +83,13 @@ export async function exportToFile(src: ExportSource, o: ExportOptions, out: Exp
       src.onDone?.();
       return;
     }
-    // a path the save dialog returned is allowed already; a typed one is approved by the backend or goes through the dialog
-    const path = out.chosen ? out.path : await resolveExportPath(out.path, o.format);
-    if (!path) return; // the dialog was cancelled
+    // a path the save dialog returned (or the dialog's own check approved) is allowed already; a typed one that
+    // reaches this point without that check (not from the dialog) is approved by the backend or refused
+    const path = out.path;
+    if (!out.chosen) {
+      const why = await approveExportPath(path, o.format);
+      if (why) throw new Error(why);
+    }
     const l = src.loaded?.();
     const rows = l?.complete ? await exportResult({ columns: l.columns, rows: l.rows }, o, path) : await exportQuery(src.dsId, src.sql, o, path);
     notify({ kind: "success", title: "Export finished", body: `${plural(rows, "row")} exported to ${path}`, timeout: 6000 });

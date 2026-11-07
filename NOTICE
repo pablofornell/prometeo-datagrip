@@ -60,3 +60,15 @@ Obtained from intellij-community platform/jewel/int-ui/int-ui-standalone/src/mai
 
 The OFL requires the license text to accompany the font files when they are redistributed:
 add the full OFL 1.1 text (e.g. as src/theme/fonts/OFL.txt) before shipping a build.
+
+-------------------------------------------------------------------------------
+5. oracledb (rust-oracledb) - UPL-1.0 OR Apache-2.0
+-------------------------------------------------------------------------------
+Source:    https://github.com/oracle/rust-oracledb (crate `oracledb` 26.0.0-beta.5)
+Copyright: Copyright (c) 2026, Oracle and/or its affiliates.
+License:   Universal Permissive License 1.0 or Apache License, Version 2.0, at your choice
+           (vendor/oracledb/LICENSE.txt and vendor/oracledb/NOTICE.txt, kept unchanged).
+
+Files:     vendor/oracledb/** - the pure-Rust Oracle Database driver used for the Oracle data source
+           (no Oracle Client libraries needed). Modified: a cancel handle, a transaction-in-progress flag and
+           the declared type of LOB columns were added, see vendor/oracledb/PATCHES.md.

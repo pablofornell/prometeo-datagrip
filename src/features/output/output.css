@@ -5,12 +5,14 @@
   flex: 1;
   min-width: 0;
   height: 100%;
+  overflow: hidden;
 }
 .dgo-source {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 26px;
   height: 26px;
   margin-left: auto;
   padding: 0 2px 0 4px;
@@ -24,6 +26,11 @@
 }
 .dgo-source:hover {
   background: var(--dg-action-button-hover-bg);
+}
+.dgo-source-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .dgo-source-ms {
   color: var(--dg-text-secondary);

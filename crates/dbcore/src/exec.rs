@@ -20,12 +20,19 @@
 //!
 //! # Cancellation
 //! PG: `pg_cancel_backend(pid)` from a side connection. MySQL: `KILL QUERY id`.
-//! SQLite: `sqlite3_interrupt`. Closing a partially read result cancels the query,
+//! SQLite: `sqlite3_interrupt`. Oracle: a flag the connection's worker thread checks between rows plus the break
+//! marker of the vendored driver for a call that is busy on the server (the statement fails with `ORA-01013`). Closing a partially read result cancels the query,
 //! except inside an open transaction (see [`crate::tx`]) where the remaining rows are drained so
 //! the transaction is not aborted. A *user* cancel inside a transaction does cancel: PostgreSQL then
 //! aborts the transaction (`57014` surfaces while the rest is drained, the session becomes `failed` and
 //! `TxStatus` is sent, so a later `COMMIT` reports `committed: false`); MySQL only rolls the statement back
 //! (error 1317), the transaction stays `active`.
+//!
+//! # Oracle
+//! Oracle has no autocommit: with `ExecOptions::auto_commit` (the console's Auto mode) every statement that
+//! succeeded is committed right after it. After PL/SQL blocks, `CALL` / `EXEC` and queries that call functions
+//! the lines written with `DBMS_OUTPUT.PUT_LINE` are drained and sent as `Message` events (before the error of a
+//! failed statement, if any).
 //!
 //! # Lost connection
 //! When a statement fails because the connection is gone (see [`DbError::ConnectionLost`]) the `Error` event
@@ -299,6 +306,32 @@ impl Task {
         }
     }
 
+    /// Oracle, after a statement: show what `DBMS_OUTPUT` collected and, in Auto mode (`auto_commit`), commit a
+    /// statement that succeeded (the server has no autocommit). Returns the error of the commit.
+    async fn oracle_after(
+        &mut self,
+        conn: &mut Conn,
+        idx: usize,
+        sql: &str,
+        ok: bool,
+    ) -> Option<DbError> {
+        let Conn::Ora(c) = conn else { return None };
+        if crate::oracle::may_print(sql) {
+            if let Ok(lines) = c.drain_output().await {
+                for text in lines {
+                    self.sh.send(ExecEvent::Message {
+                        index: Some(idx),
+                        text,
+                    });
+                }
+            }
+        }
+        if ok && self.opts.auto_commit && c.in_transaction() {
+            return c.commit().await.err().map(|e| e.for_driver(Driver::Oracle));
+        }
+        None
+    }
+
     /// A statement (or the cleanup after it) failed with `e`, already tagged with the driver. Sends the
     /// `Error` event when `report` (or the connection is lost); returns true if the connection is gone:
     /// the session is dead then, the script must stop and the caller drops the connection.
@@ -414,7 +447,8 @@ async fn pull(stream: &mut ItemStream<'_>, sh: &Shared, st: &mut StreamState, t0
 async fn abort_stream(mut stream: ItemStream<'_>, sh: &Shared) -> Option<DbError> {
     let in_tx = sh.session.in_tx();
     let user = sh.token.is_cancelled();
-    let cancel = !in_tx || user;
+    // Oracle: a cancel only stops the statement, the transaction survives
+    let cancel = !in_tx || user || sh.session.live.driver() == Driver::Oracle;
     if cancel {
         sh.session.cancel_running().await;
     }
@@ -738,10 +772,21 @@ async fn exec_task(
                 let mut lost = false;
                 match run_statement(&mut task, conn, i, &st.text, i + 1 == n).await {
                     Ok(Flow::Next) => match task.abort_err.take() {
-                        None => {
-                            task.tx_after(Some(&mut *conn), i, &st.text, tx::Outcome::Ok)
-                                .await
-                        }
+                        None => match task.oracle_after(conn, i, &st.text, true).await {
+                            None => {
+                                task.tx_after(Some(&mut *conn), i, &st.text, tx::Outcome::Ok)
+                                    .await
+                            }
+                            // Auto mode: the commit after the statement failed
+                            Some(e) => {
+                                lost = task
+                                    .statement_failed(Some(&mut *conn), i, &st.text, &e, true)
+                                    .await;
+                                if !lost && task.opts.stop_on_error {
+                                    break;
+                                }
+                            }
+                        },
                         // the statement itself finished; closing its stream hit an error (a cancel)
                         Some(e) => {
                             lost = task
@@ -752,6 +797,9 @@ async fn exec_task(
                     Ok(Flow::Paged) => lost = sess.is_lost(),
                     Err(e) => {
                         let e = e.for_driver(sess.live.driver());
+                        if !e.is_connection_lost() {
+                            task.oracle_after(conn, i, &st.text, false).await;
+                        }
                         lost = task
                             .statement_failed(Some(&mut *conn), i, &st.text, &e, true)
                             .await;

@@ -480,12 +480,18 @@ impl Conn {
     }
 
     pub async fn close(self) {
-        let _ = match self {
-            Conn::Pg(c) => c.close().await,
-            Conn::My(c) => c.close().await,
-            Conn::Lite(c) => c.close().await,
-            Conn::Ora(c) => Ok(c.close().await),
-        };
+        match self {
+            Conn::Pg(c) => {
+                let _ = c.close().await;
+            }
+            Conn::My(c) => {
+                let _ = c.close().await;
+            }
+            Conn::Lite(c) => {
+                let _ = c.close().await;
+            }
+            Conn::Ora(c) => c.close().await,
+        }
     }
 }
 

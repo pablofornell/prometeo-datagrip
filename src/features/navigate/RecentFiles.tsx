@@ -74,7 +74,7 @@ function RecentFiles(props: { mode: RecentMode; reverse: boolean }): JSX.Element
     if (!n) return;
     const set = col() === "files" ? setFi : setTi;
     set((i) => (Math.max(0, Math.min(i, n - 1)) + d + n) % n);
-    queueMicrotask(() => listEl?.querySelector(".dgr-sel")?.scrollIntoView({ block: "nearest" }));
+    queueMicrotask(() => listEl?.querySelector(".dgrf-sel")?.scrollIntoView({ block: "nearest" }));
   };
   const clampSel = () => {
     setFi((i) => Math.max(0, Math.min(i, files().length - 1)));
@@ -124,60 +124,60 @@ function RecentFiles(props: { mode: RecentMode; reverse: boolean }): JSX.Element
 
   return (
     <div
-      class="dgr-backdrop"
+      class="dgrf-backdrop"
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) close(true);
       }}
     >
-      <div class="dgr-popup" role="dialog" aria-label={props.mode === "switch" ? "Switcher" : "Recent Files"}>
-        <div class="dgr-header">
-          <span class="dgr-title">{props.mode === "switch" ? "Switcher" : "Recent Files"}</span>
+      <div class="dgrf-popup" role="dialog" aria-label={props.mode === "switch" ? "Switcher" : "Recent Files"}>
+        <div class="dgrf-header">
+          <span class="dgrf-title">{props.mode === "switch" ? "Switcher" : "Recent Files"}</span>
           <Show when={query()}>
-            <span class="dgr-query">{query()}</span>
+            <span class="dgrf-query">{query()}</span>
           </Show>
-          <span class="dgr-edited">
+          <span class="dgrf-edited">
             <Checkbox checked={edited()} onChange={(v) => (setEdited(v), clampSel())} label="Show edited only" />
-            <span class="dgr-key">Ctrl+E</span>
+            <span class="dgrf-key">Ctrl+E</span>
           </span>
         </div>
-        <div class="dgr-cols" ref={listEl}>
-          <div class="dgr-tools" classList={{ "dgr-colactive": col() === "tools" }}>
+        <div class="dgrf-cols" ref={listEl}>
+          <div class="dgrf-tools" classList={{ "dgrf-colactive": col() === "tools" }}>
             <For each={tools()}>
               {(t, i) => (
                 <div
-                  class="dgr-row"
-                  classList={{ "dgr-sel": col() === "tools" && i() === ti() }}
+                  class="dgrf-row"
+                  classList={{ "dgrf-sel": col() === "tools" && i() === ti() }}
                   onMouseMove={() => (setCol("tools"), setTi(i()))}
                   onClick={() => open()}
                 >
-                  <Icon name={t.menuIcon ?? t.icon.replace("@20x20", "")} class="dgr-ico" />
-                  <span class="dgr-name">
+                  <Icon name={t.menuIcon ?? t.icon.replace("@20x20", "")} class="dgrf-ico" />
+                  <span class="dgrf-name">
                     <Highlighted text={t.title} query={query()} />
                   </span>
                   <Show when={t.shortcut}>
-                    <span class="dgr-key">{t.shortcut}</span>
+                    <span class="dgrf-key">{t.shortcut}</span>
                   </Show>
                 </div>
               )}
             </For>
           </div>
-          <div class="dgr-files" classList={{ "dgr-colactive": col() === "files" }}>
-            <For each={files()} fallback={<div class="dgr-empty">{edited() ? "No edited files" : "No recent files"}</div>}>
+          <div class="dgrf-files" classList={{ "dgrf-colactive": col() === "files" }}>
+            <For each={files()} fallback={<div class="dgrf-empty">{edited() ? "No edited files" : "No recent files"}</div>}>
               {(e, i) => (
                 <div
-                  class="dgr-row"
-                  classList={{ "dgr-sel": col() === "files" && i() === fi(), "dgr-closed": e.closed }}
+                  class="dgrf-row"
+                  classList={{ "dgrf-sel": col() === "files" && i() === fi(), "dgrf-closed": e.closed }}
                   onMouseMove={() => (setCol("files"), setFi(i()))}
                   onClick={() => open()}
                 >
-                  <Icon name={e.tab.icon ?? "dg/console"} class="dgr-ico" />
-                  <span class="dgr-name">
+                  <Icon name={e.tab.icon ?? "dg/console"} class="dgrf-ico" />
+                  <span class="dgrf-name">
                     <Highlighted text={e.tab.title} query={query()} />
                   </span>
-                  <span class="dgr-loc">{referenceOf(e.tab)}</span>
+                  <span class="dgrf-loc">{referenceOf(e.tab)}</span>
                   <Show when={col() === "files" && i() === fi()}>
                     <span
-                      class="dgr-split"
+                      class="dgrf-split"
                       title="Open in Right Split (Shift+Enter)"
                       onClick={(ev) => {
                         ev.stopPropagation();
@@ -192,7 +192,7 @@ function RecentFiles(props: { mode: RecentMode; reverse: boolean }): JSX.Element
             </For>
           </div>
         </div>
-        <div class="dgr-footer">{selected() ? referenceOf(selected()!.tab) : ""}</div>
+        <div class="dgrf-footer">{selected() ? referenceOf(selected()!.tab) : ""}</div>
       </div>
     </div>
   );

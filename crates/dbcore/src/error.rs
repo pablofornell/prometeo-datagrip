@@ -424,6 +424,34 @@ mod tests {
     }
 
     #[test]
+    fn oracle_codes_that_end_the_session() {
+        let e = lost(None, None).for_driver(Driver::Oracle);
+        assert!(
+            e.to_string()
+                .starts_with("[08006] The connection to the database was lost."),
+            "{e}"
+        );
+        let ora = |n: i64| ServerError {
+            driver: Driver::Oracle,
+            code: format!("ORA-{n:05}"),
+            native_code: Some(n),
+            severity: None,
+            message: format!("ORA-{n:05}: x"),
+            detail: None,
+            hint: None,
+            position: None,
+        };
+        // killed session, end-of-file on the channel, not logged on, shutdown in progress
+        for n in [28, 1012, 1033, 1089, 3113, 3114, 3135, 12537, 12541] {
+            assert!(known_codes_end_connection(&ora(n)), "ORA-{n:05}");
+        }
+        // a statement error does not end it (table missing, cancelled, unique violation, deadlock)
+        for n in [942, 1013, 1, 60, 1017] {
+            assert!(!known_codes_end_connection(&ora(n)), "ORA-{n:05}");
+        }
+    }
+
+    #[test]
     fn connection_lost_text_and_sqlstate() {
         let e = lost(None, None).for_driver(Driver::Postgres);
         assert!(

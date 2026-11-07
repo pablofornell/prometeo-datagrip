@@ -35,6 +35,7 @@ import {
   syntheticLabel,
   tabIconOf,
 } from "./model";
+import { tabs, updateTab } from "../../state/tabs";
 import { theme } from "../../state/theme";
 import { dsFolders, dsGroupOf } from "../../state/ds-folders";
 import { isObjectVisible, isSchemaVisible, visibleSchemas, visibleSchemasRaw } from "../datasource/schemas";
@@ -204,8 +205,8 @@ export function setShowSystemObjects(v: boolean): void {
 
 // ---------------------------------------------------------------- data sources
 
-/** What makes a data source node stale: its saved config (not the color: only the row tint changes), and the schema filter (UI state). */
-const dsSignature = (ds: DataSource) => JSON.stringify({ ...ds, color: null }) + "\u0000" + (visibleSchemasRaw(ds) ?? "");
+/** What makes a data source node stale: its saved config (not the color or the name: they only change the row), and the schema filter (UI state). */
+const dsSignature = (ds: DataSource) => JSON.stringify({ ...ds, color: null, name: null }) + "\u0000" + (visibleSchemasRaw(ds) ?? "");
 
 function dsNode(ds: DataSource): ENode {
   const n: ENode = {
@@ -227,20 +228,40 @@ export async function reloadDataSources(): Promise<void> {
   const prev = new Map(roots().map((n) => [n.id, n]));
   setDataSources(list);
   let changed = prev.size !== list.length;
+  let relabelled = false;
   const next = list.map((ds) => {
     const old = prev.get(ds.id);
-    if (old && old.data.extra.sig === dsSignature(ds)) return old;
+    if (old && old.data.extra.sig === dsSignature(ds)) {
+      if (old.data.name === ds.name) return old;
+      // renamed only: the node keeps its loaded subtree (no reconnect, no reload), just the label changes
+      // tab titles carry the data source name: "console [old]" -> "console [new]"
+      for (const t of tabs()) {
+        const suffix = ` [${old.data.name}]`;
+        if ((t.data as { dsId?: string } | undefined)?.dsId === ds.id && t.title.endsWith(suffix)) updateTab(t.id, { title: t.title.slice(0, -suffix.length) + ` [${ds.name}]` });
+      }
+      const renamed: ENode = { ...old, label: ds.name, data: { ...old.data, name: ds.name } };
+      nodes.set(renamed.id, renamed);
+      if (selectedNode()?.id === renamed.id) {
+        setSelectedNode(renamed);
+        setExplorerPath(crumbsOf(renamed));
+      }
+      relabelled = true;
+      return renamed;
+    }
     changed = true;
     if (old) dropSubtree(old);
     return dsNode(ds);
   });
   for (const [id, n] of prev) if (!list.some((d) => d.id === id)) dropSubtree(n, true);
-  if (changed || next.some((n, i) => n !== roots()[i])) {
+  if (changed || relabelled || next.some((n, i) => n !== roots()[i])) {
     setRoots(next);
-    ctrl?.refresh(); // forget the Tree's cached children of replaced / removed data sources
+    if (changed) ctrl?.refresh(); // forget the Tree's cached children of replaced / removed data sources
   }
   await refreshConnectionState();
-  if (selectedNode() && !nodes.has(selectedNode()!.id)) setSelectedNode(undefined);
+  if (selectedNode() && !nodes.has(selectedNode()!.id)) {
+    setSelectedNode(undefined);
+    setExplorerPath([]); // the status bar must not keep the name of a removed data source
+  }
   for (const n of next) restoreSelection(n);
 }
 

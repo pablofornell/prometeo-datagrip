@@ -36,6 +36,7 @@ import { type ENode, type NodeData, TABLE_CHILD, TABLE_LIKE, ddlRefOf, reference
 import { canRenameNode, renameSqlOf } from "./rename";
 import { confirmEndTransactions } from "../console/txguard";
 import { reconnectsOnSave } from "../datasource/model";
+import { friendlyConnectionError } from "../../state/connection-errors";
 import { forgetVisibleSchemas } from "../../state/schema-filter";
 import { parseDataSourceUrl } from "../datasource/urlParse";
 import { addDsFolder, forgetDsGroup, moveToDsFolder, removeDsFolder, renameDsFolder } from "../../state/ds-folders";
@@ -43,6 +44,11 @@ import { addDsFolder, forgetDsGroup, moveToDsFolder, removeDsFolder, renameDsFol
 const errText = (e: unknown) => String((e as Error)?.message ?? e).replace(/^Error:\s*/, "");
 const fail = (title: string, e: unknown): void => {
   notify({ kind: "error", title, body: errText(e) });
+};
+/** A failure that may be an unreachable data source: DataGrip's wording ("Connection to host:port refused. ..."), like Test Connection. */
+const failDs = (dsId: string, title: string, e: unknown): void => {
+  const ds = dsOf(dsId);
+  notify({ kind: "error", title, body: ds ? friendlyConnectionError(errText(e), { driver: ds.driver, host: ds.host, port: ds.port, file: ds.file }) : errText(e) });
 };
 
 // ---------------------------------------------------------------- tabs
@@ -57,7 +63,7 @@ export async function openTableRef(dsId: string, ref: ObjectRef): Promise<void> 
   try {
     await ensureConnected(dsId);
   } catch (e) {
-    return fail(`Connection to ${dsName(dsId)} failed`, e);
+    return failDs(dsId, `Connection to ${dsName(dsId)} failed`, e);
   }
   openTab({
     id: `table:${dsId}:${ref.schema ?? ""}.${ref.name}`,
@@ -78,7 +84,7 @@ export async function openDdlRef(dsId: string, ref: ObjectRef, column?: string):
   try {
     await ensureConnected(dsId);
   } catch (e) {
-    return fail(`Connection to ${dsName(dsId)} failed`, e);
+    return failDs(dsId, `Connection to ${dsName(dsId)} failed`, e);
   }
   openTab({
     id: `ddl:${dsId}:${ref.schema ?? ""}.${ref.name}${ref.signature != null ? `(${ref.signature})` : ""}`,
@@ -137,7 +143,7 @@ export async function newConsole(dsId?: string): Promise<void> {
     await ensureConnected(id);
     openConsoleTab(id, await createConsole(id));
   } catch (e) {
-    fail("Cannot create a query console", e);
+    failDs(id, "Cannot create a query console", e);
   }
 }
 
@@ -156,14 +162,14 @@ export async function jumpToConsole(dsId?: string): Promise<void> {
       ...names.map<MenuItem>((n) => ({
         label: `${n} [${dsName(id)}]`,
         icon: "dg/console",
-        run: () => void ensureConnected(id).then(() => openConsoleTab(id, n), (e) => fail("Cannot connect", e)),
+        run: () => void ensureConnected(id).then(() => openConsoleTab(id, n), (e) => failDs(id, "Cannot connect", e)),
       })),
       { type: "separator" },
       { label: "New Query Console", icon: "add", shortcut: "Ctrl+Shift+Q", run: () => void newConsole(id) },
     ];
     openMenu(items, { ...popupPos(), title: "Query Consoles", compact: true });
   } catch (e) {
-    fail("Cannot list the query consoles", e);
+    failDs(id, "Cannot list the query consoles", e);
   }
 }
 

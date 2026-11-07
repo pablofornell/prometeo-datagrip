@@ -69,6 +69,8 @@ pub struct Metadata {
     object_type: Option<MetadataObjectType>,
     domain: Option<(String, String)>,
     annotations: Vec<(String, String)>,
+    // PATCH (Prometeo): the column type before a LOB was redefined as LONG / LONG RAW
+    declared_type: Option<&'static DbType>,
 }
 
 impl Metadata {
@@ -102,6 +104,7 @@ impl Metadata {
             object_type: None,
             domain: None,
             annotations: Vec::new(),
+            declared_type: None,
         }
     }
 
@@ -110,6 +113,7 @@ impl Metadata {
     pub(crate) fn define_metadata(&self) -> Metadata {
         let mut metadata = self.clone();
         metadata.max_size = 0;
+        metadata.declared_type = Some(self.db_type);
         metadata.db_type = match self.db_type {
             crate::DB_TYPE_BLOB => crate::DB_TYPE_LONG_RAW,
             crate::DB_TYPE_CLOB => crate::DB_TYPE_LONG,
@@ -139,6 +143,7 @@ impl Metadata {
             object_type: None,
             domain: None,
             annotations: Vec::new(),
+            declared_type: None,
         };
         let ora_type_num: u16 = resp.read_u8()?.into();
         resp.read_u8()?; // flags
@@ -441,6 +446,15 @@ impl Metadata {
                 }
             }
             _ => self.db_type.ora_name.to_string(),
+        }
+    }
+
+    /// PATCH (Prometeo): like [`data_type`](Self::data_type) but a CLOB / BLOB / NCLOB column that is fetched as
+    /// a string / bytes still reports its declared type (`db_type()` says LONG / LONG RAW then).
+    pub fn declared_data_type(&self) -> String {
+        match self.declared_type {
+            Some(t) => t.ora_name.to_string(),
+            None => self.data_type(),
         }
     }
 

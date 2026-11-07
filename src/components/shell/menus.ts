@@ -138,8 +138,7 @@ export const MAIN_MENU: MenuBarEntry[] = [
       a("sql.rollback", "R"),
       sep,
       a("sql.history", "H"),
-      a("db.jumpToConsole", "J"),
-      opt("run.file", "F", { label: "Run File" }),
+      opt("run.file", "F", { label: "Run File" }), // DataGrip: Run '<file>' Ctrl+Shift+F10; Jump to Query Console lives in the explorer's toolbar and menus
       opt("run.chooseConfiguration", "u"),
       opt("run.sqlScript", "q"),
       opt("run.editConfigurations", "g"),

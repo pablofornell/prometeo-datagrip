@@ -3,7 +3,7 @@ pub mod files;
 pub mod state;
 pub mod store;
 
-use tauri::{Manager, RunEvent};
+use tauri::{Manager, RunEvent, WebviewWindowBuilder};
 
 pub use state::AppState;
 
@@ -20,8 +20,25 @@ pub fn run() {
             let data_dir = std::env::var_os("PROMETEO_DATA_DIR")
                 .map(Into::into)
                 .unwrap_or(paths.app_data_dir()?);
+            // The WebView keeps its own storage (localStorage: explorer state, tabs, layout). Under an overridden
+            // data / config dir it must live there too, or the state of one profile leaks into another.
+            let webview_dir = std::env::var_os("PROMETEO_DATA_DIR")
+                .map(|d| std::path::PathBuf::from(d).join("webview"))
+                .or_else(|| {
+                    std::env::var_os("PROMETEO_CONFIG_DIR")
+                        .map(|d| std::path::PathBuf::from(d).join("webview"))
+                });
             let state = AppState::open(config_dir, data_dir)?;
             app.manage(state);
+            // the main window is declared in tauri.conf.json with `create: false`: built here to set the WebView data directory
+            for cfg in app.config().app.windows.iter().filter(|w| !w.create) {
+                let mut builder = WebviewWindowBuilder::from_config(app.handle(), cfg)?;
+                if let Some(dir) = &webview_dir {
+                    std::fs::create_dir_all(dir)?;
+                    builder = builder.data_directory(dir.clone());
+                }
+                builder.build()?;
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -30,6 +47,7 @@ pub fn run() {
             commands::save_data_source,
             commands::delete_data_source,
             commands::duplicate_data_source,
+            commands::copy_data_source_password,
             commands::test_connection,
             commands::connect,
             commands::disconnect,

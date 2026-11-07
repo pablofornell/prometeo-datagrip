@@ -361,6 +361,14 @@ async function mayClose(tab: EditorTab): Promise<boolean> {
   return true;
 }
 
+/** Asks the `beforeClose` hooks about every open tab without closing any (quitting the app). False when one vetoed. */
+export async function confirmCloseAll(): Promise<boolean> {
+  for (const t of [...tabsState.list]) {
+    if (!(await mayClose({ ...t }))) return false;
+  }
+  return true;
+}
+
 /** Removes the tab without asking (the caller already decided, or the tab's subject is gone). */
 export function removeTab(id: string): void {
   const i = tabsState.list.findIndex((t) => t.id === id);

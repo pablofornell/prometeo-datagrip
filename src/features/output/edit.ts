@@ -4,6 +4,22 @@
  */
 import type { Cell, ColumnMeta, ObjectRef } from "../../api/types";
 import type { GridChange } from "../../components/grid/types";
+import { rowsAffected } from "./format";
+
+/**
+ * The Output lines of a grid Submit, like the ones of a console statement: each UPDATE / INSERT / DELETE on one
+ * line, then `N rows affected in T ms` (or the failure). `statements` come from `changeStatements`.
+ */
+export function logSubmitted(
+  log: (kind: "sql" | "text" | "error", text: string, prompt?: string) => unknown,
+  prompt: string,
+  statements: string[],
+  outcome: { rowsAffected: number; ms: number } | { error: string },
+): void {
+  for (const s of statements) log("sql", s.replace(/\s*\n\s*/g, " "), prompt);
+  if ("error" in outcome) log("error", outcome.error);
+  else log("text", rowsAffected(outcome.rowsAffected, outcome.ms));
+}
 
 export interface EditTarget {
   table: ObjectRef;

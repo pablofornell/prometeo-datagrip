@@ -3,7 +3,7 @@ import { For, Show, createEffect, createSignal, onCleanup, onMount, type JSX } f
 import { Portal } from "solid-js/web";
 import type { ColumnMeta, Driver, ExportFormat, ExportOptions } from "../../api/types";
 import { SqlEditor } from "../../components/editor";
-import { chooseExportPath, defaultExportPath } from "../../api/db";
+import { approveExportPath, chooseExportPath, defaultExportPath, exportFolder, isTauri } from "../../api/db";
 import { Button, Checkbox, ComboBox, Dialog, Icon, TextField, tip } from "../../components/ui";
 import { EXTRACTORS } from "../output/extractors";
 import { FILTER_OPS, type FilterOp } from "./sql";
@@ -164,6 +164,8 @@ export function ExportDialog(props: ExportDialogProps): JSX.Element {
   const [chosen, setChosen] = createSignal(false);
   const [preview, setPreview] = createSignal("");
   const [error, setError] = createSignal("");
+  /** Why the backend refused the typed output file (the save dialog is then offered). */
+  const [pathError, setPathError] = createSignal("");
   const fmt = () => opts().format;
   const textual = () => ["csv", "tsv", "markdown", "csvPipe", "csvSemicolon"].includes(fmt());
   const nullable = () => textual() || ["html", "pretty"].includes(fmt());
@@ -176,6 +178,7 @@ export function ExportDialog(props: ExportDialogProps): JSX.Element {
 
   // the extension follows the extractor as long as the name still ends with the previous one
   const changeFormat = (f: ExportFormat) => {
+    setPathError("");
     const old = `.${ext(fmt())}`;
     if (path().endsWith(old)) setPath(path().slice(0, -old.length) + `.${ext(f)}`);
     patch({ format: f });
@@ -198,14 +201,27 @@ export function ExportDialog(props: ExportDialogProps): JSX.Element {
 
   const browse = async () => {
     try {
-      const p = await chooseExportPath(path().split("/").pop() || undefined, fmt());
-      if (p) (setPath(p), setChosen(true));
+      // opens in the folder that was typed (when it exists)
+      const p = await chooseExportPath(path().split("/").pop() || undefined, fmt(), exportFolder(path()) ?? undefined);
+      if (p) (setPath(p), setChosen(true), setPathError(""));
     } catch (e) {
       setError(String((e as Error)?.message ?? e));
     }
   };
 
-  const run = (target: ExportTarget) => props.onExport(opts(), target, out());
+  const run = async (target: ExportTarget) => {
+    if (target === "file" && isTauri() && !chosen()) {
+      // a typed path: the backend approves it or says why not; only then the save dialog is offered
+      try {
+        const why = await approveExportPath(path().trim(), fmt());
+        if (why) return setPathError(why);
+      } catch (e) {
+        return setPathError(String((e as Error)?.message ?? e));
+      }
+      return props.onExport(opts(), target, { path: path().trim(), chosen: true });
+    }
+    props.onExport(opts(), target, out());
+  };
   return (
     <Dialog
       title="Export Data"
@@ -253,13 +269,21 @@ export function ExportDialog(props: ExportDialogProps): JSX.Element {
           <label>Output file:</label>
           <TextField
             value={path()}
-            onInput={(v) => (setPath(v), setChosen(false))}
+            onInput={(v) => (setPath(v), setChosen(false), setPathError(""))}
             suffix={
               <button type="button" class="dgt-export-browse" {...tip("Choose the output file")} tabindex={-1} onClick={() => void browse()}>
                 <Icon name="folder" size={16} />
               </button>
             }
           />
+          <Show when={pathError()}>
+            <div class="dgt-export-patherr" role="alert">
+              {pathError()}{" "}
+              <button type="button" class="dgt-export-link" onClick={() => void browse()}>
+                Choose location...
+              </button>
+            </div>
+          </Show>
         </div>
         <div class="dgt-export-right">
           <label>Export preview (first {PREVIEW_ROWS} rows are shown):</label>

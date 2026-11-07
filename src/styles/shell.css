@@ -121,10 +121,15 @@
 .dg-window-btn:hover {
   background: var(--dg-window-btn-hover-bg);
 }
+/* the light variants of the window icons are pale grey (#A8ADBD, the inactive-window look): darken them on the light toolbar */
+:root[data-theme="light"] .dg-window-btn .dg-icon {
+  filter: brightness(0.45);
+}
 .dg-window-close:hover {
   background: #e81123;
 }
-.dg-window-close:hover .dg-icon {
+.dg-window-close:hover .dg-icon,
+:root[data-theme="light"] .dg-window-close:hover .dg-icon {
   filter: brightness(0) invert(1);
 }
 

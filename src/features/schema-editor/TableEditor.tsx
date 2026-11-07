@@ -15,7 +15,7 @@ import { askChoice } from "../table/dialogs";
 import { PlanError, runPlan } from "./apply";
 import { ColumnList, Choice, Field, Text, TypeCombo } from "./fields";
 import { ArrowDown, ArrowUp, EditorFrame, TbButton } from "./Frame";
-import { type EditorCtx, errText, loadColumnNames, loadTable, loadTableNames } from "./load";
+import { type EditorCtx, errText, loadColumnNames, loadPrimaryKeyColumns, loadTable, loadTableNames } from "./load";
 import {
   type ColumnDef,
   FK_ACTIONS,
@@ -602,6 +602,16 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
     );
   }
 
+  /** The target columns of a foreign key start as the primary key of the target table (what DataGrip preselects). */
+  async function preselectTarget(uid: string, table: string): Promise<void> {
+    if (!table) return;
+    const isSelf = table === cur.name || (!!orig() && table === orig()!.name);
+    const pk = isSelf ? (cur.keys.find((k) => k.primary)?.columns ?? []) : await loadPrimaryKeyColumns(ctx, table);
+    // the user may have picked another table or columns while the keys were loading
+    const f = cur.fks.find((x) => x.uid === uid);
+    if (pk.length && f && f.refTable === table && f.refColumns.length === 0) setCur("fks", (x) => x.uid === uid, { refColumns: [...pk] });
+  }
+
   function FkSheet(p: { uid: string }): JSX.Element {
     const f = () => cur.fks.find((x) => x.uid === p.uid);
     const self = () => f()?.refTable === cur.name || (!!orig() && f()?.refTable === orig()!.name);
@@ -624,7 +634,10 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
             value={f()!.refTable}
             options={names()}
             allowEmpty
-            onChange={(v) => setF({ refTable: v, refSchema: f()!.refSchema || ctx.schema, refColumns: [] })}
+            onChange={(v) => {
+              setF({ refTable: v, refSchema: f()!.refSchema || ctx.schema, refColumns: [] });
+              void preselectTarget(p.uid, v);
+            }}
           />
         </Field>
         <Field label="Columns" top>
@@ -707,6 +720,7 @@ export function TableEditor(props: TableEditorProps): JSX.Element {
 
   return (
     <EditorFrame
+      title={create() ? "Create Table" : `Modify Table ${orig()!.name}`}
       toolbar={
         <>
           <TbButton title="Add" onClick={openAddMenu} ref={(el) => (addButton = el)}>

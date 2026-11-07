@@ -270,8 +270,10 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
       default:
         break;
     }
-    // CTE: name AS ( ... )   preceded by WITH [RECURSIVE] or ','
-    if (isNameAt(i) && isWordAt(i + 1) && lw[i + 1] === "as" && (isP(i + 2, "(") || (isWordAt(i + 2) && ["materialized", "not"].includes(lw[i + 2])))) {
+    // CTE: name [(col, ..)] AS ( ... )   preceded by WITH [RECURSIVE] or ','
+    let ca = i + 1;
+    if (isNameAt(i) && isP(ca, "(") && match[ca] > ca) ca = match[ca] + 1; // column list: `r(n) AS (..)`
+    if (isNameAt(i) && isWordAt(ca) && lw[ca] === "as" && (isP(ca + 1, "(") || (isWordAt(ca + 1) && ["materialized", "not"].includes(lw[ca + 1])))) {
       if (i === 0 ? false : lw[i - 1] === "with" || lw[i - 1] === "recursive" || isP(i - 1, ",")) {
         ctes.add(lw[i]);
         roles[i] = "decl";
@@ -285,6 +287,22 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
       roles[j] = "decl";
       if (joinDot(j + 1)) j += 2;
       else break;
+    }
+  }
+
+  // MySQL 8 row alias: `INSERT .. VALUES (..) AS nw [(x, y)] ON DUPLICATE KEY UPDATE a = nw.a`
+  if ((first === "insert" || first === "replace") && refs.length) {
+    for (let d = 1; d + 2 < n; d++) {
+      if (!(owners[d] === undefined && lw[d] === "on" && isWordAt(d) && lw[d + 1] === "duplicate" && lw[d + 2] === "key")) continue;
+      let a = d - 1;
+      const listed = isP(a, ")") && match[a] >= 0 && isNameAt(match[a] - 1) && isWordAt(match[a] - 2) && lw[match[a] - 2] === "as";
+      if (listed) a = match[a] - 1;
+      if (isNameAt(a) && isWordAt(a - 1) && lw[a - 1] === "as") {
+        roles[a] = "alias";
+        const target = refs.find((r) => r.parts.length);
+        refs.push({ parts: [], alias: lw[a], aliasText: raw[a], table: target?.table, opaque: listed || !target?.table });
+      }
+      break;
     }
   }
 
@@ -346,6 +364,7 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
   // function call detection: ident followed by "(" and not in a table-introducing position
   const isCall = (i: number): boolean => {
     if (!isP(i + 1, "(") || roles[i]) return false;
+    if (lw[i] === "conflict" && isWordAt(i - 1) && lw[i - 1] === "on") return false; // `ON CONFLICT (id)`
     let b = i - 1;
     while (joinDot(b) && isNameAt(b - 1)) b -= 2;
     return !(isWordAt(b) && (TABLE_INTRO.has(lw[b]) || ["function", "procedure", "type", "as", "returns"].includes(lw[b])));
@@ -457,6 +476,8 @@ export function analyzeStatement(text: string, toks: Token[], idx: SchemaIndex, 
       const qref = byName.get(w);
       // Oracle `seq.nextval` / `seq.currval`: the qualifier is a sequence
       if (dialect === "oracle" && /^(nextval|currval)$/.test(lw[i + 2] ?? "") && !qref) continue;
+      // PostgreSQL / SQLite `ON CONFLICT .. DO UPDATE SET c = excluded.c`: the row proposed for insertion
+      if (w === "excluded" && !qref && lw.some((x, k) => x === "conflict" && isWordAt(k) && isWordAt(k - 1) && lw[k - 1] === "on")) continue;
       if (qref?.table) hit(i, qref.table);
       if (flagUnresolved && !role && refs.length > 0 && !anyOpaque && !byName.has(w) && !idx.hasSchema(w) && !ctes.has(w) && ["select", "with", "update", "delete", "insert"].includes(first)) {
         mk("bad");

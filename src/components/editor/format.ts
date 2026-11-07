@@ -165,6 +165,7 @@ export function formatStatement(src: string, dialect: Dialect): string {
           out = out.slice(0, out.length - 1).replace(/[ \t]+$/, "");
           nl(top().base);
           out += ")";
+          lineStart = false; // what follows (`select`, an alias, `,`) is not at the start of a line
         }
       } else if (s === "," && f.query && next) {
         // wrap long select / from lists under their first item

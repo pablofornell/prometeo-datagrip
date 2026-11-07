@@ -38,6 +38,14 @@
 //!   `ROLLBACK PREPARED` inside a transaction fail it. `apply_changes_in_session` rolls back to its own
 //!   savepoint, so a failing batch leaves an active transaction active.
 //! * **SQLite**: `sqlite3_get_autocommit` on the raw handle (exact).
+//! * **Oracle**: there is no `BEGIN`; the first DML statement (or `SELECT ... FOR UPDATE`, `LOCK TABLE`) opens a
+//!   transaction and `COMMIT` / `ROLLBACK` / any DDL or DCL statement (implicit commit, also when it fails after
+//!   parsing) ends it. The server reports "transaction in progress" in every response and the driver keeps it
+//!   (`OraConn::in_transaction`), so with the connection at hand the state is exact, including PL/SQL blocks that
+//!   commit. While a result stream still occupies the connection it is derived from the statement text
+//!   ([`oracle_effect`]). A failing statement rolls back only itself. `TxEnded` tag `IMPLICIT COMMIT` for DDL. In the
+//!   console's Auto mode (`ExecOptions::auto_commit`) the executor commits after every successful statement, so the
+//!   session stays `idle`.
 //! * **PostgreSQL**: the wire protocol reports the transaction status in every `ReadyForQuery`, but sqlx
 //!   does not expose it and there is no reliable SQL-level probe that is free of side effects (`SAVEPOINT`
 //!   would log an error in the server log on every autocommit statement). The state is therefore tracked
@@ -622,7 +630,94 @@ async fn probe_sqlite(conn: &mut Conn) -> Option<TxStatus> {
 pub(crate) async fn probe(conn: &mut Conn) -> Option<TxStatus> {
     match conn {
         Conn::Lite(_) => probe_sqlite(conn).await,
-        Conn::My(_) | Conn::Pg(_) | Conn::Ora(_) => None,
+        Conn::Ora(c) => Some(if c.in_transaction() {
+            TxStatus::Active
+        } else {
+            TxStatus::Idle
+        }),
+        Conn::My(_) | Conn::Pg(_) => None,
+    }
+}
+
+/// What an Oracle statement does to the transaction, judged from its text (used while a result stream still
+/// occupies the connection; otherwise the server's own report decides).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OraEffect {
+    /// DDL / DCL: commits the open transaction before and after it runs.
+    Commits,
+    /// DML, `LOCK TABLE`, `SELECT ... FOR UPDATE`: opens a transaction.
+    Opens,
+    Other,
+}
+
+fn oracle_effect(sql: &str) -> OraEffect {
+    let w = words(sql, 3);
+    let w: Vec<&str> = w.iter().map(String::as_str).collect();
+    match w.first().copied() {
+        Some("ALTER") if w.get(1) == Some(&"SESSION") => OraEffect::Other,
+        Some(
+            "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "RENAME" | "GRANT" | "REVOKE" | "COMMENT"
+            | "AUDIT" | "NOAUDIT" | "ANALYZE" | "FLASHBACK" | "PURGE" | "ASSOCIATE"
+            | "DISASSOCIATE",
+        ) => OraEffect::Commits,
+        Some("INSERT" | "UPDATE" | "DELETE" | "MERGE" | "LOCK") => OraEffect::Opens,
+        Some("SELECT" | "WITH") if sql.to_ascii_uppercase().contains("FOR UPDATE") => {
+            OraEffect::Opens
+        }
+        _ => OraEffect::Other,
+    }
+}
+
+/// Oracle: the server reports after every call whether a transaction is open (no `BEGIN`; DML opens one, DDL
+/// commits it), so with the connection at hand the state is exact. Without it (a result stream is still open)
+/// it is derived from the statement text.
+fn after_oracle(
+    sess: &Session,
+    conn: Option<&Conn>,
+    prev: TxStatus,
+    sql: &str,
+    outcome: &Outcome,
+) -> TxUpdate {
+    let kind = classify(sql);
+    let effect = oracle_effect(sql);
+    let ok = outcome.is_ok();
+    let next = match conn {
+        Some(Conn::Ora(c)) => {
+            if c.in_transaction() {
+                TxStatus::Active
+            } else {
+                TxStatus::Idle
+            }
+        }
+        _ => match (kind, effect) {
+            (TxKind::Commit { .. } | TxKind::Rollback { .. }, _) if ok => TxStatus::Idle,
+            (_, OraEffect::Commits) if ok => TxStatus::Idle,
+            (_, OraEffect::Opens) if ok => TxStatus::Active,
+            _ => prev,
+        },
+    };
+    sess.set_tx_status(next);
+    let mut ended = None;
+    let mut note = None;
+    if prev.is_open() && ok {
+        match kind {
+            TxKind::Commit { .. } => ended = Some((true, "COMMIT")),
+            TxKind::Rollback { .. } => ended = Some((false, "ROLLBACK")),
+            _ if effect == OraEffect::Commits && next == TxStatus::Idle => {
+                ended = Some((true, "IMPLICIT COMMIT"));
+                note = Some(
+                    "The statement committed the open transaction implicitly (Oracle DDL / DCL)."
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+    TxUpdate {
+        status: next,
+        changed: next != prev,
+        ended,
+        note,
     }
 }
 
@@ -648,6 +743,9 @@ pub(crate) async fn after_statement(
     let driver = sess.live.driver();
     if driver == Driver::MySql {
         return after_mysql(sess, prev, sql, &outcome);
+    }
+    if driver == Driver::Oracle {
+        return after_oracle(sess, conn.as_deref(), prev, sql, &outcome);
     }
     let kind = classify(sql);
     let ok = outcome.is_ok();
@@ -809,6 +907,29 @@ mod tests {
         assert_eq!(classify("prepare transaction 'x'"), TxKind::Prepare);
         assert_eq!(classify("prepare p as select 1"), TxKind::Other);
         assert_eq!(classify("select 'commit'"), TxKind::Other);
+    }
+
+    #[test]
+    fn oracle_statement_effects() {
+        use OraEffect::*;
+        assert_eq!(oracle_effect("insert into t values (1)"), Opens);
+        assert_eq!(oracle_effect("  /* c */ update t set a = 1"), Opens);
+        assert_eq!(oracle_effect("delete from t"), Opens);
+        assert_eq!(
+            oracle_effect("merge into t using s on (1=1) when matched then update set a = 1"),
+            Opens
+        );
+        assert_eq!(oracle_effect("lock table t in exclusive mode"), Opens);
+        assert_eq!(oracle_effect("select * from t for update"), Opens);
+        assert_eq!(oracle_effect("select * from t"), Other);
+        assert_eq!(oracle_effect("begin null; end;"), Other);
+        assert_eq!(oracle_effect("create table t (a int)"), Commits);
+        assert_eq!(oracle_effect("drop table t"), Commits);
+        assert_eq!(oracle_effect("truncate table t"), Commits);
+        assert_eq!(oracle_effect("grant select on t to u"), Commits);
+        assert_eq!(oracle_effect("comment on table t is 'x'"), Commits);
+        assert_eq!(oracle_effect("alter table t add b int"), Commits);
+        assert_eq!(oracle_effect("alter session set current_schema = x"), Other);
     }
 
     #[test]

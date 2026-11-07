@@ -678,6 +678,15 @@ impl DataSourceStore {
         // an empty string would clear; a missing password must stay missing
         self.save(cfg)
     }
+
+    /// Gives `to` a copy of the stored password of `from` (the dialog's Duplicate: the UI never sees passwords).
+    /// A source without a password leaves `to` unchanged.
+    pub fn copy_password(&self, from: &str, to: &str) -> Result<DataSourceView, String> {
+        let password = self.get(from)?.password;
+        let mut cfg = self.get(to)?;
+        cfg.password = password.filter(|p| !p.is_empty());
+        self.save(cfg)
+    }
 }
 
 // ====================================================================== ui state
@@ -968,6 +977,16 @@ mod tests {
             store.get(&dup.cfg.id).unwrap().password.as_deref(),
             Some("pw")
         );
+        // the dialog's Duplicate: a fresh source takes the stored password of the original
+        let fresh = store.save(cfg("fresh", None)).unwrap();
+        assert_eq!(store.get(&fresh.cfg.id).unwrap().password, None);
+        let copied = store.copy_password(&v.cfg.id, &fresh.cfg.id).unwrap();
+        assert!(copied.has_password);
+        assert_eq!(
+            store.get(&fresh.cfg.id).unwrap().password.as_deref(),
+            Some("pw")
+        );
+        store.delete(&fresh.cfg.id).unwrap();
         store.delete(&v.cfg.id).unwrap();
         assert_eq!(store.list().len(), 1);
     }

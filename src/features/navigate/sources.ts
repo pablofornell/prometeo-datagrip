@@ -511,18 +511,9 @@ export function locationOf(e: Entry, ds: DataSource | undefined): string {
   return [segs.join("."), dsPart].filter(Boolean).join(" ");
 }
 
-/** Gray path in the popup footer for a database object (DataGrip shows the internal node path). */
+/** Gray path in the popup footer for a database object: `postgres@localhost/postgres/sales/invoices/invoices_pkey`. */
 export function footerPath(e: Entry, ds: DataSource | undefined): string {
   if (e.group === "console") return `Database Consoles/${ds?.name ?? ""}/${e.name}`;
   if (e.group !== "db" || !ds) return "";
-  const seg = (k: string, v: string) => `${k}/${v}`;
-  const parts = [ds.id];
-  if (e.kind === "dataSource") return ds.id;
-  if (ds.driver === "postgres") parts.push(seg("database", ds.database || "postgres"));
-  if (e.schema) parts.push(seg("schema", e.schema));
-  const folder: Partial<Record<EntryKind, string>> = { table: "table", view: "view", materializedView: "materialized-view", routine: "routine", function: "routine", procedure: "routine", sequence: "sequence" };
-  const childSeg: Partial<Record<EntryKind, string>> = { column: "column", index: "index", primaryKey: "key", uniqueKey: "key", foreignKey: "foreign-key", check: "check", trigger: "trigger" };
-  if (childSeg[e.kind]) parts.push(seg(folder[e.tableKind as EntryKind] ?? "table", e.table ?? ""), seg(childSeg[e.kind]!, e.name));
-  else if (folder[e.kind]) parts.push(seg(folder[e.kind]!, e.name));
-  return parts.join("/");
+  return e.kind === "dataSource" ? ds.name : [...pathOf(e, ds), e.name].join("/");
 }

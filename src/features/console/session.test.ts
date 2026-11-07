@@ -114,8 +114,9 @@ vi.mock("./schemaPref", () => {
   };
 });
 
+import { openSession } from "../../api/db";
 import { savedSchema, savedSearchPath } from "./schemaPref";
-import { ConsoleSession, isolationLevels } from "./session";
+import { ConsoleSession, isNamespace, isolationLevels } from "./session";
 
 const ds = (driver: "postgres" | "mysql" = "postgres") => ({ id: "d1", name: "pg", driver, database: "shop", readOnly: false }) as never;
 const mk = (driver: "postgres" | "mysql" = "postgres") => new ConsoleSession("tab1", ds(driver), "console", () => "console [pg]");
@@ -281,6 +282,30 @@ describe("a failed statement", () => {
     await s.run(req("update t set a = 1"));
     expect(s.out.selected()).toBe("output");
     expect(s.execError()).toBeNull();
+  });
+});
+
+describe("an unreachable data source", () => {
+  it("logs DataGrip's wording and marks the statement as failed", async () => {
+    const s = new ConsoleSession("tab1", { id: "dead1", name: "dead", driver: "postgres", host: "127.0.0.1", port: 54398, database: "x", readOnly: false } as never, "console", () => "console [dead]");
+    vi.mocked(openSession).mockRejectedValueOnce(new Error("error communicating with database: Connection refused (os error 111)"));
+    await s.run({ sql: "select 1;", ranges: [{ from: 0, to: 9 }], source: "statement" });
+    const want = "Connection to 127.0.0.1:54398 refused. Check that the hostname and port are correct and that the postmaster is accepting TCP/IP connections.";
+    expect(lines(s)).toContain(want);
+    expect(lines(s).join("\n")).not.toContain("os error");
+    expect(s.execError()).toBe(want);
+    expect(s.marks().map((m) => [m.from, m.to, m.status])).toEqual([[0, 9, "error"]]);
+    expect(s.errors().map((e) => [e.statementFrom, e.message])).toEqual([[0, want]]);
+  });
+});
+
+describe("schema switcher", () => {
+  const n = (kind: string, name: string, extra = {}) => ({ id: name, kind, name, hint: null, path: [name], hasChildren: true, extra }) as never;
+  it("lists databases and schemas, not the Server / Database Objects groups", () => {
+    const nodes = [n("schema", "public"), n("schema", "shop"), n("folder", "Database Objects", { group: true, folder: "$objects" })];
+    expect(nodes.filter(isNamespace).map((x: { name: string }) => x.name)).toEqual(["public", "shop"]);
+    expect(isNamespace(n("database", "postgres"))).toBe(true);
+    expect(isNamespace(n("folder", "Server Objects", { group: true }))).toBe(false);
   });
 });
 

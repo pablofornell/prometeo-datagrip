@@ -1,10 +1,10 @@
 /* Recent Files (Ctrl+E) / Switcher (Ctrl+Tab). Geometry measured on docs/ux/screens/124 (540x445, 1:1 CSS px). */
-.dgr-backdrop {
+.dgrf-backdrop {
   position: fixed;
   inset: 0;
   z-index: 1900;
 }
-.dgr-popup {
+.dgrf-popup {
   position: absolute;
   left: 50%;
   top: calc(50% - 20px);
@@ -22,43 +22,43 @@
   font: var(--dg-font-size) / 16px var(--dg-font-ui);
   overflow: hidden;
 }
-.dgr-header {
+.dgrf-header {
   flex: none;
   display: flex;
   align-items: center;
   height: 40px;
   padding: 0 16px 0 20px;
 }
-.dgr-title {
+.dgrf-title {
   font-weight: 600;
 }
-.dgr-query {
+.dgrf-query {
   margin-left: 12px;
   padding: 0 6px;
   border-radius: 4px;
   background: var(--dg-list-selection-bg);
 }
-.dgr-edited {
+.dgrf-edited {
   display: flex;
   align-items: center;
   gap: 6px;
   margin-left: auto;
 }
-.dgr-key {
+.dgrf-key {
   flex: none;
   margin-left: auto;
   color: var(--dg-text-secondary);
 }
-.dgr-edited .dgr-key {
+.dgrf-edited .dgrf-key {
   margin-left: 0;
 }
-.dgr-cols {
+.dgrf-cols {
   flex: 1;
   display: flex;
   min-height: 0;
   border-top: 1px solid var(--dg-separator);
 }
-.dgr-tools {
+.dgrf-tools {
   flex: none;
   width: 215px;
   box-sizing: border-box;
@@ -66,14 +66,14 @@
   overflow-y: auto;
   border-right: 1px solid var(--dg-separator);
 }
-.dgr-files {
+.dgrf-files {
   flex: 1;
   min-width: 0;
   box-sizing: border-box;
   padding: 4px 6px;
   overflow-y: auto;
 }
-.dgr-row {
+.dgrf-row {
   display: flex;
   align-items: center;
   height: 24px;
@@ -81,24 +81,24 @@
   border-radius: 6px;
   white-space: nowrap;
 }
-.dgr-row.dgr-sel {
+.dgrf-row.dgrf-sel {
   background: var(--dg-list-selection-bg);
 }
-.dgr-tools:not(.dgr-colactive) .dgr-row.dgr-sel,
-.dgr-files:not(.dgr-colactive) .dgr-row.dgr-sel {
+.dgrf-tools:not(.dgrf-colactive) .dgrf-row.dgrf-sel,
+.dgrf-files:not(.dgrf-colactive) .dgrf-row.dgrf-sel {
   background: var(--dg-row-hover-bg);
 }
-.dgr-ico {
+.dgrf-ico {
   flex: none;
   margin-right: 6px;
 }
-.dgr-name {
+.dgrf-name {
   flex: none;
   max-width: 70%;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.dgr-loc {
+.dgrf-loc {
   flex: 0 1 auto;
   min-width: 0;
   margin-left: 8px;
@@ -106,20 +106,20 @@
   text-overflow: ellipsis;
   color: var(--dg-text-secondary);
 }
-.dgr-closed .dgr-name {
+.dgrf-closed .dgrf-name {
   color: var(--dg-text-secondary);
 }
-.dgr-split {
+.dgrf-split {
   display: flex;
   flex: none;
   margin-left: auto;
   padding-left: 6px;
 }
-.dgr-empty {
+.dgrf-empty {
   padding: 4px 8px;
   color: var(--dg-text-secondary);
 }
-.dgr-footer {
+.dgrf-footer {
   flex: none;
   height: 28px;
   box-sizing: border-box;

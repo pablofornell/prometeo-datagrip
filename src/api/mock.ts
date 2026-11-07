@@ -13,6 +13,7 @@
 // model (ORACLE_SCHEMAS: DEMO / HR, packages, synonyms, sequences ...) with Oracle names and ORA- errors.
 
 import type { MockHandler } from "./tauri";
+import { splitStatements as splitOracle } from "../components/editor/split";
 import type {
   ApplyResult,
   Cell,
@@ -142,8 +143,13 @@ function splitRaw(sql: string): { start: number; end: number; full: number }[] {
   return out;
 }
 
-function toStatements(sql: string): Statement[] {
-  return splitRaw(sql).map((r, index) => {
+function toStatements(sql: string, driver?: string): Statement[] {
+  // Oracle: PL/SQL blocks end with a `/` line, `q'[...]'` quoting (the editor's splitter is the same logic as dbcore/split.rs)
+  const raws =
+    driver === "oracle"
+      ? splitOracle(sql, "oracle").map((s) => ({ start: s.start, end: s.end, full: s.fullEnd }))
+      : splitRaw(sql);
+  return raws.map((r, index) => {
     const pre = sql.slice(0, r.start);
     const body = sql.slice(r.start, r.end);
     return {
@@ -159,15 +165,18 @@ function toStatements(sql: string): Statement[] {
   });
 }
 
-function statementAt(sql: string, caret: number): Statement | null {
-  const raws = splitRaw(sql);
+function statementAt(sql: string, caret: number, driver?: string): Statement | null {
+  const raws =
+    driver === "oracle"
+      ? splitOracle(sql, "oracle").map((s) => ({ start: s.start, end: s.end, full: s.fullEnd }))
+      : splitRaw(sql);
   if (!raws.length) return null;
   let pick = raws.findIndex((r) => caret >= r.start && caret <= r.full);
   if (pick < 0) {
     const before = raws.filter((r) => r.full <= caret);
     pick = before.length ? raws.indexOf(before[before.length - 1]) : 0;
   }
-  return toStatements(sql)[pick] ?? null;
+  return toStatements(sql, driver)[pick] ?? null;
 }
 
 // ---------------------------------------------------------------- schema model
@@ -1212,7 +1221,7 @@ async function runExecution(
   let fetchMs = 0;
   let rowsTotal = 0;
   let firstError: string | null = null;
-  const stmts = toStatements(sql);
+  const stmts = toStatements(sql, M.oracle ? "oracle" : undefined);
   const range = (s: Statement) => ({
     start: s.start, end: s.end, startChar: s.startChar, endChar: s.endChar, startUtf16: s.startUtf16, endUtf16: s.endUtf16,
   });
@@ -1566,6 +1575,13 @@ export const mockHandlers: Record<string, MockHandler> = {
     ls.remove(P + consoleKey(a.id));
     persistSources();
   }),
+  copy_data_source_password: h((a) => {
+    const to = ds(a.to);
+    const from = ds(a.from);
+    to.hasPassword = from.hasPassword;
+    persistSources();
+    return to;
+  }),
   duplicate_data_source: h((a) => {
     const src = ds(a.id);
     let name = `${src.name} 1`;
@@ -1816,7 +1832,11 @@ export const mockHandlers: Record<string, MockHandler> = {
   // ---- export (no file system in a browser: files are only counted)
   choose_export_path: h((a) => `/mock/${(a.suggestedName as string | null) ?? "export.csv"}`),
   default_export_path: h((a) => `/home/mock/${a.fileName as string}`),
-  approve_export_path: h((a) => !/\/\./.test(a.path as string) && (a.path as string).startsWith("/home/mock/")),
+  approve_export_path: h((a) =>
+    !/\/\./.test(a.path as string) && (a.path as string).startsWith("/home/mock/")
+      ? null
+      : "Only folders below your home folder (/home/mock) are accepted here.",
+  ),
   export_query: h(async (a) => {
     needConn(a.dsId);
     await sleep(100);
@@ -1908,8 +1928,8 @@ export const mockHandlers: Record<string, MockHandler> = {
   }),
 
   // ---- splitter
-  split_statements: h((a) => toStatements(a.sql)),
-  statement_at: h((a) => statementAt(a.sql, a.caretUtf16)),
+  split_statements: h((a) => toStatements(a.sql, a.driver)),
+  statement_at: h((a) => statementAt(a.sql, a.caretUtf16, a.driver)),
 
   // ---- history
   history_list: h((a) =>

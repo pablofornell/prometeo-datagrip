@@ -90,6 +90,49 @@ describe("semantic inspection does not flag valid names", () => {
   });
 });
 
+describe("semantic inspection: CTE column lists, upsert and row aliases", () => {
+  it("recursive CTE with a column list", () => {
+    for (const d of ["postgres", "sqlite", "mysql"] as Dialect[]) {
+      expect(problems("with recursive r(n) as (select 1 union all select n+1 from r where n<5) select n from r", d)).toEqual([]);
+      expect(problems("with x(k) as (select a from t) select k from x", d)).toEqual([]);
+      expect(problems("with x(k) as (select a from t), y as (select k from x) select * from y join x on true", d)).toEqual([]);
+    }
+  });
+  it("PostgreSQL / SQLite ON CONFLICT .. excluded", () => {
+    for (const d of ["postgres", "sqlite"] as Dialect[]) {
+      expect(problems("insert into t (a, name) values (1, 'x') on conflict (a) do update set name = excluded.name", d)).toEqual([]);
+      expect(problems("insert into t (a, name) values (1, 'x') on conflict(a) do update set name = excluded.name where t.a > 1 returning a, name", d)).toEqual([]);
+      expect(problems("insert into t (a) values (1) on conflict do nothing", d)).toEqual([]);
+    }
+  });
+  it("MySQL 8 row alias and VALUES()", () => {
+    expect(problems("insert into t(a) values (1) as nw on duplicate key update a = nw.a", "mysql")).toEqual([]);
+    expect(problems("insert into t(a, b) values (1, 2) as nw(x, y) on duplicate key update a = nw.x, b = nw.y", "mysql")).toEqual([]);
+    expect(problems("insert into t(a) values (1) on duplicate key update a = values(a)", "mysql")).toEqual([]);
+    expect(problems("insert into t(a) select a from u on duplicate key update a = values(a) + 1", "mysql")).toEqual([]);
+  });
+  it("RETURNING, UPDATE .. FROM, MERGE and LATERAL joins", () => {
+    expect(problems("insert into t(a) values (1) returning a, b as k", "postgres")).toEqual([]);
+    expect(problems("update t set a = u.c from u where t.a = u.a returning t.a", "postgres")).toEqual([]);
+    expect(problems("update t set a = c from u where t.a = u.a", "sqlite")).toEqual([]);
+    expect(problems("merge into t as x using u on x.a = u.a when matched then update set b = u.c when not matched then insert (a, b) values (u.a, u.c)", "postgres")).toEqual([]);
+    expect(problems("merge into t using (select a, c from u) s on t.a = s.a when matched then delete", "postgres")).toEqual([]);
+    expect(problems("select t.a, l.c from t cross join lateral (select c from u where u.a = t.a) l", "postgres")).toEqual([]);
+    expect(problems("select t.a, l.c from t left join lateral (select c from u where u.a = t.a limit 1) l on true", "postgres")).toEqual([]);
+    expect(problems("select * from t e, lateral (select count(*) c from u d where d.a = e.a) z limit 1", "postgres")).toEqual([]);
+    expect(problems("select t.a, l.c from t join lateral (select c from u where u.a = t.a) l on true", "mysql")).toEqual([]);
+  });
+  it("still flags what is really unknown", () => {
+    expect(problems("with x(k) as (select a from t) select k from nosuch", "postgres").join()).toContain("Unable to resolve table 'nosuch'");
+    expect(problems("with recursive r(n) as (select 1 union all select n+1 from rr where n<5) select n from r", "postgres").join()).toContain("Unable to resolve table 'rr'");
+    expect(problems("select excluded.a from t", "postgres").join()).toContain("Unable to resolve table 'excluded'");
+    expect(problems("insert into t (a) values (1) on conflict (a) do update set a = nosuch.a", "postgres").join()).toContain("Unable to resolve table 'nosuch'");
+    expect(problems("insert into t(a) values (1) as nw on duplicate key update a = zz.a", "mysql").join()).toContain("Unable to resolve table 'zz'");
+    expect(problems("insert into t(a) values (1) as nw on duplicate key update a = nw.nope", "mysql").join()).toContain("Unable to resolve column 'nope'");
+    expect(problems("insert into nosuch(a) values (1) on conflict (a) do update set a = excluded.a", "postgres").join()).toContain("Unable to resolve table 'nosuch'");
+  });
+});
+
 describe("Oracle", () => {
   const ora = (sql: string) => problems(sql, "oracle");
   it("syntax inspection accepts Oracle constructs", () => {
