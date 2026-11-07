@@ -22,3 +22,10 @@ codegen-units = 1
 opt-level = 3
 strip = true
 panic = "abort"
+
+# Local `make run` builds: release-like speed, much faster rebuilds than the full LTO release profile.
+[profile.fast-release]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+incremental = true

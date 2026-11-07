@@ -2,6 +2,8 @@
 # Run `make` or `make help` to see the targets.
 
 SHELL := /bin/bash
+# A failed recipe must not leave a half-written target that counts as up to date (dist/index.html).
+.DELETE_ON_ERROR:
 .DEFAULT_GOAL := help
 
 # rustup installs cargo in ~/.cargo/bin. A shell started before the install
@@ -50,15 +52,30 @@ install: ## Install the frontend dependencies
 dev: ## Run the app in development mode (Vite + Tauri)
 	$(NPM) run tauri dev
 
-build: ## Build the optimized release binary (no installer bundles)
-	$(NPX) tauri build --no-bundle
+# The frontend bundle is rebuilt only when its sources are newer than dist/index.html.
+# `tauri build` would otherwise run `npm run build` every time; that rewrites dist/ with new
+# timestamps and makes cargo recompile (and fully LTO-relink) the app even when nothing changed.
+# `find src` also lists directories: their mtime changes when a file is added, renamed or deleted.
+# node_modules/.package-lock.json is rewritten by every `npm install`.
+FRONTEND_SRC := $(shell find src) index.html package.json package-lock.json \
+                tsconfig.json vite.config.ts $(wildcard node_modules/.package-lock.json)
+NO_BEFORE_BUILD := --config '{"build":{"beforeBuildCommand":null}}'
+
+dist/index.html: $(FRONTEND_SRC)
+	$(NPM) run build
+
+build: dist/index.html ## Build the optimized release binary (no installer bundles)
+	$(NPX) tauri build --no-bundle $(NO_BEFORE_BUILD)
 	@echo "Binary: target/release/prometeo-datagrip"
 
-bundle: ## Build the release binary and the installer bundles (deb, AppImage, ...)
-	$(NPX) tauri build
+bundle: dist/index.html ## Build the release binary and the installer bundles (deb, AppImage, ...)
+	$(NPX) tauri build $(NO_BEFORE_BUILD)
 
-run: build ## Build the release binary (if changed) and start the app
-	./target/release/prometeo-datagrip
+# `run` uses the fast-release profile (thin LTO, parallel codegen, incremental): close to release
+# speed, but a code change rebuilds in seconds instead of minutes. `build`/`bundle` stay fully optimized.
+run: dist/index.html ## Build a fast-release binary (only if something changed) and start the app
+	$(CARGO) build --profile fast-release --bins --features tauri/custom-protocol -p prometeo-datagrip
+	./target/fast-release/prometeo-datagrip
 
 ## ---- Tests ----
 
