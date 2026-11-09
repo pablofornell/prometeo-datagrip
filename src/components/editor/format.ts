@@ -15,6 +15,29 @@ const JOIN_PART = new Set(["left", "right", "inner", "full", "cross", "natural",
 const BREAK_CLAUSES = new Set(["select", "from", "where", "having", "limit", "offset", "values", "returning", "window", "insert", "delete", "with", "union", "intersect", "except"]);
 const WRAP_COL = 100;
 
+/**
+ * Whether `src` is procedural code the line formatter must not touch: a stored routine / trigger / package body, a
+ * PL/SQL block, or a MySQL DELIMITER script. Reformatting such text would mangle the body, so it is kept as-is.
+ */
+export function isProcedural(src: string, dialect: Dialect): boolean {
+  const t = src.trim();
+  if (!t) return false;
+  // MySQL stored programs start with a DELIMITER directive
+  if (dialect === "mysql" && /^delimiter\b/i.test(t)) return true;
+  const toks = lex(src, dialect);
+  // PostgreSQL dollar-quoted routine bodies (plpgsql, ...): a string token that opens with `$`
+  // (a `$tag$` inside a `'..'` literal is not a body, it is part of an ordinary string token)
+  if (dialect === "postgres" && toks.some((x) => x.kind === "string" && src[x.from] === "$")) return true;
+  // word tokens only (strings and comments are ignored), lower-cased
+  const words = toks.filter((x) => x.kind === "word").map((x) => src.slice(x.from, x.to).toLowerCase());
+  const first = words[0] ?? "";
+  // a CREATE ... FUNCTION / PROCEDURE / TRIGGER / PACKAGE / TYPE with a BEGIN body
+  if (first === "create" && ["function", "procedure", "trigger", "package", "type"].some((w) => words.includes(w)) && words.includes("begin")) return true;
+  // a bare PL/SQL block (Oracle), or a compound statement
+  if (first === "begin" || first === "declare") return true;
+  return false;
+}
+
 interface Frame {
   base: number;
   query: boolean;
@@ -48,6 +71,7 @@ function mergeOps(src: string, toks: Token[]): Token[] {
 }
 
 export function formatStatement(src: string, dialect: Dialect): string {
+  if (isProcedural(src, dialect)) return src;
   const toks = mergeOps(src, lex(src, dialect));
   const frames: Frame[] = [{ base: 0, query: true, clause: "", cont: 0, betweenPending: false }];
   let out = "";

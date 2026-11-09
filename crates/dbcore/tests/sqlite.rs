@@ -278,6 +278,56 @@ async fn introspection_and_ddl() {
 }
 
 #[tokio::test]
+async fn snapshot_has_foreign_keys() {
+    let (_d, _cfg, mgr) = setup().await;
+    let snap = mgr.schema_snapshot("lite", None).await.unwrap();
+    let products = snap.iter().find(|o| o.name == "products").unwrap();
+    assert_eq!(products.foreign_keys.len(), 1);
+    let fk = &products.foreign_keys[0];
+    assert_eq!(fk.columns, vec!["category_id".to_string()]);
+    assert_eq!(fk.ref_schema, "main");
+    assert_eq!(fk.ref_table, "categories");
+    assert_eq!(fk.ref_columns, vec!["id".to_string()]);
+    // a self-referencing FK keeps its direction
+    let categories = snap.iter().find(|o| o.name == "categories").unwrap();
+    assert_eq!(categories.foreign_keys.len(), 1);
+    assert_eq!(
+        categories.foreign_keys[0].columns,
+        vec!["parent_id".to_string()]
+    );
+    assert_eq!(categories.foreign_keys[0].ref_table, "categories");
+    assert_eq!(
+        categories.foreign_keys[0].ref_columns,
+        vec!["id".to_string()]
+    );
+
+    // composite FK: the columns and referenced columns keep their order
+    let s = mgr.open_session("lite").await.unwrap();
+    assert_ok(
+        &run(
+            &mgr,
+            &s,
+            "create table pfk_parent (a int, b int, primary key (a, b));\
+         create table pfk_child (x int, y int, foreign key (x, y) references pfk_parent (a, b));",
+        )
+        .await,
+    );
+    mgr.close_session(&s).await;
+    let snap = mgr.schema_snapshot("lite", None).await.unwrap();
+    let child = snap.iter().find(|o| o.name == "pfk_child").unwrap();
+    assert_eq!(child.foreign_keys.len(), 1);
+    assert_eq!(
+        child.foreign_keys[0].columns,
+        vec!["x".to_string(), "y".to_string()]
+    );
+    assert_eq!(child.foreign_keys[0].ref_table, "pfk_parent");
+    assert_eq!(
+        child.foreign_keys[0].ref_columns,
+        vec!["a".to_string(), "b".to_string()]
+    );
+}
+
+#[tokio::test]
 async fn expression_indexes_keep_their_terms() {
     let (_dir, _cfg, mgr) = setup().await;
     let s = mgr.open_session("lite").await.unwrap();

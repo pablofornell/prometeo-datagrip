@@ -5,6 +5,7 @@
  */
 import { type EditorState, EditorSelection, Facet, StateField } from "@codemirror/state";
 import { type EditorView } from "@codemirror/view";
+import { aliasFor } from "./alias";
 import { quoteIdent } from "./complete";
 import { docAnalysis, LARGE_DOC } from "./highlight";
 import { ORACLE_RESERVED, keywordsFor } from "./keywords";
@@ -73,14 +74,7 @@ export function closest(name: string, candidates: Iterable<string>): string[] {
 }
 
 /** Initials of a table name: `order_items` -> `oi`, `products` -> `p`; made unique against `taken`. */
-export function aliasFor(table: string, taken: Set<string>): string {
-  const parts = table.split(/[^A-Za-z0-9]+/).filter(Boolean);
-  let a = (parts.length > 1 ? parts.map((p) => p[0]).join("") : (parts[0] ?? "t").slice(0, 1)).toLowerCase();
-  if (!/^[a-z_]/.test(a)) a = "t";
-  let alias = a;
-  for (let i = 2; taken.has(alias) || keywordsFor("postgres").has(alias); i++) alias = a + i;
-  return alias;
-}
+export { aliasFor } from "./alias";
 
 interface Ctx {
   st: Statement;
@@ -222,7 +216,7 @@ export function intentionsAt(state: EditorState, pos: number, o: IntentionOption
     const qualifiedElsewhere = sig.some((t, i) => i !== tokIdx && t.kind !== "string" && identName(text.slice(t.from, t.to)) === name && sig[i + 1] && text[sig[i + 1].from] === "." && sig[i + 1].from === t.to);
     if ((prev === "from" || prev === "join" || text[sig[tokIdx - 1].from] === ",") && !hasAlias && !qualifiedElsewhere && !raw.includes(".")) {
       const taken = new Set(an.scope.refs.map((r) => r.alias).filter((x): x is string => !!x));
-      const alias = aliasFor(hit.table.name, taken);
+      const alias = aliasFor(hit.table.name, taken, dialect);
       out.push({ id: "add-alias", label: `Add alias '${alias}'`, kind: "action", apply: (v) => v.dispatch({ changes: { from: tok.to, insert: ` ${alias}` }, userEvent: "input.intention" }) });
     }
   }

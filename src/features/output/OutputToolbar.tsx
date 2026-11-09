@@ -3,7 +3,7 @@ import { Show, type JSX } from "solid-js";
 import { GridToolbar } from "../../components/grid";
 import type { ObjectRef } from "../../api/types";
 import { ActionButton, Icon, type MenuItem, ToolbarSeparator, openMenu, overflowToolbar } from "../../components/ui";
-import { openDdlTab } from "../table/commands";
+import { openDdlTab, openTableTab } from "../table/commands";
 import { EXTRACTORS, copyResult, exportResultData, extractorMenuItems, formatLabel } from "./export";
 import { resultTable } from "../console/title";
 import { PLAN_TAB, currentOutput, type ConsoleOutput, type ResultTab } from "./model";
@@ -77,6 +77,7 @@ function ResultToolbar(props: { out: ConsoleOutput; tab: ResultTab }): JSX.Eleme
         pinned={tab().pinned()}
         onPin={() => tab().setPinned(!tab().pinned())}
         onSql={() => tab().setShowQuery(true)}
+        onOpenInEditor={ddl() ? () => void openTableTab(host()!.dsId, ddl()!) : undefined}
         onDDL={ddl() ? () => void openDdlTab(host()!.dsId, ddl()!) : undefined}
         onExport={tab().rowCount() > 0 || tab().hasMore() ? () => host() && exportResultData(tab(), host()!) : undefined}
         onOptions={(r) =>

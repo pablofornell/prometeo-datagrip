@@ -52,6 +52,12 @@ describe("edit distance", () => {
   it("builds aliases", () => {
     expect(aliasFor("order_items", new Set())).toBe("oi");
     expect(aliasFor("products", new Set(["p"]))).toBe("p2");
+    expect(aliasFor("Foo_Table", new Set())).toBe("ft");
+    expect(aliasFor("FooTable", new Set())).toBe("ft");
+    expect(aliasFor("ORDER_ITEMS", new Set())).toBe("oi");
+    expect(aliasFor("orderItems", new Set())).toBe("oi");
+    expect(aliasFor("My Table", new Set())).toBe("mt");
+    expect(aliasFor("public.user_roles", new Set())).toBe("ur");
   });
 });
 

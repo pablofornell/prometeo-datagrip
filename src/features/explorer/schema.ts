@@ -14,9 +14,14 @@ interface Entry {
   schema: string | null;
   get: Accessor<SnapshotObject[] | undefined>;
   set: Setter<SnapshotObject[] | undefined>;
+  /** Last load failure message, for views that offer a retry (undefined once a load succeeds). */
+  error: Accessor<string | undefined>;
+  setError: Setter<string | undefined>;
   loading?: Promise<SnapshotObject[]>;
   failedAt?: number;
 }
+
+const errorText = (e: unknown): string => (e instanceof Error ? e.message : typeof e === "string" ? e : "The schema could not be loaded.");
 
 const entries = new Map<string, Entry>();
 const RETRY_MS = 5000;
@@ -28,7 +33,8 @@ function entryFor(dsId: string, schema: string | null): Entry {
   let e = entries.get(key);
   if (!e) {
     const [get, set] = createSignal<SnapshotObject[] | undefined>(undefined);
-    e = { dsId, schema, get, set };
+    const [getError, setError] = createSignal<string | undefined>(undefined);
+    e = { dsId, schema, get, set, error: getError, setError };
     entries.set(key, e);
   }
   return e;
@@ -41,10 +47,12 @@ function load(e: Entry): Promise<SnapshotObject[]> {
       await ensureConnected(e.dsId);
       const data = await schemaSnapshot(e.dsId, e.schema);
       e.failedAt = undefined;
+      e.setError(undefined);
       e.set(data);
       return data;
-    } catch {
+    } catch (err) {
       e.failedAt = Date.now();
+      e.setError(errorText(err));
       return e.get() ?? [];
     } finally {
       e.loading = undefined;
@@ -70,6 +78,14 @@ export function loadSchemaSnapshot(dsId: string, schema?: string | null): Promis
   const e = entryFor(dsId, schema ?? null);
   const v = e.get();
   return v !== undefined ? Promise.resolve(v) : load(e);
+}
+
+/**
+ * Reactive last load error of the snapshot (undefined while never failed / after a success). Additive: existing
+ * callers keep using `schemaSnapshotFor`; views that can offer a retry read this.
+ */
+export function schemaSnapshotErrorFor(dsId: string, schema?: string | null): string | undefined {
+  return entryFor(dsId, schema ?? null).error();
 }
 
 /** Reloads the snapshots of a data source that were requested before (called on refresh). */

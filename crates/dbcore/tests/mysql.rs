@@ -917,6 +917,49 @@ async fn table_data_and_edit() {
 }
 
 #[tokio::test]
+async fn schema_snapshot_has_foreign_keys() {
+    let (_cfg, mgr) = setup!();
+    let snap = mgr.schema_snapshot("my", Some("demo")).await.unwrap();
+    let fk_of = |t: &str| {
+        snap.iter()
+            .find(|o| o.name == t)
+            .unwrap()
+            .foreign_keys
+            .clone()
+    };
+
+    // order_items -> orders / products (named constraints, column order kept)
+    let oi = fk_of("order_items");
+    assert_eq!(
+        oi.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+        ["fk_items_order", "fk_items_product"]
+    );
+    assert_eq!(oi[0].columns, vec!["order_id".to_string()]);
+    assert_eq!(
+        (oi[0].ref_schema.as_str(), oi[0].ref_table.as_str()),
+        ("demo", "orders")
+    );
+    assert_eq!(oi[0].ref_columns, vec!["id".to_string()]);
+    assert_eq!(oi[1].columns, vec!["product_id".to_string()]);
+    assert_eq!(oi[1].ref_table, "products");
+
+    // products -> categories, orders -> customers, categories -> categories (self reference)
+    assert_eq!(fk_of("products")[0].name, "fk_products_category");
+    assert_eq!(fk_of("products")[0].ref_table, "categories");
+    let orders = fk_of("orders");
+    assert_eq!(orders.len(), 1);
+    assert_eq!(
+        (orders[0].name.as_str(), orders[0].ref_table.as_str()),
+        ("fk_orders_customer", "customers")
+    );
+    let cats = fk_of("categories");
+    assert_eq!(
+        (cats[0].ref_table.as_str(), cats[0].columns.clone()),
+        ("categories", vec!["parent_id".to_string()])
+    );
+}
+
+#[tokio::test]
 async fn export_and_benchmark() {
     let (_cfg, mgr) = setup!();
     let t = Instant::now();

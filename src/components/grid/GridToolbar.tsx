@@ -146,7 +146,6 @@ export function GridToolbar(props: GridToolbarProps): JSX.Element {
         { label: "Transpose", primary: true, checked: !!props.transposed, disabled: !props.onTransposeChange, onSelect: () => props.onTransposeChange?.(!props.transposed) },
         { separator: true },
         { label: "Table", checked: mode() === "table", onSelect: pick("table") },
-        { label: "Tree", disabled: true },
         { label: "Text", checked: mode() === "text", onSelect: pick("text") },
       ],
     });

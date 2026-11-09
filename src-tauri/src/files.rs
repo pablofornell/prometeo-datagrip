@@ -187,8 +187,9 @@ impl FileAccess {
         }
     }
 
-    /// The canonical path of `path` when the policy allows it, else the reason it is refused.
-    fn resolve(&self, path: &str) -> Result<PathBuf, String> {
+    /// The canonical path of `path` when the policy allows it, else the reason it is refused. Also the gate of the
+    /// script runner (`run_sql_file`): a script runs only from a file the user granted, like an editor file.
+    pub fn resolve(&self, path: &str) -> Result<PathBuf, String> {
         let canon = fs::canonicalize(path).map_err(|e| format!("Cannot open {path}: {e}"))?;
         if canon.starts_with(self.scratch_dir()?) {
             return Ok(canon);
@@ -448,6 +449,18 @@ mod tests {
             .contains("changed on disk"));
         fa.write(&path, "bb", Some(m)).unwrap();
         assert_eq!(fs::read_to_string(proj.join("b.sql")).unwrap(), "bb");
+    }
+
+    #[test]
+    fn a_script_runs_only_from_a_granted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let fa = access(dir.path());
+        let script = dir.path().join("dump.sql");
+        fs::write(&script, "select 1;").unwrap();
+        let p = script.display().to_string();
+        assert!(fa.resolve(&p).unwrap_err().contains("Refusing"));
+        fa.approve_file(&script).unwrap();
+        assert_eq!(fa.resolve(&p).unwrap(), fs::canonicalize(&script).unwrap());
     }
 
     #[test]

@@ -164,6 +164,10 @@ export function ConfigEditor(props: { cfg: RunConfig; onChange: (c: RunConfig) =
             </For>
           </div>
         </div>
+        <div class="dgr-row dgr-options">
+          <Checkbox checked={c().stopOnError} label="Stop on error" onChange={(v) => set({ stopOnError: v })} />
+          <Checkbox checked={c().singleTransaction} label="Single transaction" onChange={(v) => set({ singleTransaction: v })} />
+        </div>
       </Show>
 
       <div class="dgr-before">

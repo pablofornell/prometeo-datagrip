@@ -5,10 +5,11 @@
 use std::path::PathBuf;
 
 use dbcore::{
-    ApplyResult, ConnectInfo, DataSourceConfig, Driver, ExecEvent, ExecOptions, ExplainPlan,
-    ExportFormat, ExportOptions, FetchedRows, HistoryEntry, ImportFormat, ImportPreview,
-    ImportProgress, ImportRequest, ImportResult, ObjectRef, ResultSet, RowChange, SessionState,
-    SnapshotObject, Statement, TableDataRequest, TestResult, TreeNode, TxStatus,
+    ApplyResult, ConnectInfo, DataSourceConfig, Driver, DumpOptions, DumpProgress, DumpResult,
+    ExecEvent, ExecOptions, ExplainPlan, ExportFormat, ExportOptions, ExportProgress, ExportReport,
+    FetchedRows, HistoryEntry, ImportFormat, ImportPreview, ImportProgress, ImportRequest,
+    ImportResult, ObjectRef, ResultSet, RowChange, ScriptOptions, ScriptProgress, ScriptSummary,
+    SessionState, SnapshotObject, Statement, TableDataRequest, TestResult, TreeNode, TxStatus,
 };
 use serde_json::Value;
 use tauri::ipc::Channel;
@@ -58,6 +59,78 @@ pub async fn copy_data_source_password(
     to: String,
 ) -> Res<DataSourceView> {
     state.copy_data_source_password(&from, &to).await
+}
+
+/// Write the data sources `ids` (all when absent or empty) to `path`, a path from `choose_export_path`. The file
+/// never holds a password or token, only a `hasPassword` flag. Returns how many were written.
+#[tauri::command]
+pub async fn export_data_sources(
+    state: State<'_, AppState>,
+    ids: Option<Vec<String>>,
+    path: String,
+) -> Res<usize> {
+    state.export_data_sources(ids, &PathBuf::from(path)).await
+}
+
+/// Create data sources from an export file, a path from `choose_open_json`: new ids, names made unique
+/// (`name (2)`), no passwords (the summary says which ones need one).
+#[tauri::command]
+pub async fn import_data_sources(
+    state: State<'_, AppState>,
+    path: String,
+) -> Res<crate::store::ImportSummary> {
+    state.import_data_sources(&path).await
+}
+
+/// Same as `import_data_sources` for the text of an export (the clipboard).
+#[tauri::command]
+pub async fn import_data_sources_text(
+    state: State<'_, AppState>,
+    text: String,
+) -> Res<crate::store::ImportSummary> {
+    state.import_data_sources_text(text).await
+}
+
+/// Write the IDE settings object the UI built (settings, keymap, color scheme, layout; no data sources, no
+/// secrets) to `path`, a path from `choose_export_path`.
+#[tauri::command]
+pub async fn export_settings(state: State<'_, AppState>, settings: Value, path: String) -> Res<()> {
+    state.export_settings(settings, &PathBuf::from(path)).await
+}
+
+/// The settings object of a settings export file, a path from `choose_open_json`.
+#[tauri::command]
+pub async fn import_settings(state: State<'_, AppState>, path: String) -> Res<Value> {
+    state.import_settings(&path).await
+}
+
+/// Open the native "Open" dialog for a JSON export file and return the chosen path (`null` = cancelled). Only a
+/// path returned here is read by `import_data_sources` / `import_settings`.
+#[tauri::command]
+pub async fn choose_open_json(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Res<Option<String>> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_parent(&window)
+        .add_filter("JSON", &["json"])
+        .add_filter("All files", &["*"])
+        .pick_file(move |p| {
+            let _ = tx.send(p);
+        });
+    let Some(chosen) = rx
+        .await
+        .map_err(|_| "The open dialog was closed".to_string())?
+    else {
+        return Ok(None);
+    };
+    let path = chosen.into_path().map_err(|e| e.to_string())?;
+    state.allow_import_path(path.clone());
+    Ok(Some(path.display().to_string()))
 }
 
 #[tauri::command]
@@ -455,7 +528,9 @@ pub async fn approve_export_path(
     }
 }
 
-/// `path` must come from `choose_export_path`.
+/// `path` must come from `choose_export_path`. `exportId` (unique per export) lets `cancel_export` stop it;
+/// `onProgress` gets the rows written at most every 100 ms or 1000 rows, and once at the end. The report counts the characters a Windows-1252 file
+/// could not hold (written as `?`).
 #[tauri::command]
 pub async fn export_query(
     state: State<'_, AppState>,
@@ -463,9 +538,20 @@ pub async fn export_query(
     sql: String,
     options: ExportOptions,
     path: String,
-) -> Res<usize> {
+    export_id: String,
+    on_progress: Channel<ExportProgress>,
+) -> Res<ExportReport> {
     state
-        .export_query(&ds_id, &sql, options, &PathBuf::from(path))
+        .export_query_with(
+            &ds_id,
+            &sql,
+            options,
+            &PathBuf::from(path),
+            Some(&export_id),
+            move |p| {
+                let _ = on_progress.send(p);
+            },
+        )
         .await
 }
 
@@ -479,17 +565,34 @@ pub async fn export_query_to_string(
     state.export_query_to_string(&ds_id, &sql, options).await
 }
 
-/// `path` must come from `choose_export_path`.
+/// `path` must come from `choose_export_path`. `exportId` / `onProgress` / the report as in `export_query`.
 #[tauri::command]
 pub async fn export_result(
     state: State<'_, AppState>,
     result: ResultSet,
     options: ExportOptions,
     path: String,
-) -> Res<usize> {
+    export_id: String,
+    on_progress: Channel<ExportProgress>,
+) -> Res<ExportReport> {
     state
-        .export_result(result, options, PathBuf::from(path))
+        .export_result_with(
+            result,
+            options,
+            PathBuf::from(path),
+            Some(&export_id),
+            move |p| {
+                let _ = on_progress.send(p);
+            },
+        )
         .await
+}
+
+/// Stops the export `export_id` (its `export_query` / `export_result` then fails and leaves no file behind).
+#[tauri::command]
+pub async fn cancel_export(state: State<'_, AppState>, export_id: String) -> Res<()> {
+    state.cancel_export(&export_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -589,6 +692,92 @@ pub async fn import_file(
 #[tauri::command]
 pub async fn cancel_import(state: State<'_, AppState>, import_id: String) -> Res<()> {
     state.cancel_import(&import_id);
+    Ok(())
+}
+
+// ---------------------------------------------------------------- SQL dump
+
+/// Dumps the objects of `schema` (PostgreSQL schema, MySQL database, SQLite `main`) to `path`, a file from
+/// `choose_export_path` (format `sqlInsert`). `dump_id` (unique per dump) lets `cancel_dump` stop it; `progress`
+/// gets a [`DumpProgress`] per phase and per data batch. A cancelled or failed dump leaves no file.
+#[tauri::command]
+pub async fn dump_schema(
+    state: State<'_, AppState>,
+    ds_id: String,
+    schema: String,
+    options: DumpOptions,
+    path: String,
+    dump_id: String,
+    progress: Channel<DumpProgress>,
+) -> Res<DumpResult> {
+    state
+        .dump_schema(
+            &ds_id,
+            &schema,
+            options,
+            &dump_id,
+            &PathBuf::from(path),
+            move |p| {
+                let _ = progress.send(p);
+            },
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn cancel_dump(state: State<'_, AppState>, dump_id: String) -> Res<()> {
+    state.cancel_dump(&dump_id);
+    Ok(())
+}
+
+/// Opens the folder of a file that a finished dump of this session wrote ("Open Folder" of its notification).
+/// Any other path is refused: the webview cannot make the backend open an arbitrary folder.
+#[tauri::command]
+pub async fn open_dump_folder(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> Res<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let folder = state.dump_folder(&path)?;
+    app.opener()
+        .open_path(folder.display().to_string(), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------- SQL scripts (run a script file)
+
+/// Runs the SQL script file `path` on a data source, in `schema` when given. `path` must be a file the user granted
+/// (`choose_open_files`, or a file of an attached folder or of the scratches). `script_id` (unique per run) lets
+/// `cancel_script` stop it; `on_progress` gets a [`ScriptProgress`] about every 100 ms. The summary counts the
+/// statements that ran and that failed, and gives the first error with its line.
+#[tauri::command]
+pub async fn run_sql_file(
+    state: State<'_, AppState>,
+    ds_id: String,
+    script_id: String,
+    schema: Option<String>,
+    path: String,
+    opts: ScriptOptions,
+    on_progress: Channel<ScriptProgress>,
+) -> Res<ScriptSummary> {
+    state
+        .run_sql_file(
+            &ds_id,
+            &script_id,
+            schema.as_deref(),
+            &path,
+            opts,
+            move |p| {
+                let _ = on_progress.send(p);
+            },
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn cancel_script(state: State<'_, AppState>, script_id: String) -> Res<()> {
+    state.cancel_script(&script_id);
     Ok(())
 }
 

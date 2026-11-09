@@ -8,16 +8,19 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dbcore::import::CancellationToken;
 use dbcore::{
-    export_result, export_to_string, ApplyResult, ConnectInfo, ConnectionManager, DataSourceConfig,
-    Driver, ExecEvent, ExecOptions, ExecutionId, ExplainPlan, ExportOptions, FetchedRows,
+    export_result_with, export_to_string, ApplyResult, ConnectInfo, ConnectionManager,
+    DataSourceConfig, Driver, DumpOptions, DumpProgress, DumpResult, ExecEvent, ExecOptions,
+    ExecutionId, ExplainPlan, ExportOptions, ExportProgress, ExportReport, FetchedRows,
     HistoryEntry, ImportFormat, ImportPreview, ImportProgress, ImportRequest, ImportResult,
-    ObjectRef, QueryHistory, ResultSet, RowChange, SessionId, SessionState, SnapshotObject,
-    Statement, TableDataRequest, TestResult, TreeNode, TxStatus,
+    ObjectRef, QueryHistory, ResultSet, RowChange, ScriptOptions, ScriptProgress, ScriptSummary,
+    SessionId, SessionState, SnapshotObject, Statement, TableDataRequest, TestResult, TreeNode,
+    TxStatus,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -35,8 +38,9 @@ pub struct AppInfo {
     pub version: String,
     pub config_dir: String,
     pub data_dir: String,
-    /// Where new passwords are stored: the OS keyring when reachable, otherwise the JSON file.
-    pub password_storage: PasswordStorage,
+    /// Where new passwords are stored: the OS keyring when reachable, otherwise the JSON file. `null` until
+    /// something needed the keyring (a password was saved or migrated): the app does not probe it at every launch.
+    pub password_storage: Option<PasswordStorage>,
     /// Files that were corrupt at startup and set aside (`<file>.corrupt-<ts>`); the app started with an
     /// empty one. Show them once. Empty in the normal case.
     pub startup_warnings: Vec<StartupNotice>,
@@ -47,6 +51,9 @@ const EXPORT_PATH_TTL: Duration = Duration::from_secs(300);
 
 /// How long a `cancel_import` for an unknown id waits for its `import_file`.
 const EARLY_CANCEL_TTL: Duration = Duration::from_secs(30);
+
+/// How many finished SQL dump files `open_dump_folder` may open the folder of.
+const DUMPS_KEPT: usize = 20;
 
 /// Permission to write one export file.
 struct ExportGrant {
@@ -73,6 +80,96 @@ impl ExportTarget {
             dbcore::fsutil::create_new_nofollow(&self.path)
         };
         f.map_err(|e| format!("Cannot create {}: {e}", self.path.display()))
+    }
+
+    /// Opens the file the output is written to: a new one next to the target (see [`PartFile`]); the target itself is
+    /// not touched before [`commit`](Self::commit). Refuses at once what `commit` would refuse: a target that exists
+    /// unless `replace`.
+    pub fn create_part(&self) -> Result<(File, PartFile), String> {
+        if !self.replace && std::fs::symlink_metadata(&self.path).is_ok() {
+            return Err(format!(
+                "Cannot create {}: the file exists already",
+                self.path.display()
+            ));
+        }
+        let name = self
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "export".into());
+        let part = self.path.with_file_name(format!(
+            ".{name}.part-{}-{}",
+            std::process::id(),
+            PART_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = dbcore::fsutil::create_new_nofollow(&part)
+            .map_err(|e| format!("Cannot create {}: {e}", self.path.display()))?;
+        Ok((
+            file,
+            PartFile {
+                path: part,
+                committed: false,
+            },
+        ))
+    }
+
+    /// Puts the finished `part` (closed) in the place of the target. A new file never replaces one that appeared in
+    /// the meantime. On an error `part` is removed and the target is as it was.
+    pub fn commit(&self, mut part: PartFile) -> Result<(), String> {
+        let fail = |e: std::io::Error| format!("Cannot write {}: {e}", self.path.display());
+        if self.replace {
+            std::fs::rename(&part.path, &self.path).map_err(fail)?;
+            part.committed = true;
+            return Ok(());
+        }
+        // the link fails when the name is taken, which `rename` would not
+        match std::fs::hard_link(&part.path, &self.path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(fail(e)),
+            // a file system without hard links: check, then move
+            Err(_) if std::fs::symlink_metadata(&self.path).is_err() => {
+                std::fs::rename(&part.path, &self.path).map_err(fail)?;
+                part.committed = true;
+                Ok(())
+            }
+            Err(e) => Err(fail(e)),
+        }
+    }
+}
+
+/// A file written next to its target (`.<name>.part-<n>`) and moved over the target only when the export succeeded: one
+/// that fails or is cancelled must not take the file it was going to replace with it. Dropping a `PartFile` that was not
+/// committed removes it (close the file first: Windows cannot remove an open one).
+pub struct PartFile {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl PartFile {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PartFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+static PART_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Removes an export id from the running exports however the export ends.
+struct RegisteredExport<'a> {
+    exports: &'a Mutex<HashMap<String, CancellationToken>>,
+    id: String,
+}
+
+impl Drop for RegisteredExport<'_> {
+    fn drop(&mut self) {
+        self.exports.lock().unwrap().remove(&self.id);
     }
 }
 
@@ -109,8 +206,17 @@ pub struct AppState {
     import_paths: Mutex<HashMap<PathBuf, Instant>>,
     /// import id -> cancellation token of a running import.
     imports: Mutex<HashMap<String, CancellationToken>>,
-    /// import id -> when `cancel_import` named it before `import_file` registered it (see [`AppState::cancel_import`]).
+    /// export id -> cancellation token of a running export (`export_query` / `export_result` with an id).
+    exports: Mutex<HashMap<String, CancellationToken>>,
+    /// import or export id -> when `cancel_import` / `cancel_export` named it before its call registered it (see
+    /// [`AppState::cancel_import`]).
     early_cancels: Mutex<HashMap<String, Instant>>,
+    /// dump id -> cancellation token of a running SQL dump (`dump_schema`).
+    dumps: Mutex<HashMap<String, CancellationToken>>,
+    /// Files that finished SQL dumps wrote in this session: `open_dump_folder` opens only their folders.
+    dumped: Mutex<Vec<PathBuf>>,
+    /// script id -> cancellation token of a running SQL script (`run_sql_file`).
+    scripts: Mutex<HashMap<String, CancellationToken>>,
 }
 
 /// Run blocking work (file IO, keyring) off the async workers.
@@ -214,13 +320,17 @@ impl AppState {
             export_paths: Mutex::new(HashMap::new()),
             import_paths: Mutex::new(HashMap::new()),
             imports: Mutex::new(HashMap::new()),
+            exports: Mutex::new(HashMap::new()),
             early_cancels: Mutex::new(HashMap::new()),
+            dumps: Mutex::new(HashMap::new()),
+            dumped: Mutex::new(Vec::new()),
+            scripts: Mutex::new(HashMap::new()),
         })
     }
 
     pub async fn app_info(&self) -> Result<AppInfo, String> {
         let sources = self.sources.clone();
-        let password_storage = blocking(move || Ok(sources.default_storage())).await?;
+        let password_storage = blocking(move || Ok(sources.known_storage())).await?;
         Ok(AppInfo {
             name: "Prometeo DataGrip".into(),
             version: env!("CARGO_PKG_VERSION").into(),
@@ -288,6 +398,88 @@ impl AppState {
     ) -> Result<DataSourceView, String> {
         let (sources, from, to) = (self.sources.clone(), from.to_string(), to.to_string());
         blocking(move || sources.copy_password(&from, &to)).await
+    }
+
+    // ------------------------------------------------------------ export / import of data sources and settings
+
+    /// Write `text` to a file the user picked in the save dialog (`choose_export_path`).
+    async fn write_export_text(&self, path: &Path, text: String) -> Result<(), String> {
+        let target = self.take_export_path(path)?;
+        blocking(move || {
+            let mut file = target.create()?;
+            file.write_all(text.as_bytes())
+                .and_then(|_| file.flush())
+                .map_err(|e| {
+                    let _ = std::fs::remove_file(&target.path);
+                    format!("Cannot write {}: {e}", target.path.display())
+                })
+        })
+        .await
+    }
+
+    /// Read a JSON export file the user picked in the open dialog (`choose_open_json`).
+    async fn read_export_text(&self, path: &str) -> Result<String, String> {
+        let path = self.check_import_path(path)?;
+        blocking(move || {
+            let len = std::fs::metadata(&path)
+                .map_err(|e| format!("Cannot read {}: {e}", path.display()))?
+                .len();
+            if len > crate::store::MAX_EXPORT_FILE {
+                return Err(format!(
+                    "{} is too big to be an export file.",
+                    path.display()
+                ));
+            }
+            std::fs::read_to_string(&path)
+                .map_err(|e| format!("Cannot read {}: {e}", path.display()))
+        })
+        .await
+    }
+
+    /// Write the data sources `ids` (all when empty) to `path` (from `choose_export_path`) without passwords.
+    /// Returns how many were written.
+    pub async fn export_data_sources(
+        &self,
+        ids: Option<Vec<String>>,
+        path: &Path,
+    ) -> Result<usize, String> {
+        let sources = self.sources.clone();
+        let (text, n) = blocking(move || sources.export_json(ids.as_deref())).await?;
+        self.write_export_text(path, text).await?;
+        Ok(n)
+    }
+
+    /// Create data sources from an export file (from `choose_open_json`).
+    pub async fn import_data_sources(
+        &self,
+        path: &str,
+    ) -> Result<crate::store::ImportSummary, String> {
+        let text = self.read_export_text(path).await?;
+        self.import_data_sources_text(text).await
+    }
+
+    /// Create data sources from the text of an export file (the clipboard).
+    pub async fn import_data_sources_text(
+        &self,
+        text: String,
+    ) -> Result<crate::store::ImportSummary, String> {
+        if text.len() as u64 > crate::store::MAX_EXPORT_FILE {
+            return Err("The text is too big to be a data sources export.".into());
+        }
+        let sources = self.sources.clone();
+        blocking(move || sources.import_json(&text)).await
+    }
+
+    /// Write the IDE settings the UI collected (settings, keymap, color scheme, layout) to `path`.
+    pub async fn export_settings(&self, settings: Value, path: &Path) -> Result<(), String> {
+        let text = crate::store::settings_document(settings)?;
+        self.write_export_text(path, text).await
+    }
+
+    /// The settings object of a settings export file (from `choose_open_json`).
+    pub async fn import_settings(&self, path: &str) -> Result<Value, String> {
+        let text = self.read_export_text(path).await?;
+        crate::store::parse_settings_document(&text)
     }
 
     pub async fn test_connection(&self, cfg: DataSourceConfig) -> Result<TestResult, String> {
@@ -626,6 +818,48 @@ impl AppState {
         }
     }
 
+    /// Registers `export_id` as running (its token is cancelled at once when `cancel_export` named it before).
+    /// An id that is running already is refused. `None`: nothing is registered and the export cannot be cancelled.
+    fn begin_export(
+        &self,
+        export_id: Option<&str>,
+    ) -> Result<(Option<RegisteredExport<'_>>, CancellationToken), String> {
+        let token = CancellationToken::new();
+        let Some(id) = export_id else {
+            return Ok((None, token));
+        };
+        let mut exports = self.exports.lock().unwrap();
+        if exports.contains_key(id) {
+            return Err(format!("The export id {id} is in use already"));
+        }
+        exports.insert(id.to_string(), token.clone());
+        let mut early = self.early_cancels.lock().unwrap();
+        early.retain(|_, t| t.elapsed() < EARLY_CANCEL_TTL);
+        if early.remove(id).is_some() {
+            token.cancel();
+        }
+        let registered = RegisteredExport {
+            exports: &self.exports,
+            id: id.to_string(),
+        };
+        Ok((Some(registered), token))
+    }
+
+    /// Cancels the running export `export_id`, or remembers the cancel for a few seconds when it has not
+    /// registered yet (see [`AppState::cancel_import`]). A no-op once the export ended.
+    pub fn cancel_export(&self, export_id: &str) {
+        let exports = self.exports.lock().unwrap();
+        if let Some(t) = exports.get(export_id) {
+            t.cancel();
+            return;
+        }
+        let mut early = self.early_cancels.lock().unwrap();
+        early.retain(|_, t| t.elapsed() < EARLY_CANCEL_TTL);
+        if early.len() < 64 {
+            early.insert(export_id.to_string(), Instant::now());
+        }
+    }
+
     /// Stream every row of `sql` to `path` (a path from [`allow_export_path`](Self::allow_export_path)).
     /// Returns the number of rows written.
     pub async fn export_query(
@@ -635,19 +869,37 @@ impl AppState {
         opts: ExportOptions,
         path: &Path,
     ) -> Result<usize, String> {
+        Ok(self
+            .export_query_with(ds_id, sql, opts, path, None, |_| {})
+            .await?
+            .rows)
+    }
+
+    /// `export_query` with an export id (for `cancel_export`), progress events and the report (rows written and
+    /// the characters a Windows-1252 file could not hold). A cancelled or failed export leaves no file behind.
+    pub async fn export_query_with(
+        &self,
+        ds_id: &str,
+        sql: &str,
+        opts: ExportOptions,
+        path: &Path,
+        export_id: Option<&str>,
+        progress: impl Fn(ExportProgress) + Send + Sync,
+    ) -> Result<ExportReport, String> {
+        let (_registered, token) = self.begin_export(export_id)?;
         let target = self.take_export_path(path)?;
-        let path = target.path.as_path();
-        let file = target.create()?;
+        let (file, part) = target.create_part()?;
         let mut w = BufWriter::new(file);
-        let res = self.mgr.export_query(ds_id, sql, &opts, &mut w).await;
+        let res = self
+            .mgr
+            .export_query_with(ds_id, sql, &opts, &mut w, &token, progress)
+            .await;
         let res = res
             .map_err(String::from)
-            .and_then(|n| w.flush().map(|_| n).map_err(|e| format!("I/O error: {e}")));
-        if res.is_err() {
-            drop(w);
-            let _ = std::fs::remove_file(path);
-        }
-        res
+            .and_then(|r| w.flush().map(|_| r).map_err(|e| format!("I/O error: {e}")));
+        // closed before it is moved (or removed) on Windows
+        drop(w);
+        res.and_then(|r| target.commit(part).map(|_| r))
     }
 
     pub async fn export_query_to_string(
@@ -691,13 +943,32 @@ impl AppState {
         opts: ExportOptions,
         path: PathBuf,
     ) -> Result<usize, String> {
+        Ok(self
+            .export_result_with(rs, opts, path, None, |_| {})
+            .await?
+            .rows)
+    }
+
+    /// `export_result` with an export id (for `cancel_export`), progress events and the report. A cancelled or
+    /// failed export leaves no file behind.
+    pub async fn export_result_with(
+        &self,
+        rs: ResultSet,
+        opts: ExportOptions,
+        path: PathBuf,
+        export_id: Option<&str>,
+        progress: impl Fn(ExportProgress) + Send + Sync + 'static,
+    ) -> Result<ExportReport, String> {
+        let (_registered, token) = self.begin_export(export_id)?;
         let target = self.take_export_path(&path)?;
         blocking(move || {
-            let file = target.create()?;
+            let (file, part) = target.create_part()?;
             let mut w = BufWriter::new(file);
-            let n = export_result(&rs, &opts, &mut w).map_err(String::from)?;
-            w.flush().map_err(|e| format!("I/O error: {e}"))?;
-            Ok(n)
+            let res =
+                export_result_with(&rs, &opts, &mut w, &token, progress).map_err(String::from);
+            let res = res.and_then(|r| w.flush().map(|_| r).map_err(|e| format!("I/O error: {e}")));
+            drop(w);
+            res.and_then(|r| target.commit(part).map(|_| r))
         })
         .await
     }
@@ -816,6 +1087,152 @@ impl AppState {
         early.retain(|_, t| t.elapsed() < EARLY_CANCEL_TTL);
         if early.len() < 64 {
             early.insert(import_id.to_string(), Instant::now());
+        }
+    }
+
+    // ------------------------------------------------------------ SQL dump
+
+    /// Dumps the objects of `schema` to `path` (a path from [`allow_export_path`](Self::allow_export_path), once).
+    /// `dump_id` (unique per dump) lets [`cancel_dump`](Self::cancel_dump) stop it. A cancelled or failed dump
+    /// leaves no file behind; `progress` gets one event per phase and per data batch.
+    pub async fn dump_schema(
+        &self,
+        ds_id: &str,
+        schema: &str,
+        opts: DumpOptions,
+        dump_id: &str,
+        path: &Path,
+        progress: impl Fn(DumpProgress) + Send + Sync,
+    ) -> Result<DumpResult, String> {
+        let token = CancellationToken::new();
+        {
+            // the `dumps` lock is held while the id is registered, as in `import_file`
+            let mut dumps = self.dumps.lock().unwrap();
+            if dumps.contains_key(dump_id) {
+                return Err(format!("The dump id {dump_id} is in use already"));
+            }
+            dumps.insert(dump_id.to_string(), token.clone());
+            let mut early = self.early_cancels.lock().unwrap();
+            early.retain(|_, t| t.elapsed() < EARLY_CANCEL_TTL);
+            if early.remove(dump_id).is_some() {
+                token.cancel();
+            }
+        }
+        // removes the registration however this function ends
+        struct Registered<'a>(&'a Mutex<HashMap<String, CancellationToken>>, &'a str);
+        impl Drop for Registered<'_> {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().remove(self.1);
+            }
+        }
+        let _registered = Registered(&self.dumps, dump_id);
+
+        let target = self.take_export_path(path)?;
+        let (file, part) = target.create_part()?;
+        // `file` is moved into the dump and closed when it returns, so the part can be moved or removed on Windows too
+        let res = self
+            .mgr
+            .dump_schema(ds_id, schema, &opts, &token, &progress, file)
+            .await
+            .map_err(String::from);
+        match res {
+            Ok(r) if !r.cancelled => {
+                target.commit(part)?;
+                let mut dumped = self.dumped.lock().unwrap();
+                dumped.push(target.path.clone());
+                let excess = dumped.len().saturating_sub(DUMPS_KEPT);
+                dumped.drain(..excess);
+                Ok(r)
+            }
+            // a cancelled or failed dump: `part` is removed when it goes out of scope, the target stays as it was
+            other => other,
+        }
+    }
+
+    /// Rolls a running dump back (its file is removed). Like [`cancel_import`](Self::cancel_import), an id that is
+    /// not running (yet) is remembered for a few seconds; a no-op once the dump ended.
+    pub fn cancel_dump(&self, dump_id: &str) {
+        let dumps = self.dumps.lock().unwrap();
+        if let Some(t) = dumps.get(dump_id) {
+            t.cancel();
+            return;
+        }
+        let mut early = self.early_cancels.lock().unwrap();
+        early.retain(|_, t| t.elapsed() < EARLY_CANCEL_TTL);
+        if early.len() < 64 {
+            early.insert(dump_id.to_string(), Instant::now());
+        }
+    }
+
+    /// The folder of a file that a finished dump of this session wrote (the "Open Folder" action of its
+    /// notification). Any other path is refused.
+    pub fn dump_folder(&self, path: &str) -> Result<PathBuf, String> {
+        let dumped = self.dumped.lock().unwrap();
+        dumped
+            .iter()
+            .find(|p| p.as_path() == Path::new(path))
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .ok_or_else(|| format!("Refusing to open the folder of {path}: no SQL dump of this session wrote that file"))
+    }
+
+    // ------------------------------------------------------------ SQL scripts
+
+    /// Runs the script file `path` on a data source. `path` must be a file the user granted (opened in the open
+    /// dialog, or inside an attached folder, see `files.rs`). `script_id` (unique per run) lets
+    /// [`cancel_script`](Self::cancel_script) stop it. Like `dump_schema`, the id is registered before anything else
+    /// happens, so a cancel cannot slip in between.
+    pub async fn run_sql_file(
+        &self,
+        ds_id: &str,
+        script_id: &str,
+        schema: Option<&str>,
+        path: &str,
+        opts: ScriptOptions,
+        progress: impl FnMut(ScriptProgress),
+    ) -> Result<ScriptSummary, String> {
+        let token = CancellationToken::new();
+        {
+            // the `scripts` lock is held while the id is registered, as in `dump_schema`
+            let mut scripts = self.scripts.lock().unwrap();
+            if scripts.contains_key(script_id) {
+                return Err(format!("The script id {script_id} is in use already"));
+            }
+            scripts.insert(script_id.to_string(), token.clone());
+            let mut early = self.early_cancels.lock().unwrap();
+            early.retain(|_, t| t.elapsed() < EARLY_CANCEL_TTL);
+            if early.remove(script_id).is_some() {
+                token.cancel();
+            }
+        }
+        // removes the registration however this function ends
+        struct Registered<'a>(&'a Mutex<HashMap<String, CancellationToken>>, &'a str);
+        impl Drop for Registered<'_> {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().remove(self.1);
+            }
+        }
+        let _registered = Registered(&self.scripts, script_id);
+
+        let path = self.files.resolve(path)?;
+        self.mgr
+            .run_sql_file(ds_id, schema, &path, &opts, &token, progress)
+            .await
+            .map_err(String::from)
+    }
+
+    /// Stops a running script: the statement in progress is interrupted and the rest is not run. Like
+    /// [`cancel_dump`](Self::cancel_dump), an id that is not running (yet) is remembered for a few seconds; a no-op
+    /// once the script ended.
+    pub fn cancel_script(&self, script_id: &str) {
+        let scripts = self.scripts.lock().unwrap();
+        if let Some(t) = scripts.get(script_id) {
+            t.cancel();
+            return;
+        }
+        let mut early = self.early_cancels.lock().unwrap();
+        early.retain(|_, t| t.elapsed() < EARLY_CANCEL_TTL);
+        if early.len() < 64 {
+            early.insert(script_id.to_string(), Instant::now());
         }
     }
 
@@ -985,5 +1402,481 @@ mod tests {
         assert!(err.contains("in use already"), "{err}");
         // the refused call did not drop the first import's registration
         assert!(s.imports.lock().unwrap().contains_key("run"));
+    }
+
+    #[test]
+    fn a_script_runs_only_from_a_granted_file_and_leaves_no_registration() {
+        let (s, dir) = state();
+        let script = dir.path().join("dump.sql");
+        std::fs::write(&script, "select 1;").unwrap();
+        let rt = runtime();
+        // not granted: refused before anything connects
+        let path = script.display().to_string();
+        let err = rt
+            .block_on(s.run_sql_file("ds", "s1", None, &path, Default::default(), |_| {}))
+            .unwrap_err();
+        assert!(err.contains("Refusing"), "{err}");
+        assert!(s.scripts.lock().unwrap().is_empty());
+        // granted, but the data source is not connected
+        s.files.approve_file(&script).unwrap();
+        let path = script.display().to_string();
+        let err = rt
+            .block_on(s.run_sql_file("ds", "s2", None, &path, Default::default(), |_| {}))
+            .unwrap_err();
+        assert!(err.contains("not connected"), "{err}");
+        assert!(s.scripts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_cancel_before_the_script_is_remembered_and_applied() {
+        let (s, dir) = state();
+        let rt = runtime();
+        let cfg = DataSourceConfig {
+            id: "lite".into(),
+            name: "lite".into(),
+            driver: dbcore::Driver::Sqlite,
+            file: dir.path().join("db.sqlite").display().to_string(),
+            options: [("create".to_string(), "true".to_string())].into(),
+            ..Default::default()
+        };
+        rt.block_on(s.mgr.connect(&cfg)).unwrap();
+        let script = dir.path().join("late.sql");
+        std::fs::write(&script, "create table t (a integer);\n").unwrap();
+        s.files.approve_file(&script).unwrap();
+        // the cancel overtakes the run: the run starts already cancelled and runs nothing
+        s.cancel_script("early");
+        assert!(s.early_cancels.lock().unwrap().contains_key("early"));
+        let path = script.display().to_string();
+        let sum = rt
+            .block_on(s.run_sql_file("lite", "early", None, &path, Default::default(), |_| {}))
+            .unwrap();
+        assert!(sum.cancelled);
+        assert_eq!(sum.ok, 0);
+        assert!(s.early_cancels.lock().unwrap().is_empty());
+        assert!(s.scripts.lock().unwrap().is_empty());
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// One column, two rows: `café` (in Windows-1252) and `中` (not in it).
+    fn accented_result() -> ResultSet {
+        serde_json::from_value(serde_json::json!({
+            "columns": [{ "name": "name", "typeName": "text", "nullable": true, "isPk": false }],
+            "rows": [["café"], ["中"]],
+            "hasMore": false,
+            "totalHint": null
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_cancel_before_the_export_is_remembered_and_applied() {
+        let (s, dir) = state();
+        s.cancel_export("early-export");
+        assert!(s.early_cancels.lock().unwrap().contains_key("early-export"));
+        let path = dir.path().join("out.csv");
+        s.allow_export_path(path.clone());
+        let err = runtime()
+            .block_on(s.export_result_with(
+                accented_result(),
+                ExportOptions::default(),
+                path.clone(),
+                Some("early-export"),
+                |_| {},
+            ))
+            .unwrap_err();
+        assert!(err.contains("cancelled"), "{err}");
+        assert!(!path.exists(), "a cancelled export leaves no file behind");
+        assert!(s.early_cancels.lock().unwrap().is_empty());
+        assert!(s.exports.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_running_export_is_cancelled_by_id_and_its_id_is_refused_meanwhile() {
+        let (s, dir) = state();
+        let token = CancellationToken::new();
+        s.exports
+            .lock()
+            .unwrap()
+            .insert("run-export".into(), token.clone());
+        s.cancel_export("run-export");
+        assert!(token.is_cancelled());
+        let err = runtime()
+            .block_on(s.export_result_with(
+                accented_result(),
+                ExportOptions::default(),
+                dir.path().join("x.csv"),
+                Some("run-export"),
+                |_| {},
+            ))
+            .unwrap_err();
+        assert!(err.contains("in use already"), "{err}");
+        // the refused call did not drop the first export's registration
+        assert!(s.exports.lock().unwrap().contains_key("run-export"));
+    }
+
+    #[test]
+    fn a_windows_1252_export_reports_the_characters_it_replaced() {
+        let (s, dir) = state();
+        let path = dir.path().join("out.csv");
+        s.allow_export_path(path.clone());
+        let opts = ExportOptions {
+            encoding: dbcore::ExportEncoding::Windows1252,
+            ..ExportOptions::default()
+        };
+        let report = runtime()
+            .block_on(s.export_result_with(
+                accented_result(),
+                opts,
+                path.clone(),
+                Some("cp1252"),
+                |_| {},
+            ))
+            .unwrap();
+        assert_eq!((report.rows, report.unmappable), (2, 1));
+        assert_eq!(std::fs::read(&path).unwrap(), b"name\ncaf\xe9\n?\n");
+        // the registration ends with the export
+        assert!(s.exports.lock().unwrap().is_empty());
+    }
+
+    // ---------------------------------------------------------------- SQL dump
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// Connects a SQLite file in `dir` (id `lite`) and creates two tables with one row each.
+    async fn lite_with_tables(s: &AppState, dir: &tempfile::TempDir) {
+        let cfg = DataSourceConfig {
+            id: "lite".into(),
+            name: "lite".into(),
+            driver: Driver::Sqlite,
+            file: dir.path().join("src.db").display().to_string(),
+            options: [("create".to_string(), "true".to_string())].into(),
+            ..Default::default()
+        };
+        s.mgr.connect(&cfg).await.unwrap();
+        let sid = s.mgr.open_session("lite").await.unwrap();
+        s.mgr
+            .execute_collect(
+                &sid,
+                "create table t (id integer primary key, name text); insert into t values (1, 'a'); \
+                 create table u (id integer primary key); insert into u values (7);",
+                ExecOptions {
+                    max_rows: 10,
+                    stop_on_error: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        s.mgr.close_session(&sid).await;
+    }
+
+    #[test]
+    fn a_dump_writes_the_granted_file_and_keeps_it() {
+        let (s, dir) = state();
+        rt().block_on(async {
+            lite_with_tables(&s, &dir).await;
+            let out = dir.path().join("out.sql");
+            s.allow_export_path(out.clone());
+            let res = s
+                .dump_schema("lite", "main", DumpOptions::default(), "d1", &out, |_| {})
+                .await
+                .unwrap();
+            assert_eq!((res.tables, res.rows, res.cancelled), (2, 2, false));
+            let text = std::fs::read_to_string(&out).unwrap();
+            assert!(text.contains("CREATE TABLE t ("), "{text}");
+            // the folder of the file is the one "Open Folder" opens
+            assert_eq!(
+                s.dump_folder(&out.display().to_string()).unwrap(),
+                dir.path().to_path_buf()
+            );
+            // no registration is left behind
+            assert!(s.dumps.lock().unwrap().is_empty());
+            // the grant is used up: a second dump to the same path is refused
+            let err = s
+                .dump_schema("lite", "main", DumpOptions::default(), "d2", &out, |_| {})
+                .await
+                .unwrap_err();
+            assert!(err.contains("Refusing to write"), "{err}");
+        });
+    }
+
+    #[test]
+    fn a_dump_to_a_path_nobody_chose_is_refused_and_writes_nothing() {
+        let (s, dir) = state();
+        rt().block_on(async {
+            lite_with_tables(&s, &dir).await;
+            let out = dir.path().join("typed.sql");
+            let err = s
+                .dump_schema("lite", "main", DumpOptions::default(), "d3", &out, |_| {})
+                .await
+                .unwrap_err();
+            assert!(err.contains("Refusing to write"), "{err}");
+            assert!(!out.exists());
+            assert!(s.dumps.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_running_dump_id_is_refused_and_the_running_one_stays_registered() {
+        let (s, dir) = state();
+        s.dumps
+            .lock()
+            .unwrap()
+            .insert("run".into(), CancellationToken::new());
+        let out = dir.path().join("second.sql");
+        s.allow_export_path(out.clone());
+        let err = rt()
+            .block_on(s.dump_schema("lite", "main", DumpOptions::default(), "run", &out, |_| {}))
+            .unwrap_err();
+        assert!(err.contains("in use already"), "{err}");
+        assert!(s.dumps.lock().unwrap().contains_key("run"));
+        // the refused call did not consume the grant
+        assert!(s.export_paths.lock().unwrap().contains_key(&out));
+    }
+
+    #[test]
+    fn a_cancel_that_overtakes_the_dump_stops_it_and_removes_the_file() {
+        let (s, dir) = state();
+        rt().block_on(async {
+            lite_with_tables(&s, &dir).await;
+            s.cancel_dump("early");
+            let out = dir.path().join("early.sql");
+            s.allow_export_path(out.clone());
+            let res = s
+                .dump_schema(
+                    "lite",
+                    "main",
+                    DumpOptions::default(),
+                    "early",
+                    &out,
+                    |_| {},
+                )
+                .await
+                .unwrap();
+            assert!(res.cancelled, "{res:?}");
+            assert!(!out.exists());
+            assert!(s.early_cancels.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_cancel_during_the_dump_stops_it_and_removes_the_file() {
+        let (s, dir) = state();
+        rt().block_on(async {
+            lite_with_tables(&s, &dir).await;
+            let out = dir.path().join("running.sql");
+            s.allow_export_path(out.clone());
+            // cancel as soon as the first table is written: the second table is not dumped
+            let res = s
+                .dump_schema("lite", "main", DumpOptions::default(), "run2", &out, |p| {
+                    if p.phase == "tables" && p.tables_done == 1 {
+                        s.cancel_dump("run2");
+                    }
+                })
+                .await
+                .unwrap();
+            assert!(res.cancelled, "{res:?}");
+            assert!(res.tables < 2, "{res:?}");
+            assert!(!out.exists());
+            assert!(s.dumps.lock().unwrap().is_empty());
+            // the folder of a cancelled dump is not offered
+            assert!(s.dump_folder(&out.display().to_string()).is_err());
+        });
+    }
+
+    #[test]
+    fn a_failed_dump_removes_its_file() {
+        let (s, dir) = state();
+        rt().block_on(async {
+            lite_with_tables(&s, &dir).await;
+            let out = dir.path().join("failed.sql");
+            s.allow_export_path(out.clone());
+            // no data source of that id: the dump fails before it writes anything
+            assert!(s
+                .dump_schema("nope", "main", DumpOptions::default(), "d4", &out, |_| {})
+                .await
+                .is_err());
+            assert!(!out.exists());
+            assert!(s.dumps.lock().unwrap().is_empty());
+        });
+    }
+
+    /// What is in `dir` besides the files named in `known` (leftover `.part` files show up here).
+    fn strays(dir: &Path, known: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| !known.contains(&n.as_str()))
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn a_cancelled_or_failed_dump_leaves_the_file_it_was_to_replace_alone() {
+        let (s, dir) = state();
+        rt().block_on(async {
+            lite_with_tables(&s, &dir).await;
+            let out = dir.path().join("keep.sql");
+            std::fs::write(&out, "ORIGINAL").unwrap();
+            // the user confirmed replacing it in the save dialog; the dump is cancelled before it starts
+            s.cancel_dump("c1");
+            s.allow_export_path(out.clone());
+            let res = s
+                .dump_schema("lite", "main", DumpOptions::default(), "c1", &out, |_| {})
+                .await
+                .unwrap();
+            assert!(res.cancelled);
+            assert_eq!(std::fs::read_to_string(&out).unwrap(), "ORIGINAL");
+            // a failing dump
+            s.allow_export_path(out.clone());
+            assert!(s
+                .dump_schema("nope", "main", DumpOptions::default(), "c2", &out, |_| {})
+                .await
+                .is_err());
+            assert_eq!(std::fs::read_to_string(&out).unwrap(), "ORIGINAL");
+            assert_eq!(
+                strays(dir.path(), &["keep.sql", "src.db", "config", "data"]),
+                Vec::<String>::new()
+            );
+            // a dump that finishes replaces it
+            s.allow_export_path(out.clone());
+            s.dump_schema("lite", "main", DumpOptions::default(), "c3", &out, |_| {})
+                .await
+                .unwrap();
+            assert!(std::fs::read_to_string(&out)
+                .unwrap()
+                .contains("CREATE TABLE t ("));
+            assert_eq!(
+                strays(dir.path(), &["keep.sql", "src.db", "config", "data"]),
+                Vec::<String>::new()
+            );
+        });
+    }
+
+    #[test]
+    fn a_cancelled_or_failed_export_leaves_the_file_it_was_to_replace_alone() {
+        let (s, dir) = state();
+        rt().block_on(async {
+            lite_with_tables(&s, &dir).await;
+            let out = dir.path().join("keep.csv");
+            std::fs::write(&out, "ORIGINAL").unwrap();
+            let known = ["keep.csv", "src.db", "config", "data"];
+            let opts = dbcore::ExportOptions::default();
+            // cancelled before it starts
+            s.cancel_export("e1");
+            s.allow_export_path(out.clone());
+            let err = s
+                .export_query_with(
+                    "lite",
+                    "select * from t",
+                    opts.clone(),
+                    &out,
+                    Some("e1"),
+                    |_| {},
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_lowercase().contains("cancel"), "{err}");
+            assert_eq!(std::fs::read_to_string(&out).unwrap(), "ORIGINAL");
+            // a statement that fails
+            s.allow_export_path(out.clone());
+            assert!(s
+                .export_query_with(
+                    "lite",
+                    "select * from nope",
+                    opts.clone(),
+                    &out,
+                    None,
+                    |_| {}
+                )
+                .await
+                .is_err());
+            assert_eq!(std::fs::read_to_string(&out).unwrap(), "ORIGINAL");
+            // the same for an in-memory result
+            s.cancel_export("e2");
+            s.allow_export_path(out.clone());
+            let rs = dbcore::ResultSet {
+                columns: vec![dbcore::ColumnMeta {
+                    name: "a".into(),
+                    type_name: "text".into(),
+                    nullable: true,
+                    is_pk: false,
+                    table_ref: None,
+                }],
+                rows: vec![vec![serde_json::json!(1)]],
+                ..Default::default()
+            };
+            assert!(s
+                .export_result_with(rs.clone(), opts.clone(), out.clone(), Some("e2"), |_| {})
+                .await
+                .is_err());
+            assert_eq!(std::fs::read_to_string(&out).unwrap(), "ORIGINAL");
+            assert_eq!(strays(dir.path(), &known), Vec::<String>::new());
+            // one that finishes replaces it, and leaves nothing else behind
+            s.allow_export_path(out.clone());
+            let n = s
+                .export_query_with("lite", "select * from t", opts.clone(), &out, None, |_| {})
+                .await
+                .unwrap()
+                .rows;
+            assert_eq!(n, 1);
+            assert_eq!(std::fs::read_to_string(&out).unwrap(), "id,name\n1,a\n");
+            assert_eq!(strays(dir.path(), &known), Vec::<String>::new());
+            // a typed path is a new file: written once, never over an existing one
+            let typed = dir.path().join("typed.csv");
+            s.allow_typed_export_path(typed.clone(), typed.clone());
+            s.export_query_with(
+                "lite",
+                "select * from t",
+                opts.clone(),
+                &typed,
+                None,
+                |_| {},
+            )
+            .await
+            .unwrap();
+            assert!(typed.exists());
+            s.allow_typed_export_path(typed.clone(), typed.clone());
+            let err = s
+                .export_query_with("lite", "select * from u", opts, &typed, None, |_| {})
+                .await
+                .unwrap_err();
+            assert!(err.contains("exists already"), "{err}");
+            assert_eq!(std::fs::read_to_string(&typed).unwrap(), "id,name\n1,a\n");
+            assert_eq!(
+                strays(
+                    dir.path(),
+                    &["keep.csv", "typed.csv", "src.db", "config", "data"]
+                ),
+                Vec::<String>::new()
+            );
+        });
+    }
+
+    #[test]
+    fn open_dump_folder_opens_only_the_folder_of_a_finished_dump() {
+        let (s, dir) = state();
+        let out = dir.path().join("mine.sql");
+        assert!(s.dump_folder(&out.display().to_string()).is_err());
+        s.dumped.lock().unwrap().push(out.clone());
+        assert_eq!(
+            s.dump_folder(&out.display().to_string()).unwrap(),
+            dir.path().to_path_buf()
+        );
+        // another file in the same folder is not a dump of this session
+        let other = dir.path().join("other.sql");
+        assert!(s.dump_folder(&other.display().to_string()).is_err());
     }
 }

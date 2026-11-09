@@ -6,7 +6,7 @@ import { showToolWindow } from "../../state/layout";
 import { type Crumb, setEditorPath, setStatus } from "../../state/status";
 import { type EditorTab, updateTab } from "../../state/tabs";
 import { connectedDataSourceIds, explorerDataSources, openDdlRef, refreshNode, revealObject, schemaSnapshotFor, showQuickDocRef, synonymsFor } from "../explorer";
-import { Icon } from "../../components/ui";
+import { Icon, notify } from "../../components/ui";
 import { dsIconUrl } from "../output/dsicon";
 import { copyText } from "../output/export";
 import { markConsoleActive } from "../output/model";
@@ -17,6 +17,7 @@ import { registerSession, unregisterSession } from "./registry";
 import { ConsoleSession } from "./session";
 
 const SAVE_DELAY = 600;
+const errText = (e: unknown): string => String((e as Error)?.message ?? e).replace(/^Error:\s*/, "");
 
 /** The database object a name in the SQL refers to (for a column: its table). */
 const objectRefOf = (t: NavTarget): ObjectRef => ({ schema: t.schema, name: t.name, kind: t.kind === "matview" ? "materializedView" : (t.kind as ObjectRef["kind"]) });
@@ -77,7 +78,17 @@ export function ConsoleInner(props: { tab: EditorTab; active: boolean; dsId: str
   // ---- autosave (like DataGrip: no explicit save)
   let timer: ReturnType<typeof setTimeout> | undefined;
   let dirty = false;
-  const write = () => void writeConsole(props.dsId, props.consoleName, text()).catch(() => {});
+  /** The autosave of this console failed: one balloon, until a later save succeeds (the next change retries). */
+  let saveErrorShown = false;
+  const saved = () => {
+    saveErrorShown = false;
+  };
+  const saveFailed = (e: unknown) => {
+    if (saveErrorShown) return;
+    saveErrorShown = true;
+    notify({ kind: "error", title: `Cannot save ${props.consoleName}`, body: errText(e) });
+  };
+  const write = () => void writeConsole(props.dsId, props.consoleName, text()).then(saved, saveFailed);
   /**
    * Saves the script. A console of a data source that was deleted meanwhile is NOT written back (that would resurrect
    * its folder): the backend's list decides, since the explorer's own list is refreshed after the tabs are closed.
@@ -89,7 +100,7 @@ export function ConsoleInner(props: { tab: EditorTab; active: boolean; dsId: str
     if (!checkDataSource) return write();
     const body = text();
     void listDataSources().then(
-      (l) => l.some((d) => d.id === props.dsId) && void writeConsole(props.dsId, props.consoleName, body).catch(() => {}),
+      (l) => l.some((d) => d.id === props.dsId) && void writeConsole(props.dsId, props.consoleName, body).then(saved, saveFailed),
       write,
     );
   };

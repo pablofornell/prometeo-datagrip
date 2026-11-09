@@ -4,10 +4,12 @@
  * modules). `optional` entries belong to features other modules own: they are left out while no module has
  * registered the action, and appear on their own once it does. `mnemonic` letters are underlined in the bar.
  */
+import { openLogFolder } from "../../api/tauri";
 import { selectedNode } from "../../features/explorer/core";
 import { importTargetOf } from "../../features/import/target";
 import { runAction } from "../../state/actions";
 import { toolWindowMenuItems } from "../../state/layout";
+import { notify } from "../ui";
 import type { MenuItem } from "../ui/Menu";
 
 const sep: MenuItem = { type: "separator" };
@@ -52,6 +54,7 @@ export const MAIN_MENU: MenuBarEntry[] = [
       sep,
       a("app.settings", "t"),
       a("db.dataSources", "D"),
+      sub("Manage IDE Settings", "M", [a("app.exportSettings", "E"), a("app.importSettings", "I")]),
       sep,
       opt("file.saveAll", "l"),
       opt("file.reload", "R"),
@@ -97,7 +100,6 @@ export const MAIN_MENU: MenuBarEntry[] = [
       sub("Tool Windows", "T", toolWindowMenuItems()),
       sub("Appearance", "A", [a("theme.system"), a("theme.dark"), a("theme.light")]),
       sep,
-      opt("nav.recentLocations", "L"),
       opt("nav.recentFiles", "F"),
       sep,
       a("view.fontIncrease", "I"),
@@ -120,6 +122,7 @@ export const MAIN_MENU: MenuBarEntry[] = [
       sep,
       a("db.gotoDdl", "G"),
       a("db.editData", "E"),
+      opt("diagram.show"),
       a("explorer.locate", "O", { label: "Scroll from Editor" }),
     ],
   },
@@ -182,7 +185,20 @@ export const MAIN_MENU: MenuBarEntry[] = [
   {
     label: "Help",
     mnemonic: "H",
-    items: [a("nav.findAction", "F"), sep, a("help.about", "A")],
+    items: [
+      a("nav.findAction", "F"),
+      sep,
+      {
+        label: "Open Log Folder",
+        mnemonic: "L",
+        run: () =>
+          void openLogFolder().catch((e) =>
+            notify({ kind: "error", title: "Cannot open the log folder", body: String((e as Error)?.message ?? e) }),
+          ),
+      },
+      sep,
+      a("help.about", "A"),
+    ],
   },
 ];
 

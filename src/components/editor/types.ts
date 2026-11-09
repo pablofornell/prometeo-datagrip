@@ -15,10 +15,22 @@ export interface SchemaColumn {
 
 export type TableKind = "table" | "view" | "matview" | "foreign" | "sequence" | string;
 
+/** A foreign key of a table in the schema snapshot (shared with the backend contract). */
+export interface SchemaForeignKey {
+  name: string;
+  /** Columns of the referencing table, in constraint order. */
+  columns: string[];
+  refSchema: string;
+  refTable: string;
+  /** Referenced columns, parallel to `columns`. */
+  refColumns: string[];
+}
+
 export interface SchemaTable {
   name: string;
   kind: TableKind;
   columns: SchemaColumn[];
+  foreignKeys?: SchemaForeignKey[];
 }
 
 export interface SchemaRoutine {

@@ -14,6 +14,10 @@ export interface EditorConfig {
   implicit?: TableRef[];
   /** Single-line fields: no live templates. */
   noTemplates?: boolean;
+  /** Case of completion keywords and live templates (`keep` | `upper` | `lower`). */
+  keywordCase?: "keep" | "upper" | "lower";
+  /** Completion adds an alias to tables inserted in FROM / JOIN. */
+  insertTableAlias?: boolean;
 }
 
 export const setConfig = StateEffect.define<EditorConfig>();

@@ -2,12 +2,14 @@
 //! Markdown, HTML table, XML and an aligned text table.
 
 use std::io::{self, Write};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::error::Result;
-use crate::exec::query_pool;
+use crate::error::{DbError, Result};
+use crate::exec::query_cancellable;
+use crate::import::CancellationToken;
 use crate::manager::ConnectionManager;
 use crate::model::*;
 use crate::quote::{
@@ -40,6 +42,72 @@ pub enum ExportFormat {
     Pretty,
 }
 
+/// Encoding of the output file (applies in file-writing paths only; the clipboard / preview stay UTF-8).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExportEncoding {
+    #[default]
+    Utf8,
+    Utf8Bom,
+    Windows1252,
+    Utf16Le,
+}
+
+/// Progress of a running export (rows written; `total` is known only for in-memory result sets).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportProgress {
+    pub rows_written: usize,
+    pub total: Option<usize>,
+}
+
+/// Least time between two progress events of an export.
+const PROGRESS_EVERY: Duration = Duration::from_millis(100);
+/// Rows after which a progress event is due even when [`PROGRESS_EVERY`] has not passed.
+const PROGRESS_ROWS: usize = 1000;
+
+/// Throttle of the progress events: one per [`PROGRESS_EVERY`] or [`PROGRESS_ROWS`] rows, whichever comes first (the
+/// caller sends a last one at the end).
+struct ProgressGate {
+    last: Instant,
+    last_rows: usize,
+}
+
+impl ProgressGate {
+    fn new() -> Self {
+        ProgressGate {
+            last: Instant::now(),
+            last_rows: 0,
+        }
+    }
+
+    /// Did rows come after the last event (the final one is due)?
+    fn unreported(&self, rows: usize) -> bool {
+        rows != self.last_rows
+    }
+
+    /// Is an event due now that `rows` rows are written?
+    fn due(&mut self, now: Instant, rows: usize) -> bool {
+        if rows - self.last_rows >= PROGRESS_ROWS || now.duration_since(self.last) >= PROGRESS_EVERY
+        {
+            self.last = now;
+            self.last_rows = rows;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Result of an export: the rows written and how many characters the encoding could not represent
+/// (written as `?`; only the Windows-1252 encoding is lossy).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportReport {
+    pub rows: usize,
+    pub unmappable: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ExportOptions {
@@ -62,6 +130,11 @@ pub struct ExportOptions {
     pub transpose: bool,
     /// Add a first column with the row number (CSV / TSV / Markdown only; the header cell is empty).
     pub row_header: bool,
+    /// Encoding of the output file (text-like formats; the clipboard / preview are always UTF-8).
+    pub encoding: ExportEncoding,
+    /// Names of the columns that identify a row for SQL UPDATE / WHERE. `None` (or no matching column)
+    /// falls back to the primary key columns, then to every column.
+    pub key_columns: Option<Vec<String>>,
 }
 
 impl Default for ExportOptions {
@@ -77,7 +150,122 @@ impl Default for ExportOptions {
             rows_per_insert: 1,
             transpose: false,
             row_header: false,
+            encoding: ExportEncoding::Utf8,
+            key_columns: None,
         }
+    }
+}
+
+/// Encode `s` in Windows-1252, replacing every character the encoding cannot represent with `?`.
+/// Returns the bytes and how many characters were replaced (`encoding_rs`' own `encode` writes HTML
+/// numeric character references there, which is not what an export file wants).
+fn windows1252(s: &str) -> (Vec<u8>, usize) {
+    let mut encoder = encoding_rs::WINDOWS_1252.new_encoder();
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    let mut unmappable = 0usize;
+    for c in s.chars() {
+        let mut ch_buf = [0u8; 4];
+        let ch = c.encode_utf8(&mut ch_buf);
+        let mut dst = [0u8; 4];
+        match encoder.encode_from_utf8_without_replacement(ch, &mut dst, true) {
+            (encoding_rs::EncoderResult::Unmappable(_), _, _) => {
+                out.push(b'?');
+                unmappable += 1;
+            }
+            (_, _, written) => out.extend_from_slice(&dst[..written]),
+        }
+    }
+    (out, unmappable)
+}
+
+/// Wraps a writer and re-encodes the UTF-8 text written to it: `Utf8Bom` / `Utf16Le` prefix a byte-order
+/// mark, `Windows1252` replaces the characters it cannot represent with `?` (counted in
+/// [`EncodingWriter::unmappable`]). `Utf8` passes the bytes through unchanged.
+pub struct EncodingWriter<W: Write> {
+    inner: W,
+    encoding: ExportEncoding,
+    /// Whether the byte-order mark has been written already.
+    started: bool,
+    /// Characters the encoding could not represent.
+    unmappable: usize,
+}
+
+impl<W: Write> EncodingWriter<W> {
+    pub fn new(inner: W, encoding: ExportEncoding) -> Self {
+        EncodingWriter {
+            inner,
+            encoding,
+            started: false,
+            unmappable: 0,
+        }
+    }
+
+    /// How many characters the encoding could not represent (replaced with `?`).
+    pub fn unmappable(&self) -> usize {
+        self.unmappable
+    }
+
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+
+    fn write_bom(&mut self) -> io::Result<()> {
+        if self.started {
+            return Ok(());
+        }
+        self.started = true;
+        let bom: &[u8] = match self.encoding {
+            ExportEncoding::Utf16Le => &[0xFF, 0xFE],
+            ExportEncoding::Utf8Bom => &[0xEF, 0xBB, 0xBF],
+            _ => &[],
+        };
+        if !bom.is_empty() {
+            self.inner.write_all(bom)?;
+        }
+        Ok(())
+    }
+
+    /// Re-encodes one chunk of UTF-8 text in the target encoding.
+    fn encode_str(&mut self, s: &str) -> io::Result<()> {
+        match self.encoding {
+            ExportEncoding::Utf8 | ExportEncoding::Utf8Bom => self.inner.write_all(s.as_bytes())?,
+            ExportEncoding::Utf16Le => {
+                // `encoding_rs` treats UTF-16 as an input-only encoding (its `output_encoding` is
+                // UTF-8), so write the code units little-endian ourselves (surrogate pairs included).
+                for unit in s.encode_utf16() {
+                    self.inner.write_all(&unit.to_le_bytes())?;
+                }
+            }
+            ExportEncoding::Windows1252 => {
+                let (bytes, lost) = windows1252(s);
+                self.unmappable += lost;
+                self.inner.write_all(&bytes)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write> Write for EncodingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_bom()?;
+        // The exporter writes complete UTF-8 strings (the `write!` / `writeln!` macros), so every
+        // buffer is valid UTF-8; a caller that splits a multi-byte sequence is an error.
+        let text = std::str::from_utf8(buf).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the export produced invalid UTF-8",
+            )
+        })?;
+        if !text.is_empty() {
+            self.encode_str(text)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.write_bom()?;
+        self.inner.flush()
     }
 }
 
@@ -232,7 +420,7 @@ fn pg_array_element(c: &Cell) -> String {
 
 /// [`sql_literal`] for a value of a column of declared type `ty`: Oracle writes dates, timestamps and long text with
 /// conversion functions, the others only look at the value.
-fn sql_literal_typed(d: Driver, c: &Cell, ty: &str) -> String {
+pub(crate) fn sql_literal_typed(d: Driver, c: &Cell, ty: &str) -> String {
     // a DECIMAL / BIGINT that arrived as text is a number, not a string
     if let Some(t) = numeric_text(c, ty) {
         return t.to_string();
@@ -256,7 +444,7 @@ fn sql_literal_typed(d: Driver, c: &Cell, ty: &str) -> String {
     }
 }
 
-fn sql_literal(d: Driver, c: &Cell) -> String {
+pub(crate) fn sql_literal(d: Driver, c: &Cell) -> String {
     match c {
         // PG arrays arrive as JSON arrays: write them back as an array literal ('{1,2}')
         Value::Array(_) if d == Driver::Postgres => quote_literal(d, &pg_array_element(c)),
@@ -362,8 +550,22 @@ impl<W: Write> Exporter<W> {
         )
     }
 
-    /// Indexes (in the result) of the columns that identify a row: the primary key, else every column.
+    /// Indexes (in the result) of the `key_columns` option, when every name is a column of the result (a key that
+    /// matches only some of its columns would be a smaller key than the one asked for).
+    fn option_key(&self) -> Option<Vec<usize>> {
+        let names = self.o.key_columns.as_ref().filter(|n| !n.is_empty())?;
+        names
+            .iter()
+            .map(|n| self.src_cols.iter().position(|c| c == n))
+            .collect()
+    }
+
+    /// Indexes (in the result) of the columns that identify a row: the `key_columns` option, else the
+    /// primary key, else every column.
     fn key_cols(&self) -> Vec<usize> {
+        if let Some(idx) = self.option_key() {
+            return idx;
+        }
         let pk: Vec<usize> = (0..self.src_cols.len())
             .filter(|i| self.src_pk.get(*i).copied().unwrap_or(false))
             .collect();
@@ -493,9 +695,14 @@ impl<W: Write> Exporter<W> {
                 writeln!(self.w, "    </tr>\n  </thead>\n  <tbody>")?;
             }
             ExportFormat::Xml => {
+                let enc = match self.o.encoding {
+                    ExportEncoding::Utf8 | ExportEncoding::Utf8Bom => "UTF-8",
+                    ExportEncoding::Windows1252 => "windows-1252",
+                    ExportEncoding::Utf16Le => "UTF-16",
+                };
                 writeln!(
                     self.w,
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<result>"
+                    "<?xml version=\"1.0\" encoding=\"{enc}\"?>\n<result>"
                 )?;
             }
             ExportFormat::Pretty => {
@@ -821,14 +1028,54 @@ impl<W: Write> Exporter<W> {
     }
 }
 
-/// Export an in-memory result set. Returns the number of rows written.
+/// Export an in-memory result set. Returns the number of rows written (always UTF-8).
 pub fn export_result<W: Write>(rs: &ResultSet, opts: &ExportOptions, w: W) -> Result<usize> {
-    let mut e = Exporter::new(w, opts.clone());
+    let mut o = opts.clone();
+    o.encoding = ExportEncoding::Utf8;
+    Ok(export_result_with(rs, &o, w, &CancellationToken::new(), |_| {})?.rows)
+}
+
+/// Export an in-memory result set with a cancellation token, progress events and the output
+/// encoding of `opts`. Returns the rows written and how many characters could not be encoded.
+pub fn export_result_with<W: Write>(
+    rs: &ResultSet,
+    opts: &ExportOptions,
+    w: W,
+    cancel: &CancellationToken,
+    mut progress: impl FnMut(ExportProgress),
+) -> Result<ExportReport> {
+    let mut ew = EncodingWriter::new(w, opts.encoding);
+    let mut e = Exporter::new(&mut ew, opts.clone());
     e.begin(&rs.columns)?;
-    for r in &rs.rows {
+    let total = rs.rows.len();
+    let mut gate = ProgressGate::new();
+    for (i, r) in rs.rows.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err(DbError::Cancelled);
+        }
         e.row(r)?;
+        if gate.due(Instant::now(), i + 1) {
+            progress(ExportProgress {
+                rows_written: i + 1,
+                total: Some(total),
+            });
+        }
     }
-    Ok(e.finish()?.1)
+    // a cancel that arrives after the last row still cancels (an empty result has no row to notice it)
+    if cancel.is_cancelled() {
+        return Err(DbError::Cancelled);
+    }
+    let rows = e.finish()?.1;
+    if gate.unreported(rows) {
+        progress(ExportProgress {
+            rows_written: rows,
+            total: Some(total),
+        });
+    }
+    Ok(ExportReport {
+        rows,
+        unmappable: ew.unmappable(),
+    })
 }
 
 /// Export a result set to a string.
@@ -850,9 +1097,33 @@ impl ConnectionManager {
         opts: &ExportOptions,
         w: W,
     ) -> Result<usize> {
+        let mut o = opts.clone();
+        o.encoding = ExportEncoding::Utf8;
+        Ok(self
+            .export_query_with(ds_id, sql, &o, w, &CancellationToken::new(), |_| {})
+            .await?
+            .rows)
+    }
+
+    /// `export_query` with a cancellation token, progress events and the output encoding of `opts`.
+    pub async fn export_query_with<W: Write + Send>(
+        &self,
+        ds_id: &str,
+        sql: &str,
+        opts: &ExportOptions,
+        w: W,
+        cancel: &CancellationToken,
+        progress: impl Fn(ExportProgress) + Send + Sync,
+    ) -> Result<ExportReport> {
         let live = self.live(ds_id)?;
-        let mut e = Exporter::new(w, opts.clone());
-        let cols = query_pool(&live, sql, usize::MAX, |cols, row| {
+        let mut ew = EncodingWriter::new(w, opts.encoding);
+        let mut e = Exporter::new(&mut ew, opts.clone());
+        let mut written: usize = 0;
+        let mut gate = ProgressGate::new();
+        let cols = query_cancellable(&live, sql, usize::MAX, cancel, |cols, row| {
+            if cancel.is_cancelled() {
+                return Err(DbError::Cancelled);
+            }
             if !e.began {
                 e.begin(cols)?;
             } else if !cols.iter().map(|c| &c.name).eq(e.src_cols.iter()) {
@@ -861,15 +1132,40 @@ impl ConnectionManager {
                 return Ok(());
             }
             e.row(&row)?;
+            written += 1;
+            if gate.due(Instant::now(), written) {
+                progress(ExportProgress {
+                    rows_written: written,
+                    total: None,
+                });
+            }
             Ok(())
         })
         .await;
         let cols = cols?;
         if cols.is_none() {
-            let c = describe_columns_pool(&live.pool, sql).await;
+            // a result without rows: the cancel may come while its columns are described
+            let c = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(DbError::Cancelled),
+                c = describe_columns_pool(&live.pool, sql) => c,
+            };
             e.begin(&c)?;
         }
-        Ok(e.finish()?.1)
+        if cancel.is_cancelled() {
+            return Err(DbError::Cancelled);
+        }
+        let rows = e.finish()?.1;
+        if gate.unreported(rows) {
+            progress(ExportProgress {
+                rows_written: rows,
+                total: None,
+            });
+        }
+        Ok(ExportReport {
+            rows,
+            unmappable: ew.unmappable(),
+        })
     }
 }
 
@@ -1285,6 +1581,7 @@ mod tests {
         let w = run_pk(ExportFormat::WhereClause, |_| {});
         assert_eq!(w, "where \"id\" in (1, 2, '9007199254740993')\n");
         let w2 = run(ExportFormat::WhereClause, |_| {});
+        // no key: every column identifies the row (no comment line: the text also goes to the clipboard)
         assert!(
             w2.starts_with("where (\"id\" = 1 and \"name\" = 'a,b \"q\"'"),
             "{w2}"
@@ -1323,5 +1620,234 @@ mod tests {
         assert_eq!(l[0], "id               | name     | data");
         assert!(l[1].starts_with("-----------------+-"), "{p}");
         assert_eq!(l[3], "2                | -        | true");
+    }
+
+    // ---------------------------------------------------------------- encoding
+
+    /// The bytes of a one-row CSV in `enc`.
+    fn csv_bytes(enc: ExportEncoding, text: &str) -> Vec<u8> {
+        let rs = ResultSet {
+            columns: vec![ColumnMeta {
+                name: "v".into(),
+                type_name: "text".into(),
+                nullable: true,
+                is_pk: false,
+                table_ref: None,
+            }],
+            rows: vec![vec![Value::String(text.into())]],
+            ..Default::default()
+        };
+        let o = ExportOptions {
+            encoding: enc,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        export_result_with(&rs, &o, &mut buf, &CancellationToken::new(), |_| {}).unwrap();
+        buf
+    }
+
+    #[test]
+    fn encoding_boms_and_utf16le() {
+        // UTF-8: no BOM
+        assert_eq!(csv_bytes(ExportEncoding::Utf8, "a"), b"v\na\n".to_vec());
+        // UTF-8 with BOM
+        assert_eq!(
+            csv_bytes(ExportEncoding::Utf8Bom, "a"),
+            b"\xEF\xBB\xBFv\na\n".to_vec()
+        );
+        // UTF-16LE: BOM FF FE, then each code unit little-endian (no BOM characters inside)
+        let utf16 = csv_bytes(ExportEncoding::Utf16Le, "a");
+        assert_eq!(&utf16[..2], &[0xFF, 0xFE]);
+        assert_eq!(utf16.len(), 2 + 8, "{utf16:?}"); // BOM + "v\na\n" = 4 chars * 2
+        assert_eq!(&utf16[2..4], &[b'v', 0]);
+        assert_eq!(&utf16[4..6], &[b'\n', 0]);
+        assert_eq!(&utf16[6..8], &[b'a', 0]);
+        assert_eq!(&utf16[8..10], &[b'\n', 0]);
+    }
+
+    #[test]
+    fn windows1252_replaces_unmappable_and_counts_them() {
+        // 'é' (0xE9) is representable, '中' is not; a literal '?' stays a '?' (not counted)
+        let out = csv_bytes(ExportEncoding::Windows1252, "café 中 ?");
+        assert_eq!(out, b"v\ncaf\xE9 ? ?\n".to_vec(), "{out:?}");
+        let report = {
+            let rs = ResultSet {
+                columns: vec![ColumnMeta {
+                    name: "v".into(),
+                    type_name: "text".into(),
+                    nullable: true,
+                    is_pk: false,
+                    table_ref: None,
+                }],
+                rows: vec![vec![Value::String("café 中 ?".into())]],
+                ..Default::default()
+            };
+            let o = ExportOptions {
+                encoding: ExportEncoding::Windows1252,
+                ..Default::default()
+            };
+            let mut buf = Vec::new();
+            export_result_with(&rs, &o, &mut buf, &CancellationToken::new(), |_| {}).unwrap()
+        };
+        assert_eq!(report.unmappable, 1, "only the CJK character was lost");
+        assert_eq!(report.rows, 1);
+    }
+
+    #[test]
+    fn export_result_with_reports_progress_and_total() {
+        let mut seen: Vec<(usize, Option<usize>)> = Vec::new();
+        let o = ExportOptions::default();
+        let mut buf = Vec::new();
+        let report = export_result_with(&rs(), &o, &mut buf, &CancellationToken::new(), |p| {
+            seen.push((p.rows_written, p.total));
+        })
+        .unwrap();
+        assert_eq!(report.rows, 3);
+        assert_eq!(report.unmappable, 0);
+        // throttled: three quick rows give the final event only
+        assert_eq!(seen, vec![(3, Some(3))]);
+    }
+
+    #[test]
+    fn progress_is_throttled_and_ends_with_the_total() {
+        let mut big = rs();
+        let row = big.rows[0].clone();
+        big.rows = vec![row; 5000];
+        let mut seen: Vec<usize> = Vec::new();
+        let mut buf = Vec::new();
+        export_result_with(
+            &big,
+            &ExportOptions::default(),
+            &mut buf,
+            &CancellationToken::new(),
+            |p| seen.push(p.rows_written),
+        )
+        .unwrap();
+        // at most one event per 1000 rows (or 100 ms) plus the final one: nowhere near one per row
+        assert!(seen.len() <= 5 + 1 + 40, "{} events", seen.len());
+        assert!(seen.windows(2).all(|w| w[0] < w[1]), "{seen:?}");
+        assert_eq!(*seen.last().unwrap(), 5000);
+    }
+
+    #[test]
+    fn the_progress_gate_fires_per_rows_or_per_time() {
+        let t0 = Instant::now();
+        let mut g = ProgressGate {
+            last: t0,
+            last_rows: 0,
+        };
+        assert!(!g.due(t0, 1));
+        assert!(!g.due(t0 + Duration::from_millis(99), 999));
+        assert!(g.due(t0 + Duration::from_millis(99), 1000), "1000 rows");
+        assert!(!g.due(t0 + Duration::from_millis(150), 1001));
+        assert!(
+            g.due(t0 + Duration::from_millis(200), 1001),
+            "100 ms since the last event"
+        );
+        assert!(!g.due(t0 + Duration::from_millis(201), 1002));
+    }
+
+    #[test]
+    fn a_cancel_of_an_empty_result_is_not_a_success() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let mut empty = rs();
+        empty.rows.clear();
+        let mut buf = Vec::new();
+        let err = export_result_with(&empty, &ExportOptions::default(), &mut buf, &token, |_| {})
+            .unwrap_err();
+        assert!(matches!(err, DbError::Cancelled));
+    }
+
+    #[test]
+    fn xml_declares_the_encoding_of_the_file() {
+        let decl = |enc| {
+            let rs = ResultSet {
+                columns: rs().columns[..1].to_vec(),
+                ..Default::default()
+            };
+            let o = ExportOptions {
+                format: ExportFormat::Xml,
+                encoding: enc,
+                ..Default::default()
+            };
+            let mut buf = Vec::new();
+            export_result_with(&rs, &o, &mut buf, &CancellationToken::new(), |_| {}).unwrap();
+            buf
+        };
+        let utf8 = String::from_utf8(decl(ExportEncoding::Utf8)).unwrap();
+        assert!(
+            utf8.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"),
+            "{utf8}"
+        );
+        let bom = decl(ExportEncoding::Utf8Bom);
+        assert!(String::from_utf8_lossy(&bom).contains("encoding=\"UTF-8\""));
+        let w = String::from_utf8(decl(ExportEncoding::Windows1252)).unwrap();
+        assert!(
+            w.starts_with("<?xml version=\"1.0\" encoding=\"windows-1252\"?>"),
+            "{w}"
+        );
+        let u16: Vec<u16> = decl(ExportEncoding::Utf16Le)[2..]
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let u16 = String::from_utf16(&u16).unwrap();
+        assert!(
+            u16.starts_with("<?xml version=\"1.0\" encoding=\"UTF-16\"?>"),
+            "{u16}"
+        );
+    }
+
+    #[test]
+    fn export_result_with_cancel_returns_cancelled() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let mut buf = Vec::new();
+        let err = export_result_with(&rs(), &ExportOptions::default(), &mut buf, &token, |_| {})
+            .unwrap_err();
+        assert!(matches!(err, DbError::Cancelled));
+    }
+
+    // ---------------------------------------------------------------- key columns
+
+    #[test]
+    fn key_columns_override_the_primary_key() {
+        // `name` is declared the key although `id` is the primary key
+        let mut r = rs_pk();
+        r.columns[0].is_pk = true;
+        let o = ExportOptions {
+            format: ExportFormat::SqlUpdate,
+            table_name: Some("public.t".into()),
+            key_columns: Some(vec!["name".into()]),
+            ..Default::default()
+        };
+        let up = export_to_string(&r, &o).unwrap();
+        assert!(
+            up.starts_with("update \"public\".\"t\" set \"id\" = 1, \"data\" = '\\xff00'::bytea where \"name\" = 'a,b \"q\"';"),
+            "{up}"
+        );
+    }
+
+    #[test]
+    fn key_columns_matching_only_some_columns_fall_back_to_the_primary_key() {
+        // `nope` is not a column: the key is not `name` alone but the primary key, as when nothing matches
+        let o = ExportOptions {
+            format: ExportFormat::WhereClause,
+            key_columns: Some(vec!["name".into(), "nope".into()]),
+            ..Default::default()
+        };
+        let w = export_to_string(&rs_pk(), &o).unwrap();
+        assert_eq!(w, "where \"id\" in (1, 2, '9007199254740993')\n", "{w}");
+    }
+
+    #[test]
+    fn key_columns_that_match_nothing_fall_back_to_the_primary_key() {
+        let o = ExportOptions {
+            format: ExportFormat::WhereClause,
+            key_columns: Some(vec!["nope".into()]),
+            ..Default::default()
+        };
+        let w = export_to_string(&rs_pk(), &o).unwrap();
+        assert_eq!(w, "where \"id\" in (1, 2, '9007199254740993')\n", "{w}");
     }
 }

@@ -34,7 +34,7 @@ export {
   connected as connectedDataSourceIds,
   ensureConnected,
 } from "./core";
-export { schemaSnapshotFor, loadSchemaSnapshot, synonymsFor } from "./schema";
+export { schemaSnapshotFor, loadSchemaSnapshot, schemaSnapshotErrorFor, synonymsFor } from "./schema";
 export { openTable as openTableTab, openDdl as openDdlTab, openDdlRef, openTableRef, newConsole, jumpToConsole, openConsoleTab } from "./commands";
 export { showQuickDocRef, type QuickDocTarget } from "./QuickDoc";
 export { autoSyncAfter } from "./autosync";

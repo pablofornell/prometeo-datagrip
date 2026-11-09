@@ -275,6 +275,12 @@ export function CodeStyleSqlPage(props: { draft: Draft }) {
         </Row>
         <Hint>Applied by Reformat Code (Ctrl+Alt+L) to reserved words; names, strings and comments are not touched.</Hint>
       </Section>
+      <Section title="Completion" q={d().query()}>
+        <Row>
+          <Checkbox checked={d().values.sqlInsertTableAlias} onChange={(c) => d().set("sqlInsertTableAlias", c)} label={<L q={d().query()}>Insert table alias</L>} />
+        </Row>
+        <Hint>When a table is completed after FROM or JOIN, an alias is added automatically.</Hint>
+      </Section>
     </div>
   );
 }

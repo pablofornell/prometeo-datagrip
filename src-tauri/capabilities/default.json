@@ -16,6 +16,10 @@
     "core:window:allow-set-title",
     "core:webview:allow-set-webview-zoom",
     "dialog:allow-open",
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [{ "path": "$APPDATA/logs" }, { "path": "$APPDATA/logs/**" }]
+    },
     "clipboard-manager:allow-read-text",
     "clipboard-manager:allow-write-text"
   ]

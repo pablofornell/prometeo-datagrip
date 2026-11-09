@@ -33,6 +33,8 @@ export interface Settings {
   editorIndentGuides: boolean;
   /** Case of the keywords after Reformat Code: `keep` (as typed), `upper`, `lower`. */
   sqlKeywordCase: "keep" | "upper" | "lower";
+  /** Completion inserts a table alias after a table in FROM / JOIN (DataGrip: Insert table alias). */
+  sqlInsertTableAlias: boolean;
   /** Editor color scheme: follow the UI theme or force one of the built-in schemes. */
   editorScheme: "auto" | SchemeId;
   /** Edits of the color scheme attributes, kept per scheme. */
@@ -65,7 +67,8 @@ export const DEFAULT_SETTINGS: Settings = {
   execCaretInside: "ask",
   gridAlternateRows: false,
   editorIndentGuides: true,
-  sqlKeywordCase: "keep",
+  sqlKeywordCase: "upper",
+  sqlInsertTableAlias: true,
   editorScheme: "auto",
   colorOverrides: EMPTY_OVERRIDES,
   keymapOverrides: {},
@@ -116,7 +119,7 @@ export function editorMetrics(fontSize: number, lineHeight: number): { fontSize:
 
 // Editor settings reach the CSS through custom properties on <html> (editor.css reads them); the SqlEditor effect that
 // re-measures CodeMirror runs after this render effect, so it always sees the new metrics.
-if (typeof document !== "undefined") {
+if (typeof document !== "undefined" && document.documentElement) {
   createRoot(() =>
     createRenderEffect(() => {
       const m = editorMetrics(settings.editorFontSize, settings.editorLineHeight);
@@ -174,7 +177,7 @@ function setZoom(z: number): void {
   }
 }
 
-if (typeof document !== "undefined") createRoot(() => createRenderEffect(applyAppearance));
+if (typeof document !== "undefined" && document.documentElement) createRoot(() => createRenderEffect(applyAppearance));
 
 // the registry applies the keymap edits
 createRoot(() => createRenderEffect(() => setKeymapOverrides(settings.keymapOverrides)));

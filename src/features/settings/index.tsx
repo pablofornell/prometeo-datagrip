@@ -13,6 +13,7 @@ import { render } from "solid-js/web";
 import { registerAction } from "../../state/actions";
 import { loadLocal, saveUiState } from "../../state/persist";
 import { SettingsDialog } from "./SettingsDialog";
+import { exportSettings, importSettings } from "./transfer";
 import "./settings.css";
 
 const LAST_PAGE_KEY = "settings.page";
@@ -55,4 +56,16 @@ registerAction({
   shortcut: "Ctrl+Alt+S",
   icon: "settings",
   run: (ctx) => openSettings(typeof ctx === "string" ? ctx : undefined),
+});
+
+registerAction({
+  id: "app.exportSettings",
+  title: "Export Settings…",
+  run: () => void exportSettings(),
+});
+
+registerAction({
+  id: "app.importSettings",
+  title: "Import Settings…",
+  run: () => void importSettings(),
 });
