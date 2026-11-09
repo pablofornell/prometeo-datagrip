@@ -3,13 +3,14 @@
  * speed search, persisted state. Importing this module registers its slots and actions.
  *
  * Module API (for the editor / grid / dialog features):
- *   getSelectedNode()            selected explorer node (kind, dsId, objectRef, ...)
+ *   getSelectedNode()            selected explorer node (kind, dsId, objectRef, ...): the lead of the selection
+ *   selectedNodes()              every selected node in tree order (one entry for a single selection)
  *   refreshNode(idOrPath)        reload a node: id string, or [dsId, ...backend path]
  *   revealObject(dsId, ref)      expand + select an object (async)
  *   schemaSnapshotFor(dsId, s?)  reactive cached schemaSnapshot (tables + columns) for completion
  *   ensureConnected(dsId)        connects a data source if needed (tree spinner, connection state); idempotent
  */
-import { crumbsOfTab, onRefreshed, reloadDataSources, loadSaved, loaded, refreshConnectionState, setLoaded, selectedNode, nodeInfo, dataSources } from "./core";
+import { crumbsOfTab, onRefreshed, reloadDataSources, loadSaved, loaded, refreshConnectionState, setLoaded, selectedNode, selectedTreeNodes, nodeInfo, dataSources } from "./core";
 import { closeStaleTabs } from "./restore";
 import { registerSlot } from "../../state/slots";
 import { activeTab, activeTabId, tabs, updateTab } from "../../state/tabs";
@@ -42,6 +43,14 @@ export { autoSyncAfter } from "./autosync";
 /** The selected explorer node, or undefined when nothing (or a placeholder row) is selected. */
 export function getSelectedNode(): import("./model").ExplorerNodeInfo | undefined {
   return nodeInfo(selectedNode());
+}
+
+/** Every selected explorer node in tree order (a signal read: reactive). Placeholder rows are left out. */
+export function selectedNodes(): import("./model").ExplorerNodeInfo[] {
+  return selectedTreeNodes().flatMap((n) => {
+    const info = nodeInfo(n);
+    return info ? [info] : [];
+  });
 }
 
 /** Dispatched on `window` by the Data Sources dialog after it saved / deleted a data source. */

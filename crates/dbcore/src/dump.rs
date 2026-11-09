@@ -6,18 +6,26 @@
 //!   `pg_get_viewdef`, `pg_get_triggerdef`). Order: header → sequences (serial and standalone, not the
 //!   identity-owned ones) → `create table` (no foreign keys) → data `INSERT`s (foreign-key topological
 //!   order) → sequence/identity `setval` resync → `create index` → `alter table .. add constraint` (FKs) →
-//!   views → triggers (under `include_routines`).
+//!   views → triggers (under `include_routines`). A partitioned table is created with `partition by`, its
+//!   partitions follow as `create table .. partition of ..`, and its rows go in through the parent.
+//!   Foreign tables are not dumped (a comment and a warning).
 //! * MySQL: `SHOW CREATE ...`, data inserts wrapped in `SET FOREIGN_KEY_CHECKS=0` / `1`.
 //! * SQLite: `sqlite_master.sql`, data inserts wrapped in `PRAGMA foreign_keys=OFF` / `ON`.
 //! * Oracle: rebuilt from the `ALL_*` dictionary views. Order: header (`ALTER SESSION SET CURRENT_SCHEMA` with a
-//!   target schema; names are unqualified) → standalone sequences (`START WITH` the current value) →
-//!   `CREATE TABLE` (identity, virtual columns, PK / unique / check; no foreign keys) → data `INSERT`s with
-//!   NLS-independent literals (`COMMIT` every `commit_every` rows and at the end of each table) → indexes →
-//!   foreign keys → views → package specs, functions / procedures, package bodies, triggers (each ended by a `/`
-//!   line). Dropping (`drop_if_exists`) is a PL/SQL block that ignores "does not exist".
+//!   target schema; names are unqualified) → object types (specs in dependency order, then bodies) → standalone
+//!   sequences (`START WITH` the current value) → `CREATE TABLE` (identity, virtual columns, PK / unique / check,
+//!   the `PARTITION BY` clause; no foreign keys) → data `INSERT`s with NLS-independent literals (`COMMIT` every
+//!   `commit_every` rows and at the end of each table; `XMLTYPE(..)` / `JSON(..)` for those columns, the
+//!   attributes of an object column in its constructor) → indexes (`LOCAL` for a local index) → foreign keys →
+//!   private synonyms → views → materialized views (built from their query, no data) → package specs, functions /
+//!   procedures, package bodies, triggers (each ended by a `/` line). Dropping (`drop_if_exists`) is a PL/SQL block
+//!   that ignores "does not exist"; a full dump drops the types `FORCE` before it creates them again, a subset drops
+//!   its own tables first (so the types they use can be replaced).
 //!
-//! Scope (v1): plain base tables only (PG `relkind = 'r'` and not a partition; SQLite tables; MySQL base
-//! tables). Owner and comment statements are not written. `file_per_table` is not implemented.
+//! Scope: plain base tables (PG `relkind` `r` and `p`; SQLite tables; MySQL base tables). Oracle: partitioned
+//! tables with their partitions (not reference partitioning), materialized view logs are not dumped (a fast
+//! refreshable view is restored with `REFRESH FORCE`), collection columns and objects with non-scalar attributes
+//! have no data (a warning). Owner statements are not written. `file_per_table` is not implemented.
 
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
@@ -101,6 +109,8 @@ pub struct DumpResult {
     pub rows: u64,
     pub cancelled: bool,
     pub elapsed_ms: u64,
+    /// Objects or data the dump could not write in full (each one is also a comment in the file).
+    pub warnings: Vec<String>,
 }
 
 // ---------------------------------------------------------------- helpers
@@ -692,11 +702,11 @@ async fn dump_pg<W: Write>(
         }
     }
 
-    // ---- list tables and collect their definitions + FK edges
+    // ---- list tables (partitioned ones with their partitions) and collect their definitions + FK edges
     let tables: Vec<String> = pool
         .query_strings(&format!(
             "select c.relname from pg_class c join pg_namespace n on n.oid = c.relnamespace \
-             where c.relkind = 'r' and not c.relispartition and n.nspname = {} order by c.relname",
+             where c.relkind in ('r', 'p') and not c.relispartition and n.nspname = {} order by c.relname",
             pl(d, schema)
         ))
         .await?
@@ -704,6 +714,26 @@ async fn dump_pg<W: Write>(
         .map(|r| s(r, 0))
         .filter(|t| wanted(&opts.tables, t))
         .collect();
+
+    // ---- foreign tables: their data lives on the foreign server, so they are not dumped
+    if opts.tables.is_none() {
+        let foreign = pool
+            .query_strings(&format!(
+                "select c.relname from pg_class c join pg_namespace n on n.oid = c.relnamespace \
+                 where c.relkind = 'f' and n.nspname = {} order by c.relname",
+                pl(d, schema)
+            ))
+            .await?;
+        for r in &foreign {
+            let name = s(r, 0);
+            writeln!(w, "-- foreign table {name}: not dumped")?;
+            res.warnings
+                .push(format!("foreign table {name}: not dumped"));
+        }
+        if !foreign.is_empty() {
+            writeln!(w)?;
+        }
+    }
 
     let mut defs: HashMap<String, PgTable> = HashMap::new();
     let mut edges: Vec<(String, String)> = Vec::new();
@@ -809,7 +839,7 @@ async fn dump_pg<W: Write>(
             writeln!(
                 w,
                 "{};",
-                maybe_rename(&lower_keywords(&s(r, 0)), schema, target)
+                maybe_rename(&pg_index_on_all(&lower_keywords(&s(r, 0))), schema, target)
             )?;
         }
     }
@@ -978,10 +1008,27 @@ async fn pg_table_parts(
         }
     }
 
-    let create_sql = format!(
-        "create {unlogged}table {qname}\n(\n{}\n);",
+    // a partitioned table: `partition by` after the columns, then its partitions (their rows come through this table)
+    let key = first_cell(pool, &format!("select pg_get_partkeydef({rel})"))
+        .await?
+        .unwrap_or_default();
+    let mut create_sql = format!(
+        "create {unlogged}table {qname}\n(\n{}\n)",
         items.join(",\n")
     );
+    if !key.is_empty() {
+        create_sql.push_str(&format!(
+            "\npartition by {}",
+            maybe_rename(&lower_keywords(&key), schema, target)
+        ));
+    }
+    create_sql.push(';');
+    if !key.is_empty() {
+        for stmt in pg_partitions(pool, schema, target, name).await? {
+            create_sql.push('\n');
+            create_sql.push_str(&stmt);
+        }
+    }
     Ok((
         PgTable {
             create_sql,
@@ -991,6 +1038,50 @@ async fn pg_table_parts(
         },
         fk_edges,
     ))
+}
+
+/// `create table .. partition of ..` for the partitions of `name` and, for those partitioned in turn, their
+/// partitions (parents first).
+async fn pg_partitions(pool: &Pool, schema: &str, target: &str, name: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut todo = vec![name.to_string()];
+    let mut i = 0;
+    while i < todo.len() {
+        let parent = todo[i].clone();
+        i += 1;
+        let rows = pool
+            .query_strings(&format!(
+                "select c.relname, coalesce(pg_get_partkeydef(c.oid), ''), pg_get_expr(c.relpartbound, c.oid) \
+                 from pg_inherits i join pg_class c on c.oid = i.inhrelid \
+                 where i.inhparent = {} and c.relispartition order by c.relname",
+                pg_rel_expr(schema, &parent)
+            ))
+            .await?;
+        for r in &rows {
+            let child = s(r, 0);
+            let mut stmt = format!(
+                "create table {} partition of {} {}",
+                pg_qname(target, &child),
+                pg_qname(target, &parent),
+                maybe_rename(&lower_keywords(&s(r, 2)), schema, target)
+            );
+            if !s(r, 1).is_empty() {
+                stmt.push_str(&format!(
+                    " partition by {}",
+                    maybe_rename(&lower_keywords(&s(r, 1)), schema, target)
+                ));
+                todo.push(child);
+            }
+            out.push(format!("{stmt};"));
+        }
+    }
+    Ok(out)
+}
+
+/// `create index .. on only t` (the index of a partitioned table, as `pg_get_indexdef` writes it, lower-cased)
+/// becomes `on t`: the index then goes on every partition, which exist by the time it is created.
+fn pg_index_on_all(sql: &str) -> String {
+    sql.replacen(" on only ", " on ", 1)
 }
 
 fn pg_col_line(r: &Row, schema: &str, target: &str) -> String {
@@ -1403,6 +1494,10 @@ enum OraKind {
     Raw,
     Blob,
     Bool,
+    /// `XMLTYPE`: read as its CLOB text, written as `XMLTYPE(..)`.
+    Xml,
+    /// `JSON` (21c+ type): read as its text, written as `JSON(..)`.
+    Json,
 }
 
 fn ora_kind(data_type: &str) -> OraKind {
@@ -1418,6 +1513,8 @@ fn ora_kind(data_type: &str) -> OraKind {
         "RAW" | "LONG RAW" => OraKind::Raw,
         "BLOB" => OraKind::Blob,
         "BOOLEAN" => OraKind::Bool,
+        "XMLTYPE" => OraKind::Xml,
+        "JSON" => OraKind::Json,
         _ if t.starts_with("TIMESTAMP") => {
             if t.contains("TIME ZONE") {
                 OraKind::TimestampTz
@@ -1471,11 +1568,32 @@ enum OraLit {
     Sql(String),
     /// `var` is the PL/SQL type of the temporary LOB, `pieces` the expressions `DBMS_LOB.APPEND` adds (for a
     /// BLOB: hex text, converted from a variable: the server needs time quadratic in the size of a literal
-    /// `HEXTORAW` argument).
+    /// `HEXTORAW` argument). `wrap`: a constructor the LOB is passed to in the `VALUES` (`XMLTYPE`, `JSON`).
     Lob {
         var: &'static str,
         pieces: Vec<String>,
+        wrap: Option<&'static str>,
     },
+}
+
+/// The literal `func(lit)`: `XMLTYPE('..')` for a plain value, `XMLTYPE(v1)` for a LOB built in a block.
+fn ora_wrap(func: &'static str, lit: OraLit) -> OraLit {
+    match lit {
+        OraLit::Sql(e) => OraLit::Sql(format!("{func}({e})")),
+        OraLit::Lob { var, pieces, .. } => OraLit::Lob {
+            var,
+            pieces,
+            wrap: Some(func),
+        },
+    }
+}
+
+/// The SQL text of a literal that is not a LOB (a LOB never reaches here: the row is written as a block).
+fn ora_value_sql(l: OraLit) -> String {
+    match l {
+        OraLit::Sql(e) => e,
+        OraLit::Lob { .. } => String::new(),
+    }
 }
 
 fn ora_q(s: &str) -> String {
@@ -1505,6 +1623,7 @@ fn ora_text_lit(s: &str, nat: bool) -> OraLit {
                 .iter()
                 .map(|p| format!("TO_NCLOB(N{})", ora_q(p)))
                 .collect(),
+            wrap: None,
         };
     }
     if s.len() <= 4000 {
@@ -1526,6 +1645,7 @@ fn ora_text_lit(s: &str, nat: bool) -> OraLit {
             .iter()
             .map(|p| format!("TO_CLOB({})", ora_q(p)))
             .collect(),
+        wrap: None,
     }
 }
 
@@ -1546,6 +1666,7 @@ fn ora_blob_lit(hex: &str) -> OraLit {
             .chunks(ORA_PLSQL_HEX)
             .map(|p| String::from_utf8_lossy(p).into_owned())
             .collect(),
+        wrap: None,
     }
 }
 
@@ -1660,7 +1781,7 @@ fn ora_block_insert(dst: &str, cols: &str, lits: &[OraLit]) -> String {
     for (i, l) in lits.iter().enumerate() {
         match l {
             OraLit::Sql(e) => vals.push(e.clone()),
-            OraLit::Lob { var, pieces } => {
+            OraLit::Lob { var, pieces, wrap } => {
                 let v = format!("v{i}");
                 decl.push_str(&format!("    {v} {var};\n"));
                 body.push_str(&format!("    DBMS_LOB.CREATETEMPORARY({v}, TRUE);\n"));
@@ -1675,7 +1796,10 @@ fn ora_block_insert(dst: &str, cols: &str, lits: &[OraLit]) -> String {
                     }
                 }
                 free.push_str(&format!("    DBMS_LOB.FREETEMPORARY({v});\n"));
-                vals.push(v);
+                vals.push(match wrap {
+                    Some(f) => format!("{f}({v})"),
+                    None => v,
+                });
             }
         }
     }
@@ -1721,20 +1845,23 @@ fn ora_col_type(r: &Row, schema: &str) -> String {
         },
         "FLOAT" => format!("FLOAT({prec})"),
         "RAW" | "UROWID" => format!("{t}({len})"),
-        _ => {
-            let owner = s(r, 3);
-            if owner.is_empty() {
-                t
-            } else if owner == schema {
-                quote_ident(Driver::Oracle, &t)
-            } else {
-                format!(
-                    "{}.{}",
-                    quote_ident(Driver::Oracle, &owner),
-                    quote_ident(Driver::Oracle, &t)
-                )
-            }
-        }
+        _ => ora_type_name(&s(r, 3), &t, schema),
+    }
+}
+
+/// A type as a column or a constructor names it: built-in types (no owner, or `PUBLIC` as `XMLTYPE` has) bare,
+/// one of the dumped schema unqualified (the dump may run in another schema), others qualified.
+fn ora_type_name(owner: &str, name: &str, schema: &str) -> String {
+    if owner.is_empty() || owner == "PUBLIC" {
+        name.to_string()
+    } else if owner == schema {
+        quote_ident(Driver::Oracle, name)
+    } else {
+        format!(
+            "{}.{}",
+            quote_ident(Driver::Oracle, owner),
+            quote_ident(Driver::Oracle, name)
+        )
     }
 }
 
@@ -1790,6 +1917,19 @@ struct OraCol {
     virtual_expr: Option<String>,
     identity: Option<OraIdentity>,
     invisible: bool,
+    /// Owner of the column's type (`DATA_TYPE_OWNER`); empty for a built-in type.
+    type_owner: String,
+    /// An object column whose attributes are all scalar: written with its constructor (see [`ora_col_lit`]).
+    obj: Option<OraObj>,
+    /// Why the data of the column is not dumped (collections, objects with non-scalar attributes).
+    skip: Option<String>,
+}
+
+/// The constructor of an object column and its attributes (name and kind), in attribute order.
+#[derive(Debug, Clone)]
+struct OraObj {
+    ctor: String,
+    attrs: Vec<(String, OraKind)>,
 }
 
 /// Row of the columns query -> column.
@@ -1825,6 +1965,9 @@ fn ora_col(r: &Row, schema: &str) -> OraCol {
         virtual_expr: if virt { default } else { None },
         identity,
         invisible: s(r, 14) == "YES",
+        type_owner: s(r, 3),
+        obj: None,
+        skip: None,
     }
 }
 
@@ -1864,19 +2007,134 @@ fn ora_col_line(c: &OraCol, data: bool, in_pk: bool, fix: &dyn Fn(&str) -> Strin
     l
 }
 
-/// `TO_CHAR` of the time-zone types, so the zone survives whatever the driver does with it; other columns as is.
+/// `TO_CHAR` of the time-zone types, so the zone survives whatever the driver does with it; `XMLTYPE` and `JSON`
+/// as their text (`XMLSERIALIZE` / `JSON_SERIALIZE`); other columns as is.
 fn ora_select_expr(c: &OraCol) -> String {
     let q = quote_ident(Driver::Oracle, &c.name);
     const FMT: &str = "'YYYY-MM-DD HH24:MI:SS.FF9 TZH:TZM'";
-    if c.kind == OraKind::TimestampTz {
-        let v = if c.base.contains("LOCAL") {
-            format!("CAST({q} AS TIMESTAMP WITH TIME ZONE)")
-        } else {
-            q.clone()
+    match c.kind {
+        OraKind::TimestampTz => {
+            let v = if c.base.contains("LOCAL") {
+                format!("CAST({q} AS TIMESTAMP WITH TIME ZONE)")
+            } else {
+                q.clone()
+            };
+            format!("TO_CHAR({v}, {FMT}) AS {q}")
+        }
+        OraKind::Xml => format!("XMLSERIALIZE(CONTENT {q} AS CLOB) AS {q}"),
+        OraKind::Json => format!("JSON_SERIALIZE({q} RETURNING CLOB) AS {q}"),
+        _ => q,
+    }
+}
+
+/// Alias of the table in the data query: object attributes are reached through it (`dmp_t."ADDR"."STREET"`).
+const ORA_ROW_ALIAS: &str = "dmp_t";
+
+/// The select-list items of a data column: one, or for an object column a presence flag (`0` when the object is
+/// NULL) and each attribute. Read back by [`ora_col_lit`].
+fn ora_select_items(c: &OraCol) -> Vec<String> {
+    match &c.obj {
+        Some(obj) => {
+            let q = quote_ident(Driver::Oracle, &c.name);
+            let mut items = vec![format!(
+                "case when {ORA_ROW_ALIAS}.{q} is null then 0 else 1 end"
+            )];
+            items.extend(
+                obj.attrs.iter().map(|(a, _)| {
+                    format!("{ORA_ROW_ALIAS}.{q}.{}", quote_ident(Driver::Oracle, a))
+                }),
+            );
+            items
+        }
+        None => vec![ora_select_expr(c)],
+    }
+}
+
+/// How many select-list items [`ora_select_items`] gives for `c`.
+fn ora_select_width(c: &OraCol) -> usize {
+    c.obj.as_ref().map_or(1, |o| 1 + o.attrs.len())
+}
+
+/// `true` when the value of a flag item says the object is there.
+fn ora_is_present(v: &Value) -> bool {
+    v.as_i64() == Some(1) || v.as_str() == Some("1")
+}
+
+/// The attributes of a type (`ALL_TYPE_ATTRS` rows: name, type name, type owner, inherited; in attribute order) as
+/// the kinds of their values, when every attribute is a scalar the dump reads as text. `Err` gives the reason
+/// otherwise: no attributes (a collection), an inherited attribute (a subtype), an object or LOB attribute.
+fn ora_obj_attrs(
+    rows: &[(String, String, String, String)],
+) -> std::result::Result<Vec<(String, OraKind)>, String> {
+    if rows.is_empty() {
+        return Err("a collection or a type without attributes".into());
+    }
+    let mut out = Vec::new();
+    for (name, ty, owner, inherited) in rows {
+        if inherited == "YES" {
+            return Err("a subtype".into());
+        }
+        // `TIMESTAMP(6) WITH TIME ZONE` -> `TIMESTAMP WITH TIME ZONE`: the precision goes, the rest stays
+        let base = match (ty.find('('), ty.find(')')) {
+            (Some(a), Some(b)) if b > a => format!("{}{}", &ty[..a], &ty[b + 1..]),
+            _ => ty.clone(),
         };
-        format!("TO_CHAR({v}, {FMT}) AS {q}")
-    } else {
-        q
+        let base = base
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_uppercase();
+        let scalar = matches!(
+            base.as_str(),
+            "VARCHAR2"
+                | "CHAR"
+                | "NVARCHAR2"
+                | "NCHAR"
+                | "NUMBER"
+                | "FLOAT"
+                | "DATE"
+                | "TIMESTAMP"
+                | "BINARY_FLOAT"
+                | "BINARY_DOUBLE"
+                | "RAW"
+        );
+        if !owner.is_empty() || !scalar {
+            return Err(format!("attribute {name} is not a plain scalar"));
+        }
+        out.push((name.clone(), ora_kind(&base)));
+    }
+    Ok(out)
+}
+
+/// The literal of a data column from its select items (`vals`, as many as [`ora_select_width`] says). An object
+/// column is `TYPE(attr, ..)` (its attributes are scalar: a LOB-sized one is written as a plain literal, which
+/// fails at restore rather than silently losing data); `XMLTYPE` and `JSON` values are wrapped in their constructor.
+fn ora_col_lit(c: &OraCol, vals: &[Value]) -> OraLit {
+    let first = vals.first().unwrap_or(&Value::Null);
+    match &c.obj {
+        Some(obj) => {
+            if !ora_is_present(first) {
+                return OraLit::Sql("NULL".into());
+            }
+            let args: Vec<String> = obj
+                .attrs
+                .iter()
+                .zip(vals.iter().skip(1))
+                .map(|((_, k), v)| match ora_literal(v, *k) {
+                    OraLit::Sql(e) => e,
+                    OraLit::Lob { .. } => ora_q(v.as_str().unwrap_or_default()),
+                })
+                .collect();
+            OraLit::Sql(format!("{}({})", obj.ctor, args.join(", ")))
+        }
+        None => {
+            let lit = ora_literal(first, c.kind);
+            match (c.kind, first.is_null()) {
+                (OraKind::Xml, false) => ora_wrap("XMLTYPE", lit),
+                (OraKind::Json, false) => ora_wrap("JSON", lit),
+                _ => lit,
+            }
+        }
     }
 }
 
@@ -1909,11 +2167,152 @@ struct OraTable {
     /// Global temporary table: `ON COMMIT ..` clause.
     temp: Option<&'static str>,
     iot: bool,
+    /// The dictionary says the table is partitioned.
     partitioned: bool,
+    /// The `PARTITION BY` clause (see [`ora_partition_clause`]); `None` when the table is not restored partitioned.
+    partition: Option<String>,
+    /// `NESTED TABLE <column> STORE AS <storage table>` of the nested table columns.
+    nested: Vec<String>,
     cols: Vec<OraCol>,
     /// Primary key, unique and check constraints (inline `create table` lines).
     items: Vec<String>,
     pk_cols: Vec<String>,
+}
+
+/// A partitioned table's partitioning, from the dictionary (`ALL_PART_TABLES`, `ALL_PART_KEY_COLUMNS`,
+/// `ALL_TAB_PARTITIONS`, `ALL_TAB_SUBPARTITIONS`).
+#[derive(Debug, Clone, Default)]
+struct OraPartSpec {
+    /// `RANGE`, `LIST`, `HASH`, `SYSTEM` or `REFERENCE`.
+    kind: String,
+    keys: Vec<String>,
+    /// The `INTERVAL` expression of an interval-partitioned table (empty otherwise).
+    interval: String,
+    /// `RANGE` / `LIST` / `HASH` subpartitioning (empty when the table is not composite).
+    sub_kind: String,
+    sub_keys: Vec<String>,
+    /// Subpartitions per partition of a `HASH` subpartitioning.
+    sub_count: usize,
+    /// The partitions to name. Interval partitions are left out: the data creates them again.
+    parts: Vec<OraPartDef>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OraPartDef {
+    name: String,
+    /// The bound as the dictionary writes it (`'a', 'b'`, `DEFAULT`, `MAXVALUE`, ...); empty for hash and system.
+    high: String,
+    /// `(name, bound)` of the subpartitions of a `RANGE` / `LIST` subpartitioning.
+    subs: Vec<(String, String)>,
+}
+
+/// The `PARTITION BY` clause of a partitioned table, or `None` for reference partitioning (its parent must exist
+/// first: the table is then created unpartitioned) and for a table without partitions. Interval, composite
+/// (range or list over range, list or hash) and system partitioning are written. Hash partitions with the
+/// system names are written as a count (`PARTITIONS 4`), as the server generated them.
+fn ora_partition_clause(p: &OraPartSpec) -> Option<String> {
+    let keys = |ks: &[String]| {
+        ks.iter()
+            .map(|k| quote_ident(Driver::Oracle, k))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut out = match p.kind.as_str() {
+        "RANGE" | "LIST" => format!("PARTITION BY {} ({})", p.kind, keys(&p.keys)),
+        "HASH" if p.sub_kind.is_empty() => format!("PARTITION BY HASH ({})", keys(&p.keys)),
+        "SYSTEM" => "PARTITION BY SYSTEM".to_string(),
+        // a composite over hash partitioning is not written
+        _ => return None,
+    };
+    if p.parts.is_empty() {
+        return None;
+    }
+    if p.kind == "HASH" && p.parts.iter().all(|d| d.name.starts_with("SYS_P")) {
+        out.push_str(&format!(" PARTITIONS {}", p.parts.len()));
+        return Some(out);
+    }
+    if !p.interval.is_empty() {
+        out.push_str(&format!("\nINTERVAL ({})", p.interval));
+    }
+    match p.sub_kind.as_str() {
+        "" => {}
+        "HASH" => out.push_str(&format!(
+            "\nSUBPARTITION BY HASH ({}) SUBPARTITIONS {}",
+            keys(&p.sub_keys),
+            p.sub_count.max(1)
+        )),
+        other => out.push_str(&format!(
+            "\nSUBPARTITION BY {other} ({})",
+            keys(&p.sub_keys)
+        )),
+    }
+    let defs: Vec<String> = p
+        .parts
+        .iter()
+        .map(|d| ora_part_def(&p.kind, &p.sub_kind, d))
+        .collect();
+    out.push_str(&format!("\n(\n    {}\n)", defs.join(",\n    ")));
+    Some(out)
+}
+
+/// One partition of a `PARTITION BY` list, with its subpartitions when they are listed.
+fn ora_part_def(kind: &str, sub_kind: &str, d: &OraPartDef) -> String {
+    let name = quote_ident(Driver::Oracle, &d.name);
+    let head = match kind {
+        "RANGE" => format!("PARTITION {name} VALUES LESS THAN ({})", d.high),
+        "LIST" => format!("PARTITION {name} VALUES ({})", d.high),
+        _ => format!("PARTITION {name}"),
+    };
+    if d.subs.is_empty() || !matches!(sub_kind, "RANGE" | "LIST") {
+        return head;
+    }
+    let subs: Vec<String> = d
+        .subs
+        .iter()
+        .map(|(n, h)| {
+            let sn = quote_ident(Driver::Oracle, n);
+            if sub_kind == "RANGE" {
+                format!("SUBPARTITION {sn} VALUES LESS THAN ({h})")
+            } else {
+                format!("SUBPARTITION {sn} VALUES ({h})")
+            }
+        })
+        .collect();
+    format!("{head} ({})", subs.join(", "))
+}
+
+/// `CREATE MATERIALIZED VIEW` of a view from `ALL_MVIEWS` (`qname` quoted). `method` is the refresh method of the
+/// source: `FAST` becomes `FORCE` (the materialized view logs are not dumped, and a fast refresh needs them).
+/// `mode` is `DEMAND`, `COMMIT` or `NEVER`; `build` `IMMEDIATE` or `DEFERRED`.
+fn ora_mview_sql(qname: &str, build: &str, method: &str, mode: &str, query: &str) -> String {
+    let refresh = if mode == "NEVER" {
+        "NEVER REFRESH".to_string()
+    } else {
+        let method = if method == "FAST" || method.is_empty() {
+            "FORCE"
+        } else {
+            method
+        };
+        let on = if mode == "COMMIT" {
+            "ON COMMIT"
+        } else {
+            "ON DEMAND"
+        };
+        format!("REFRESH {method} {on}")
+    };
+    let mut query = query.trim().to_string();
+    // a trailing `--` comment would swallow the `;`
+    if query.lines().last().is_some_and(|l| l.contains("--")) {
+        query.push('\n');
+    }
+    format!(
+        "CREATE MATERIALIZED VIEW {qname} BUILD {} {refresh}\nAS\n{query};",
+        if build == "DEFERRED" {
+            "DEFERRED"
+        } else {
+            "IMMEDIATE"
+        }
+    )
 }
 
 impl OraTable {
@@ -1945,6 +2344,14 @@ impl OraTable {
         if self.iot {
             out.push_str("\nORGANIZATION INDEX");
         }
+        for n in &self.nested {
+            out.push('\n');
+            out.push_str(n);
+        }
+        if let Some(p) = &self.partition {
+            out.push('\n');
+            out.push_str(p);
+        }
         out.push(';');
         out
     }
@@ -1965,7 +2372,11 @@ async fn dump_rows_ora<W: Write>(
     tables_total: usize,
 ) -> Result<u64> {
     let d = Driver::Oracle;
-    let cols: Vec<&OraCol> = t.cols.iter().filter(|c| c.virtual_expr.is_none()).collect();
+    let cols: Vec<&OraCol> = t
+        .cols
+        .iter()
+        .filter(|c| c.virtual_expr.is_none() && c.skip.is_none())
+        .collect();
     if cols.is_empty() {
         return Ok(0);
     }
@@ -1975,14 +2386,18 @@ async fn dump_rows_ora<W: Write>(
         .collect::<Vec<_>>()
         .join(", ");
     let dst = quote_ident(d, &t.name);
+    let items: Vec<String> = cols.iter().copied().flat_map(ora_select_items).collect();
+    let alias = if cols.iter().any(|c| c.obj.is_some()) {
+        format!(" {ORA_ROW_ALIAS}")
+    } else {
+        String::new()
+    };
     let sql = format!(
-        "select {} from {}",
-        cols.iter()
-            .map(|c| ora_select_expr(c))
-            .collect::<Vec<_>>()
-            .join(", "),
+        "select {} from {}{alias}",
+        items.join(", "),
         qualified(d, Some(schema), &t.name)
     );
+    let widths: Vec<usize> = cols.iter().copied().map(ora_select_width).collect();
     let per_stmt = opts
         .batch_size
         .max(1)
@@ -2015,10 +2430,15 @@ async fn dump_rows_ora<W: Write>(
         if cancel.is_cancelled() {
             return Err(DbError::Cancelled);
         }
-        let lits: Vec<OraLit> = row
+        let mut at = 0;
+        let lits: Vec<OraLit> = cols
             .iter()
-            .zip(&cols)
-            .map(|(c, col)| ora_literal(c, col.kind))
+            .zip(&widths)
+            .map(|(col, w)| {
+                let vals = row.get(at..at + w).unwrap_or(&[]);
+                at += w;
+                ora_col_lit(col, vals)
+            })
             .collect();
         rows += 1;
         if lits.iter().any(|l| matches!(l, OraLit::Lob { .. })) {
@@ -2031,13 +2451,7 @@ async fn dump_rows_ora<W: Write>(
                 since_commit = 0;
             }
         } else {
-            let vals: Vec<String> = lits
-                .into_iter()
-                .map(|l| match l {
-                    OraLit::Sql(e) => e,
-                    OraLit::Lob { .. } => String::new(),
-                })
-                .collect();
+            let vals: Vec<String> = lits.into_iter().map(ora_value_sql).collect();
             let tuple = format!("({})", vals.join(", "));
             batch_bytes += tuple.len();
             batch.push(tuple);
@@ -2123,6 +2537,17 @@ async fn dump_ora<W: Write>(
         .collect();
     let names: Vec<String> = table_rows.iter().map(|r| s(r, 0)).collect();
 
+    // ---- materialized views (their containers are not in the table list: ora_table_filter leaves them out)
+    let mview_rows: Vec<Row> = if opts.include_ddl && opts.include_views && opts.tables.is_none() {
+        pool.query_strings(&format!(
+            "select mview_name, build_mode, refresh_method, refresh_mode, query from all_mviews \
+             where owner = {o} order by mview_name"
+        ))
+        .await?
+    } else {
+        Vec::new()
+    };
+
     // ---- columns (tables and views) in one query
     let col_rows = pool
         .query_strings(&format!(
@@ -2143,6 +2568,57 @@ async fn dump_ora<W: Write>(
         cols_of.entry(s(r, 0)).or_default().push(ora_col(r, schema));
     }
 
+    // ---- object types of the columns: their attributes (an object of scalar attributes is written with its
+    // constructor; a collection or an object with other attributes has no data)
+    let mut type_names: Vec<String> = cols_of
+        .values()
+        .flatten()
+        .filter(|c| !c.type_owner.is_empty() && c.kind == OraKind::Text)
+        .map(|c| c.base.clone())
+        .collect();
+    type_names.sort();
+    type_names.dedup();
+    let mut attrs_of: HashMap<(String, String), Vec<Row>> = HashMap::new();
+    if !type_names.is_empty() {
+        let attr_rows = pool
+            .query_strings(&format!(
+                "select owner, type_name, attr_name, attr_type_name, attr_type_owner, inherited \
+                 from all_type_attrs where type_name in ({}) order by owner, type_name, attr_no",
+                type_names
+                    .iter()
+                    .map(|n| pl(d, n))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+            .await?;
+        for r in attr_rows {
+            attrs_of.entry((s(&r, 0), s(&r, 1))).or_default().push(r);
+        }
+    }
+    for c in cols_of
+        .values_mut()
+        .flatten()
+        .filter(|c| !c.type_owner.is_empty() && c.kind == OraKind::Text)
+    {
+        let attrs: Vec<(String, String, String, String)> = attrs_of
+            .get(&(c.type_owner.clone(), c.base.clone()))
+            .map(|rows| {
+                rows.iter()
+                    .map(|r| (s(r, 2), s(r, 3), s(r, 4), s(r, 5)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        match ora_obj_attrs(&attrs) {
+            Ok(attrs) => {
+                c.obj = Some(OraObj {
+                    ctor: ora_type_name(&c.type_owner, &c.base, schema),
+                    attrs,
+                })
+            }
+            Err(why) => c.skip = Some(why),
+        }
+    }
+
     // ---- primary key, unique and check constraints
     let con_rows = pool
         .query_strings(&format!(
@@ -2151,6 +2627,9 @@ async fn dump_ora<W: Write>(
              from all_constraints c \
              left join all_cons_columns cc on cc.owner = c.owner and cc.constraint_name = c.constraint_name \
              where c.owner = {o} and c.constraint_type in ('P', 'U', 'C') \
+               and not exists (select 1 from all_tab_cols h where h.owner = c.owner and h.table_name = c.table_name \
+                               and h.column_name = cc.column_name and h.user_generated = 'NO') \
+               and coalesce(instr(c.search_condition_vc, 'SYS_NC'), 0) = 0 \
              order by c.table_name, decode(c.constraint_type, 'P', 1, 'U', 2, 3), c.constraint_name, cc.position"
         ))
         .await?;
@@ -2272,6 +2751,105 @@ async fn dump_ora<W: Write>(
         }
     }
 
+    // ---- partitioning: the keys, and the partitions the DDL names (interval partitions are created by the data)
+    // ---- nested table columns: the storage table is named (its rows are the column's: not dumped)
+    let mut nested_of: HashMap<String, Vec<String>> = HashMap::new();
+    for r in pool
+        .query_strings(&format!(
+            "select parent_table_name, parent_table_column, table_name from all_nested_tables where owner = {o}"
+        ))
+        .await?
+    {
+        nested_of.entry(s(&r, 0)).or_default().push(format!(
+            "NESTED TABLE {} STORE AS {}",
+            qi(&s(&r, 1)),
+            qi(&s(&r, 2))
+        ));
+    }
+
+    let mut parts_of: HashMap<String, OraPartSpec> = HashMap::new();
+    for r in pool
+        .query_strings(&format!(
+            "select table_name, partitioning_type, subpartitioning_type, interval, def_subpartition_count \
+             from all_part_tables where owner = {o}"
+        ))
+        .await?
+    {
+        let sub = s(&r, 2);
+        parts_of.insert(
+            s(&r, 0),
+            OraPartSpec {
+                kind: s(&r, 1),
+                interval: s(&r, 3),
+                sub_kind: if sub == "NONE" { String::new() } else { sub },
+                sub_count: s(&r, 4).parse().unwrap_or(1),
+                ..Default::default()
+            },
+        );
+    }
+    if !parts_of.is_empty() {
+        for r in pool
+            .query_strings(&format!(
+                "select name, column_name from all_part_key_columns \
+                 where owner = {o} and object_type = 'TABLE' order by name, column_position"
+            ))
+            .await?
+        {
+            if let Some(p) = parts_of.get_mut(&s(&r, 0)) {
+                p.keys.push(s(&r, 1));
+            }
+        }
+        for r in pool
+            .query_strings(&format!(
+                "select name, column_name from all_subpart_key_columns \
+                 where owner = {o} and object_type = 'TABLE' order by name, column_position"
+            ))
+            .await?
+        {
+            if let Some(p) = parts_of.get_mut(&s(&r, 0)) {
+                p.sub_keys.push(s(&r, 1));
+            }
+        }
+        for r in pool
+            .query_strings(&format!(
+                "select table_name, partition_name, high_value, interval from all_tab_partitions \
+                 where table_owner = {o} order by table_name, partition_position"
+            ))
+            .await?
+        {
+            if s(&r, 3) == "YES" {
+                continue;
+            }
+            if let Some(p) = parts_of.get_mut(&s(&r, 0)) {
+                p.parts.push(OraPartDef {
+                    name: s(&r, 1),
+                    high: s(&r, 2),
+                    subs: Vec::new(),
+                });
+            }
+        }
+        // the subpartitions are named only for a range or list subpartitioning (a hash one is a count)
+        if parts_of
+            .values()
+            .any(|p| matches!(p.sub_kind.as_str(), "RANGE" | "LIST"))
+        {
+            for r in pool
+                .query_strings(&format!(
+                    "select table_name, partition_name, subpartition_name, high_value from all_tab_subpartitions \
+                     where table_owner = {o} order by table_name, partition_name, subpartition_position"
+                ))
+                .await?
+            {
+                if let Some(d) = parts_of
+                    .get_mut(&s(&r, 0))
+                    .and_then(|p| p.parts.iter_mut().find(|d| d.name == s(&r, 1)))
+                {
+                    d.subs.push((s(&r, 2), s(&r, 3)));
+                }
+            }
+        }
+    }
+
     // ---- table definitions
     let mut defs: HashMap<String, OraTable> = HashMap::new();
     for r in &table_rows {
@@ -2289,6 +2867,12 @@ async fn dump_ora<W: Write>(
                 }),
                 iot: s(r, 3) == "IOT",
                 partitioned: s(r, 4) == "YES",
+                // a temporary table cannot be partitioned
+                nested: nested_of.remove(&name).unwrap_or_default(),
+                partition: parts_of
+                    .get(&name)
+                    .filter(|_| s(r, 1) != "Y")
+                    .and_then(ora_partition_clause),
                 cols: cols_of.get(&name).cloned().unwrap_or_default(),
                 items: items_of.remove(&name).unwrap_or_default(),
                 pk_cols: pk_of.remove(&name).unwrap_or_default(),
@@ -2336,6 +2920,123 @@ async fn dump_ora<W: Write>(
         }
         Ok(())
     };
+
+    // ---- materialized views are dropped before the tables they select from (created after the views)
+    if opts.drop_if_exists && opts.include_ddl && opts.include_views && opts.tables.is_none() {
+        for r in &mview_rows {
+            writeln!(
+                w,
+                "{}",
+                ora_drop_block(
+                    &format!("MATERIALIZED VIEW {}", qi(&s(r, 0))),
+                    &[-12003, -942]
+                )
+            )?;
+        }
+    }
+
+    // ---- object types: the specs in dependency order, then the bodies, before the tables that may use them.
+    // A subset of tables brings the types they use (and the types those use); a full dump brings them all.
+    if opts.include_ddl {
+        let src = pool
+            .query_strings(&format!(
+                "select name, type, text from all_source where owner = {o} and type in ('TYPE', 'TYPE BODY') \
+                 order by name, type, line"
+            ))
+            .await?;
+        let mut text_of: HashMap<(String, String), String> = HashMap::new();
+        for r in &src {
+            text_of
+                .entry((s(r, 1), s(r, 0)))
+                .or_default()
+                .push_str(&s(r, 2));
+        }
+        let deps = pool
+            .query_strings(&format!(
+                "select name, referenced_name from all_dependencies \
+                 where owner = {o} and type = 'TYPE' and referenced_owner = {o} and referenced_type = 'TYPE'"
+            ))
+            .await?;
+        // (referenced, referencing), as topo_sort wants them
+        let edges: Vec<(String, String)> = deps.iter().map(|r| (s(r, 1), s(r, 0))).collect();
+        let mut spec_names: Vec<String> = text_of
+            .keys()
+            .filter(|k| k.0 == "TYPE")
+            .map(|k| k.1.clone())
+            .collect();
+        spec_names.sort();
+        let mut needed: Vec<String> = if opts.tables.is_none() {
+            spec_names.clone()
+        } else {
+            let mut used: Vec<String> = cols_of
+                .iter()
+                .filter(|(t, _)| names.contains(t))
+                .flat_map(|(_, cols)| cols.iter())
+                .filter(|c| c.type_owner == schema && spec_names.contains(&c.base))
+                .map(|c| c.base.clone())
+                .collect();
+            used.sort();
+            used.dedup();
+            // the types those types are built from
+            let mut i = 0;
+            while i < used.len() {
+                let name = used[i].clone();
+                i += 1;
+                for (referenced, referencing) in &edges {
+                    if *referencing == name && !used.contains(referenced) {
+                        used.push(referenced.clone());
+                    }
+                }
+            }
+            used
+        };
+        needed.retain(|n| spec_names.contains(n));
+        let type_order = topo_sort(&needed, &edges);
+        if opts.drop_if_exists && opts.tables.is_none() {
+            // a type with table dependents cannot be replaced: dropped first (FORCE), created again below
+            for name in type_order.iter().rev() {
+                writeln!(
+                    w,
+                    "{}",
+                    ora_drop_block(&format!("TYPE {} FORCE", qi(name)), &ORA_DROP_MISSING)
+                )?;
+            }
+        } else if opts.drop_if_exists && !type_order.is_empty() {
+            // a subset: its own tables go first, so that the types they use can be replaced; a table outside the
+            // subset that uses one still stops the replace (nothing is forced)
+            for name in order.iter().rev() {
+                writeln!(
+                    w,
+                    "{}",
+                    ora_drop_block(
+                        &format!("TABLE {} CASCADE CONSTRAINTS PURGE", qi(name)),
+                        &ORA_DROP_MISSING
+                    )
+                )?;
+            }
+        }
+        for name in &type_order {
+            writeln!(
+                w,
+                "{}",
+                ora_unit_sql(&fix(&text_of[&("TYPE".to_string(), name.clone())]))
+            )?;
+            writeln!(w)?;
+        }
+        let mut bodies: Vec<&String> = needed
+            .iter()
+            .filter(|n| text_of.contains_key(&("TYPE BODY".to_string(), (*n).clone())))
+            .collect();
+        bodies.sort();
+        for name in bodies {
+            writeln!(
+                w,
+                "{}",
+                ora_unit_sql(&fix(&text_of[&("TYPE BODY".to_string(), name.clone())]))
+            )?;
+            writeln!(w)?;
+        }
+    }
 
     // ---- sequences (standalone; the identity sequences belong to their table)
     if opts.include_ddl && opts.include_sequences && opts.tables.is_none() {
@@ -2399,11 +3100,11 @@ async fn dump_ora<W: Write>(
             writeln!(w, "--")?;
             writeln!(w, "-- Name: {}; Type: TABLE", name)?;
             writeln!(w, "--")?;
-            if t.partitioned {
-                writeln!(
-                    w,
-                    "-- partitioned in the source: the partitions are not dumped"
-                )?;
+            if t.partitioned && t.partition.is_none() {
+                writeln!(w, "-- partitioning not restored: created unpartitioned")?;
+                res.warnings.push(format!(
+                    "{name}: partitioning not restored, the table is created unpartitioned"
+                ));
             }
             if opts.drop_if_exists {
                 writeln!(
@@ -2420,6 +3121,12 @@ async fn dump_ora<W: Write>(
             writeln!(w)?;
         }
         if with_data {
+            for c in t.cols.iter().filter(|c| c.skip.is_some()) {
+                let why = c.skip.as_deref().unwrap_or_default();
+                writeln!(w, "-- column {}: data not dumped ({why})", c.name)?;
+                res.warnings
+                    .push(format!("{name}.{}: data not dumped ({why})", c.name));
+            }
             // rows carry their own identity values: an ALWAYS identity accepts them only as BY DEFAULT
             if !opts.include_ddl {
                 for c in identities
@@ -2470,11 +3177,12 @@ async fn dump_ora<W: Write>(
         let idx_rows = pool
             .query_strings(&format!(
                 "select i.table_name, i.index_name, i.uniqueness, i.index_type, ic.column_name, ic.descend, \
-                        e.column_expression \
+                        e.column_expression, pi.locality \
                  from all_indexes i \
                  join all_ind_columns ic on ic.index_owner = i.owner and ic.index_name = i.index_name \
                  left join all_ind_expressions e on e.index_owner = i.owner and e.index_name = i.index_name \
                                                 and e.column_position = ic.column_position \
+                 left join all_part_indexes pi on pi.owner = i.owner and pi.index_name = i.index_name \
                  where i.table_owner = {o} and i.owner = {o} and i.generated = 'N' \
                    and i.index_type not in ('LOB', 'IOT - TOP', 'DOMAIN', 'CLUSTER') \
                    and not exists (select 1 from all_constraints k where k.owner = i.owner and k.index_name = i.index_name) \
@@ -2512,9 +3220,16 @@ async fn dump_ora<W: Write>(
             } else {
                 ""
             };
+            // a local index is partitioned like its table; a global partitioned one becomes a plain index
+            let local = if s(head, 7) == "LOCAL" { " LOCAL" } else { "" };
+            if s(head, 7) == "GLOBAL" {
+                res.warnings.push(format!(
+                    "index {index}: globally partitioned in the source, restored as a non-partitioned index"
+                ));
+            }
             writeln!(
                 w,
-                "CREATE {kind}INDEX {} ON {} ({}){};",
+                "CREATE {kind}INDEX {} ON {} ({}){}{local};",
                 qi(&index),
                 qi(&table),
                 cols.join(", "),
@@ -2533,6 +3248,38 @@ async fn dump_ora<W: Write>(
             }
         }
         writeln!(w)?;
+    }
+
+    // ---- private synonyms (a target in the dumped schema is written in the target schema)
+    if opts.include_ddl && opts.include_views && opts.tables.is_none() {
+        let target = opts.target_schema.as_deref().unwrap_or(schema);
+        let syns = pool
+            .query_strings(&format!(
+                "select synonym_name, table_owner, table_name, db_link from all_synonyms \
+                 where owner = {o} order by synonym_name"
+            ))
+            .await?;
+        for r in &syns {
+            let owner = if s(r, 1) == schema {
+                target.to_string()
+            } else {
+                s(r, 1)
+            };
+            let link = if s(r, 3).is_empty() {
+                String::new()
+            } else {
+                format!("@{}", s(r, 3))
+            };
+            writeln!(
+                w,
+                "CREATE OR REPLACE SYNONYM {} FOR {}{link};",
+                qi(&s(r, 0)),
+                qualified(d, Some(&owner), &s(r, 2))
+            )?;
+        }
+        if !syns.is_empty() {
+            writeln!(w)?;
+        }
     }
 
     // ---- views (dependency order)
@@ -2585,6 +3332,50 @@ async fn dump_ora<W: Write>(
             )?;
             write_comments(w, &v)?;
             writeln!(w)?;
+        }
+    }
+
+    // ---- materialized views (after the views they select from; built from their query, so no data is written)
+    if !mview_rows.is_empty() && opts.include_ddl && opts.include_views && opts.tables.is_none() {
+        report(progress, "materialized views", total, total, res.rows);
+        let by_name: HashMap<String, &Row> = mview_rows.iter().map(|r| (s(r, 0), r)).collect();
+        let names_m: Vec<String> = mview_rows.iter().map(|r| s(r, 0)).collect();
+        let dep_rows = pool
+            .query_strings(&format!(
+                "select name, referenced_name from all_dependencies \
+                 where owner = {o} and type = 'MATERIALIZED VIEW' and referenced_owner = {o} \
+                   and referenced_type = 'MATERIALIZED VIEW'"
+            ))
+            .await?;
+        let mv_edges: Vec<(String, String)> = dep_rows.iter().map(|r| (s(r, 1), s(r, 0))).collect();
+        for m in topo_sort(&names_m, &mv_edges) {
+            if cancel.is_cancelled() {
+                return Err(DbError::Cancelled);
+            }
+            let r = by_name[&m];
+            if s(r, 2) == "FAST" {
+                res.warnings.push(format!(
+                    "materialized view {m}: fast refresh in the source; its materialized view logs are not dumped, \
+                     so it is restored with REFRESH FORCE"
+                ));
+            }
+            writeln!(
+                w,
+                "{}",
+                ora_mview_sql(&qi(&m), &s(r, 1), &s(r, 2), &s(r, 3), &fix(&s(r, 4)))
+            )?;
+            writeln!(w)?;
+        }
+    }
+    // ---- materialized view logs are not dumped
+    if opts.include_ddl && opts.include_views && opts.tables.is_none() {
+        for r in pool
+            .query_strings(&format!(
+                "select master from all_mview_logs where log_owner = {o} order by master"
+            ))
+            .await?
+        {
+            writeln!(w, "-- materialized view log on {}: not dumped", s(&r, 0))?;
         }
     }
 
@@ -2824,7 +3615,7 @@ mod tests {
         assert!(!text.contains("'\u{fffd}"));
         // too many pieces for a chain: a block builds it
         match ora_text_lit(&"x".repeat(ORA_SQL_TEXT * (ORA_CHAIN_MAX + 1)), false) {
-            OraLit::Lob { var, pieces } => {
+            OraLit::Lob { var, pieces, .. } => {
                 assert_eq!(var, "CLOB");
                 assert!(pieces
                     .iter()
@@ -2856,7 +3647,7 @@ mod tests {
         assert_eq!(sql(ora_blob_lit("cafe")), "TO_BLOB(HEXTORAW('cafe'))");
         // `||` does not join BLOBs: anything over a RAW literal is built in a block
         match ora_blob_lit(&"ab".repeat(2001)) {
-            OraLit::Lob { var, pieces } => {
+            OraLit::Lob { var, pieces, .. } => {
                 assert_eq!(var, "BLOB");
                 assert_eq!(pieces, vec!["ab".repeat(2001)]);
             }
@@ -2953,6 +3744,8 @@ mod tests {
             ("RAW", OraKind::Raw),
             ("BLOB", OraKind::Blob),
             ("ROWID", OraKind::Text),
+            ("XMLTYPE", OraKind::Xml),
+            ("JSON", OraKind::Json),
         ] {
             assert_eq!(ora_kind(t), k, "{t}");
         }
@@ -2978,10 +3771,12 @@ mod tests {
                 OraLit::Lob {
                     var: "CLOB",
                     pieces: vec!["TO_CLOB('x')".into(), "TO_CLOB('y')".into()],
+                    wrap: None,
                 },
                 OraLit::Lob {
                     var: "BLOB",
                     pieces: vec!["0a0b".into()],
+                    wrap: None,
                 },
                 OraLit::Sql("NULL".into()),
             ],
@@ -3054,6 +3849,9 @@ mod tests {
             virtual_expr: None,
             identity: None,
             invisible: false,
+            type_owner: String::new(),
+            obj: None,
+            skip: None,
         };
         let same = |t: &str| t.to_string();
         let mut c = col("ID", "NUMBER");
@@ -3139,6 +3937,8 @@ mod tests {
             temp: Some("PRESERVE ROWS"),
             iot: false,
             partitioned: false,
+            partition: None,
+            nested: vec![],
             cols: vec![OraCol {
                 name: "X".into(),
                 ty: "NUMBER".into(),
@@ -3150,6 +3950,9 @@ mod tests {
                 virtual_expr: None,
                 identity: None,
                 invisible: false,
+                type_owner: String::new(),
+                obj: None,
+                skip: None,
             }],
             items: vec!["PRIMARY KEY (X)".into()],
             pk_cols: vec!["X".into()],
@@ -3157,6 +3960,321 @@ mod tests {
         assert_eq!(
             t.create_sql(true, &|s| s.to_string()),
             "CREATE GLOBAL TEMPORARY TABLE T\n(\n    X NUMBER,\n    PRIMARY KEY (X)\n)\nON COMMIT PRESERVE ROWS;"
+        );
+    }
+
+    #[test]
+    fn ora_partition_clauses_name_every_partition() {
+        let part = |name: &str, high: &str| OraPartDef {
+            name: name.into(),
+            high: high.into(),
+            subs: vec![],
+        };
+        // interval: the explicit partitions, then the interval expression (interval partitions are not named)
+        let range = OraPartSpec {
+            kind: "RANGE".into(),
+            keys: vec!["D".into()],
+            interval: "NUMTOYMINTERVAL(1, 'MONTH')".into(),
+            parts: vec![
+                part(
+                    "P_OLD",
+                    "TO_DATE(' 2024-01-01 00:00:00', 'SYYYY-MM-DD HH24:MI:SS')",
+                ),
+                part("P_MAX", "MAXVALUE"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            ora_partition_clause(&range).unwrap(),
+            "PARTITION BY RANGE (D)\nINTERVAL (NUMTOYMINTERVAL(1, 'MONTH'))\n(\n    PARTITION P_OLD VALUES LESS THAN (TO_DATE(' 2024-01-01 00:00:00', 'SYYYY-MM-DD HH24:MI:SS')),\n    PARTITION P_MAX VALUES LESS THAN (MAXVALUE)\n)"
+        );
+        // list, with the default partition; a quoted key and partition name keeps its quotes
+        let list = OraPartSpec {
+            kind: "LIST".into(),
+            keys: vec!["Code".into()],
+            parts: vec![part("P_A", "'AAA', 'BBB'"), part("P_DEF", "DEFAULT")],
+            ..Default::default()
+        };
+        assert_eq!(
+            ora_partition_clause(&list).unwrap(),
+            "PARTITION BY LIST (\"Code\")\n(\n    PARTITION P_A VALUES ('AAA', 'BBB'),\n    PARTITION P_DEF VALUES (DEFAULT)\n)"
+        );
+        // hash: system names are a count, given names are listed
+        let system = OraPartSpec {
+            kind: "HASH".into(),
+            keys: vec!["ID".into()],
+            parts: (719..723).map(|n| part(&format!("SYS_P{n}"), "")).collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            ora_partition_clause(&system).unwrap(),
+            "PARTITION BY HASH (ID) PARTITIONS 4"
+        );
+        let named = OraPartSpec {
+            kind: "HASH".into(),
+            keys: vec!["ID".into()],
+            parts: vec![part("H1", ""), part("H2", "")],
+            ..Default::default()
+        };
+        assert_eq!(
+            ora_partition_clause(&named).unwrap(),
+            "PARTITION BY HASH (ID)\n(\n    PARTITION H1,\n    PARTITION H2\n)"
+        );
+        // composite: hash subpartitions are a count, range subpartitions are listed per partition
+        let range_hash = OraPartSpec {
+            kind: "RANGE".into(),
+            keys: vec!["A".into()],
+            sub_kind: "HASH".into(),
+            sub_keys: vec!["B".into()],
+            sub_count: 2,
+            parts: vec![part("P1", "10"), part("P2", "MAXVALUE")],
+            ..Default::default()
+        };
+        assert_eq!(
+            ora_partition_clause(&range_hash).unwrap(),
+            "PARTITION BY RANGE (A)\nSUBPARTITION BY HASH (B) SUBPARTITIONS 2\n(\n    PARTITION P1 VALUES LESS THAN (10),\n    PARTITION P2 VALUES LESS THAN (MAXVALUE)\n)"
+        );
+        let list_range = OraPartSpec {
+            kind: "LIST".into(),
+            keys: vec!["A".into()],
+            sub_kind: "RANGE".into(),
+            sub_keys: vec!["B".into()],
+            parts: vec![OraPartDef {
+                name: "Q1".into(),
+                high: "1, 2".into(),
+                subs: vec![
+                    ("SQ1".into(), "5".into()),
+                    ("SYS_SUBP9".into(), "MAXVALUE".into()),
+                ],
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            ora_partition_clause(&list_range).unwrap(),
+            "PARTITION BY LIST (A)\nSUBPARTITION BY RANGE (B)\n(\n    PARTITION Q1 VALUES (1, 2) (SUBPARTITION SQ1 VALUES LESS THAN (5), SUBPARTITION SYS_SUBP9 VALUES LESS THAN (MAXVALUE))\n)"
+        );
+        // system partitioning names the partitions only
+        let system_part = OraPartSpec {
+            kind: "SYSTEM".into(),
+            parts: vec![part("S1", "")],
+            ..Default::default()
+        };
+        assert_eq!(
+            ora_partition_clause(&system_part).unwrap(),
+            "PARTITION BY SYSTEM\n(\n    PARTITION S1\n)"
+        );
+        // not written: reference partitioning (its parent comes first), a composite over hash, no partitions
+        let reference = OraPartSpec {
+            kind: "REFERENCE".into(),
+            parts: vec![part("R1", "")],
+            ..Default::default()
+        };
+        assert!(ora_partition_clause(&reference).is_none());
+        let hash_hash = OraPartSpec {
+            kind: "HASH".into(),
+            sub_kind: "HASH".into(),
+            parts: vec![part("H1", "")],
+            ..Default::default()
+        };
+        assert!(ora_partition_clause(&hash_hash).is_none());
+        assert!(ora_partition_clause(&OraPartSpec {
+            kind: "RANGE".into(),
+            keys: vec!["D".into()],
+            ..Default::default()
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn ora_materialized_view_statements() {
+        let q = "select id from t";
+        assert_eq!(
+            ora_mview_sql("\"V\"", "IMMEDIATE", "FORCE", "DEMAND", q),
+            "CREATE MATERIALIZED VIEW \"V\" BUILD IMMEDIATE REFRESH FORCE ON DEMAND\nAS\nselect id from t;"
+        );
+        // a fast refresh needs the logs, which are not dumped: FORCE; the commit mode and a deferred build stay
+        assert_eq!(
+            ora_mview_sql("V", "DEFERRED", "FAST", "COMMIT", q),
+            "CREATE MATERIALIZED VIEW V BUILD DEFERRED REFRESH FORCE ON COMMIT\nAS\nselect id from t;"
+        );
+        assert_eq!(
+            ora_mview_sql("V", "IMMEDIATE", "COMPLETE", "NEVER", q),
+            "CREATE MATERIALIZED VIEW V BUILD IMMEDIATE NEVER REFRESH\nAS\nselect id from t;"
+        );
+        // a trailing `--` comment keeps the `;` on its own line
+        assert!(ora_mview_sql(
+            "V",
+            "IMMEDIATE",
+            "COMPLETE",
+            "DEMAND",
+            "select 1 from t -- x"
+        )
+        .ends_with("from t -- x\n;"));
+    }
+
+    #[test]
+    fn ora_object_attributes_must_be_plain_scalars() {
+        let a = |n: &str, t: &str, o: &str, inh: &str| {
+            (n.to_string(), t.to_string(), o.to_string(), inh.to_string())
+        };
+        assert_eq!(
+            ora_obj_attrs(&[
+                a("STREET", "VARCHAR2", "", "NO"),
+                a("ZIP", "NUMBER", "", "NO"),
+                a("AT", "TIMESTAMP", "", "NO")
+            ]),
+            Ok(vec![
+                ("STREET".to_string(), OraKind::Text),
+                ("ZIP".to_string(), OraKind::Number),
+                ("AT".to_string(), OraKind::Timestamp),
+            ])
+        );
+        // a collection has no attributes, a subtype inherits some, an object or a time zone attribute is not written
+        assert!(ora_obj_attrs(&[]).is_err());
+        assert!(ora_obj_attrs(&[a("X", "NUMBER", "", "YES")]).is_err());
+        assert!(ora_obj_attrs(&[a("X", "ADDR_T", "DEMO", "NO")]).is_err());
+        assert!(ora_obj_attrs(&[a("X", "TIMESTAMP(6) WITH TIME ZONE", "", "NO")]).is_err());
+        assert!(ora_obj_attrs(&[a("X", "CLOB", "", "NO")]).is_err());
+    }
+
+    #[test]
+    fn ora_object_columns_are_written_with_their_constructor() {
+        let col = |kind: OraKind, obj: Option<OraObj>| OraCol {
+            name: "A".into(),
+            ty: "ADDR_T".into(),
+            base: "ADDR_T".into(),
+            kind,
+            nullable: true,
+            default: None,
+            default_on_null: false,
+            virtual_expr: None,
+            identity: None,
+            invisible: false,
+            type_owner: "DEMO".into(),
+            obj,
+            skip: None,
+        };
+        let obj = OraObj {
+            ctor: "ADDR_T".into(),
+            attrs: vec![
+                ("STREET".into(), OraKind::Text),
+                ("ZIP".into(), OraKind::Number),
+            ],
+        };
+        let c = col(OraKind::Text, Some(obj));
+        assert_eq!(ora_select_width(&c), 3);
+        assert_eq!(
+            ora_select_items(&c),
+            vec![
+                "case when dmp_t.A is null then 0 else 1 end".to_string(),
+                "dmp_t.A.STREET".to_string(),
+                "dmp_t.A.ZIP".to_string(),
+            ]
+        );
+        let lit = |vals: &[Value]| sql(ora_col_lit(&c, vals));
+        assert_eq!(
+            lit(&[json!(1), json!("Main"), json!(1234)]),
+            "ADDR_T('Main', 1234)"
+        );
+        assert_eq!(
+            lit(&[json!(1), Value::Null, Value::Null]),
+            "ADDR_T(NULL, NULL)"
+        );
+        // a NULL object is NULL, whatever its attributes say
+        assert_eq!(lit(&[json!(0), Value::Null, Value::Null]), "NULL");
+        // an attribute that needs a LOB literal is a plain literal (it fails at restore, not silently)
+        let long = "x".repeat(30000);
+        assert_eq!(
+            lit(&[json!(1), json!(long.clone()), json!(1)]),
+            format!("ADDR_T('{long}', 1)")
+        );
+    }
+
+    #[test]
+    fn ora_xml_and_json_values_go_through_their_constructor() {
+        let col = |kind: OraKind| OraCol {
+            name: "DOC".into(),
+            ty: "XMLTYPE".into(),
+            base: "XMLTYPE".into(),
+            kind,
+            nullable: true,
+            default: None,
+            default_on_null: false,
+            virtual_expr: None,
+            identity: None,
+            invisible: false,
+            type_owner: "PUBLIC".into(),
+            obj: None,
+            skip: None,
+        };
+        let xml = col(OraKind::Xml);
+        assert_eq!(
+            ora_select_items(&xml),
+            vec!["XMLSERIALIZE(CONTENT DOC AS CLOB) AS DOC".to_string()]
+        );
+        assert_eq!(
+            sql(ora_col_lit(&xml, &[json!("<a x=\"1\"/>")])),
+            "XMLTYPE('<a x=\"1\"/>')"
+        );
+        assert_eq!(sql(ora_col_lit(&xml, &[Value::Null])), "NULL");
+        // a long document is a LOB (more than eight literal pieces): the wrapper goes around the block variable
+        match ora_col_lit(
+            &xml,
+            &[json!("<a>".to_string() + &"x".repeat(30000) + "</a>")],
+        ) {
+            OraLit::Lob { var, wrap, .. } => {
+                assert_eq!((var, wrap), ("CLOB", Some("XMLTYPE")));
+                let block = ora_block_insert(
+                    "T",
+                    "DOC",
+                    &[OraLit::Lob {
+                        var,
+                        pieces: vec!["TO_CLOB('x')".into()],
+                        wrap,
+                    }],
+                );
+                assert!(
+                    block.contains("INSERT INTO T (DOC) VALUES (XMLTYPE(v0));"),
+                    "{block}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        let json_col = col(OraKind::Json);
+        assert_eq!(
+            ora_select_items(&json_col),
+            vec!["JSON_SERIALIZE(DOC RETURNING CLOB) AS DOC".to_string()]
+        );
+        assert_eq!(
+            sql(ora_col_lit(&json_col, &[json!("{\"k\":1}")])),
+            "JSON('{\"k\":1}')"
+        );
+    }
+
+    #[test]
+    fn ora_public_types_are_named_bare() {
+        // XMLTYPE's owner is PUBLIC: `PUBLIC.XMLTYPE` is not a name
+        assert_eq!(
+            ora_col_type(
+                &row(&["DOC", "C", "XMLTYPE", "PUBLIC", "", "", "", "", ""]),
+                "DEMO"
+            ),
+            "XMLTYPE"
+        );
+        assert_eq!(ora_type_name("DEMO", "T", "DEMO"), "T");
+        assert_eq!(ora_type_name("OTHER", "T", "DEMO"), "OTHER.T");
+    }
+
+    #[test]
+    fn pg_partitioned_index_goes_on_every_partition() {
+        assert_eq!(
+            pg_index_on_all("create index events_kind_idx on only s.events using btree (kind)"),
+            "create index events_kind_idx on s.events using btree (kind)"
+        );
+        // a plain index is untouched
+        assert_eq!(
+            pg_index_on_all("create index i on s.t using btree (a)"),
+            "create index i on s.t using btree (a)"
         );
     }
 

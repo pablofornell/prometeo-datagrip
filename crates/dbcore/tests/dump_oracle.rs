@@ -30,7 +30,8 @@ async fn exec_ok(mgr: &ConnectionManager, s: &SessionId, sql: &str) {
     assert_ok(&run(mgr, s, sql).await);
 }
 
-/// Drops every object whose name starts with `prefix` (tables with their constraints, sequences, views, units).
+/// Drops every object whose name starts with `prefix` (tables with their constraints, sequences, views, materialized
+/// views, synonyms, types, units).
 async fn clean(mgr: &ConnectionManager, s: &SessionId, prefix: &str) {
     exec_ok(
         mgr,
@@ -40,11 +41,12 @@ async fn clean(mgr: &ConnectionManager, s: &SessionId, prefix: &str) {
 begin
   for o in (select object_type, object_name from user_objects
              where object_name like '{prefix}\_%' escape '\'
-               and object_type in ('VIEW', 'TABLE', 'SEQUENCE', 'FUNCTION', 'PROCEDURE', 'PACKAGE')
-             order by decode(object_type, 'VIEW', 1, 'TABLE', 2, 3)) loop
+               and object_type in ('VIEW', 'MATERIALIZED VIEW', 'SYNONYM', 'TABLE', 'SEQUENCE', 'TYPE', 'FUNCTION',
+                                   'PROCEDURE', 'PACKAGE')
+             order by decode(object_type, 'VIEW', 1, 'MATERIALIZED VIEW', 1, 'SYNONYM', 1, 'TABLE', 2, 3)) loop
     begin
       execute immediate 'drop ' || o.object_type || ' "' || o.object_name || '"'
-        || case when o.object_type = 'TABLE' then ' cascade constraints purge' end;
+        || case when o.object_type = 'TABLE' then ' cascade constraints purge' when o.object_type = 'TYPE' then ' force' end;
     exception when others then null;
     end;
   end loop;
@@ -107,12 +109,32 @@ async fn restore(mgr: &ConnectionManager, s: &SessionId, dump: &str) {
     assert_ok(&ev);
 }
 
+/// Runs a dump file the way the app does (`run_sql_file`: statement by statement, one transaction), and asserts no
+/// statement failed.
+async fn restore_file(mgr: &ConnectionManager, text: &str, name: &str) {
+    let file = std::env::temp_dir().join(name);
+    std::fs::write(&file, text).unwrap();
+    let sum = mgr
+        .run_sql_file(
+            "ora",
+            None,
+            &file,
+            &ScriptOptions::default(),
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert_eq!((sum.failed, sum.first_error.clone()), (0, None), "{sum:?}");
+}
+
 /// `true` when the statement is a PL/SQL unit (ends at a `/` line).
 fn is_plsql(sql: &str) -> bool {
     let up = sql.trim_start().to_ascii_uppercase();
     up.starts_with("BEGIN")
         || up.starts_with("DECLARE")
-        || ["FUNCTION", "PROCEDURE", "PACKAGE", "TRIGGER"]
+        || ["FUNCTION", "PROCEDURE", "PACKAGE", "TRIGGER", "TYPE"]
             .iter()
             .any(|k| up.starts_with(&format!("CREATE OR REPLACE {k}")))
 }
@@ -952,5 +974,435 @@ async fn cancel_stops_the_dump_and_progress_names_the_table() {
     assert!(res.cancelled);
 
     clean(mgr, &s, "ZDC").await;
+    mgr.disconnect("ora").await;
+}
+
+// ---------------------------------------------------------------- partitions, local indexes (prefix ZDW)
+
+const SETUP_PART: &str = r#"
+create table zdw_rng (
+  id number not null,
+  d date not null,
+  v varchar2(20),
+  constraint zdw_rng_pk primary key (id, d)
+)
+partition by range (d) interval (numtoyminterval(1, 'MONTH'))
+(partition zdw_old values less than (to_date('2024-01-01', 'YYYY-MM-DD')),
+ partition zdw_2024 values less than (to_date('2025-01-01', 'YYYY-MM-DD')));
+create index zdw_rng_ix on zdw_rng (v) local;
+create table zdw_lst (code varchar2(3) not null, n number, constraint zdw_lst_ck check (n >= 0))
+partition by list (code) (partition zdw_a values ('AAA', 'BBB'), partition zdw_def values (default));
+create index zdw_lst_ix on zdw_lst (n) global partition by range (n)
+(partition zdw_g1 values less than (10), partition zdw_g2 values less than (maxvalue));
+create table zdw_comp (a number not null, b number not null, c varchar2(5))
+partition by range (a) subpartition by hash (b) subpartitions 2
+(partition zdw_p1 values less than (10), partition zdw_p2 values less than (maxvalue));
+insert into zdw_rng values (1, date '2024-03-05', 'x');
+insert into zdw_rng values (2, date '2025-07-05', 'y');
+insert into zdw_rng values (3, date '2025-09-01', 'z');
+insert into zdw_lst values ('AAA', 1);
+insert into zdw_lst values ('ZZZ', 2);
+insert into zdw_comp values (5, 3, 'a');
+insert into zdw_comp values (15, 4, 'b');
+insert into zdw_comp values (15, 7, 'c');
+commit;
+"#;
+
+/// The partitioning as the dictionary shows it: the partitions in order (interval ones by kind, their generated names
+/// left out), the partitioned tables, the local index.
+async fn partition_facts(mgr: &ConnectionManager, s: &SessionId) -> String {
+    let parts = one(
+        mgr,
+        s,
+        "select listagg(table_name || '.' || partition_position || '.' || \
+                case when interval = 'YES' then 'interval' else partition_name end, ';') \
+                within group (order by table_name, partition_position) \
+         from user_tab_partitions where table_name like 'ZDW%'",
+    )
+    .await;
+    let tables = one(
+        mgr,
+        s,
+        "select listagg(table_name || ':' || partitioning_type || ':' || nvl(subpartitioning_type, '-') || ':' \
+                || def_subpartition_count || ':' || nvl(interval, '-'), ';') within group (order by table_name) \
+         from user_part_tables where table_name like 'ZDW%'",
+    )
+    .await;
+    let index = one(
+        mgr,
+        s,
+        "select listagg(index_name || ':' || locality, ';') within group (order by index_name) \
+         from user_part_indexes where index_name = 'ZDW_RNG_IX'",
+    )
+    .await;
+    format!("{parts} | {tables} | {index}")
+}
+
+#[tokio::test]
+async fn partitions_and_local_indexes_round_trip() {
+    let Some(cfg) = oracle_cfg() else {
+        eprintln!("PROMETEO_ORACLE_URL not set: skipping");
+        return;
+    };
+    let _guard = LOCK.lock().await;
+    let mgr = &connected(&cfg).await;
+    let s = mgr.open_session("ora").await.unwrap();
+    let schema = current_schema(mgr, &s).await;
+    clean(mgr, &s, "ZDW").await;
+    exec_ok(mgr, &s, SETUP_PART).await;
+    let facts = partition_facts(mgr, &s).await;
+    let counts = "select (select count(*) from zdw_rng partition (zdw_old)) || ',' \
+                  || (select count(*) from zdw_rng partition (zdw_2024)) || ',' || (select count(*) from zdw_rng) || ',' \
+                  || (select count(*) from zdw_lst partition (zdw_def)) || ',' \
+                  || (select count(*) from zdw_comp partition (zdw_p2)) from dual";
+    let rows_before = one(mgr, &s, counts).await;
+    assert_eq!(rows_before, "0,1,3,1,2");
+
+    // the three partitioned tables; the global partitioned index is restored as a plain one (a warning)
+    let opts = DumpOptions {
+        drop_if_exists: true,
+        batch_size: 2,
+        ..options(Some(vec!["ZDW_RNG", "ZDW_LST", "ZDW_COMP"]))
+    };
+    let (text, res) = dump(mgr, &schema, &opts).await;
+    assert_eq!((res.tables, res.rows), (3, 8), "{:?}", res.warnings);
+    assert!(
+        res.warnings
+            .iter()
+            .any(|w| w.starts_with("index ZDW_LST_IX: globally partitioned")),
+        "{:?}",
+        res.warnings
+    );
+    // the bound of the default partition is written as the dictionary has it (lower case)
+    let up = text.to_ascii_uppercase();
+    for needle in [
+        "PARTITION BY RANGE (D)\nINTERVAL (NUMTOYMINTERVAL(1, 'MONTH'))",
+        "PARTITION ZDW_OLD VALUES LESS THAN (TO_DATE(",
+        "PARTITION BY LIST (CODE)",
+        "PARTITION ZDW_DEF VALUES (DEFAULT)",
+        "PARTITION BY RANGE (A)\nSUBPARTITION BY HASH (B) SUBPARTITIONS 2",
+        "CREATE INDEX ZDW_RNG_IX ON ZDW_RNG (V) LOCAL;",
+        "CREATE INDEX ZDW_LST_IX ON ZDW_LST (N);",
+    ] {
+        assert!(
+            up.contains(&needle.to_ascii_uppercase()),
+            "{needle:?} missing in the dump:\n{text}"
+        );
+    }
+    // the interval partitions are created by the rows, under names of their own: none is written
+    assert!(!text.contains("SYS_P"), "{text}");
+
+    // drop everything, restore the file the way the app runs it
+    clean(mgr, &s, "ZDW").await;
+    assert_eq!(
+        one(
+            mgr,
+            &s,
+            "select count(*) from user_tables where table_name like 'ZDW%'"
+        )
+        .await,
+        "0"
+    );
+    restore_file(mgr, &text, "prometeo-dump-oracle-partitions.sql").await;
+
+    assert_eq!(partition_facts(mgr, &s).await, facts);
+    assert_eq!(one(mgr, &s, counts).await, rows_before);
+    // the interval keeps going: a row in a new month gets a new partition
+    let parts_before = one(
+        mgr,
+        &s,
+        "select count(*) from user_tab_partitions where table_name = 'ZDW_RNG'",
+    )
+    .await;
+    exec_ok(
+        mgr,
+        &s,
+        "insert into zdw_rng values (9, date '2026-02-02', 'k'); commit;",
+    )
+    .await;
+    assert_eq!(
+        one(
+            mgr,
+            &s,
+            "select count(*) from user_tab_partitions where table_name = 'ZDW_RNG'"
+        )
+        .await,
+        (parts_before.parse::<i64>().unwrap() + 1).to_string()
+    );
+
+    // restored again over the existing tables (drop_if_exists): the same partitioning
+    restore(mgr, &s, &text).await;
+    assert_eq!(partition_facts(mgr, &s).await, facts);
+    assert_eq!(one(mgr, &s, counts).await, rows_before);
+
+    clean(mgr, &s, "ZDW").await;
+    mgr.disconnect("ora").await;
+}
+
+// ---------------------------------------------------------------- object types, XMLTYPE, JSON (prefix ZDW)
+
+const SETUP_TYPES: &str = r#"
+create or replace type zdw_addr as object (
+  street varchar2(50), zip number, city varchar2(30),
+  member function city_len return number
+);
+/
+create or replace type body zdw_addr as
+  member function city_len return number is begin return length(city); end;
+end;
+/
+create or replace type zdw_nums as table of number;
+/
+create table zdw_obj (
+  id number primary key,
+  addr zdw_addr,
+  doc xmltype,
+  js json
+);
+create table zdw_coll (id number primary key, nums zdw_nums) nested table nums store as zdw_coll_nums;
+insert into zdw_obj values (1, zdw_addr('Main', 1234, 'Lisbon'), xmltype('<doc n="1">é</doc>'), json('{"k":1}'));
+insert into zdw_obj values (2, null, null, null);
+insert into zdw_obj values (3, zdw_addr(null, null, null), xmltype('<x/>'), json('[1,2]'));
+insert into zdw_coll values (1, zdw_nums(1, 2, 3));
+insert into zdw_coll values (2, null);
+commit;
+"#;
+
+/// The values of the object, XML and JSON columns as text (and the method of the object type).
+async fn object_facts(mgr: &ConnectionManager, s: &SessionId) -> String {
+    one(
+        mgr,
+        s,
+        "select listagg(t.id || ':' || case when t.addr is null then 'N' else 'O' end || ':' \
+                || nvl(t.addr.street, '-') || ':' || nvl(to_char(t.addr.zip), '-') || ':' \
+                || nvl(to_char(t.addr.city_len()), '-') || ':' \
+                || replace(nvl(xmlserialize(content t.doc as varchar2(4000)), '-'), chr(10), '') || ':' \
+                || nvl(json_serialize(t.js), '-'), ';') within group (order by t.id) \
+         from zdw_obj t",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn object_types_xmltype_and_json_round_trip() {
+    let Some(cfg) = oracle_cfg() else {
+        eprintln!("PROMETEO_ORACLE_URL not set: skipping");
+        return;
+    };
+    let _guard = LOCK.lock().await;
+    let mgr = &connected(&cfg).await;
+    let s = mgr.open_session("ora").await.unwrap();
+    let schema = current_schema(mgr, &s).await;
+    clean(mgr, &s, "ZDW").await;
+    exec_ok(mgr, &s, SETUP_TYPES).await;
+    let before = object_facts(mgr, &s).await;
+    assert_eq!(
+        before, "1:O:Main:1234:6:<doc n=\"1\">é</doc>:{\"k\":1};2:N:-:-:-:-:-;3:O:-:-:-:<x/>:[1,2]",
+        "the source values"
+    );
+
+    // the object types come along when a subset needs them (zdw_obj uses zdw_addr, zdw_coll uses zdw_nums);
+    // one row per INSERT, so that each value is visible
+    let (text, res) = dump(
+        mgr,
+        &schema,
+        &DumpOptions {
+            batch_size: 1,
+            ..options(Some(vec!["ZDW_OBJ", "ZDW_COLL"]))
+        },
+    )
+    .await;
+    let up = text.to_ascii_uppercase();
+    assert!(
+        up.contains("CREATE OR REPLACE TYPE ZDW_ADDR AS OBJECT"),
+        "{text}"
+    );
+    assert!(
+        up.contains("CREATE OR REPLACE TYPE BODY ZDW_ADDR"),
+        "{text}"
+    );
+    assert!(
+        up.contains("CREATE OR REPLACE TYPE ZDW_NUMS AS TABLE OF NUMBER"),
+        "{text}"
+    );
+    assert!(
+        up.find("CREATE OR REPLACE TYPE ZDW_ADDR AS OBJECT")
+            .unwrap()
+            < up.find("CREATE OR REPLACE TYPE BODY ZDW_ADDR").unwrap()
+            && up.find("CREATE OR REPLACE TYPE BODY ZDW_ADDR").unwrap()
+                < up.find("CREATE TABLE ZDW_OBJ").unwrap(),
+        "types before the tables that use them: {text}"
+    );
+    // the XML text carries the newline Oracle keeps after a document: the needles stop before it
+    for needle in [
+        "INSERT INTO ZDW_OBJ (ID, ADDR, DOC, JS) VALUES (1, ZDW_ADDR('Main', 1234, 'Lisbon'), XMLTYPE('<doc n=\"1\">é</doc>",
+        "ZDW_ADDR(NULL, NULL, NULL)",
+        "XMLTYPE('<x/>",
+        "JSON('[1,2]')",
+        "INSERT INTO ZDW_OBJ (ID, ADDR, DOC, JS) VALUES (2, NULL, NULL, NULL);",
+    ] {
+        assert!(text.contains(needle), "{needle:?} missing in the dump:\n{text}");
+    }
+    // the collection column has no data: a warning and a comment
+    assert!(
+        res.warnings
+            .iter()
+            .any(|w| w.starts_with("ZDW_COLL.NUMS: data not dumped")),
+        "{:?}",
+        res.warnings
+    );
+    assert!(text.contains("-- column NUMS: data not dumped"), "{text}");
+    assert!(
+        !res.warnings.iter().any(|w| w.starts_with("ZDW_OBJ.")),
+        "{:?}",
+        res.warnings
+    );
+
+    clean(mgr, &s, "ZDW").await;
+    restore_file(mgr, &text, "prometeo-dump-oracle-types.sql").await;
+    assert_eq!(object_facts(mgr, &s).await, before);
+    assert_eq!(
+        one(mgr, &s, "select count(*) from zdw_coll where nums is null").await,
+        "2",
+        "the collection column is restored empty"
+    );
+    assert_eq!(
+        one(
+            mgr,
+            &s,
+            "select status from user_objects where object_name = 'ZDW_ADDR' and object_type = 'TYPE BODY'"
+        )
+        .await,
+        "VALID"
+    );
+
+    // again over the existing types and tables
+    restore_file(mgr, &text, "prometeo-dump-oracle-types.sql").await;
+    assert_eq!(object_facts(mgr, &s).await, before);
+
+    clean(mgr, &s, "ZDW").await;
+    mgr.disconnect("ora").await;
+}
+
+// ---------------------------------------------------------------- materialized views, synonyms (prefix ZDW)
+
+const SETUP_MV: &str = r#"
+create table zdw_base (id number primary key, code varchar2(5) not null, n number);
+insert into zdw_base values (1, 'A', 10);
+insert into zdw_base values (2, 'A', -1);
+insert into zdw_base values (3, 'B', 5);
+create view zdw_v as select code, n from zdw_base where n > 0;
+create materialized view log on zdw_base with primary key;
+create materialized view zdw_mv refresh complete on demand as
+  select code, count(*) cnt from zdw_base group by code;
+create materialized view zdw_mv_fast refresh fast on commit as select id, n from zdw_base;
+create materialized view zdw_mv_v refresh force on demand as select code, n from zdw_v;
+create materialized view zdw_mv_never never refresh as select id from zdw_base;
+create synonym zdw_syn for zdw_base;
+create synonym zdw_syn_v for zdw_v;
+commit;
+"#;
+
+#[tokio::test]
+async fn materialized_views_and_synonyms_round_trip() {
+    let Some(cfg) = oracle_cfg() else {
+        eprintln!("PROMETEO_ORACLE_URL not set: skipping");
+        return;
+    };
+    let _guard = LOCK.lock().await;
+    let mgr = &connected(&cfg).await;
+    let s = mgr.open_session("ora").await.unwrap();
+    let schema = current_schema(mgr, &s).await;
+    clean(mgr, &s, "ZDW").await;
+    exec_ok(mgr, &s, SETUP_MV).await;
+    let mv_facts = "select listagg(mview_name || '=' || refresh_method || ':' || refresh_mode || ':' || build_mode, ';') \
+                    within group (order by mview_name) from user_mviews where mview_name like 'ZDW%'";
+    let mv_before = one(mgr, &s, mv_facts).await;
+    assert_eq!(
+        mv_before,
+        "ZDW_MV=COMPLETE:DEMAND:IMMEDIATE;ZDW_MV_FAST=FAST:COMMIT:IMMEDIATE;ZDW_MV_NEVER=NEVER:NEVER:IMMEDIATE;ZDW_MV_V=FORCE:DEMAND:IMMEDIATE"
+    );
+
+    let (text, res) = dump(mgr, &schema, &options(None)).await;
+    for needle in [
+        "CREATE MATERIALIZED VIEW ZDW_MV BUILD IMMEDIATE REFRESH COMPLETE ON DEMAND\nAS\n",
+        // a fast refresh needs the logs, which are not dumped: FORCE
+        "CREATE MATERIALIZED VIEW ZDW_MV_FAST BUILD IMMEDIATE REFRESH FORCE ON COMMIT",
+        "CREATE MATERIALIZED VIEW ZDW_MV_NEVER BUILD IMMEDIATE NEVER REFRESH",
+        "CREATE OR REPLACE SYNONYM ZDW_SYN FOR ",
+        "-- materialized view log on ZDW_BASE: not dumped",
+    ] {
+        assert!(
+            text.contains(needle),
+            "{needle:?} missing in the dump:\n{text}"
+        );
+    }
+    assert!(
+        !text.contains("CREATE TABLE ZDW_MV"),
+        "the containers are not tables:\n{text}"
+    );
+    assert!(!text.contains("MLOG$"), "{text}");
+    assert!(
+        res.warnings
+            .iter()
+            .any(|w| w.starts_with("materialized view ZDW_MV_FAST: fast refresh")),
+        "{:?}",
+        res.warnings
+    );
+    // order: synonyms and views first, the materialized views after the view they select from
+    let up = text.to_ascii_uppercase();
+    assert!(
+        up.find("CREATE OR REPLACE SYNONYM ZDW_SYN_V").unwrap()
+            < up.find("CREATE OR REPLACE FORCE VIEW ZDW_V").unwrap()
+    );
+    assert!(
+        up.find("CREATE OR REPLACE FORCE VIEW ZDW_V").unwrap()
+            < up.find("CREATE MATERIALIZED VIEW ZDW_MV_V").unwrap()
+    );
+    assert!(
+        up.find("CREATE TABLE ZDW_BASE").unwrap()
+            < up.find("CREATE MATERIALIZED VIEW ZDW_MV ").unwrap()
+    );
+
+    // restore the objects of this test only (the schema may hold others)
+    let script = only_prefix(&text, "ZDW_");
+    clean(mgr, &s, "ZDW").await;
+    restore_file(mgr, &script, "prometeo-dump-oracle-mviews.sql").await;
+    // the fast one is restored with FORCE (its logs are not in the dump)
+    assert_eq!(
+        one(mgr, &s, mv_facts).await,
+        "ZDW_MV=COMPLETE:DEMAND:IMMEDIATE;ZDW_MV_FAST=FORCE:COMMIT:IMMEDIATE;ZDW_MV_NEVER=NEVER:NEVER:IMMEDIATE;ZDW_MV_V=FORCE:DEMAND:IMMEDIATE"
+    );
+    assert_eq!(one(mgr, &s, "select count(*) from zdw_mv").await, "2");
+    assert_eq!(one(mgr, &s, "select count(*) from zdw_mv_fast").await, "3");
+    assert_eq!(one(mgr, &s, "select count(*) from zdw_mv_v").await, "2");
+    assert_eq!(one(mgr, &s, "select count(*) from zdw_syn").await, "3");
+    assert_eq!(one(mgr, &s, "select count(*) from zdw_syn_v").await, "2");
+    assert_eq!(
+        one(
+            mgr,
+            &s,
+            "select table_name from user_synonyms where synonym_name = 'ZDW_SYN_V'"
+        )
+        .await,
+        "ZDW_V"
+    );
+    // the container is a table of its own, once
+    assert_eq!(
+        one(
+            mgr,
+            &s,
+            "select count(*) from user_tables where table_name = 'ZDW_MV'"
+        )
+        .await,
+        "1"
+    );
+
+    // again over the existing objects (drop_if_exists drops the materialized views first)
+    restore_file(mgr, &script, "prometeo-dump-oracle-mviews.sql").await;
+    assert_eq!(one(mgr, &s, "select count(*) from zdw_mv_v").await, "2");
+    assert_eq!(one(mgr, &s, "select count(*) from zdw_mv_fast").await, "3");
+
+    clean(mgr, &s, "ZDW").await;
     mgr.disconnect("ora").await;
 }

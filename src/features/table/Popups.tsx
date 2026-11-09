@@ -5,7 +5,7 @@ import type { ColumnMeta, Driver, ExportFormat, ExportOptions } from "../../api/
 import { SqlEditor } from "../../components/editor";
 import { approveExportPath, chooseExportPath, defaultExportPath, exportFolder, isTauri } from "../../api/db";
 import { Button, Checkbox, ComboBox, Dialog, Icon, TextField, tip } from "../../components/ui";
-import { EXPORT_CHARSETS, EXTRACTORS } from "../output/extractors";
+import { EXPORT_CHARSETS, EXTRACTORS, isBinaryFormat } from "../output/extractors";
 import { FILTER_OPS, type FilterOp } from "./sql";
 
 // ---------------------------------------------------------------- SQL popup (`60-grid-preview-pending-changes-popup`)
@@ -168,7 +168,9 @@ export function ExportDialog(props: ExportDialogProps): JSX.Element {
   const [pathError, setPathError] = createSignal("");
   const fmt = () => opts().format;
   const textual = () => ["csv", "tsv", "markdown", "csvPipe", "csvSemicolon"].includes(fmt());
-  const nullable = () => textual() || ["html", "pretty"].includes(fmt());
+  /** Excel (xlsx): a binary file, so no charset, no transpose and no clipboard; header and row header are kept. */
+  const binary = () => isBinaryFormat(fmt());
+  const nullable = () => textual() || binary() || ["html", "pretty"].includes(fmt());
   const sqlTable = () => ["sqlInsert", "sqlUpdate"].includes(fmt());
   const out = (): ExportPath => ({ path: path().trim(), chosen: chosen() });
   const canExport = () => path().trim().length > 0;
@@ -181,7 +183,8 @@ export function ExportDialog(props: ExportDialogProps): JSX.Element {
     setPathError("");
     const old = `.${ext(fmt())}`;
     if (path().endsWith(old)) setPath(path().slice(0, -old.length) + `.${ext(f)}`);
-    patch({ format: f });
+    // a workbook has no transposed layout
+    patch(isBinaryFormat(f) ? { format: f, transpose: false } : { format: f });
   };
 
   // the preview follows every option (the last request wins)
@@ -230,7 +233,7 @@ export function ExportDialog(props: ExportDialogProps): JSX.Element {
       buttons={[
         { label: "Export to File", primary: true, disabled: !canExport(), run: () => run("file") },
         { label: "Cancel", run: props.onClose },
-        { label: "Copy to Clipboard", run: () => run("clipboard") },
+        { label: "Copy to Clipboard", disabled: binary(), run: () => run("clipboard") },
       ]}
     >
       <div class="dgt-export">
@@ -239,12 +242,14 @@ export function ExportDialog(props: ExportDialogProps): JSX.Element {
           <div class="dgt-export-source">{props.source}</div>
           <label>Extractor:</label>
           <ComboBox options={EXPORT_FORMATS} value={fmt()} onChange={changeFormat} />
-          <label>Charset:</label>
-          <ComboBox options={EXPORT_CHARSETS} value={opts().encoding ?? "utf8"} onChange={(v) => patch({ encoding: v })} />
+          <Show when={!binary()}>
+            <label>Charset:</label>
+            <ComboBox options={EXPORT_CHARSETS} value={opts().encoding ?? "utf8"} onChange={(v) => patch({ encoding: v })} />
+          </Show>
           <div class="dgt-export-checks">
-            <Checkbox checked={!!opts().transpose} onChange={(v) => patch({ transpose: v })} label="Transpose" />
-            <Checkbox checked={opts().header} disabled={!textual()} onChange={(v) => patch({ header: v })} label="Add column header" />
-            <Checkbox checked={!!opts().rowHeader} disabled={!textual()} onChange={(v) => patch({ rowHeader: v })} label="Add row header" />
+            <Checkbox checked={!!opts().transpose} disabled={binary()} onChange={(v) => patch({ transpose: v })} label="Transpose" />
+            <Checkbox checked={opts().header} disabled={!textual() && !binary()} onChange={(v) => patch({ header: v })} label="Add column header" />
+            <Checkbox checked={!!opts().rowHeader} disabled={!textual() && !binary()} onChange={(v) => patch({ rowHeader: v })} label="Add row header" />
           </div>
           <Show when={nullable()}>
             <div class="dgt-export-opts">

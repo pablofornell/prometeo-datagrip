@@ -7,6 +7,7 @@ import { invoke, isTauri } from "./tauri";
 import type {
   ApplyResult,
   AppInfo,
+  CellContent,
   ConnectInfo,
   DataSource,
   DataSourceConfig,
@@ -27,6 +28,8 @@ import type {
   ObjectRef,
   ResultSet,
   RowChange,
+  SchemaModel,
+  ValueFile,
   SessionState,
   SnapshotObject,
   Statement,
@@ -34,6 +37,7 @@ import type {
   TestResult,
   TreeNode,
   TxStatus,
+  Usage,
 } from "./types";
 
 export * from "./types";
@@ -114,6 +118,16 @@ export const getDdl = (dsId: string, object: ObjectRef, unqualified = false): Pr
 /** Flat tables/views with columns, for completion. `schema` omitted = every non-system schema. */
 export const schemaSnapshot = (dsId: string, schema?: string | null): Promise<SnapshotObject[]> =>
   invoke("schema_snapshot", { dsId, schema: schema ?? null });
+
+/** Find Usages (Alt+F7): the objects that refer to `objectRef`, and the lines of routine text that name it. */
+export const findUsages = (dsId: string, objectRef: ObjectRef): Promise<Usage[]> => invoke("find_usages", { dsId, objectRef });
+
+/**
+ * Normalized model of one schema for "Compare schemas" (tables, views, sequences, routines). `namePrefix` keeps the
+ * objects whose name starts with it; the compare reads every object kind in one query each.
+ */
+export const schemaModel = (dsId: string, schema: string, namePrefix?: string | null): Promise<SchemaModel> =>
+  invoke("schema_model", { dsId, schema, namePrefix: namePrefix ?? null });
 
 // ---------------------------------------------------------------- execution
 
@@ -242,6 +256,28 @@ export const tableData = (dsId: string, table: ObjectRef, request: TableDataRequ
  */
 export const applyChanges = (dsId: string, table: ObjectRef, changes: RowChange[]): Promise<ApplyResult> =>
   invoke("apply_changes", { dsId, table, changes });
+
+// ---------------------------------------------------------------- cell values (value viewer)
+
+/**
+ * The full value of `column` of the row whose primary key is `keys` (primary key column -> value). `maxBytes` caps
+ * what is read (0 = the 32 MB cap). Rejects for a table without a primary key, a NULL value or a missing row.
+ */
+export const fetchCell = (dsId: string, table: ObjectRef, keys: Record<string, unknown>, column: string, maxBytes = 0): Promise<CellContent> =>
+  invoke("fetch_cell", { dsId, table, keys, column, maxBytes });
+
+/** Native Save dialog for a cell value (`null` = cancelled). `extension` without the dot. Only that path is written. */
+export const chooseValueSavePath = (suggestedName: string, extension?: string): Promise<string | null> =>
+  invoke("choose_value_save_path", { suggestedName, extension: extension ?? null });
+
+/** Writes a cell value to a path from `chooseValueSavePath`. `base64`: the bytes, standard base64. */
+export const writeValueFile = (path: string, base64: string): Promise<void> => invoke("write_value_file", { path, base64 });
+
+/** Native Open dialog for a file to load into a cell (`null` = cancelled). Only that file is read by `readValueFile`. */
+export const chooseValueFile = (): Promise<ValueFile | null> => invoke("choose_value_file");
+
+/** The bytes of a file from `chooseValueFile`, standard base64 (at most 32 MB). */
+export const readValueFile = (path: string): Promise<string> => invoke("read_value_file", { path });
 
 // ---------------------------------------------------------------- export
 

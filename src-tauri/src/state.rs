@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use dbcore::compare::SchemaModel;
 use dbcore::import::CancellationToken;
 use dbcore::{
     export_result_with, export_to_string, ApplyResult, ConnectInfo, ConnectionManager,
@@ -20,7 +21,7 @@ use dbcore::{
     HistoryEntry, ImportFormat, ImportPreview, ImportProgress, ImportRequest, ImportResult,
     ObjectRef, QueryHistory, ResultSet, RowChange, ScriptOptions, ScriptProgress, ScriptSummary,
     SessionId, SessionState, SnapshotObject, Statement, TableDataRequest, TestResult, TreeNode,
-    TxStatus,
+    TxStatus, Usage,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -607,6 +608,14 @@ impl AppState {
             .map_err(String::from)
     }
 
+    /// Find Usages (Alt+F7): the objects that refer to `object`, see `dbcore::usages`.
+    pub async fn find_usages(&self, ds_id: &str, object: ObjectRef) -> Result<Vec<Usage>, String> {
+        self.mgr
+            .find_usages(ds_id, &object)
+            .await
+            .map_err(String::from)
+    }
+
     pub async fn schema_snapshot(
         &self,
         ds_id: &str,
@@ -614,6 +623,19 @@ impl AppState {
     ) -> Result<Vec<SnapshotObject>, String> {
         self.mgr
             .schema_snapshot(ds_id, schema.as_deref())
+            .await
+            .map_err(String::from)
+    }
+
+    /// Normalized model of a schema for "Compare schemas" (see `dbcore::compare`).
+    pub async fn schema_model(
+        &self,
+        ds_id: &str,
+        schema: &str,
+        name_prefix: Option<&str>,
+    ) -> Result<SchemaModel, String> {
+        self.mgr
+            .schema_model(ds_id, schema, name_prefix)
             .await
             .map_err(String::from)
     }
@@ -773,6 +795,50 @@ impl AppState {
             .apply_changes_in_session(&SessionId(session_id.to_string()), &table, &changes)
             .await
             .map_err(String::from)
+    }
+
+    // ------------------------------------------------------------ cell values
+
+    /// The full value of one cell, by the primary key of its row (see `dbcore::cell`).
+    pub async fn fetch_cell(
+        &self,
+        ds_id: &str,
+        table: ObjectRef,
+        keys: std::collections::BTreeMap<String, Value>,
+        column: &str,
+        max_bytes: u64,
+    ) -> Result<dbcore::cell::CellContent, String> {
+        self.mgr
+            .fetch_cell(ds_id, &table, &keys, column, max_bytes)
+            .await
+            .map_err(String::from)
+    }
+
+    /// Writes a cell value to `path`, a path from `choose_value_save_path` (the export grant, once).
+    pub fn write_value_file(&self, path: &Path, bytes: &[u8]) -> Result<(), String> {
+        let target = self.take_export_path(path)?;
+        let (mut file, part) = target.create_part()?;
+        file.write_all(bytes)
+            .map_err(|e| format!("I/O error: {e}"))?;
+        // closed before it is moved over the target (Windows)
+        drop(file);
+        target.commit(part)
+    }
+
+    /// The bytes of a file picked in the value viewer's open dialog (`choose_value_file`), at most the cell cap.
+    pub fn read_value_file(&self, path: &str) -> Result<Vec<u8>, String> {
+        use std::io::Read as _;
+        let path = self.check_import_path(path)?;
+        let cannot = |e: std::io::Error| format!("Cannot read {}: {e}", path.display());
+        let file = File::open(&path).map_err(cannot)?;
+        let mut bytes = Vec::new();
+        file.take(dbcore::cell::MAX_CELL_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(cannot)?;
+        if bytes.len() as u64 > dbcore::cell::MAX_CELL_BYTES {
+            return Err("The file is larger than 32 MB: it cannot be stored in a cell".into());
+        }
+        Ok(bytes)
     }
 
     // ------------------------------------------------------------ export

@@ -9,12 +9,11 @@ import {
   canDrop,
   canRename,
   copyDdl,
-  copyName,
   dataSourceDialogAvailable,
-  copyReference,
   ddlToConsole,
   deactivate,
   dataSourceProperties,
+  dropSqlOf,
   duplicateDs,
   isTableLike,
   isTableRelated,
@@ -30,8 +29,10 @@ import {
   removeFolder,
   renameFolder,
   requestDrop,
+  setDialog,
   startRename,
   updateDataSource,
+  writeClipboard,
 } from "./commands";
 import { showQuickDoc } from "./QuickDoc";
 import { importTargetOf } from "../import/target";
@@ -44,14 +45,16 @@ import {
   expandAllLoaded,
   isDsFolder,
   nodes,
-  refreshSelected,
+  refreshNodes,
   revealObject,
   selectedNode,
+  selectedTreeNodes,
   colorOfNode,
   setNodeColor,
 } from "./core";
-import { type ENode, ddlRefOf, tableRefOf } from "./model";
+import { type ENode, type ExplorerKind, TABLE_CHILD, TABLE_LIKE, ddlRefOf, referenceOf, tableRefOf } from "./model";
 import { LOCAL, localIconUrl, providerIcon } from "./icons";
+import { usageTargetOf } from "../usages/target";
 import { dsFolders, dsGroupOf } from "../../state/ds-folders";
 import { activeTab } from "../../state/tabs";
 import { theme } from "../../state/theme";
@@ -63,6 +66,18 @@ export const explorerFocused = (): boolean => !!(document.activeElement as HTMLE
 
 const sel = (): ENode | undefined => selectedNode();
 const real = (n: ENode | undefined): n is ENode => !!n && n.data.kind !== "loading" && n.data.kind !== "error" && !isDsFolder(n);
+
+/** The nodes a menu or a shortcut acts on: every selected node of the tree (the lead alone when nothing else is selected). */
+const group = (): ENode[] => (selectedTreeNodes().length ? selectedTreeNodes() : sel() ? [sel()!] : []);
+/** The selected nodes that can be worked on (placeholder rows and data source folders left out). */
+const targets = (): ENode[] => group().filter(real);
+/** Enablement of an action that works on one node only: disabled while several nodes are selected. */
+const enabledForOne =
+  (enabled: () => boolean) =>
+  (): boolean =>
+    group().length <= 1 && enabled();
+/** Menu item of an action that works on one node only: disabled while several nodes are selected. */
+const itemForOne = (it: MenuItem, multi: boolean): MenuItem => (multi && (!it.type || it.type === "item") ? { ...it, enabled: false } : it);
 
 export const DRIVERS = [
   { driver: "mariadb", label: "MariaDB" },
@@ -107,8 +122,8 @@ export function registerExplorerActions(): () => void {
       shortcut: "Ctrl+F5",
       icon: "refresh",
       when: explorerFocused,
-      enabled: () => real(sel()),
-      run: () => refreshSelected(),
+      enabled: () => targets().length > 0,
+      run: () => refreshNodes(targets()),
     },
     {
       id: "db.disconnect",
@@ -116,10 +131,10 @@ export function registerExplorerActions(): () => void {
       shortcut: "Ctrl+F2",
       icon: "dg/kill-process",
       when: explorerFocused,
-      enabled: () => {
+      enabled: enabledForOne(() => {
         const n = sel();
         return !!n && connected().has(n.data.dsId);
-      },
+      }),
       run: () => deactivate(sel()?.data.dsId),
     },
     {
@@ -128,7 +143,7 @@ export function registerExplorerActions(): () => void {
       shortcut: "F4",
       icon: "dg/edit-data",
       when: explorerFocused,
-      enabled: () => isTableRelated(sel()),
+      enabled: enabledForOne(() => isTableRelated(sel())),
       run: () => openTable(sel()?.data),
     },
     {
@@ -136,10 +151,10 @@ export function registerExplorerActions(): () => void {
       title: "Go to DDL",
       shortcut: "Ctrl+B",
       when: explorerFocused,
-      enabled: () => {
+      enabled: enabledForOne(() => {
         const n = sel();
         return real(n) && !!ddlRefOf(n.data);
-      },
+      }),
       run: () => openDdl(sel()?.data),
     },
     {
@@ -147,8 +162,12 @@ export function registerExplorerActions(): () => void {
       title: "Drop…",
       shortcut: "Delete",
       when: explorerFocused,
-      enabled: () => canDrop(sel()) || isDsFolder(sel()),
-      run: () => (isDsFolder(sel()) ? removeFolder(sel()!.data.name) : requestDrop(sel())),
+      enabled: () => (group().length > 1 ? dropPlanOf(group()) !== undefined : canDrop(sel()) || isDsFolder(sel())),
+      run: () => {
+        if (group().length > 1) requestDropMany(group());
+        else if (isDsFolder(sel())) removeFolder(sel()!.data.name);
+        else requestDrop(sel());
+      },
     },
     {
       id: "db.copyReference",
@@ -156,15 +175,15 @@ export function registerExplorerActions(): () => void {
       shortcut: "Ctrl+Alt+Shift+C",
       icon: "copy",
       when: explorerFocused,
-      enabled: () => real(sel()),
-      run: () => copyReference(sel()?.data),
+      enabled: () => targets().length > 0,
+      run: () => void writeClipboard(targets().map((n) => referenceOf(n.data)).join("\n")),
     },
     {
       id: "db.rename",
       title: "Rename…",
       shortcut: "Shift+F6",
       when: explorerFocused,
-      enabled: () => canRename(sel()) || isDsFolder(sel()),
+      enabled: enabledForOne(() => canRename(sel()) || isDsFolder(sel())),
       run: () => (isDsFolder(sel()) ? renameFolder(sel()!.data.name) : startRename(sel())),
     },
     {
@@ -172,19 +191,24 @@ export function registerExplorerActions(): () => void {
       title: "Quick Documentation",
       shortcut: "Ctrl+Q",
       when: explorerFocused,
-      enabled: () => real(sel()),
+      enabled: enabledForOne(() => real(sel())),
       run: () => showQuickDoc(sel()),
     },
-    { id: "db.copyName", title: "Copy Name", enabled: () => real(sel()), run: () => copyName(sel()?.data) },
+    {
+      id: "db.copyName",
+      title: "Copy Name",
+      enabled: () => targets().length > 0,
+      run: () => void writeClipboard(targets().map((n) => n.data.name).join("\n")),
+    },
     {
       id: "db.copyDdl",
       title: "Generate DDL to Clipboard",
       shortcut: ["Ctrl+Alt+Shift+G", "Ctrl+Shift+C"],
       when: explorerFocused,
-      enabled: () => {
+      enabled: enabledForOne(() => {
         const n = sel();
         return real(n) && !!ddlRefOf(n.data);
-      },
+      }),
       run: () => copyDdl(sel()?.data),
     },
     {
@@ -192,16 +216,16 @@ export function registerExplorerActions(): () => void {
       title: "Generate DDL to Query Console",
       shortcut: "Ctrl+Alt+Shift+B",
       when: explorerFocused,
-      enabled: () => {
+      enabled: enabledForOne(() => {
         const n = sel();
         return real(n) && !!ddlRefOf(n.data);
-      },
+      }),
       run: () => ddlToConsole(sel()?.data),
     },
     {
       id: "db.duplicateDataSource",
       title: "Duplicate",
-      enabled: () => sel()?.data.kind === "dataSource",
+      enabled: enabledForOne(() => sel()?.data.kind === "dataSource"),
       run: () => duplicateDs(sel()!.data.dsId),
     },
     {
@@ -209,7 +233,7 @@ export function registerExplorerActions(): () => void {
       title: "Modify Object…",
       shortcut: "Ctrl+F6",
       when: explorerFocused,
-      enabled: () => canModify(sel()),
+      enabled: enabledForOne(() => canModify(sel())),
       run: () => void modifyObject(sel()),
     },
     {
@@ -217,7 +241,7 @@ export function registerExplorerActions(): () => void {
       title: "New",
       shortcut: "Alt+Insert",
       when: explorerFocused,
-      enabled: () => !!sel(),
+      enabled: enabledForOne(() => !!sel()),
       run: () => openNewPopup(sel()),
     },
     { id: "explorer.locate", title: "Select Opened Object", shortcut: "Alt+Shift+B", icon: "locate", run: () => locateOpened() },
@@ -272,7 +296,7 @@ const newSub = (n?: ENode): MenuItem => ({ label: "New", icon: "add", children: 
 
 /** Alt+Insert: the New popup at the selected row. */
 function openNewPopup(n: ENode | undefined): void {
-  const row = document.querySelector<HTMLElement>(".dg-explorer-tree .dg-tree-row.dg-selected");
+  const row = document.querySelector<HTMLElement>(".dg-explorer-tree .dg-tree-row.dg-tree-lead");
   const r = row?.getBoundingClientRect();
   openMenu(newChildren(real(n) ? n : undefined), {
     x: (r?.left ?? 0) + 60,
@@ -357,13 +381,55 @@ const containerOf = (n: ENode): ENode | undefined => {
   return undefined;
 };
 
-export function contextMenuItems(n: ENode | undefined): MenuItem[] {
+/**
+ * "Drop…" on several nodes: one DROP per object, dependants first (the parts of a table, then views, then the tables).
+ * Only objects of one data source and one container (a schema, a database) can be dropped together: one confirmation,
+ * one run, and the container refreshed afterwards (`confirmDrop` refreshes the container of its first node).
+ * Undefined when the nodes cannot be dropped together.
+ */
+export function dropPlanOf(list: readonly ENode[]): { node: ENode; sql: string; what: string } | undefined {
+  if (list.length < 2) return undefined;
+  const [first] = list;
+  const container = containerOf(first)?.id;
+  const drops: { rank: number; sql: string }[] = [];
+  for (const n of list) {
+    if (!real(n) || n.data.kind === "dataSource" || n.data.dsId !== first.data.dsId || containerOf(n)?.id !== container) return undefined;
+    const sql = dropSqlOf(n.data);
+    if (!sql) return undefined;
+    drops.push({ rank: dropRank(n.data.kind), sql });
+  }
+  drops.sort((a, b) => a.rank - b.rank); // stable: the tree order within one rank
+  return { node: first, sql: drops.map((d) => d.sql).join(";\n"), what: `${list.length} objects` };
+}
+
+/** Parts of a table first, then the views and other objects that read tables, then the tables themselves. */
+const dropRank = (kind: ExplorerKind): number => (kind === "table" ? 3 : TABLE_CHILD.includes(kind) ? 0 : TABLE_LIKE.includes(kind) ? 1 : 2);
+
+/** Opens the Drop confirmation for several nodes: the dialog and the run are the ones of a single node. */
+function requestDropMany(list: readonly ENode[]): void {
+  const plan = dropPlanOf(list);
+  if (plan) setDialog({ kind: "drop", ...plan });
+}
+
+/**
+ * Context menu of a node. `selection`: the selected nodes of the tree. When it holds several nodes and `n` is one of
+ * them, the menu acts on all of them: the actions that work on one node only are disabled.
+ */
+export function contextMenuItems(n: ENode | undefined, selection: readonly ENode[] = []): MenuItem[] {
   if (n && isDsFolder(n)) return folderMenu(n);
   if (!real(n)) return [newSub()];
   const d = n.data;
+  const multi = selection.length > 1 && selection.some((x) => x.id === n.id);
+  const list: readonly ENode[] = multi ? selection : [n];
+  const one = (it: MenuItem): MenuItem => itemForOne(it, multi);
   const navigation = (): MenuItem => ({
     label: "Navigation",
-    children: [{ action: "db.gotoDdl" }, { action: "db.jumpToConsole" }],
+    children: [
+      { action: "db.gotoDdl" },
+      // the usages of the node (features/usages): the same action Alt+F7 runs, with the node as its object
+      ...(usageTargetOf(d) ? [{ action: "db.findUsages", run: () => void runAction("db.findUsages", { dsId: d.dsId, object: usageTargetOf(d)! }) }] : []),
+      { action: "db.jumpToConsole" },
+    ],
   });
   const exportItem = (): MenuItem => ({
     label: "Export Data…",
@@ -385,54 +451,56 @@ export function contextMenuItems(n: ENode | undefined): MenuItem[] {
     icon: "sql-file",
     run: () => void runAction("dump.sqlFile", t),
   });
-  const dump = dumpTargetOfSelection([{ data: d, owner: containerOf(n)?.data }]);
+  // several table nodes of one schema dump those tables (`dumpTargetOfSelection` answers null for anything else)
+  const dump = dumpTargetOfSelection(list.map((x) => ({ data: x.data, owner: containerOf(x)?.data })));
 
   if (d.kind === "dataSource") {
     return [
-      {
+      one({
         label: "Properties",
         icon: "dg/manage-data-sources",
         shortcut: "Ctrl+Alt+Shift+S",
         enabled: () => dataSourceDialogAvailable(),
         run: () => dataSourceProperties(d.dsId),
-      },
+      }),
       sep,
-      newSub(n),
+      one(newSub(n)),
       { label: "Copy/Paste", children: [{ action: "db.copyReference" }, { action: "db.duplicateDataSource" }] },
       { action: "db.refresh" },
       { action: "db.disconnect" },
       sep,
       { action: "db.rename", mnemonic: "R" },
-      moveItem(n),
-      setColorItem(n),
+      one(moveItem(n)),
+      one(setColorItem(n)),
       sep,
       { action: "db.quickDoc", mnemonic: "D" },
-      { label: "Navigation", children: [{ action: "db.jumpToConsole" }] },
+      one({ label: "Navigation", children: [{ action: "db.jumpToConsole" }] }),
       { label: "Diagrams", icon: "dg/schema", children: [{ action: "diagram.show" }] },
-      { label: "SQL Scripts", children: [runScript(), ...(dump ? [dumpItem(dump)] : [])] },
+      { label: "SQL Scripts", children: [one(runScript()), ...(dump ? [dumpItem(dump)] : [])] },
       sep,
-      { label: "Remove Data Source…", shortcut: "Delete", run: () => requestDrop(n) },
+      one({ label: "Remove Data Source…", shortcut: "Delete", run: () => requestDrop(n) }),
     ];
   }
 
-  const items: MenuItem[] = [newSub(n), ...modifyItem(n), { label: "Copy/Paste", children: [{ action: "db.copyReference" }, { action: "db.copyName" }] }];
+  const items: MenuItem[] = [one(newSub(n)), ...modifyItem(n), { label: "Copy/Paste", children: [{ action: "db.copyReference" }, { action: "db.copyName" }] }];
   if (isTableLike(n)) items.push({ action: "db.editData" });
   items.push({ action: "db.refresh" });
   if (canRename(n)) items.push(sep, { action: "db.rename", mnemonic: "R" });
-  if (colorable(n)) items.push(...(canRename(n) ? [] : [sep]), setColorItem(n));
-  items.push(sep, { action: "db.quickDoc", mnemonic: "D" }, navigation(), { label: "Diagrams", icon: "dg/schema", children: [{ action: "diagram.show" }] });
+  if (colorable(n)) items.push(...(canRename(n) ? [] : [sep]), one(setColorItem(n)));
+  items.push(sep, { action: "db.quickDoc", mnemonic: "D" }, one(navigation()), { label: "Diagrams", icon: "dg/schema", children: [{ action: "diagram.show" }] });
+  if (d.kind === "schema") items.push({ action: "schemaDiff.compare" });
   if (ddlRefOf(d)) {
     items.push(sep, {
       label: "SQL Scripts",
       children: [
         { action: "db.copyDdl" },
         { action: "db.ddlToConsole" },
-        ...(d.kind === "schema" ? [runScript()] : []),
+        ...(d.kind === "schema" ? [one(runScript())] : []),
         ...(dump ? [dumpItem(dump)] : []),
       ],
     });
   } else if (d.kind === "schema") {
-    items.push(sep, { label: "SQL Scripts", children: [runScript(), ...(dump ? [dumpItem(dump)] : [])] });
+    items.push(sep, { label: "SQL Scripts", children: [one(runScript()), ...(dump ? [dumpItem(dump)] : [])] });
   } else if (dump) {
     items.push(sep, { label: "SQL Scripts", children: [dumpItem(dump)] });
   }
@@ -441,9 +509,10 @@ export function contextMenuItems(n: ENode | undefined): MenuItem[] {
     const children: MenuItem[] = [];
     if (importTarget) children.push({ label: "Import Data from File…", icon: "import", run: () => void runAction("import.file", importTarget) });
     if (isTableLike(n)) children.push(exportItem());
-    items.push({ label: "Import/Export", children });
+    items.push(one({ label: "Import/Export", children }));
   }
-  if (canDrop(n)) items.push(sep, { label: "Drop…", shortcut: "Delete", run: () => requestDrop(n) });
+  if (multi) items.push(sep, { label: "Drop…", shortcut: "Delete", enabled: () => dropPlanOf(list) !== undefined, run: () => requestDropMany(list) });
+  else if (canDrop(n)) items.push(sep, { label: "Drop…", shortcut: "Delete", run: () => requestDrop(n) });
   return items;
 }
 
@@ -452,5 +521,5 @@ export function showContextMenu(n: ENode | undefined, e: MouseEvent): void {
   // while the menu is open the right-clicked row shows the unfocused selection color (the tree keeps the focus)
   const tree = document.querySelector(".dg-explorer-tree");
   tree?.classList.add("dg-menu-open");
-  openMenu(contextMenuItems(n), { x: e.clientX, y: e.clientY, minWidth: 340, mnemonics: true, onClose: () => tree?.classList.remove("dg-menu-open") });
+  openMenu(contextMenuItems(n, group()), { x: e.clientX, y: e.clientY, minWidth: 340, mnemonics: true, onClose: () => tree?.classList.remove("dg-menu-open") });
 }

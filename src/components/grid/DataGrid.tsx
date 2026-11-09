@@ -42,7 +42,6 @@ import {
   displayCell,
   displayLength,
   editText,
-  isBinaryCell,
   isEditableKind,
   isExprCell,
   isRightAligned,
@@ -69,6 +68,7 @@ import type {
   ViewMode,
 } from "./types";
 import { ValueEditor } from "./ValueEditor";
+import type { CellFull, CellSource } from "./value/types";
 import "./grid.css";
 
 export const ROW_H = 27;
@@ -142,6 +142,8 @@ export interface DataGridProps {
   initialColumns?: ColumnsState;
   /** Foreign key navigation (`Go To`, F4). */
   navigation?: GridNavigation;
+  /** Full values of table cells for the value viewer (table data with a primary key). Omitted: the viewer shows the preview. */
+  cellSource?: CellSource;
   /** Name of the data extractor for the cell menu entry `Change Data Extractor (CSV)`; omit both to hide it. */
   extractorLabel?: string;
   onChangeExtractor?: (at: { x: number; y: number }) => void;
@@ -583,7 +585,7 @@ export function DataGrid(props: DataGridProps): JSX.Element {
   const [edit, setEdit] = createSignal<EditState | null>(null);
   /** The true / false / default list under a boolean cell. */
   const [boolPick, setBoolPick] = createSignal<{ r: number; vi: number; ci: number } | null>(null);
-  const [valueEd, setValueEd] = createSignal<{ r: number; vi: number; ci: number; text: string; readOnly: boolean } | null>(null);
+  const [valueEd, setValueEd] = createSignal<{ r: number; vi: number; ci: number; text: string; readOnly: boolean; cell: Cell; canLoad: boolean; load?: () => Promise<CellFull> } | null>(null);
 
 
   function setSelection(rs: SelRange[], act: CellPos | null) {
@@ -1215,17 +1217,40 @@ export function DataGrid(props: DataGridProps): JSX.Element {
     root.focus({ preventScroll: true });
   }
 
+  /** What the value viewer needs beyond the text of cell (r, ci): the cell, whether a file may be loaded into it, and the loader of its full value (stored rows of a table with a primary key). */
+  function valueSource(r: number, ci: number, v: Cell): { cell: Cell; canLoad: boolean; load?: () => Promise<CellFull> } {
+    const col = props.columns[ci];
+    if (!col) return { cell: v, canLoad: false };
+    const inserted = r < pending.insertedCount;
+    const src = inserted ? -1 : srcOf(r);
+    const deleted = !inserted && pending.isDeleted(src);
+    const canLoad = props.editable === true && !col.readOnly && !deleted;
+    const pk = props.columns.flatMap((c, i) => (c.isPk ? [i] : []));
+    let load: (() => Promise<CellFull>) | undefined;
+    if (props.cellSource && !inserted && !deleted && pk.length > 0) {
+      const row = props.getRow(src);
+      const key: Record<string, Cell> = {};
+      for (const i of pk) key[props.columns[i].name] = row?.[i] ?? null;
+      const source = props.cellSource;
+      load = () => source.fetch(key, col.name);
+    }
+    return { cell: v, canLoad, load };
+  }
+
   function openValueEditor() {
     const a = active();
     if (!a) return;
     const ci = vis()[a.c];
     const v = cellValue(a.r, ci);
+    const extra = valueSource(a.r, ci, v);
     setValueEd({
       r: a.r,
       vi: a.c,
       ci,
       text: editText(v),
-      readOnly: !canEditCell(a.r, ci),
+      // a binary column is edited by loading a file, not inline: the viewer is writable when a file may be loaded
+      readOnly: kinds()[ci] === "binary" ? !extra.canLoad : !canEditCell(a.r, ci),
+      ...extra,
     });
   }
 
@@ -2157,7 +2182,7 @@ export function DataGrid(props: DataGridProps): JSX.Element {
           const s = edit();
           if (!s) return;
           setEdit(null);
-          setValueEd({ r: s.r, vi: s.vi, ci: s.ci, text: t, readOnly: false });
+          setValueEd({ r: s.r, vi: s.vi, ci: s.ci, text: t, readOnly: false, ...valueSource(s.r, s.ci, cellValue(s.r, s.ci)) });
         }}
         onTab={(back, t) => {
           const s = edit();
@@ -2410,12 +2435,22 @@ export function DataGrid(props: DataGridProps): JSX.Element {
               title={props.columns[v().ci].name}
               typeName={props.columns[v().ci].typeName}
               text={v().text}
-              readOnly={v().readOnly || isBinaryCell(cellValue(v().r, v().ci))}
+              readOnly={v().readOnly}
               json={kinds()[v().ci] === "json"}
+              kind={kinds()[v().ci]}
+              cell={v().cell}
+              canLoad={v().canLoad}
+              loadFull={v().load}
               onApply={(t) => {
                 const s = v();
                 setValueEd(null);
                 if (t !== editText(cellValue(s.r, s.ci))) applyValue(s.r, s.ci, parseEdit(t, kinds()[s.ci]));
+                root.focus({ preventScroll: true });
+              }}
+              onApplyValue={(val) => {
+                const s = v();
+                setValueEd(null);
+                applyValue(s.r, s.ci, val);
                 root.focus({ preventScroll: true });
               }}
               onCancel={() => (setValueEd(null), root.focus({ preventScroll: true }))}

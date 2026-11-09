@@ -11,6 +11,7 @@ import {
   closeSession,
   defaultExportOptions,
   exportQueryToString,
+  fetchCell,
   exportToString,
   openSession,
   sessionTxStatus,
@@ -125,6 +126,8 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
   const sortSpecs = createMemo<SortSpec[]>(() => orderByToSort(src.applied().orderBy, cols() ?? []));
   const sourceLabel = () => ds()?.name ?? dsId;
   const tableName = () => qualifiedName(driver(), ref);
+  // full values of cells for the value viewer (a row is addressed by its primary key; see DataGrid)
+  const cellSource = { fetch: (key: Record<string, unknown>, column: string) => fetchCell(dsId, ref, key, column) };
 
   const ask = (c: Omit<Choice, "resolve">) => new Promise<string>((resolve) => setChoice({ ...c, resolve }));
   const answer = (v: string) => {
@@ -691,6 +694,7 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
               onReload={reload}
               onColumnFilter={(col, anchor) => setColFilter({ col, anchor })}
               navigation={fk.navigation}
+              cellSource={cellSource}
               fkColumns={fk.fkColumns}
               dialect={driver()}
               extractorLabel={EXPORT_FORMATS.find((f) => f.value === extractor())?.label ?? "CSV"}

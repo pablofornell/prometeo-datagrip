@@ -20,6 +20,7 @@ import {
   loaded,
   onExpandedChange,
   onSelect,
+  onSelectionChange,
   saved,
   treeRoots,
   setController,
@@ -203,6 +204,8 @@ export function ExplorerBody(): JSX.Element {
           initialExpanded={saved.expanded}
           selectedId={saved.selected}
           onSelect={onSelect}
+          multiSelect
+          onSelectionChange={onSelectionChange}
           onExpandedChange={onExpandedChange}
           onActivate={activate}
           onContextMenu={showContextMenu}

@@ -1,9 +1,10 @@
 //! Export of result sets / queries: CSV (comma, semicolon, pipe), TSV, JSON, JSON lines, SQL INSERT / UPDATE, WHERE clause,
-//! Markdown, HTML table, XML and an aligned text table.
+//! Markdown, HTML table, XML, an aligned text table and an Excel workbook (file only, see [`ExportFormat::Xlsx`]).
 
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
+use rust_xlsxwriter::{Format, Workbook, Worksheet, XlsxError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -13,8 +14,8 @@ use crate::import::CancellationToken;
 use crate::manager::ConnectionManager;
 use crate::model::*;
 use crate::quote::{
-    oracle_raw_literal, oracle_text_literal, oracle_time_kind, oracle_time_literal, quote_ident,
-    quote_literal,
+    oracle_raw_literal, oracle_text_literal, oracle_time_kind, oracle_time_literal,
+    parse_oracle_ts, quote_ident, quote_literal,
 };
 use crate::value::describe_columns_pool;
 
@@ -40,6 +41,9 @@ pub enum ExportFormat {
     Xml,
     /// Aligned plain-text table.
     Pretty,
+    /// Excel workbook (binary): written to a file only, never to the clipboard or a preview. The encoding does not
+    /// apply. Header row bold, frozen and filtered; a new worksheet every 1,048,576 rows.
+    Xlsx,
 }
 
 /// Encoding of the output file (applies in file-writing paths only; the clipboard / preview stay UTF-8).
@@ -100,12 +104,407 @@ impl ProgressGate {
 }
 
 /// Result of an export: the rows written and how many characters the encoding could not represent
-/// (written as `?`; only the Windows-1252 encoding is lossy).
+/// (written as `?`; only the Windows-1252 encoding is lossy), and how many Excel cells were cut to the length
+/// a cell holds (xlsx only).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportReport {
     pub rows: usize,
     pub unmappable: usize,
+    pub truncated: usize,
+}
+
+/// Excel's limit of rows in a worksheet, the header included.
+const XLSX_MAX_ROWS: usize = 1_048_576;
+/// Excel's limit of columns in a worksheet.
+const XLSX_MAX_COLS: usize = 16_384;
+/// Excel's limit of the characters (UTF-16 units) of a cell.
+const XLSX_MAX_CHARS: usize = 32_767;
+/// The column widths are estimated from this many first rows.
+const XLSX_WIDTH_ROWS: usize = 100;
+/// The widest column the estimate gives, in characters.
+const XLSX_MAX_WIDTH: f64 = 60.0;
+/// Excel's serial number of 1900-03-01, the first date the workbook holds: Excel counts a 1900-02-29 that never
+/// existed, so the earlier dates are written as text.
+const XLSX_FIRST_SERIAL: f64 = 61.0;
+/// Excel's serial number of 9999-12-31, the last date it holds.
+const XLSX_LAST_SERIAL: f64 = 2_958_465.0;
+
+const XLSX_NOT_TEXT: &str = "Excel (xlsx) is a binary file: export it to a file (it cannot be copied to the clipboard or shown as text)";
+
+fn xlsx_err(e: XlsxError) -> DbError {
+    match e {
+        XlsxError::IoError(e) | XlsxError::TempFileError(_, e) => DbError::Io(e),
+        other => DbError::InvalidArgument(format!("Excel export: {other}")),
+    }
+}
+
+/// How the values of a column are written in an Excel workbook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XlsxKind {
+    /// Exact decimals, integers and floats: numbers (text when a number would lose digits).
+    Number,
+    /// A date without time (`yyyy-mm-dd`).
+    Date,
+    /// A date with time (`yyyy-mm-dd hh:mm:ss`). Oracle's DATE has a time, so it is this kind.
+    DateTime,
+    Text,
+}
+
+/// The kind of a column of declared type `ty` in a result of database `d`. Zoned times stay text: an Excel date has
+/// no time zone, so the offset would be lost.
+fn xlsx_kind(ty: &str, d: Driver) -> XlsxKind {
+    let t = ty.trim().to_ascii_lowercase();
+    let zoned = (t.contains("time zone") && !t.contains("without time zone"))
+        || t.starts_with("timestamptz")
+        || t.starts_with("timetz");
+    if zoned {
+        return XlsxKind::Text;
+    }
+    let base = t
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or("");
+    match base {
+        "date" if d == Driver::Oracle => XlsxKind::DateTime,
+        "date" => XlsxKind::Date,
+        "datetime" => XlsxKind::DateTime,
+        b if b.starts_with("timestamp") => XlsxKind::DateTime,
+        _ if is_numeric_type(ty) => XlsxKind::Number,
+        _ => XlsxKind::Text,
+    }
+}
+
+/// One cell of the workbook.
+#[derive(Debug, Clone, PartialEq)]
+enum XlsxVal {
+    /// An empty cell.
+    Blank,
+    Number(f64),
+    /// An Excel date serial; `time` tells whether the date-time format shows the time too.
+    Date {
+        serial: f64,
+        time: bool,
+    },
+    Bool(bool),
+    Text(String),
+}
+
+/// Excel's serial number of the date `y-m-d` plus `secs` seconds into the day; `None` outside the dates the
+/// workbook holds (1900-03-01 to 9999-12-31).
+fn excel_serial(y: i64, m: i64, d: i64, secs: f64) -> Option<f64> {
+    // days since 1970-01-01 (proleptic Gregorian calendar, Howard Hinnant's algorithm)
+    let days = |y: i64, m: i64, d: i64| {
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = (if y >= 0 { y } else { y - 399 }) / 400;
+        let yoe = y - era * 400;
+        let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    };
+    // 1899-12-30 is serial 0 (days since 1970-01-01 is -25569 there)
+    let serial = (days(y, m, d) - days(1899, 12, 30)) as f64 + secs / 86_400.0;
+    (XLSX_FIRST_SERIAL..=XLSX_LAST_SERIAL)
+        .contains(&serial.floor())
+        .then_some(serial)
+}
+
+/// The workbook value of a date / time text (`2024-02-29 13:45:10.5`) of a column of `kind`; `None` when the text is
+/// no date the workbook holds (a zoned one included).
+fn xlsx_date(text: &str, kind: XlsxKind) -> Option<XlsxVal> {
+    let ts = parse_oracle_ts(text)?;
+    if ts.tz.is_some() {
+        return None;
+    }
+    let part = |s: &str, i: usize| s.split(':').nth(i)?.parse::<i64>().ok();
+    let ymd: Vec<i64> = ts.date.split('-').filter_map(|p| p.parse().ok()).collect();
+    let (y, m, d) = (*ymd.first()?, *ymd.get(1)?, *ymd.get(2)?);
+    let (h, mi, s) = (part(&ts.time, 0)?, part(&ts.time, 1)?, part(&ts.time, 2)?);
+    let frac: f64 = if ts.frac.is_empty() {
+        0.0
+    } else {
+        format!("0.{}", ts.frac).parse().ok()?
+    };
+    let secs = (h * 3600 + mi * 60 + s) as f64 + frac;
+    let serial = excel_serial(y, m, d, secs)?;
+    Some(XlsxVal::Date {
+        serial,
+        time: kind == XlsxKind::DateTime || secs > 0.0,
+    })
+}
+
+/// The number of a decimal text that a double holds exactly: at most 15 significant digits (a double prints back the
+/// same digits). `None` for anything else (`NaN`, exponents, more digits).
+fn decimal_value(s: &str) -> Option<f64> {
+    let t = s.trim();
+    let body = t.strip_prefix(['-', '+']).unwrap_or(t);
+    let digits = body.bytes().filter(u8::is_ascii_digit).count();
+    let shaped = digits > 0
+        && digits <= 15
+        && body.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && body.matches('.').count() <= 1;
+    if !shaped {
+        return None;
+    }
+    t.parse::<f64>().ok().filter(|f| f.is_finite())
+}
+
+/// `s` cut to the characters an Excel cell holds; `None` when it fits.
+fn cut_for_cell(s: &str) -> Option<&str> {
+    let mut units = 0;
+    for (i, c) in s.char_indices() {
+        units += c.len_utf16();
+        if units > XLSX_MAX_CHARS {
+            return Some(&s[..i]);
+        }
+    }
+    None
+}
+
+/// Text of a cell, cut to the length a cell holds (`truncated` counts the cells cut).
+fn text_value(s: &str, truncated: &mut usize) -> XlsxVal {
+    match cut_for_cell(s) {
+        Some(head) => {
+            *truncated += 1;
+            XlsxVal::Text(head.to_string())
+        }
+        None => XlsxVal::Text(s.to_string()),
+    }
+}
+
+/// The workbook value of cell `c` of a column of `kind`. NULL is `null` (a blank cell when that is empty). Binary
+/// values are their `0x...` text, arrays and objects their JSON text.
+fn xlsx_value(c: &Cell, kind: XlsxKind, null: &str, truncated: &mut usize) -> XlsxVal {
+    match c {
+        Value::Null if null.is_empty() => XlsxVal::Blank,
+        Value::Null => text_value(null, truncated),
+        Value::Bool(b) => XlsxVal::Bool(*b),
+        // a JSON number is written as a number unless it is an integer of more than 15 digits
+        Value::Number(n) => match n.as_f64() {
+            Some(f) if n.is_f64() || f.abs() < 1e15 => XlsxVal::Number(f),
+            _ => text_value(&n.to_string(), truncated),
+        },
+        Value::String(s) => match kind {
+            XlsxKind::Date | XlsxKind::DateTime => {
+                xlsx_date(s, kind).unwrap_or_else(|| text_value(s, truncated))
+            }
+            XlsxKind::Number => decimal_value(s)
+                .map(XlsxVal::Number)
+                .unwrap_or_else(|| text_value(s, truncated)),
+            XlsxKind::Text => text_value(s, truncated),
+        },
+        other => text_value(&cell_text(other, ""), truncated),
+    }
+}
+
+/// The width a value takes on screen, for the column width estimate.
+fn shown_len(v: &XlsxVal) -> usize {
+    match v {
+        XlsxVal::Blank => 0,
+        XlsxVal::Number(_) => 12,
+        XlsxVal::Date { time: true, .. } => 19,
+        XlsxVal::Date { time: false, .. } => 10,
+        XlsxVal::Bool(_) => 5,
+        XlsxVal::Text(s) => s.chars().count(),
+    }
+}
+
+/// Column width (in characters) of a column whose longest text is `longest` characters.
+fn column_width(longest: usize) -> f64 {
+    (longest as f64 + 2.0).clamp(8.0, XLSX_MAX_WIDTH)
+}
+
+/// Writes one cell (a blank cell is left out).
+fn write_cell(
+    ws: &mut Worksheet,
+    row: u32,
+    col: u16,
+    v: &XlsxVal,
+    date: &Format,
+    date_time: &Format,
+) -> std::result::Result<(), XlsxError> {
+    match v {
+        XlsxVal::Blank => Ok(()),
+        XlsxVal::Number(n) => ws.write_number(row, col, *n).map(|_| ()),
+        XlsxVal::Date { serial, time } => ws
+            .write_number_with_format(row, col, *serial, if *time { date_time } else { date })
+            .map(|_| ()),
+        XlsxVal::Bool(b) => ws.write_boolean(row, col, *b).map(|_| ()),
+        XlsxVal::Text(s) => ws.write_string(row, col, s.as_str()).map(|_| ()),
+    }
+}
+
+/// The Excel workbook of an export. A worksheet holds `max_rows` rows (the header row included, repeated on each
+/// worksheet). Rows are written in constant memory mode: the sheet data goes to a temporary file as the rows come,
+/// so a million rows do not sit in memory.
+struct XlsxBook {
+    wb: Workbook,
+    head: Format,
+    date: Format,
+    date_time: Format,
+    /// Column names of the result (the shape check of the query exports).
+    src_cols: Vec<String>,
+    /// Header names of the output columns (the row number column first when asked), and their kinds.
+    names: Vec<String>,
+    kinds: Vec<XlsxKind>,
+    /// The first column is the row number (`row_header`).
+    numbered: bool,
+    header: bool,
+    null_text: String,
+    max_rows: usize,
+    /// Rows of each worksheet written so far, the header included (the last one is the open worksheet).
+    sheet_rows: Vec<usize>,
+    /// Data rows written.
+    rows: usize,
+    /// The longest text per output column over the first rows (the header included).
+    widths: Vec<usize>,
+    truncated: usize,
+}
+
+impl XlsxBook {
+    /// A workbook for the result `columns` written with `opts` (`max_rows` per worksheet, at least 2).
+    fn new(opts: &ExportOptions, columns: &[ColumnMeta], max_rows: usize) -> Result<Self> {
+        if opts.transpose {
+            return Err(DbError::InvalidArgument(
+                "Transpose is not available for Excel (xlsx)".into(),
+            ));
+        }
+        let mut truncated = 0;
+        let mut names = Vec::new();
+        let mut kinds = Vec::new();
+        if opts.row_header {
+            names.push(String::new());
+            kinds.push(XlsxKind::Number);
+        }
+        for c in columns {
+            names.push(match cut_for_cell(&c.name) {
+                Some(head) => {
+                    truncated += 1;
+                    head.to_string()
+                }
+                None => c.name.clone(),
+            });
+            kinds.push(xlsx_kind(&c.type_name, opts.dialect));
+        }
+        if names.len() > XLSX_MAX_COLS {
+            return Err(DbError::InvalidArgument(format!(
+                "Excel holds {XLSX_MAX_COLS} columns; the result has {}",
+                names.len()
+            )));
+        }
+        let mut book = XlsxBook {
+            wb: Workbook::new(),
+            head: Format::new().set_bold(),
+            date: Format::new().set_num_format("yyyy-mm-dd"),
+            date_time: Format::new().set_num_format("yyyy-mm-dd hh:mm:ss"),
+            src_cols: columns.iter().map(|c| c.name.clone()).collect(),
+            widths: names.iter().map(|n| n.chars().count()).collect(),
+            names,
+            kinds,
+            numbered: opts.row_header,
+            header: opts.header,
+            null_text: opts.null_text.clone(),
+            max_rows: max_rows.max(2),
+            sheet_rows: Vec::new(),
+            rows: 0,
+            truncated,
+        };
+        book.start_sheet()?;
+        Ok(book)
+    }
+
+    /// Does the result have the columns `columns` (the rows of a later result set of the same call are skipped
+    /// otherwise, as in the text exports)?
+    fn same_columns(&self, columns: &[ColumnMeta]) -> bool {
+        columns.iter().map(|c| &c.name).eq(self.src_cols.iter())
+    }
+
+    /// Data rows written so far.
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Adds a worksheet (`Sheet1`, `Sheet2`...) with the header row.
+    fn start_sheet(&mut self) -> Result<()> {
+        let ws = self
+            .wb
+            .add_worksheet_with_constant_memory()
+            .map_err(xlsx_err)?;
+        let mut used = 0;
+        if self.header {
+            ws.set_freeze_panes(1, 0).map_err(xlsx_err)?;
+            for (c, name) in self.names.iter().enumerate() {
+                ws.write_string_with_format(0, c as u16, name.as_str(), &self.head)
+                    .map_err(xlsx_err)?;
+            }
+            used = 1;
+        }
+        self.sheet_rows.push(used);
+        Ok(())
+    }
+
+    /// Writes one row of the result (the next row of the open worksheet, or of a new one when it is full).
+    fn row(&mut self, row: &[Cell]) -> Result<()> {
+        if self.sheet_rows.last().copied().unwrap_or(0) >= self.max_rows {
+            self.start_sheet()?;
+        }
+        let at = self.sheet_rows.last().copied().unwrap_or(0);
+        let skip = usize::from(self.numbered);
+        let mut vals = Vec::with_capacity(self.names.len());
+        if self.numbered {
+            vals.push(XlsxVal::Number((self.rows + 1) as f64));
+        }
+        let null = Value::Null;
+        for i in 0..self.names.len() - skip {
+            let c = row.get(i).unwrap_or(&null);
+            vals.push(xlsx_value(
+                c,
+                self.kinds[i + skip],
+                &self.null_text,
+                &mut self.truncated,
+            ));
+        }
+        if self.rows < XLSX_WIDTH_ROWS {
+            for (w, v) in self.widths.iter_mut().zip(&vals) {
+                *w = (*w).max(shown_len(v));
+            }
+        }
+        let ws = self
+            .wb
+            .worksheets_mut()
+            .last_mut()
+            .ok_or_else(|| DbError::InvalidArgument("the workbook has no worksheet".into()))?;
+        for (c, v) in vals.iter().enumerate() {
+            write_cell(ws, at as u32, c as u16, v, &self.date, &self.date_time)
+                .map_err(xlsx_err)?;
+        }
+        if let Some(n) = self.sheet_rows.last_mut() {
+            *n += 1;
+        }
+        self.rows += 1;
+        Ok(())
+    }
+
+    /// Sets the filter of the header rows and the column widths of every worksheet, then writes the file to `w`.
+    fn finish<W: Write + Send>(mut self, w: W) -> Result<ExportReport> {
+        let cols = self.names.len();
+        for (ws, used) in self.wb.worksheets_mut().iter_mut().zip(&self.sheet_rows) {
+            if self.header && cols > 0 && *used >= 2 {
+                ws.autofilter(0, 0, (*used - 1) as u32, (cols - 1) as u16)
+                    .map_err(xlsx_err)?;
+            }
+            for (c, longest) in self.widths.iter().enumerate() {
+                ws.set_column_width(c as u16, column_width(*longest))
+                    .map_err(xlsx_err)?;
+            }
+        }
+        self.wb.save_to_writer(w).map_err(xlsx_err)?;
+        Ok(ExportReport {
+            rows: self.rows,
+            unmappable: 0,
+            truncated: self.truncated,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -636,6 +1035,9 @@ impl<W: Write> Exporter<W> {
     }
 
     pub fn begin(&mut self, columns: &[ColumnMeta]) -> io::Result<()> {
+        if self.o.format == ExportFormat::Xlsx {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, XLSX_NOT_TEXT));
+        }
         self.src_cols = columns.iter().map(|c| c.name.clone()).collect();
         self.src_pk = columns.iter().map(|c| c.is_pk).collect();
         self.src_types = columns.iter().map(|c| c.type_name.clone()).collect();
@@ -713,6 +1115,9 @@ impl<W: Write> Exporter<W> {
             | ExportFormat::SqlInsert
             | ExportFormat::SqlUpdate
             | ExportFormat::WhereClause => {}
+            ExportFormat::Xlsx => {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, XLSX_NOT_TEXT))
+            }
         }
         Ok(())
     }
@@ -896,6 +1301,9 @@ impl<W: Write> Exporter<W> {
                     .collect();
                 self.text_rows.push(line);
             }
+            ExportFormat::Xlsx => {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, XLSX_NOT_TEXT))
+            }
             ExportFormat::SqlInsert => {
                 let vals: Vec<String> = row
                     .iter()
@@ -1028,22 +1436,30 @@ impl<W: Write> Exporter<W> {
     }
 }
 
-/// Export an in-memory result set. Returns the number of rows written (always UTF-8).
-pub fn export_result<W: Write>(rs: &ResultSet, opts: &ExportOptions, w: W) -> Result<usize> {
+/// Export an in-memory result set. Returns the number of rows written (always UTF-8). Not for Excel (xlsx), which
+/// is a file only: see [`export_result_with`].
+pub fn export_result<W: Write + Send>(rs: &ResultSet, opts: &ExportOptions, w: W) -> Result<usize> {
+    if opts.format == ExportFormat::Xlsx {
+        return Err(DbError::Unsupported(XLSX_NOT_TEXT.into()));
+    }
     let mut o = opts.clone();
     o.encoding = ExportEncoding::Utf8;
     Ok(export_result_with(rs, &o, w, &CancellationToken::new(), |_| {})?.rows)
 }
 
 /// Export an in-memory result set with a cancellation token, progress events and the output
-/// encoding of `opts`. Returns the rows written and how many characters could not be encoded.
-pub fn export_result_with<W: Write>(
+/// encoding of `opts`. Returns the rows written and how many characters could not be encoded. An Excel
+/// (xlsx) export writes the workbook to `w` (the encoding does not apply).
+pub fn export_result_with<W: Write + Send>(
     rs: &ResultSet,
     opts: &ExportOptions,
     w: W,
     cancel: &CancellationToken,
     mut progress: impl FnMut(ExportProgress),
 ) -> Result<ExportReport> {
+    if opts.format == ExportFormat::Xlsx {
+        return export_result_xlsx(rs, opts, w, cancel, progress);
+    }
     let mut ew = EncodingWriter::new(w, opts.encoding);
     let mut e = Exporter::new(&mut ew, opts.clone());
     e.begin(&rs.columns)?;
@@ -1075,7 +1491,45 @@ pub fn export_result_with<W: Write>(
     Ok(ExportReport {
         rows,
         unmappable: ew.unmappable(),
+        truncated: 0,
     })
+}
+
+/// The Excel workbook of an in-memory result set (see [`ExportFormat::Xlsx`]).
+fn export_result_xlsx<W: Write + Send>(
+    rs: &ResultSet,
+    opts: &ExportOptions,
+    w: W,
+    cancel: &CancellationToken,
+    mut progress: impl FnMut(ExportProgress),
+) -> Result<ExportReport> {
+    let mut book = XlsxBook::new(opts, &rs.columns, XLSX_MAX_ROWS)?;
+    let total = rs.rows.len();
+    let mut gate = ProgressGate::new();
+    for (i, r) in rs.rows.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err(DbError::Cancelled);
+        }
+        book.row(r)?;
+        if gate.due(Instant::now(), i + 1) {
+            progress(ExportProgress {
+                rows_written: i + 1,
+                total: Some(total),
+            });
+        }
+    }
+    // a cancel that arrives after the last row still cancels (as in the text exports)
+    if cancel.is_cancelled() {
+        return Err(DbError::Cancelled);
+    }
+    let report = book.finish(w)?;
+    if gate.unreported(report.rows) {
+        progress(ExportProgress {
+            rows_written: report.rows,
+            total: Some(total),
+        });
+    }
+    Ok(report)
 }
 
 /// Export a result set to a string.
@@ -1097,6 +1551,9 @@ impl ConnectionManager {
         opts: &ExportOptions,
         w: W,
     ) -> Result<usize> {
+        if opts.format == ExportFormat::Xlsx {
+            return Err(DbError::Unsupported(XLSX_NOT_TEXT.into()));
+        }
         let mut o = opts.clone();
         o.encoding = ExportEncoding::Utf8;
         Ok(self
@@ -1105,7 +1562,8 @@ impl ConnectionManager {
             .rows)
     }
 
-    /// `export_query` with a cancellation token, progress events and the output encoding of `opts`.
+    /// `export_query` with a cancellation token, progress events and the output encoding of `opts`. An Excel
+    /// (xlsx) export writes the workbook to `w` (the encoding does not apply).
     pub async fn export_query_with<W: Write + Send>(
         &self,
         ds_id: &str,
@@ -1115,6 +1573,11 @@ impl ConnectionManager {
         cancel: &CancellationToken,
         progress: impl Fn(ExportProgress) + Send + Sync,
     ) -> Result<ExportReport> {
+        if opts.format == ExportFormat::Xlsx {
+            return self
+                .export_query_xlsx(ds_id, sql, opts, w, cancel, progress)
+                .await;
+        }
         let live = self.live(ds_id)?;
         let mut ew = EncodingWriter::new(w, opts.encoding);
         let mut e = Exporter::new(&mut ew, opts.clone());
@@ -1165,7 +1628,72 @@ impl ConnectionManager {
         Ok(ExportReport {
             rows,
             unmappable: ew.unmappable(),
+            truncated: 0,
         })
+    }
+
+    /// `export_query_with` for an Excel workbook: the rows of the first result shape, as the text exports write them.
+    async fn export_query_xlsx<W: Write + Send>(
+        &self,
+        ds_id: &str,
+        sql: &str,
+        opts: &ExportOptions,
+        w: W,
+        cancel: &CancellationToken,
+        progress: impl Fn(ExportProgress) + Send + Sync,
+    ) -> Result<ExportReport> {
+        let live = self.live(ds_id)?;
+        let mut book: Option<XlsxBook> = None;
+        let mut gate = ProgressGate::new();
+        let cols = query_cancellable(&live, sql, usize::MAX, cancel, |cols, row| {
+            if cancel.is_cancelled() {
+                return Err(DbError::Cancelled);
+            }
+            if book.is_none() {
+                book = Some(XlsxBook::new(opts, cols, XLSX_MAX_ROWS)?);
+            }
+            let Some(b) = book.as_mut() else {
+                return Ok(());
+            };
+            // a later result set of the same call with other columns: only the first shape is exported
+            if !b.same_columns(cols) {
+                return Ok(());
+            }
+            b.row(&row)?;
+            let n = b.rows();
+            if gate.due(Instant::now(), n) {
+                progress(ExportProgress {
+                    rows_written: n,
+                    total: None,
+                });
+            }
+            Ok(())
+        })
+        .await;
+        cols?;
+        let book = match book {
+            Some(b) => b,
+            None => {
+                // a result without rows: the cancel may come while its columns are described
+                let c = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(DbError::Cancelled),
+                    c = describe_columns_pool(&live.pool, sql) => c,
+                };
+                XlsxBook::new(opts, &c, XLSX_MAX_ROWS)?
+            }
+        };
+        if cancel.is_cancelled() {
+            return Err(DbError::Cancelled);
+        }
+        let report = book.finish(w)?;
+        if gate.unreported(report.rows) {
+            progress(ExportProgress {
+                rows_written: report.rows,
+                total: None,
+            });
+        }
+        Ok(report)
     }
 }
 
@@ -1849,5 +2377,446 @@ mod tests {
         };
         let w = export_to_string(&rs_pk(), &o).unwrap();
         assert_eq!(w, "where \"id\" in (1, 2, '9007199254740993')\n", "{w}");
+    }
+
+    // ---------------------------------------------------------------- Excel (xlsx)
+
+    fn col_of(name: &str, ty: &str) -> ColumnMeta {
+        ColumnMeta {
+            name: name.into(),
+            type_name: ty.into(),
+            nullable: true,
+            is_pk: false,
+            table_ref: None,
+        }
+    }
+
+    fn xlsx_opts() -> ExportOptions {
+        ExportOptions {
+            format: ExportFormat::Xlsx,
+            dialect: Driver::Oracle,
+            ..Default::default()
+        }
+    }
+
+    /// Part `name` of the xlsx `bytes`, as text.
+    fn xlsx_part(bytes: &[u8], name: &str) -> String {
+        use std::io::Read;
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut text = String::new();
+        zip.by_name(name)
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .read_to_string(&mut text)
+            .unwrap();
+        text
+    }
+
+    /// An Oracle-shaped result: NUMBER(38,10), DATE, TIMESTAMP, a zoned TIMESTAMP, a text and NULLs.
+    fn xlsx_rs() -> ResultSet {
+        ResultSet {
+            columns: vec![
+                col_of("N", "NUMBER(38,10)"),
+                col_of("D", "DATE"),
+                col_of("TS", "TIMESTAMP(6)"),
+                col_of("TZ", "TIMESTAMP(6) WITH TIME ZONE"),
+                col_of("NAME", "VARCHAR2(20)"),
+            ],
+            rows: vec![
+                vec![
+                    json!("12345678901234567890.1234567890"),
+                    json!("2024-02-29 13:45:10"),
+                    json!("2024-02-29 13:45:10.5"),
+                    json!("2024-02-29 13:45:10.5 +00:00"),
+                    json!("a & <b>"),
+                ],
+                vec![
+                    json!("1001.50"),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ],
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn book_bytes(rs: &ResultSet, opts: &ExportOptions) -> (Vec<u8>, ExportReport) {
+        let mut buf = Vec::new();
+        let report =
+            export_result_with(rs, opts, &mut buf, &CancellationToken::new(), |_| {}).unwrap();
+        (buf, report)
+    }
+
+    #[test]
+    fn excel_serial_numbers_of_dates() {
+        // 2024-01-01 is 45292; 1900-03-01 is 61 (the 1900 leap day Excel counts is not a date here)
+        assert_eq!(excel_serial(2024, 1, 1, 0.0), Some(45292.0));
+        assert_eq!(excel_serial(2024, 2, 29, 0.0), Some(45351.0));
+        assert_eq!(excel_serial(2024, 2, 29, 12.0 * 3600.0), Some(45351.5));
+        assert_eq!(excel_serial(1900, 3, 1, 0.0), Some(61.0));
+        assert_eq!(excel_serial(9999, 12, 31, 0.0), Some(2_958_465.0));
+        assert_eq!(excel_serial(1900, 2, 28, 0.0), None);
+        assert_eq!(excel_serial(10000, 1, 1, 0.0), None);
+    }
+
+    #[test]
+    fn excel_dates_and_times_of_the_text_of_a_column() {
+        let secs = 13.0 * 3600.0 + 45.0 * 60.0 + 10.0;
+        assert_eq!(
+            xlsx_date("2024-02-29 13:45:10", XlsxKind::DateTime),
+            Some(XlsxVal::Date {
+                serial: 45351.0 + secs / 86_400.0,
+                time: true
+            })
+        );
+        // a DATE column with no time is written without one; a time of day makes it a date-time
+        assert_eq!(
+            xlsx_date("2024-02-29", XlsxKind::Date),
+            Some(XlsxVal::Date {
+                serial: 45351.0,
+                time: false
+            })
+        );
+        assert!(matches!(
+            xlsx_date("2024-02-29 00:00:01", XlsxKind::Date),
+            Some(XlsxVal::Date { time: true, .. })
+        ));
+        // the fraction of a second is kept
+        let Some(XlsxVal::Date { serial, .. }) =
+            xlsx_date("2024-02-29 00:00:00.5", XlsxKind::DateTime)
+        else {
+            panic!("a date");
+        };
+        assert!(
+            (serial - (45351.0 + 0.5 / 86_400.0)).abs() < 1e-9,
+            "{serial}"
+        );
+        // zoned, not a date, or outside the workbook: no date
+        assert_eq!(
+            xlsx_date("2024-02-29 13:45:10 +02:00", XlsxKind::DateTime),
+            None
+        );
+        assert_eq!(xlsx_date("not a date", XlsxKind::DateTime), None);
+        assert_eq!(xlsx_date("1800-01-01 00:00:00", XlsxKind::DateTime), None);
+    }
+
+    #[test]
+    fn excel_kind_of_a_column_follows_its_declared_type() {
+        let o = Driver::Oracle;
+        assert_eq!(xlsx_kind("NUMBER(38,10)", o), XlsxKind::Number);
+        assert_eq!(
+            xlsx_kind("NUMERIC(10,2)", Driver::Postgres),
+            XlsxKind::Number
+        );
+        assert_eq!(xlsx_kind("bigint", Driver::MySql), XlsxKind::Number);
+        assert_eq!(
+            xlsx_kind("DATE", o),
+            XlsxKind::DateTime,
+            "Oracle DATE has a time"
+        );
+        assert_eq!(xlsx_kind("date", Driver::Postgres), XlsxKind::Date);
+        assert_eq!(xlsx_kind("DATETIME", Driver::MySql), XlsxKind::DateTime);
+        assert_eq!(xlsx_kind("TIMESTAMP(6)", o), XlsxKind::DateTime);
+        assert_eq!(
+            xlsx_kind("timestamp without time zone", Driver::Postgres),
+            XlsxKind::DateTime
+        );
+        assert_eq!(xlsx_kind("TIMESTAMP(6) WITH TIME ZONE", o), XlsxKind::Text);
+        assert_eq!(
+            xlsx_kind("TIMESTAMP(6) WITH LOCAL TIME ZONE", o),
+            XlsxKind::Text
+        );
+        assert_eq!(xlsx_kind("timestamptz", Driver::Postgres), XlsxKind::Text);
+        assert_eq!(xlsx_kind("VARCHAR2(20)", o), XlsxKind::Text);
+        assert_eq!(xlsx_kind("CLOB", o), XlsxKind::Text);
+        assert_eq!(xlsx_kind("", Driver::Sqlite), XlsxKind::Text);
+    }
+
+    #[test]
+    fn excel_numbers_are_numbers_only_when_they_hold_exactly() {
+        assert_eq!(decimal_value("1001.50"), Some(1001.5));
+        assert_eq!(decimal_value("-0.5"), Some(-0.5));
+        assert_eq!(
+            decimal_value("123456789012345"),
+            Some(123_456_789_012_345.0),
+            "15 digits"
+        );
+        // 16 digits: a double could not print them back
+        assert_eq!(decimal_value("1234567890123456"), None);
+        assert_eq!(decimal_value("12345678901234567890.1234567890"), None);
+        assert_eq!(decimal_value("NaN"), None);
+        assert_eq!(decimal_value("Infinity"), None);
+        assert_eq!(decimal_value("1e5"), None);
+        assert_eq!(decimal_value(""), None);
+        assert_eq!(decimal_value("1.2.3"), None);
+
+        let cell = |v: Value| xlsx_value(&v, XlsxKind::Number, "", &mut 0);
+        assert_eq!(cell(json!("1001.00")), XlsxVal::Number(1001.0));
+        assert_eq!(
+            cell(json!("12345678901234567890.1234567890")),
+            XlsxVal::Text("12345678901234567890.1234567890".into())
+        );
+        assert_eq!(cell(json!(2.5)), XlsxVal::Number(2.5));
+        assert_eq!(cell(json!(3.0)), XlsxVal::Number(3.0));
+        assert_eq!(cell(json!(42)), XlsxVal::Number(42.0));
+        // a 16-digit integer that arrives as a JSON number is text too
+        assert_eq!(
+            cell(json!(9007199254740993_i64)),
+            XlsxVal::Text("9007199254740993".into())
+        );
+    }
+
+    #[test]
+    fn excel_cell_values_by_kind() {
+        let mut t = 0;
+        let mut v = |c: Value, k: XlsxKind, null: &str| xlsx_value(&c, k, null, &mut t);
+        assert_eq!(v(Value::Null, XlsxKind::Text, ""), XlsxVal::Blank);
+        assert_eq!(
+            v(Value::Null, XlsxKind::Text, "NULL"),
+            XlsxVal::Text("NULL".into())
+        );
+        assert_eq!(v(json!(true), XlsxKind::Text, ""), XlsxVal::Bool(true));
+        // a text that looks like a number stays text (zip codes, codes)
+        assert_eq!(
+            v(json!("007"), XlsxKind::Text, ""),
+            XlsxVal::Text("007".into())
+        );
+        // binary as hex text, arrays as JSON text
+        assert_eq!(
+            v(json!({"$bin": "ff00", "len": 2}), XlsxKind::Text, ""),
+            XlsxVal::Text("0xff00".into())
+        );
+        assert_eq!(
+            v(json!([1, 2]), XlsxKind::Text, ""),
+            XlsxVal::Text("[1,2]".into())
+        );
+        // a date that does not parse is shown as it is
+        assert_eq!(
+            v(json!("soon"), XlsxKind::DateTime, ""),
+            XlsxVal::Text("soon".into())
+        );
+        assert!(matches!(
+            v(json!("2024-02-29 13:45:10"), XlsxKind::DateTime, ""),
+            XlsxVal::Date { time: true, .. }
+        ));
+    }
+
+    #[test]
+    fn excel_text_is_cut_to_the_length_a_cell_holds() {
+        assert_eq!(cut_for_cell("abc"), None);
+        let max = "a".repeat(XLSX_MAX_CHARS);
+        assert_eq!(cut_for_cell(&max), None, "exactly the limit fits");
+        let over = format!("{max}b");
+        assert_eq!(cut_for_cell(&over), Some(max.as_str()));
+        // a character outside the BMP counts two units: it is cut as a whole, never in half
+        let emoji_edge = format!("{}\u{1F600}", "a".repeat(XLSX_MAX_CHARS - 1));
+        assert_eq!(
+            cut_for_cell(&emoji_edge),
+            Some(&emoji_edge[..XLSX_MAX_CHARS - 1])
+        );
+        let mut truncated = 0;
+        assert_eq!(
+            text_value(&over, &mut truncated),
+            XlsxVal::Text(max.clone())
+        );
+        assert_eq!(truncated, 1);
+    }
+
+    #[test]
+    fn excel_widths_are_estimated_and_capped() {
+        assert_eq!(column_width(0), 8.0);
+        assert_eq!(column_width(10), 12.0);
+        assert_eq!(column_width(500), XLSX_MAX_WIDTH);
+    }
+
+    #[test]
+    fn excel_workbook_holds_the_typed_cells_and_the_header_formats() {
+        let (bytes, report) = book_bytes(&xlsx_rs(), &xlsx_opts());
+        assert_eq!(report.rows, 2);
+        assert_eq!(report.unmappable, 0);
+        assert_eq!(report.truncated, 0);
+        let sheet = xlsx_part(&bytes, "xl/worksheets/sheet1.xml");
+        // header names as text
+        for text in ["N", "D", "TS", "TZ", "NAME"] {
+            assert!(
+                sheet.contains(&format!("<t>{text}</t>")),
+                "{text} in {sheet}"
+            );
+        }
+        assert!(sheet.contains("<t>a &amp; &lt;b&gt;</t>"), "{sheet}");
+        // the NUMBER of 20 digits is text, the 1001.50 is a number
+        assert!(
+            sheet.contains("<t>12345678901234567890.1234567890</t>"),
+            "{sheet}"
+        );
+        assert!(sheet.contains("<v>1001.5</v>"), "{sheet}");
+        // the zoned timestamp keeps its offset as text
+        assert!(
+            sheet.contains("<t>2024-02-29 13:45:10.5 +00:00</t>"),
+            "{sheet}"
+        );
+        // the header is frozen and filtered over the used range
+        assert!(sheet.contains("state=\"frozen\""), "{sheet}");
+        assert!(sheet.contains("<autoFilter ref=\"A1:E3\""), "{sheet}");
+        let styles = xlsx_part(&bytes, "xl/styles.xml");
+        assert!(styles.contains("yyyy-mm-dd hh:mm:ss"), "{styles}");
+        assert!(styles.contains("<b/>"), "the bold header: {styles}");
+    }
+
+    #[test]
+    fn excel_row_header_null_text_and_no_header() {
+        let rs = xlsx_rs();
+        let o = ExportOptions {
+            row_header: true,
+            null_text: "NULL".into(),
+            ..xlsx_opts()
+        };
+        let (bytes, _) = book_bytes(&rs, &o);
+        let sheet = xlsx_part(&bytes, "xl/worksheets/sheet1.xml");
+        // the row number column comes first, the NULLs are the null text
+        assert!(
+            sheet.contains("<c r=\"A2\"") && sheet.contains("<v>1</v>"),
+            "{sheet}"
+        );
+        assert!(sheet.contains("<t>NULL</t>"), "{sheet}");
+        assert!(sheet.contains("<autoFilter ref=\"A1:F3\""), "{sheet}");
+        let o = ExportOptions {
+            header: false,
+            ..xlsx_opts()
+        };
+        let (bytes, _) = book_bytes(&rs, &o);
+        let sheet = xlsx_part(&bytes, "xl/worksheets/sheet1.xml");
+        assert!(!sheet.contains("<t>N</t>"), "no header row: {sheet}");
+        assert!(!sheet.contains("state=\"frozen\""), "{sheet}");
+        assert!(!sheet.contains("<autoFilter"), "{sheet}");
+    }
+
+    #[test]
+    fn excel_rows_split_into_worksheets_with_the_header_repeated() {
+        // three rows per worksheet, the header row included: two data rows each, then one
+        let cols = xlsx_rs().columns;
+        let mut book = XlsxBook::new(&xlsx_opts(), &cols, 3).unwrap();
+        let row = |i: i64| {
+            vec![
+                json!(i),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                json!(format!("r{i}")),
+            ]
+        };
+        for i in 1..=5 {
+            book.row(&row(i)).unwrap();
+        }
+        let mut buf = Vec::new();
+        let report = book.finish(&mut buf).unwrap();
+        assert_eq!(report.rows, 5, "data rows only");
+        let sheet1 = xlsx_part(&buf, "xl/worksheets/sheet1.xml");
+        let sheet2 = xlsx_part(&buf, "xl/worksheets/sheet2.xml");
+        let sheet3 = xlsx_part(&buf, "xl/worksheets/sheet3.xml");
+        assert!(
+            sheet1.contains("<t>r2</t>") && !sheet1.contains("<t>r3</t>"),
+            "{sheet1}"
+        );
+        assert!(sheet2.contains("<t>N</t>"), "the header again: {sheet2}");
+        assert!(
+            sheet2.contains("<t>r3</t>") && sheet2.contains("<t>r4</t>"),
+            "{sheet2}"
+        );
+        assert!(
+            sheet3.contains("<t>r5</t>") && sheet3.contains("<t>N</t>"),
+            "{sheet3}"
+        );
+        assert!(zip::ZipArchive::new(std::io::Cursor::new(&buf))
+            .unwrap()
+            .by_name("xl/worksheets/sheet4.xml")
+            .is_err());
+    }
+
+    /// The real limit: 1,048,575 data rows fill the first worksheet with its header, the last row goes to `Sheet2`.
+    #[test]
+    #[ignore = "writes 1,048,576 rows: run with --ignored (slow in a debug build)"]
+    fn excel_real_row_limit_starts_sheet2() {
+        let mut book =
+            XlsxBook::new(&xlsx_opts(), &[col_of("N", "NUMBER")], XLSX_MAX_ROWS).unwrap();
+        for i in 0..XLSX_MAX_ROWS {
+            book.row(&[json!(i)]).unwrap();
+        }
+        let mut buf = Vec::new();
+        let report = book.finish(&mut buf).unwrap();
+        assert_eq!(report.rows, XLSX_MAX_ROWS);
+        let sheet1 = xlsx_part(&buf, "xl/worksheets/sheet1.xml");
+        assert!(
+            sheet1.contains("<autoFilter ref=\"A1:A1048576\""),
+            "last row of Sheet1"
+        );
+        let sheet2 = xlsx_part(&buf, "xl/worksheets/sheet2.xml");
+        assert!(
+            sheet2.contains("<t>N</t>") && sheet2.contains("<autoFilter ref=\"A1:A2\""),
+            "{sheet2}"
+        );
+    }
+
+    #[test]
+    fn excel_is_a_file_only_format() {
+        // the clipboard and the preview are text: they refuse it with the reason
+        let err = export_to_string(&xlsx_rs(), &xlsx_opts()).unwrap_err();
+        assert!(
+            matches!(err, DbError::Unsupported(ref m) if m.contains("binary")),
+            "{err:?}"
+        );
+        let mut buf = Vec::new();
+        let err = export_result(&xlsx_rs(), &xlsx_opts(), &mut buf).unwrap_err();
+        assert!(matches!(err, DbError::Unsupported(_)));
+        assert!(buf.is_empty());
+        // the text writer refuses it if it is reached some other way
+        let mut e = Exporter::new(Vec::new(), xlsx_opts());
+        assert!(e.begin(&xlsx_rs().columns).is_err());
+        // transpose cannot be laid out in a workbook
+        let o = ExportOptions {
+            transpose: true,
+            ..xlsx_opts()
+        };
+        assert!(matches!(
+            export_result_with(
+                &xlsx_rs(),
+                &o,
+                Vec::new(),
+                &CancellationToken::new(),
+                |_| {}
+            ),
+            Err(DbError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn excel_export_stops_on_cancel() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let err =
+            export_result_with(&xlsx_rs(), &xlsx_opts(), Vec::new(), &token, |_| {}).unwrap_err();
+        assert!(matches!(err, DbError::Cancelled));
+    }
+
+    #[test]
+    fn excel_text_cells_past_the_limit_are_counted_in_the_report() {
+        let rs = ResultSet {
+            columns: vec![col_of("T", "CLOB")],
+            rows: vec![
+                vec![json!("x".repeat(XLSX_MAX_CHARS + 10))],
+                vec![json!("short")],
+            ],
+            ..Default::default()
+        };
+        let (bytes, report) = book_bytes(&rs, &xlsx_opts());
+        assert_eq!(report.truncated, 1);
+        assert_eq!(report.rows, 2);
+        let sheet = xlsx_part(&bytes, "xl/worksheets/sheet1.xml");
+        assert!(
+            sheet.contains(&format!("<t>{}</t>", "x".repeat(XLSX_MAX_CHARS))),
+            "the cut text"
+        );
+        assert!(!sheet.contains(&"x".repeat(XLSX_MAX_CHARS + 1)));
     }
 }

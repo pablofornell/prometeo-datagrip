@@ -1801,16 +1801,37 @@ mod runtime {
                 )
                 .await,
             );
+            let serial = txt(&serial);
             let ev = run(
                 admin,
                 a,
-                &format!(
-                    "alter system kill session '{sid},{}' immediate",
-                    txt(&serial)
-                ),
+                &format!("alter system kill session '{sid},{serial}' immediate"),
             )
             .await;
-            assert_ok(&ev);
+            // ORA-00031 "session marked for kill": accepted, Oracle ends the session a moment later (it was busy)
+            let errs = errors(&ev);
+            assert!(
+                errs.is_empty() || errs.iter().all(|e| e.contains("ORA-00031")),
+                "{errs:?}"
+            );
+            // wait until the session is really gone (a KILLED session still holds its locks while Oracle rolls back
+            // its transaction), so the next statement sees the loss and no lock is left
+            for _ in 0..30 {
+                let left = scalar(
+                    &run(
+                        admin,
+                        a,
+                        &format!(
+                            "select count(*) from v$session where sid = {sid} and serial# = {serial}"
+                        ),
+                    )
+                    .await,
+                );
+                if txt(&left) == "0" {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
         }
 
         // without a transaction: the next execute reports the loss, the one after reopens
@@ -1861,7 +1882,16 @@ mod runtime {
         mgr.close_session(&s).await;
 
         let t = mgr.open_session("ora").await.unwrap();
-        assert_ok(&run_auto(&mgr, &t, "drop table a_rt_lost purge").await);
+        // the rollback of the killed transaction can still hold the table lock (ORA-00054) for a moment
+        let mut ev = run_auto(&mgr, &t, "drop table a_rt_lost purge").await;
+        for _ in 0..20 {
+            if !errors(&ev).iter().any(|e| e.contains("ORA-00054")) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            ev = run_auto(&mgr, &t, "drop table a_rt_lost purge").await;
+        }
+        assert_ok(&ev);
         mgr.close_session(&t).await;
         admin.close_session(&a).await;
         admin.disconnect("ora-system").await;

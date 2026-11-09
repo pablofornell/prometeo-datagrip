@@ -8,6 +8,8 @@ export interface Extractor {
   ext: string;
   mime: string;
   section: "Built-in" | "CSV" | "Other";
+  /** A binary file: written to a file only (no clipboard, no text preview). */
+  binary?: true;
 }
 
 export const EXTRACTORS: Extractor[] = [
@@ -18,6 +20,7 @@ export const EXTRACTORS: Extractor[] = [
   { id: "tsv", label: "TSV", ext: "tsv", mime: "text/tab-separated-values", section: "CSV" },
   { id: "csvPipe", label: "Pipe-separated", ext: "csv", mime: "text/csv", section: "CSV" },
   { id: "csvSemicolon", label: "Semicolon-separated", ext: "csv", mime: "text/csv", section: "CSV" },
+  { id: "xlsx", label: "Excel (xlsx)", ext: "xlsx", mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", section: "Other", binary: true },
   { id: "html", label: "HTML", ext: "html", mime: "text/html", section: "Other" },
   { id: "json", label: "JSON", ext: "json", mime: "application/json", section: "Other" },
   { id: "jsonLines", label: "JSON Lines", ext: "jsonl", mime: "application/x-ndjson", section: "Other" },
@@ -28,6 +31,12 @@ export const EXTRACTORS: Extractor[] = [
 
 /** Toolbar label of the extractor (`SQL` for the INSERT / UPDATE ones, as in DataGrip). */
 export const extractorLabel = (f: ExportFormat): string => (f === "sqlInsert" || f === "sqlUpdate" ? "SQL" : (EXTRACTORS.find((x) => x.id === f)?.label ?? "CSV"));
+
+/** Is `f` a binary file format (Excel): it cannot go to the clipboard nor be shown as text. */
+export const isBinaryFormat = (f: ExportFormat): boolean => EXTRACTORS.some((x) => x.id === f && x.binary === true);
+
+/** The extractors that can go to the clipboard (every text format; the binary ones are for a file). */
+export const CLIPBOARD_EXTRACTORS: Extractor[] = EXTRACTORS.filter((x) => !x.binary);
 
 /** Rows of the `Data Extractors` popup (open it with the title `Data Extractors`): the sections `Built-in` / `CSV` / `Other`, the current one checked. */
 export function extractorMenuItems(current: ExportFormat, pick: (f: ExportFormat) => void): MenuItem[] {
@@ -53,6 +62,13 @@ export function replacedNotice(replaced: number): string {
   if (replaced <= 0) return "";
   const one = replaced === 1;
   return `${replaced} ${one ? "character was" : "characters were"} replaced with "?" (not in Windows-1252)`;
+}
+
+/** The notice after an Excel export that cut `cut` cells to the length an Excel cell holds; `""` when none was. */
+export function truncatedNotice(cut: number): string {
+  if (cut <= 0) return "";
+  const one = cut === 1;
+  return `${cut} ${one ? "cell was" : "cells were"} cut to the 32,767 characters an Excel cell holds`;
 }
 
 /**

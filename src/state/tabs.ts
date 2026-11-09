@@ -5,7 +5,7 @@ import { type PaneTree, type SplitDir, hasPane, leaf, leaves, oppositePane, remo
 import { loadLocal, saveUiState } from "./persist";
 import { type Ask, runDecisions } from "./decisions";
 
-export type TabKind = "console" | "table" | "ddl" | "file" | "diagram";
+export type TabKind = "console" | "table" | "ddl" | "file" | "diagram" | "schemadiff";
 
 export interface EditorTab {
   id: string;

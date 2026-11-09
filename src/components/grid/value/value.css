@@ -1,0 +1,208 @@
+/* value viewer: tabs, the text / JSON / hex / image bodies (the dialog itself is styled in ../grid.css) */
+
+.dgg-vx-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--dg-popup-border, #33353b);
+}
+.dgg-vx-tab {
+  height: 26px;
+  padding: 0 10px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--dg-text-secondary, #73767c);
+  font: inherit;
+  cursor: default;
+}
+.dgg-vx-tab.on {
+  color: var(--dg-text, #d1d3d9);
+  border-bottom-color: var(--dg-focus-ring, #3871e1);
+}
+
+.dgg-vx-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin: 8px 12px 0;
+}
+.dgg-vx-body > .dgg-ve-text {
+  margin: 0;
+}
+
+.dgg-vx-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 24px;
+  margin-bottom: 4px;
+}
+.dgg-vx-link {
+  height: 22px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--dg-text-secondary, #73767c);
+  font: inherit;
+  font-size: 12px;
+  cursor: default;
+}
+.dgg-vx-link:hover {
+  border-color: var(--dg-button-border, #40434a);
+  color: var(--dg-button-fg, #d1d3d9);
+}
+.dgg-vx-link.on {
+  color: var(--dg-text, #d1d3d9);
+  border-color: var(--dg-button-border, #40434a);
+}
+.dgg-vx-link:disabled {
+  opacity: 0.45;
+}
+.dgg-vx-note {
+  color: var(--dg-text-secondary, #73767c);
+  font-size: 12px;
+}
+.dgg-vx-pad {
+  padding: 8px;
+}
+.dgg-vx-err {
+  color: var(--dg-text-error, #f57e84);
+  font-size: 12px;
+  padding: 0 12px 4px;
+}
+
+.dgg-vx-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  position: relative;
+  border: 1px solid var(--dg-input-border, #40434a);
+  border-radius: 4px;
+  background: var(--dg-input-bg, #191a1c);
+  color: var(--dg-grid-fg, #bcbec4);
+  font: 12px / 18px var(--dg-font-mono, monospace);
+  outline: none;
+}
+.dgg-vx-spacer {
+  position: relative;
+  width: 100%;
+}
+.dgg-vx-row {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 18px;
+  white-space: pre;
+  overflow: hidden;
+}
+
+.dgg-vx-hex {
+  padding: 0 8px;
+}
+.dgg-vx-hex-off {
+  color: var(--dg-text-secondary, #73767c);
+  margin-right: 16px;
+}
+.dgg-vx-hex-asc {
+  margin-left: 16px;
+  color: var(--dg-text-secondary, #73767c);
+}
+
+.dgg-vx-jtree {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.dgg-vx-jtree > .dgg-vx-scroll {
+  flex: 1;
+}
+.dgg-vx-jrow {
+  padding-right: 8px;
+  cursor: default;
+}
+.dgg-vx-jrow.expandable {
+  cursor: pointer;
+}
+.dgg-vx-jrow:hover {
+  background: var(--dg-row-hover, rgba(255, 255, 255, 0.04));
+}
+.dgg-vx-jtog {
+  display: inline-block;
+  width: 12px;
+  color: var(--dg-text-secondary, #73767c);
+}
+.dgg-vx-jkey {
+  color: var(--dg-json-key, #c77dbb);
+}
+.dgg-vx-jsep {
+  color: var(--dg-text-secondary, #73767c);
+}
+.dgg-vx-jval.k-string {
+  color: var(--dg-json-string, #6aab73);
+}
+.dgg-vx-jval.k-number {
+  color: var(--dg-json-number, #2aacb8);
+}
+.dgg-vx-jval.k-boolean,
+.dgg-vx-jval.k-null {
+  color: var(--dg-json-keyword, #cf8e6d);
+}
+.dgg-vx-jacts {
+  display: none;
+  margin-left: 12px;
+}
+.dgg-vx-jrow:hover .dgg-vx-jacts {
+  display: inline-block;
+}
+.dgg-vx-jacts .dgg-vx-link {
+  height: 16px;
+  font-size: 11px;
+  padding: 0 4px;
+}
+
+.dgg-vx-image {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.dgg-vx-img-box {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px;
+  font: inherit;
+}
+.dgg-vx-img {
+  display: block;
+  max-width: none;
+  image-rendering: auto;
+}
+.dgg-vx-img.fit {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+.dgg-vx-img-box:not(.fit) {
+  align-items: flex-start;
+  justify-content: flex-start;
+}
+
+/* the value viewer dialog: wider than the text editor, for the tab bar and the buttons of a binary value */
+.dgg-ve.dgg-vx-dialog {
+  width: min(680px, 94%);
+  height: min(460px, 88%);
+}
+.dgg-vx-dialog .dgg-ve-foot {
+  flex-wrap: wrap;
+}
+.dgg-vx-dialog .dgg-ve-hint {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

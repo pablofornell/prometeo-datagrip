@@ -80,6 +80,7 @@ export const MAIN_MENU: MenuBarEntry[] = [
       sep,
       a("edit.find", "F"),
       a("edit.replace", "e"),
+      opt("db.findUsages"),
       sep,
       a("code.reformat", "o"),
       a("code.comment", "L"),

@@ -39,12 +39,14 @@ import type {
   PlanNode,
   ResultSet,
   RowChange,
+  SchemaModel,
   ScriptProgress,
   ScriptSummary,
   SnapshotObject,
   Statement,
   TableDataRequest,
   TreeNode,
+  Usage,
 } from "./types";
 
 // ---------------------------------------------------------------- helpers
@@ -1364,6 +1366,9 @@ function exportText(src: Pick<ResultSet, "columns" | "rows">, o: ExportOptions):
   const tbl = (o.tableName ?? "table_name").split(".").map(qi).join(".");
   const xml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   switch (o.format) {
+    case "xlsx":
+      // a binary workbook: only the desktop app writes it
+      throw new Error("Excel (xlsx) export needs the desktop app");
     case "csv":
     case "csvPipe":
     case "csvSemicolon":
@@ -1492,6 +1497,9 @@ type A = Record<string, any>;
 // ---------------------------------------------------------------- import sample
 
 const MOCK_IMPORT_PATH = "/mock/import-sample.csv";
+/** A 1 x 1 PNG, for the value viewer's file load in the browser. */
+const MOCK_VALUE_PATH = "/mock/value.png";
+const MOCK_VALUE_PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 const MOCK_IMPORT_CSV = "id,name,price,in_stock\n1,Widget,9.99,true\n2,Gadget,24.50,false\n3,Doohickey,3.25,true\n";
 const mockImports = new Map<string, { cancelled: boolean }>();
 const mockDumps = new Map<string, { cancelled: boolean }>();
@@ -1679,6 +1687,23 @@ export const mockHandlers: Record<string, MockHandler> = {
         return `-- DDL of ${o.kind} ${o.name}`;
     }
   }),
+  find_usages: h(async (a) => {
+    needConn(a.dsId);
+    useDs(a.dsId);
+    await sleep(120);
+    const o = a.objectRef as ObjectRef;
+    const sc = o.schema ?? M.defaultSchema;
+    // foreign keys only: the mock has no view or routine text to search
+    const out: Usage[] = [];
+    for (const [s, sch] of Object.entries(M.schemas))
+      for (const t of sch.tables)
+        for (const f of t.fks ?? []) {
+          const onObject = o.kind === "column" ? (t.name === o.table && f.cols.includes(o.name)) || (f.refTable === o.table && f.refCols.includes(o.name)) : o.kind === "table" && f.refTable === o.name;
+          if (s !== sc || !onObject) continue;
+          out.push({ schema: s, name: t.name, kind: "foreignKey", detail: `${f.name} (${f.cols.join(", ")}) references ${f.refTable} (${f.refCols.join(", ")})`, line: null, table: t.name });
+        }
+    return out;
+  }),
   schema_snapshot: h(async (a) => {
     needConn(a.dsId);
     useDs(a.dsId);
@@ -1696,6 +1721,50 @@ export const mockHandlers: Record<string, MockHandler> = {
         });
     }
     return out;
+  }),
+
+  // ---- schema compare: the model of the mock schema (columns, keys, checks, foreign keys, indexes, views)
+  schema_model: h(async (a) => {
+    needConn(a.dsId);
+    useDs(a.dsId);
+    await sleep(120);
+    const sc = String(a.schema);
+    const s = M.schemas[sc] ?? fail(`schema ${sc} does not exist`);
+    const tables = s.tables
+      .filter((t) => t.kind === "table")
+      .map((t) => {
+        const pk = t.cols.filter((c) => c.pk).map((c) => c.name);
+        return {
+          name: t.name,
+          columns: t.cols.map((c, i) => ({
+            name: c.name,
+            position: i + 1,
+            dataType: c.type,
+            nullable: c.nullable ?? !c.pk,
+            default: c.def ?? null,
+            extra: c.identity ? "identity by default" : null,
+          })),
+          primaryKey: pk.length ? { name: `${t.name}_pkey`, columns: pk } : null,
+          unique: (t.uniques ?? []).map((u) => ({ name: u.name, columns: u.cols })),
+          checks: (t.checks ?? []).map((c) => ({ name: c.name, expression: c.def })),
+          foreignKeys: (t.fks ?? []).map((f) => ({ name: f.name, columns: f.cols, refSchema: null, refTable: f.refTable, refColumns: f.refCols, onDelete: "NO ACTION" })),
+          indexes: (t.indexes ?? [])
+            .filter((i) => !i.primary)
+            .map((i) => ({ name: i.name, columns: i.cols.split(",").map((c) => c.trim()), unique: !!i.unique, method: "btree", predicate: i.where ?? null })),
+        };
+      });
+    const views = s.tables
+      .filter((t) => t.kind !== "table")
+      .map((v) => ({ name: v.name, definition: `select * from ${v.name}`, materialized: v.kind === "materializedView" }));
+    return {
+      driver: M.oracle ? "oracle" : "postgres",
+      schema: sc,
+      namePrefix: null,
+      tables,
+      views,
+      sequences: [],
+      routines: [],
+    } satisfies SchemaModel;
   }),
 
   // ---- execution
@@ -1867,6 +1936,20 @@ export const mockHandlers: Record<string, MockHandler> = {
   export_to_string: h((a) => exportText(a.result, a.options)),
 
   // ---- import (a browser has no file system: one built-in sample file)
+  // ---- cell values (a browser has no database files: one fixed value, one fixed file)
+  fetch_cell: h(async (a) => {
+    await sleep(40);
+    // the viewer loads whole values of binary cells only: the mock answers with bytes
+    const text = `full value of ${String(a.column)} (browser mock)`;
+    return { kind: "binary", base64: btoa(text), len: text.length, truncated: false };
+  }),
+  choose_value_save_path: h(() => "/mock/value.bin"),
+  write_value_file: h(() => undefined),
+  choose_value_file: h(() => ({ path: MOCK_VALUE_PATH, name: "value.png", size: atob(MOCK_VALUE_PNG_BASE64).length })),
+  read_value_file: h((a) => {
+    if (a.path !== MOCK_VALUE_PATH) fail(`Refusing to read ${a.path}: value files must be chosen in the open dialog (choose_value_file)`);
+    return MOCK_VALUE_PNG_BASE64;
+  }),
   choose_import_file: h(() => ({ path: MOCK_IMPORT_PATH, name: "import-sample.csv", size: MOCK_IMPORT_CSV.length, defaultErrorFile: "/mock/import-sample_errors.txt" })),
   import_preview: h(async (a) => {
     await sleep(60);

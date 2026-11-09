@@ -139,6 +139,25 @@ export function prunePositions(
  * Builds the diagram model. Nodes are sorted by (schema, name) and edges by (from, to, label), so the result is
  * deterministic for a given snapshot regardless of its input order. Missing / duplicate objects are handled safely.
  */
+/**
+ * The objects of a diagram of some tables: those tables plus their direct FK neighbours (tables they reference and
+ * tables that reference them), so each selected table shows its relations. `tables` undefined: every object.
+ */
+export function subsetOf<T extends DiagramInputObject>(objects: readonly T[], tables: readonly string[] | undefined): T[] {
+  if (!tables) return [...objects];
+  const picked = new Set(tables.map((t) => t.toLowerCase()));
+  const keep = new Set(picked);
+  for (const o of objects) {
+    const name = o.name.toLowerCase();
+    for (const fk of o.foreignKeys ?? []) {
+      const ref = fk.refTable.toLowerCase();
+      if (picked.has(name)) keep.add(ref);
+      if (picked.has(ref)) keep.add(name);
+    }
+  }
+  return objects.filter((o) => keep.has(o.name.toLowerCase()));
+}
+
 export function buildDiagram(objects: readonly DiagramInputObject[], opts: DiagramOptions): DiagramModel {
   const sorted = [...objects].sort((a, b) => a.schema.localeCompare(b.schema) || a.name.localeCompare(b.name));
 

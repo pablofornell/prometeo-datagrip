@@ -4,12 +4,14 @@
 
 use std::path::PathBuf;
 
+use dbcore::compare::SchemaModel;
 use dbcore::{
     ApplyResult, ConnectInfo, DataSourceConfig, Driver, DumpOptions, DumpProgress, DumpResult,
     ExecEvent, ExecOptions, ExplainPlan, ExportFormat, ExportOptions, ExportProgress, ExportReport,
     FetchedRows, HistoryEntry, ImportFormat, ImportPreview, ImportProgress, ImportRequest,
     ImportResult, ObjectRef, ResultSet, RowChange, ScriptOptions, ScriptProgress, ScriptSummary,
     SessionState, SnapshotObject, Statement, TableDataRequest, TestResult, TreeNode, TxStatus,
+    Usage,
 };
 use serde_json::Value;
 use tauri::ipc::Channel;
@@ -222,6 +224,16 @@ pub async fn get_ddl(
         .await
 }
 
+/// Find Usages (Alt+F7): what refers to the object (`dbcore::usages`).
+#[tauri::command]
+pub async fn find_usages(
+    state: State<'_, AppState>,
+    ds_id: String,
+    object_ref: ObjectRef,
+) -> Res<Vec<Usage>> {
+    state.find_usages(&ds_id, object_ref).await
+}
+
 #[tauri::command]
 pub async fn schema_snapshot(
     state: State<'_, AppState>,
@@ -229,6 +241,19 @@ pub async fn schema_snapshot(
     schema: Option<String>,
 ) -> Res<Vec<SnapshotObject>> {
     state.schema_snapshot(&ds_id, schema).await
+}
+
+/// Normalized model of `schema` for "Compare schemas"; `name_prefix` keeps the objects whose name starts with it.
+#[tauri::command]
+pub async fn schema_model(
+    state: State<'_, AppState>,
+    ds_id: String,
+    schema: String,
+    name_prefix: Option<String>,
+) -> Res<SchemaModel> {
+    state
+        .schema_model(&ds_id, &schema, name_prefix.as_deref())
+        .await
 }
 
 // ---------------------------------------------------------------- execution
@@ -335,6 +360,127 @@ pub async fn apply_changes_in_session(
         .await
 }
 
+// ---------------------------------------------------------------- cell values
+
+/// The full value of one cell of a table row. `keys`: primary key column -> value (the row's key). `maxBytes` caps
+/// what is read; absent or `0` means the cap of 32 MB.
+#[tauri::command]
+pub async fn fetch_cell(
+    state: State<'_, AppState>,
+    ds_id: String,
+    table: ObjectRef,
+    keys: std::collections::BTreeMap<String, Value>,
+    column: String,
+    max_bytes: Option<u64>,
+) -> Res<dbcore::cell::CellContent> {
+    state
+        .fetch_cell(&ds_id, table, keys, &column, max_bytes.unwrap_or(0))
+        .await
+}
+
+/// Open the native "Save" dialog for a cell value and return the chosen path (`null` = cancelled). Only that path is
+/// written by `write_value_file`, once.
+#[tauri::command]
+pub async fn choose_value_save_path(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    suggested_name: Option<String>,
+    extension: Option<String>,
+) -> Res<Option<String>> {
+    use tauri_plugin_dialog::DialogExt;
+    let mut dlg = app.dialog().file().set_parent(&window);
+    if let Some(ext) = extension.as_deref().filter(|e| !e.is_empty()) {
+        dlg = dlg.add_filter(ext.to_uppercase(), &[ext]);
+    }
+    dlg = dlg.add_filter("All files", &["*"]);
+    if let Some(name) = suggested_name.as_deref().filter(|n| !n.trim().is_empty()) {
+        // a file name only: the dialog decides the folder
+        let name = std::path::Path::new(name)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        dlg = dlg.set_file_name(name);
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    dlg.save_file(move |p| {
+        let _ = tx.send(p);
+    });
+    let Some(chosen) = rx
+        .await
+        .map_err(|_| "The save dialog was closed".to_string())?
+    else {
+        return Ok(None);
+    };
+    let path = chosen.into_path().map_err(|e| e.to_string())?;
+    state.allow_export_path(path.clone());
+    Ok(Some(path.display().to_string()))
+}
+
+/// Writes a cell value to `path` (from `choose_value_save_path`). `base64`: the bytes, standard base64.
+#[tauri::command]
+pub async fn write_value_file(state: State<'_, AppState>, path: String, base64: String) -> Res<()> {
+    let bytes = dbcore::cell::base64_decode(&base64)
+        .ok_or_else(|| "The value to save is not valid base64".to_string())?;
+    if bytes.len() as u64 > dbcore::cell::MAX_CELL_BYTES {
+        return Err("The value is larger than 32 MB".into());
+    }
+    state.write_value_file(&PathBuf::from(path), &bytes)
+}
+
+/// A file picked for a cell value (`choose_value_file`).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValueFile {
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+}
+
+/// Open the native "Open" dialog for a file to load into a cell and return it (`null` = cancelled). Only that file is
+/// read by `read_value_file`.
+#[tauri::command]
+pub async fn choose_value_file(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Res<Option<ValueFile>> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_parent(&window)
+        .add_filter("All files", &["*"])
+        .pick_file(move |p| {
+            let _ = tx.send(p);
+        });
+    let Some(chosen) = rx
+        .await
+        .map_err(|_| "The open dialog was closed".to_string())?
+    else {
+        return Ok(None);
+    };
+    let path = chosen.into_path().map_err(|e| e.to_string())?;
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    state.allow_import_path(path.clone());
+    Ok(Some(ValueFile {
+        path: path.display().to_string(),
+        name,
+        size,
+    }))
+}
+
+/// The bytes of a file from `choose_value_file`, standard base64 (at most 32 MB).
+#[tauri::command]
+pub async fn read_value_file(state: State<'_, AppState>, path: String) -> Res<String> {
+    let bytes = state.read_value_file(&path)?;
+    Ok(dbcore::cell::base64_encode(&bytes))
+}
+
 // ---------------------------------------------------------------- export
 
 /// File extension and dialog label of an export format (none: CSV).
@@ -350,6 +496,7 @@ fn export_extension(format: Option<ExportFormat>) -> (&'static str, &'static str
         Some(ExportFormat::Html) => ("html", "HTML"),
         Some(ExportFormat::Xml) => ("xml", "XML"),
         Some(ExportFormat::Pretty) => ("txt", "Text"),
+        Some(ExportFormat::Xlsx) => ("xlsx", "Excel"),
         _ => ("csv", "CSV"),
     }
 }
@@ -1064,6 +1211,8 @@ mod tests {
         assert!(ok(&h.join("a.md"), h, f(ExportFormat::Markdown)));
         assert!(ok(&h.join("a.csv"), h, f(ExportFormat::CsvSemicolon)));
         assert!(ok(&h.join("a.txt"), h, f(ExportFormat::Pretty)));
+        assert!(ok(&h.join("a.xlsx"), h, f(ExportFormat::Xlsx)));
+        assert!(!ok(&h.join("a.csv"), h, f(ExportFormat::Xlsx)));
         assert!(!ok(&h.join("a.json"), h, f(ExportFormat::Csv)));
         assert!(!ok(&h.join("a.csv"), h, f(ExportFormat::Json)));
         assert!(!ok(&h.join("conftest.py"), h, f(ExportFormat::Csv)));

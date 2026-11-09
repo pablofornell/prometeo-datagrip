@@ -52,6 +52,8 @@ export const [badges, setBadges] = createSignal<Record<string, string>>({});
 /** Colors set with "Set Color" on schemas / tables (a data source's color is part of its configuration). */
 export const [nodeColors, setNodeColors] = createSignal<Record<string, string>>({});
 export const [selectedNode, setSelectedNode] = createSignal<ENode | undefined>(undefined);
+/** Every selected node of the tree in tree order (one node for a single selection); the lead is `selectedNode()`. */
+export const [selectedTreeNodes, setSelectedTreeNodes] = createSignal<ENode[]>([]);
 export const [searchQuery, setSearchQuery] = createSignal("");
 export const [showSystemObjects, setShowSystemObjectsSignal] = createSignal(false);
 export const [loaded, setLoaded] = createSignal(false);
@@ -598,14 +600,15 @@ export function refreshNode(target: string | string[]): void {
   if (n) refreshNodeObject(n);
 }
 
-/** Drops everything loaded below the node and, if it is expanded, loads it again. */
-export function refreshSelected(): void {
-  const n = selectedNode();
-  if (!n) return;
-  // A leaf (column, key...) refreshes the object it belongs to.
-  let t: ENode | undefined = n;
-  while (t && !t.hasChildren && t.data.parentId) t = nodes.get(t.data.parentId);
-  if (t) {
+/** Drops everything loaded below each node and, if it is expanded, loads it again. */
+export function refreshNodes(list: readonly ENode[]): void {
+  const done = new Set<string>();
+  for (const n of list) {
+    // A leaf (column, key...) refreshes the object it belongs to.
+    let t: ENode | undefined = n;
+    while (t && !t.hasChildren && t.data.parentId) t = nodes.get(t.data.parentId);
+    if (!t || done.has(t.id)) continue;
+    done.add(t.id);
     markFullIntrospection(t.data.dsId);
     refreshNodeObject(t);
     if (t.data.kind === "dataSource") void ensureConnectedSafe(t);
@@ -686,6 +689,11 @@ export function onSelect(n: ENode | undefined): void {
     if (areaOf(document.activeElement) === "explorer") setFocusArea("explorer");
   }
   saveState();
+}
+
+/** The tree's selection changed (several rows, Ctrl / Shift click, Ctrl+A): the nodes in tree order. */
+export function onSelectionChange(items: ENode[]): void {
+  setSelectedTreeNodes(items);
 }
 
 export function nodeInfo(n: ENode | undefined): ExplorerNodeInfo | undefined {

@@ -3,6 +3,7 @@ import { toggleLineComment } from "@codemirror/commands";
 import { EditorSelection } from "@codemirror/state";
 import { type Command, EditorView } from "@codemirror/view";
 import { isTauri } from "../../api/tauri";
+import { runAction } from "../../state/actions";
 import { type MenuItem, openMenu } from "../ui";
 import { duplicate, goToLine, recordClip } from "./commands";
 import { showIntentions } from "./intentionsPopup";
@@ -116,8 +117,10 @@ export function openEditorMenu(view: EditorView, e: MouseEvent, o: EditorMenuOpt
   items.push(...edit, sep);
 
   if (!o.single) {
+    // the usages of the name at the caret (features/usages): references in the database and in the SQL files
+    if (o.nav.goTo) items.push({ label: "Find Usages", shortcut: "Alt+F7", run: () => { view.focus(); void runAction("db.findUsages"); } }, sep);
     const go: MenuItem[] = [];
-    if (o.nav.goTo) go.push({ label: "Declaration or Usages", shortcut: "Ctrl+B", run: cmd(o.goToDeclaration) });
+    if (o.nav.goTo) go.push({ label: "Go to Declaration", shortcut: "Ctrl+B", run: cmd(o.goToDeclaration) });
     go.push({ label: "Line:Column…", shortcut: "Ctrl+G", run: cmd(goToLine) });
     items.push({ label: "Go To", children: go }, sep);
   }
