@@ -198,9 +198,15 @@ async fn postgres_end_to_end() {
     // ---- execute select * from the big table, page with fetch_more
     let sess = st.open_session(&ds).await.unwrap();
     let t0 = Instant::now();
-    let ev = run(&st, &sess, "select * from shop.big_table limit 1000", 500).await;
+    let ev = run(
+        &st,
+        &sess,
+        "select * from shop.big_table order by id limit 1000",
+        500,
+    )
+    .await;
     println!(
-        "BENCH execute(select * from shop.big_table limit 1000) -> done: {:?}",
+        "BENCH execute(select * from shop.big_table order by id limit 1000) -> done: {:?}",
         t0.elapsed()
     );
     assert_eq!(first_rs(&ev), (6, 500, true));
@@ -969,4 +975,100 @@ async fn import_reads_only_picked_files_and_writes_only_allowed_error_files() {
 
     // cancelling an unknown import is a no-op
     st.cancel_import("nope");
+}
+
+/// Export and import of data sources and settings only touch files picked in the backend's dialogs, never write a
+/// password, and refuse oversized input.
+#[tokio::test]
+async fn data_source_and_settings_files_go_through_granted_paths_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(&dir);
+    let cfg = DataSourceConfig {
+        name: "prod".into(),
+        driver: Driver::Postgres,
+        user: "scott".into(),
+        password: Some("tr0ub4dor-secret".into()),
+        ..Default::default()
+    };
+    st.save_data_source(cfg).await.unwrap();
+
+    // a path the webview invents is not written
+    let out = dir.path().join("out.json");
+    let e = st.export_data_sources(None, &out).await.unwrap_err();
+    assert!(e.contains("save dialog"), "{e}");
+    assert!(!out.exists());
+    // a dialog-chosen one is, once, and the text never holds the password
+    st.allow_export_path(out.clone());
+    assert_eq!(st.export_data_sources(None, &out).await.unwrap(), 1);
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(!text.contains("tr0ub4dor-secret"));
+    assert!(text.contains("\"hasPassword\": true"));
+    assert!(
+        st.export_data_sources(None, &out).await.is_err(),
+        "the grant is used up"
+    );
+
+    // reading: only a file picked in the open dialog
+    let e = st
+        .import_data_sources(&out.display().to_string())
+        .await
+        .unwrap_err();
+    assert!(e.contains("open dialog"), "{e}");
+    st.allow_import_path(out.clone());
+    let summary = st
+        .import_data_sources(&out.display().to_string())
+        .await
+        .unwrap();
+    assert_eq!(summary.imported.len(), 1);
+    assert_eq!(summary.imported[0].name, "prod (2)");
+    assert!(summary.imported[0].needs_password);
+    assert_eq!(st.list_data_sources().await.unwrap().len(), 2);
+
+    // more than 8 MB is refused, as a file and as text
+    let big = dir.path().join("big.json");
+    let size = prometeo_datagrip_lib::store::MAX_EXPORT_FILE as usize + 1;
+    std::fs::write(&big, vec![b' '; size]).unwrap();
+    st.allow_import_path(big.clone());
+    let e = st
+        .import_data_sources(&big.display().to_string())
+        .await
+        .unwrap_err();
+    assert!(e.contains("too big"), "{e}");
+    let e = st
+        .import_settings(&big.display().to_string())
+        .await
+        .unwrap_err();
+    assert!(e.contains("too big"), "{e}");
+    let e = st
+        .import_data_sources_text(" ".repeat(size))
+        .await
+        .unwrap_err();
+    assert!(e.contains("too big"), "{e}");
+    assert_eq!(
+        st.list_data_sources().await.unwrap().len(),
+        2,
+        "nothing was imported"
+    );
+
+    // settings: same grants, and a data sources file is not a settings file
+    let settings_file = dir.path().join("settings.json");
+    st.allow_export_path(settings_file.clone());
+    st.export_settings(
+        json!({ "settings": { "gridPageSize": 100 }, "theme": "dark" }),
+        &settings_file,
+    )
+    .await
+    .unwrap();
+    st.allow_import_path(settings_file.clone());
+    let back = st
+        .import_settings(&settings_file.display().to_string())
+        .await
+        .unwrap();
+    assert_eq!(back["settings"]["gridPageSize"], 100);
+    st.allow_import_path(out.clone());
+    let e = st
+        .import_settings(&out.display().to_string())
+        .await
+        .unwrap_err();
+    assert!(e.contains("not a Prometeo settings"), "{e}");
 }

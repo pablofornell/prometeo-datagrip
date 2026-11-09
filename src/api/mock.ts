@@ -21,6 +21,8 @@ import type {
   DataSource,
   DataSourceConfig,
   Driver,
+  DumpProgress,
+  DumpResult,
   ExecEvent,
   ExecOptions,
   ExplainPlan,
@@ -37,6 +39,8 @@ import type {
   PlanNode,
   ResultSet,
   RowChange,
+  ScriptProgress,
+  ScriptSummary,
   SnapshotObject,
   Statement,
   TableDataRequest,
@@ -1490,6 +1494,8 @@ type A = Record<string, any>;
 const MOCK_IMPORT_PATH = "/mock/import-sample.csv";
 const MOCK_IMPORT_CSV = "id,name,price,in_stock\n1,Widget,9.99,true\n2,Gadget,24.50,false\n3,Doohickey,3.25,true\n";
 const mockImports = new Map<string, { cancelled: boolean }>();
+const mockDumps = new Map<string, { cancelled: boolean }>();
+const mockScripts = new Map<string, { cancelled: boolean }>();
 
 /** Minimal delimited-text parser for the mock (quotes, doubled quotes, line breaks inside quotes). */
 function mockParseImport(f: ImportFormat): { rows: (string | null)[][] } {
@@ -1681,7 +1687,13 @@ export const mockHandlers: Record<string, MockHandler> = {
     for (const [sc, s] of Object.entries(M.schemas)) {
       if (s.system || (a.schema && a.schema !== sc)) continue;
       for (const t of s.tables)
-        out.push({ schema: sc, name: t.name, kind: t.kind, columns: t.cols.map((x) => ({ name: x.name, typeName: x.wire, isPk: !!x.pk })) });
+        out.push({
+          schema: sc,
+          name: t.name,
+          kind: t.kind,
+          columns: t.cols.map((x) => ({ name: x.name, typeName: x.wire, isPk: !!x.pk })),
+          foreignKeys: (t.fks ?? []).map((f) => ({ name: f.name, columns: f.cols, refSchema: sc, refTable: f.refTable, refColumns: f.refCols })),
+        });
     }
     return out;
   }),
@@ -1841,7 +1853,7 @@ export const mockHandlers: Record<string, MockHandler> = {
     needConn(a.dsId);
     await sleep(100);
     console.info(`[mock] export_query to ${a.path} (not written in a browser)`);
-    return queryRows(a.sql).rows.length;
+    return { rows: queryRows(a.sql).rows.length, unmappable: 0 };
   }),
   export_query_to_string: h((a) => {
     needConn(a.dsId);
@@ -1849,8 +1861,9 @@ export const mockHandlers: Record<string, MockHandler> = {
   }),
   export_result: h((a) => {
     console.info(`[mock] export_result to ${a.path} (not written in a browser)`);
-    return (a.result as ResultSet).rows.length;
+    return { rows: (a.result as ResultSet).rows.length, unmappable: 0 };
   }),
+  cancel_export: h(() => undefined),
   export_to_string: h((a) => exportText(a.result, a.options)),
 
   // ---- import (a browser has no file system: one built-in sample file)
@@ -1924,6 +1937,70 @@ export const mockHandlers: Record<string, MockHandler> = {
   }),
   cancel_import: h((a) => {
     const t = mockImports.get(a.importId as string);
+    if (t) t.cancelled = true;
+  }),
+
+  // ---- SQL dump (a browser has no file system: the tables are walked and counted, nothing is written)
+  dump_schema: h(async (a) => {
+    needConn(a.dsId);
+    useDs(a.dsId);
+    if (!String(a.path).startsWith("/mock/")) fail(`Refusing to write ${a.path}: export targets must be chosen in the save dialog (choose_export_path)`);
+    const sc = M.schemas[a.schema as string] ?? fail(`Schema ${a.schema} not found`);
+    const sink = a.progress as { onmessage?: (p: DumpProgress) => void } | undefined;
+    const token = { cancelled: false };
+    mockDumps.set(a.dumpId as string, token);
+    const started = Date.now();
+    const tables = sc.tables.filter((t) => t.kind === "table");
+    let rows = 0;
+    let done = 0;
+    for (const t of tables) {
+      await sleep(120);
+      if (token.cancelled) break;
+      done++;
+      rows += t.rows;
+      sink?.onmessage?.({ phase: "tables", tablesDone: done, tablesTotal: tables.length, rows });
+    }
+    mockDumps.delete(a.dumpId as string);
+    return { tables: done, rows, cancelled: token.cancelled, elapsedMs: Date.now() - started } satisfies DumpResult;
+  }),
+  cancel_dump: h((a) => {
+    const t = mockDumps.get(a.dumpId as string);
+    if (t) t.cancelled = true;
+  }),
+  open_dump_folder: h((a) => {
+    if (!String(a.path).startsWith("/mock/")) fail(`Refusing to open the folder of ${a.path}: no SQL dump of this session wrote that file`);
+  }),
+
+  // ---- SQL script file (a browser runs nothing: the statements of the file are counted and reported as run)
+  run_sql_file: h(async (a) => {
+    needConn(a.dsId);
+    useDs(a.dsId);
+    const file = fsFile(loadFs(), a.path as string);
+    const sink = a.onProgress as { onmessage?: (p: ScriptProgress) => void } | undefined;
+    const token = { cancelled: false };
+    mockScripts.set(a.scriptId as string, token);
+    const started = Date.now();
+    const stmts = toStatements(file.text, ds(a.dsId).driver);
+    let done = 0;
+    for (const s of stmts) {
+      await sleep(40);
+      if (token.cancelled) break;
+      done++;
+      sink?.onmessage?.({ statementsDone: done, bytesDone: Math.min(file.text.length, s.end), bytesTotal: file.text.length });
+    }
+    mockScripts.delete(a.scriptId as string);
+    return {
+      ok: done,
+      failed: 0,
+      firstError: null,
+      cancelled: token.cancelled,
+      rolledBack: false,
+      ddlCommitted: false,
+      elapsedMs: Date.now() - started,
+    } satisfies ScriptSummary;
+  }),
+  cancel_script: h((a) => {
+    const t = mockScripts.get(a.scriptId as string);
     if (t) t.cancelled = true;
   }),
 

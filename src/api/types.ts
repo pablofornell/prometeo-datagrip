@@ -133,11 +133,22 @@ export interface SnapshotColumn {
   isPk: boolean;
 }
 
+export interface SnapshotForeignKey {
+  name: string;
+  /** Columns of the referencing table, in constraint order. */
+  columns: string[];
+  refSchema: string;
+  refTable: string;
+  /** Referenced columns, parallel to `columns`. */
+  refColumns: string[];
+}
+
 export interface SnapshotObject {
   schema: string;
   name: string;
   kind: NodeKind;
   columns: SnapshotColumn[];
+  foreignKeys?: SnapshotForeignKey[];
 }
 
 // ---------------------------------------------------------------- result sets
@@ -361,6 +372,25 @@ export interface ExportOptions {
   transpose?: boolean;
   /** First column with the row number (CSV / TSV / Markdown only). */
   rowHeader?: boolean;
+  /** Encoding of the output file (the clipboard and the preview are always UTF-8). Default `utf8`. */
+  encoding?: ExportEncoding;
+  /** Columns that identify a row for SQL UPDATE / WHERE (a table export passes its primary key). `null`: the backend decides. */
+  keyColumns?: string[] | null;
+}
+
+/** Encoding of an export file. `windows1252` writes `?` for the characters it cannot hold. */
+export type ExportEncoding = "utf8" | "utf8Bom" | "windows1252" | "utf16Le";
+
+/** Progress of a running export: rows written so far (`total` only when the whole result is in memory). */
+export interface ExportProgress {
+  rowsWritten: number;
+  total: number | null;
+}
+
+/** Result of an export file: the rows written and the characters a Windows-1252 file replaced with `?`. */
+export interface ExportReport {
+  rows: number;
+  unmappable: number;
 }
 
 // ---------------------------------------------------------------- explain
@@ -417,8 +447,11 @@ export interface AppInfo {
   configDir: string | null;
   /** Directory of consoles/ and history.jsonl (`null` in the browser mock). */
   dataDir: string | null;
-  /** Where new passwords are stored: the OS keyring when reachable, otherwise the JSON file. */
-  passwordStorage: PasswordStorage;
+  /**
+   * Where new passwords are stored: the OS keyring when reachable, otherwise the JSON file. `null` until something
+   * needed the keyring (a password was saved or migrated): it is not probed at every launch.
+   */
+  passwordStorage: PasswordStorage | null;
   /**
    * Config files that were corrupt at startup: the backend set them aside and started with an empty
    * one. Show each once (a notice). Absent / empty in the normal case.
@@ -524,5 +557,116 @@ export interface ImportResult {
   /** Nothing was kept: cancelled, or an error with `abortOnError`. */
   rolledBack: boolean;
   createdTable: boolean;
+  elapsedMs: number;
+}
+
+// ---------------------------------------------------------------- export / import of data sources (src-tauri/src/store.rs)
+
+/** One data source created by `import_data_sources` / `import_data_sources_text`. */
+export interface ImportedDataSource {
+  /** The new id. */
+  id: string;
+  /** The name it got (`name (2)` when the name was taken). */
+  name: string;
+  /** The name in the file. */
+  originalName: string;
+  renamed: boolean;
+  /** It had a password when exported; the file never holds one, so the user has to enter it. */
+  needsPassword: boolean;
+  /** Paths in the file that point at another machine (UNC or `//host/share`); nothing reads them on import. */
+  remotePaths: string[];
+}
+
+export interface SkippedDataSource {
+  name: string;
+  reason: string;
+}
+
+export interface DataSourceImportSummary {
+  imported: ImportedDataSource[];
+  skipped: SkippedDataSource[];
+}
+
+// ---------------------------------------------------------------- SQL dump (crates/dbcore/src/dump.rs)
+
+/** What a dump writes (`DumpOptions`). Every field is optional on the wire; the backend fills the defaults. */
+export interface DumpOptions {
+  /** `insert` statements for the rows. */
+  data: boolean;
+  /** `drop ... if exists` before each `create`. */
+  dropIfExists: boolean;
+  includeViews: boolean;
+  /** PostgreSQL only: standalone and serial sequences. */
+  includeSequences: boolean;
+  /** Stored routines and triggers (PostgreSQL: triggers only). */
+  includeRoutines: boolean;
+  /** Restore into this schema / database instead of the dumped one (`null`: the same). */
+  targetSchema: string | null;
+  /** Rows per `insert` statement. */
+  batchSize: number;
+  /** Dump only these tables (their indexes and the foreign keys among them); views and routines are skipped. `null`: all. */
+  tables?: string[] | null;
+  /** `false`: data only (no create / drop statements; sequence resync kept). Default `true`. */
+  includeDdl?: boolean;
+  /** `commit` after every N rows and at the end of the data (`0`: Oracle only at the end). */
+  commitEvery?: number;
+}
+
+/** One progress event of a running dump. */
+export interface DumpProgress {
+  /** "schema", "tables", "data" (rows of the current table), "indexes", "foreign keys", "views", "routines". */
+  phase: string;
+  tablesDone: number;
+  tablesTotal: number;
+  rows: number;
+  /** The table being written (absent between tables). */
+  table?: string | null;
+}
+
+export interface DumpResult {
+  tables: number;
+  rows: number;
+  /** Stopped by `cancel_dump`; the file was removed. */
+  cancelled: boolean;
+  elapsedMs: number;
+}
+
+// ---------------------------------------------------------------- SQL script file (crates/dbcore/src/script.rs)
+
+/** How a script file runs (`ScriptOptions`). The backend fills the defaults for missing fields. */
+export interface ScriptOptions {
+  /** Stop at the first failing statement (default). Off: the failures are counted and the run goes on. */
+  stopOnError: boolean;
+  /** One transaction: committed at the end, rolled back when the run stops on an error or is cancelled. */
+  singleTransaction: boolean;
+  /** `UTF-8` (default; a byte order mark is dropped) or `ISO-8859-1`. */
+  encoding: string;
+}
+
+/** One progress event of a running script (about every 100 ms). */
+export interface ScriptProgress {
+  statementsDone: number;
+  /** Bytes of the file read so far. */
+  bytesDone: number;
+  bytesTotal: number;
+}
+
+/** The first failing statement: its message and the 1-based line of the file where it starts. */
+export interface ScriptError {
+  message: string;
+  line: number;
+}
+
+export interface ScriptSummary {
+  /** Statements that ran without error (also those of a transaction rolled back afterwards). */
+  ok: number;
+  failed: number;
+  firstError: ScriptError | null;
+  /** Stopped by `cancel_script`. */
+  cancelled: boolean;
+  /** The single transaction was rolled back (see `ddlCommitted` for what stays). */
+  rolledBack: boolean;
+  /** MySQL / Oracle with a single transaction: DDL ran, and the server commits it by itself, so it stays even when `rolledBack`. */
+  ddlCommitted: boolean;
   elapsedMs: number;
 }

@@ -464,15 +464,20 @@ const paramInfoField = StateField.define<Tooltip | null>({
 
 export const parameterInfoExtension: Extension = paramInfoField;
 
-/** Ctrl+P. */
-export const parameterInfo: Command = (view) => {
-  const head = view.state.selection.main.head;
-  const call = callAt(view.state.doc.sliceString(0, head), head);
-  const sig = call ? signatureOf(view.state, call.name) : null;
-  if (!call || !sig) {
-    view.dispatch({ effects: setParamInfo.of(null) });
-    return true;
-  }
+/** The offset from which to scan backward for the call at `head`: the current statement start, capped ~4000 chars back. */
+export function callScanStart(state: import("@codemirror/state").EditorState, head: number): number {
+  const cfg = state.field(configField);
+  const a = docAnalysis(state.doc, cfg.dialect);
+  const si = statementIndexAt(a.statements, head);
+  return Math.max(si !== null ? a.statements[si].start : 0, head - 4000);
+}
+
+/** The parameter-info tooltip for the call around `head`, or null when there is no known signature. */
+function paramInfoTooltip(state: import("@codemirror/state").EditorState, head: number): Tooltip | null {
+  const from = callScanStart(state, head);
+  const call = callAt(state.doc.sliceString(from, head), head - from);
+  const sig = call ? signatureOf(state, call.name) : null;
+  if (!call || !sig) return null;
   const tip: Tooltip = {
     pos: head,
     above: true,
@@ -496,6 +501,27 @@ export const parameterInfo: Command = (view) => {
       return { dom };
     },
   };
-  view.dispatch({ effects: setParamInfo.of(tip) });
+  return tip;
+}
+
+/** Ctrl+P. */
+export const parameterInfo: Command = (view) => {
+  const head = view.state.selection.main.head;
+  view.dispatch({ effects: setParamInfo.of(paramInfoTooltip(view.state, head)) });
   return true;
 };
+
+/** Auto-shows the parameter info after `(` and refreshes it after `,` inside a call (DataGrip's popup). */
+export const autoParameterInfo: Extension = EditorView.updateListener.of((u) => {
+  if (!u.docChanged || u.state.readOnly) return;
+  let trigger = false;
+  u.changes.iterChanges((_a, _b, _c, _d, ins) => {
+    const t = ins.toString();
+    if (t === "(" || t === "," || t.endsWith("(") || t.endsWith(",")) trigger = true;
+  });
+  if (!trigger) return;
+  const head = u.state.selection.main.head;
+  const tip = paramInfoTooltip(u.state, head);
+  if (!tip) return;
+  u.view.dispatch({ effects: setParamInfo.of(tip) });
+});

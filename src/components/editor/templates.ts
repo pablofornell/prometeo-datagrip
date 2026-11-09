@@ -7,7 +7,9 @@ import { type Completion, hasNextSnippetField, hasPrevSnippetField, snippet, sni
 import { type EditorState, StateEffect, StateField } from "@codemirror/state";
 import { type Command, EditorView } from "@codemirror/view";
 import { docAnalysis } from "./highlight";
+import { applyKeywordCase, type KeywordCase } from "./keywordCase";
 import { configField } from "./state";
+import type { Dialect } from "./split";
 
 export interface LiveTemplate {
   abbreviation: string;
@@ -36,10 +38,19 @@ const byAbbreviation = new Map(LIVE_TEMPLATES.map((t) => [t.abbreviation, t]));
 /** `description` of a template completion (the right-aligned gray text). */
 export const templateDescriptions = new WeakMap<Completion, string>();
 
+/** The template with its keywords in the requested case; snippet placeholders are left untouched. */
+function caseTemplate(template: string, dialect: Dialect, mode: KeywordCase): string {
+  if (mode === "keep") return template;
+  return template
+    .split(/(\$\{[^}]*\})/)
+    .map((seg) => (seg.startsWith("${") ? seg : applyKeywordCase(seg, dialect, mode)))
+    .join("");
+}
+
 /** The templates as completion options (`type: "template"`: the template icon). */
-export function templateOptions(boost = 9): Completion[] {
+export function templateOptions(boost = 9, dialect: Dialect = "postgres", mode: KeywordCase = "keep"): Completion[] {
   return LIVE_TEMPLATES.map((t, i) => {
-    const c = snippetCompletion(t.template, { label: t.abbreviation, type: "template", boost: boost - i * 0.0001 });
+    const c = snippetCompletion(caseTemplate(t.template, dialect, mode), { label: t.abbreviation, type: "template", boost: boost - i * 0.0001 });
     templateDescriptions.set(c, t.description);
     return c;
   });
@@ -121,7 +132,8 @@ export const expandTemplate: Command = (view) => {
   if (view.state.readOnly || view.state.field(configField).noTemplates) return false;
   const hit = abbreviationBefore(view.state);
   if (!hit) return false;
-  snippet(hit.template.template)(view, null, hit.from, view.state.selection.main.head);
+  const cfg = view.state.field(configField);
+  snippet(caseTemplate(hit.template.template, cfg.dialect, cfg.keywordCase ?? "keep"))(view, null, hit.from, view.state.selection.main.head);
   completeSlot(view);
   return true;
 };

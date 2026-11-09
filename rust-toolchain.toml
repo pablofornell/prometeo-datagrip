@@ -1,0 +1,6 @@
+# The Rust version pin lives in `rust-version` (workspace Cargo.toml) and in CI, which
+# installs exactly 1.99.0. No channel is set on purpose: this keeps the host toolchain the
+# developer already uses (MSVC or GNU on Windows) instead of forcing a host triple. The file
+# only makes sure the local toolchain has the components the lint/format targets need.
+[toolchain]
+components = ["rustfmt", "clippy"]

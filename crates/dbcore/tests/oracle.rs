@@ -311,6 +311,64 @@ mod dialect {
     }
 
     #[tokio::test]
+    async fn schema_snapshot_has_foreign_keys() {
+        let (_cfg, mgr) = setup!();
+        let snap = mgr.schema_snapshot("ora", Some("DEMO")).await.unwrap();
+        let fk_of = |t: &str| {
+            snap.iter()
+                .find(|o| o.name == t)
+                .unwrap()
+                .foreign_keys
+                .clone()
+        };
+        let fk_by_name = |t: &str| {
+            fk_of(t)
+                .into_iter()
+                .map(|f| (f.name.clone(), f))
+                .collect::<BTreeMap<_, _>>()
+        };
+
+        // order_items -> orders / products (two foreign keys)
+        let oi = fk_by_name("ORDER_ITEMS");
+        assert_eq!(
+            oi.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["FK_ITEMS_ORDER", "FK_ITEMS_PRODUCT"]
+        );
+        let f = &oi["FK_ITEMS_ORDER"];
+        assert_eq!(f.columns, vec!["ORDER_ID".to_string()]);
+        assert_eq!(
+            (f.ref_schema.as_str(), f.ref_table.as_str()),
+            ("DEMO", "ORDERS")
+        );
+        assert_eq!(f.ref_columns, vec!["ID".to_string()]);
+        assert_eq!(oi["FK_ITEMS_PRODUCT"].ref_table, "PRODUCTS");
+
+        // orders -> customers, categories -> categories (self reference)
+        let orders = fk_of("ORDERS");
+        assert_eq!(orders.len(), 1);
+        assert_eq!(
+            (
+                orders[0].name.as_str(),
+                orders[0].columns.clone(),
+                orders[0].ref_table.as_str()
+            ),
+            (
+                "FK_ORDERS_CUSTOMER",
+                vec!["CUSTOMER_ID".to_string()],
+                "CUSTOMERS"
+            )
+        );
+        assert_eq!(fk_of("PRODUCTS")[0].ref_table, "CATEGORIES");
+        let cats = fk_of("CATEGORIES");
+        assert_eq!(
+            (cats[0].ref_table.as_str(), cats[0].columns.clone()),
+            ("CATEGORIES", vec!["PARENT_ID".to_string()])
+        );
+        // a table without foreign keys has none
+        assert!(fk_of("CUSTOMERS").is_empty());
+    }
+
+    #[tokio::test]
     async fn ddl_generation() {
         let (_cfg, mgr) = setup!();
         let obj = |kind: NodeKind, name: &str| ObjectRef {

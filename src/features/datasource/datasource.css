@@ -29,6 +29,14 @@ body.dg-modal-open .dg-notifications {
   text-overflow: ellipsis;
 }
 
+.ds-footer-warning {
+  display: block;
+  color: var(--dg-text-warning);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .ds-root::before {
   content: "";
   position: absolute;

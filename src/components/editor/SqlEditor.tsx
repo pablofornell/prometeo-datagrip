@@ -20,7 +20,7 @@ import { type Component, createEffect, on, onCleanup, onMount } from "solid-js";
 import { getAction, isActionEnabled, runAction } from "../../state/actions";
 import { editorMetrics, settings } from "../../state/settings";
 import "./editor.css";
-import { clipRecorder, completeStatement, duplicate, extendSelection, goToLine, moveLine, moveStatement, parameterInfo, parameterInfoExtension, pasteFromHistory, shiftTab, shrinkSelection, tabIndent, toggleBlock } from "./commands";
+import { autoParameterInfo, clipRecorder, completeStatement, duplicate, extendSelection, goToLine, moveLine, moveStatement, parameterInfo, parameterInfoExtension, pasteFromHistory, shiftTab, shrinkSelection, tabIndent, toggleBlock } from "./commands";
 import { sqlCompletion } from "./complete";
 import { completionExtras, withExtras } from "./extras";
 import { errorExtension } from "./errors";
@@ -192,6 +192,8 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
       sourceLabel: props.sourceLabel,
       statementFrame: props.statementFrame !== false && !props.singleLine,
       noTemplates: !!props.singleLine,
+      keywordCase: settings.sqlKeywordCase,
+      insertTableAlias: settings.sqlInsertTableAlias,
       implicit: table ? [{ parts: [table.name.toLowerCase()], table, opaque: false }] : undefined,
     });
   };
@@ -262,6 +264,7 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
         execMarksField,
         previewField,
         parameterInfoExtension,
+        autoParameterInfo,
         clipRecorder,
         intentionHostFacet.of({
           get refreshSchema() {
@@ -347,7 +350,7 @@ export const SqlEditor: Component<SqlEditorProps> = (props) => {
   );
   createEffect(
     on(
-      () => [props.dialect, props.schema, extras(), props.defaultSchema, props.sourceLabel, props.statementFrame, props.scopeTable?.name, props.scopeTable?.schema] as const,
+      () => [props.dialect, props.schema, extras(), props.defaultSchema, props.sourceLabel, props.statementFrame, props.scopeTable?.name, props.scopeTable?.schema, settings.sqlKeywordCase, settings.sqlInsertTableAlias] as const,
       () => view?.dispatch({ effects: configEffect() }),
       { defer: true },
     ),

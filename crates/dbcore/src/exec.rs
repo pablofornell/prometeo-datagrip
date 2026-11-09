@@ -207,6 +207,48 @@ pub(crate) async fn query_pool(
     Ok(first)
 }
 
+/// How long closing the connection of [`query_cancellable`] may take.
+const OWN_CONN_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// [`query_pool`] on a connection of its own that `cancel` can stop at any time: while the connection opens, while the
+/// server works before the first row, and between rows. A running statement is interrupted on the server (as the
+/// console does, see the module docs) and the call returns [`DbError::Cancelled`].
+pub(crate) async fn query_cancellable(
+    live: &Live,
+    sql: &str,
+    bin_limit: usize,
+    cancel: &CancellationToken,
+    on_row: impl FnMut(&[ColumnMeta], Vec<Cell>) -> Result<()>,
+) -> Result<Option<Vec<ColumnMeta>>> {
+    let mut conn = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(DbError::Cancelled),
+        c = live.new_conn() => c?,
+    };
+    let target = match cancel_target_of(&mut conn).await {
+        Ok(t) => t,
+        Err(e) => {
+            conn.close().await;
+            return Err(e);
+        }
+    };
+    let res = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            interrupt(&live.pool, &target).await;
+            Err(DbError::Cancelled)
+        }
+        r = query_conn(live, &mut conn, sql, bin_limit, on_row) => r,
+    };
+    match &target {
+        CancelTarget::Lite(h) => *h.lock().unwrap() = None,
+        CancelTarget::Ora(h) => h.detach(),
+        _ => {}
+    }
+    let _ = tokio::time::timeout(OWN_CONN_CLOSE_TIMEOUT, conn.close()).await;
+    res
+}
+
 /// Same as [`query_pool`] on a dedicated connection (a console / editor session).
 pub(crate) async fn query_conn(
     live: &Live,

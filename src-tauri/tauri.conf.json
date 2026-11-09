@@ -33,12 +33,37 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "Prometeo",
+    "copyright": "Copyright © 2026 Prometeo",
+    "category": "DeveloperTool",
+    "shortDescription": "A fast DataGrip-style database client built with Rust and Tauri.",
+    "longDescription": "Prometeo DataGrip is a desktop database client for PostgreSQL, MySQL/MariaDB, SQLite and Oracle: SQL editor, schema explorer, virtualized data grid, export, import, query history and DDL view.",
+    "licenseFile": "../LICENSE",
     "icon": [
       "icons/32x32.png",
+      "icons/64x64.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
+      "icons/icon.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper"
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["English", "Spanish"]
+      }
+    },
+    "linux": {
+      "deb": {
+        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0"]
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    }
   }
 }

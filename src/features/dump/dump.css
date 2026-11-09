@@ -1,0 +1,35 @@
+/* Dump to SQL File dialog (features/dump). The form grid and checkboxes reuse the Export Data classes (dgt-export-*). */
+.dgd-root {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font: 13px / 18px var(--dg-font-ui, "Inter", sans-serif);
+}
+.dgd-source {
+  display: flex;
+  align-items: center;
+  height: var(--dg-control-height);
+  padding: var(--dg-input-padding);
+  box-sizing: border-box;
+  background: var(--dg-input-bg);
+  border: 1px solid var(--dg-input-disabled-border);
+  border-radius: var(--dg-input-radius);
+  color: var(--dg-text);
+  overflow: hidden;
+  white-space: nowrap;
+}
+.dgd-problem {
+  color: var(--dg-text-error, #ff5261);
+}
+.dgd-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 16px;
+}
+.dgd-progress-text {
+  color: var(--dg-text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

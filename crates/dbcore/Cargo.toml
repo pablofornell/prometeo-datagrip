@@ -17,6 +17,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
+encoding_rs = "=0.8.44"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -2,7 +2,7 @@
 import { EditorState } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { describe, expect, it } from "vitest";
-import { callAt, clipHistory, completeStatement, recordClip, signatureOf } from "./commands";
+import { callAt, callScanStart, clipHistory, completeStatement, recordClip, signatureOf } from "./commands";
 import { configField } from "./state";
 
 /** Runs a command on a fake view and returns the resulting text and caret. */
@@ -42,6 +42,18 @@ describe("parameter info", () => {
     const state = EditorState.create({ doc: "", extensions: [configField] });
     expect(signatureOf(state, "COUNT")?.args).toEqual(["*"]);
     expect(signatureOf(state, "nope")).toBeNull();
+  });
+
+  it("bounds the call scan to the current statement", () => {
+    const doc = "select g(1, 2);\nselect f(";
+    const state = EditorState.create({ doc, extensions: [configField] });
+    expect(callScanStart(state, doc.length)).toBe("select g(1, 2);\n".length);
+  });
+
+  it("caps the call scan at ~4000 chars", () => {
+    const doc = "select 1;\n" + "x".repeat(9000);
+    const state = EditorState.create({ doc, extensions: [configField] });
+    expect(callScanStart(state, doc.length)).toBe(doc.length - 4000);
   });
 });
 

@@ -11,11 +11,12 @@ import {
 import { type Extension, Prec } from "@codemirror/state";
 import { type EditorView, ViewPlugin, keymap } from "@codemirror/view";
 import type { MenuItem } from "../ui/Menu";
+import { aliasFor } from "./alias";
 import { docAnalysis } from "./highlight";
 import { KEYWORD_HINTS, ORACLE_RESERVED, functionsFor, keywordsFor } from "./keywords";
 import { type Token } from "./lexer";
 import type { TableIdx } from "./schemaIndex";
-import { analyzeStatement, identName, type Scope } from "./semantic";
+import { analyzeStatement, identName, type Scope, type TableRef } from "./semantic";
 import { configField } from "./state";
 import { type Dialect, statementIndexAt } from "./split";
 import { expandTemplate, insertLiveTemplate, nextTemplateField, templateDescriptions, templateListField, templateListWatcher, templateOptions } from "./templates";
@@ -77,19 +78,38 @@ function columnOptions(t: TableIdx, label: string | null): Completion[] {
   );
 }
 
-function tableOption(t: TableIdx, cfg: { sourceLabel?: string; defaultSchema?: string; dialect: Dialect; database?: string }, qualify: boolean): Completion {
+function tableOption(t: TableIdx, cfg: { sourceLabel?: string; defaultSchema?: string; dialect: Dialect; database?: string }, qualify: boolean, alias?: string, on?: string): Completion {
   const view = t.kind === "view" || t.kind === "matview";
   const name = quoteIdent(t.name, cfg.dialect);
+  const base = qualify ? `${quoteIdent(t.schema, cfg.dialect)}.${name}` : name;
+  const apply = on ? `${base} ${alias} on ${on}` : alias ? `${base} ${alias}` : base;
   return mkOpt(
     {
       label: t.name,
       type: view ? "view" : t.kind === "sequence" ? "sequence" : "table",
       detail: ` (${cfg.database ? `${cfg.database}.${t.schema}` : t.schema})`,
-      apply: qualify ? `${quoteIdent(t.schema, cfg.dialect)}.${name}` : name,
-      boost: t.kind === "sequence" ? 28 : 30,
+      apply,
+      boost: on ? 55 : t.kind === "sequence" ? 28 : 30,
     },
     cfg.sourceLabel ?? t.kind,
   );
+}
+
+/** The `ON <target>.<ref> = <source>.<fk>` join condition when `source` and `target` are FK-related, else null. */
+function joinOn(source: TableRef, target: TableIdx, sourceAlias: string, targetAlias: string, dialect: Dialect): string | null {
+  const st = source.table!;
+  for (const fk of st.foreignKeys) {
+    if (fk.refTable.toLowerCase() === target.name.toLowerCase() && fk.refSchema.toLowerCase() === target.schema.toLowerCase()) {
+      // composite keys: one `x.a = y.a AND x.b = y.b` pair per column, in FK column order
+      return fk.columns.map((c, i) => `${quoteIdent(targetAlias, dialect)}.${quoteIdent(fk.refColumns[i] ?? "id", dialect)} = ${quoteIdent(sourceAlias, dialect)}.${quoteIdent(c, dialect)}`).join(" AND ");
+    }
+  }
+  for (const fk of target.foreignKeys) {
+    if (fk.refTable.toLowerCase() === st.name.toLowerCase() && fk.refSchema.toLowerCase() === st.schema.toLowerCase()) {
+      return fk.columns.map((c, i) => `${quoteIdent(targetAlias, dialect)}.${quoteIdent(c, dialect)} = ${quoteIdent(sourceAlias, dialect)}.${quoteIdent(fk.refColumns[i] ?? "id", dialect)}`).join(" AND ");
+    }
+  }
+  return null;
 }
 
 function functionOption(f: { name: string; args: string; ret?: string }): Completion {
@@ -123,6 +143,8 @@ function routineOption(r: { name: string; args: string; returns?: string }): Com
 }
 
 const TABLE_WORDS = new Set(["from", "join", "update", "into", "table", "truncate", "references", "only", "view"]);
+/** After these the popup also opens on an empty prefix (DataGrip: show tables / columns there). */
+const EMPTY_PREFIX_WORDS = new Set([...TABLE_WORDS, "on"]);
 
 function tokenBefore(toks: Token[], pos: number): number {
   let lo = 0;
@@ -138,7 +160,7 @@ function tokenBefore(toks: Token[], pos: number): number {
   return ans;
 }
 
-function completionSource(ctx: CompletionContext): CompletionResult | null {
+export function completionSource(ctx: CompletionContext): CompletionResult | null {
   const state = ctx.state;
   const cfg = state.field(configField);
   const idx = cfg.index;
@@ -159,10 +181,21 @@ function completionSource(ctx: CompletionContext): CompletionResult | null {
   }
 
   // Ctrl+J: only the live templates, typing filters them
-  if (state.field(templateListField)) return { from, options: templateOptions(), validFor: /^[\p{L}\p{N}_$]*$/u };
+  if (state.field(templateListField)) return { from, options: templateOptions(9, cfg.dialect, cfg.keywordCase ?? "keep"), validFor: /^[\p{L}\p{N}_$]*$/u };
 
   const dotBefore = from > 0 && a.text[from - 1] === ".";
-  if (!dotBefore && prefix === "" && !ctx.explicit) return null;
+
+  // previous significant token decides the context (and whether the popup opens on an empty prefix)
+  const pi = tokenBefore(toks, from);
+  let prevWord = "";
+  let prevPunct = "";
+  if (pi >= 0 && toks[pi].kind !== "comment") {
+    const t = toks[pi];
+    if (t.kind === "word") prevWord = a.text.slice(t.from, t.to).toLowerCase();
+    else if (t.kind === "punct") prevPunct = a.text.slice(t.from, t.to);
+  }
+
+  if (!dotBefore && prefix === "" && !ctx.explicit && !EMPTY_PREFIX_WORDS.has(prevWord)) return null;
   if (!dotBefore && /^\d/.test(prefix)) return null;
 
   // statement tokens and scope
@@ -219,17 +252,10 @@ function completionSource(ctx: CompletionContext): CompletionResult | null {
     return { from, options, validFor: /^[\p{L}\p{N}_$]*$/u, filter: true };
   }
 
-  // previous significant token decides table vs expression context
-  const pi = tokenBefore(toks, from);
-  let prevWord = "";
-  let prevPunct = "";
-  if (pi >= 0 && toks[pi].kind !== "comment") {
-    const t = toks[pi];
-    if (t.kind === "word") prevWord = a.text.slice(t.from, t.to).toLowerCase();
-    else if (t.kind === "punct") prevPunct = a.text.slice(t.from, t.to);
-  }
+  // previous significant token decides table vs expression context (already computed above)
   // `FROM a, |`: a comma inside a FROM list
   let tableCtx = TABLE_WORDS.has(prevWord);
+  let fromListComma = false;
   if (!tableCtx && prevPunct === ",") {
     for (let k = pi - 1; k >= 0 && k > pi - 40; k--) {
       const t = toks[k];
@@ -238,22 +264,52 @@ function completionSource(ctx: CompletionContext): CompletionResult | null {
         const w = a.text.slice(t.from, t.to).toLowerCase();
         if (w === "from") {
           tableCtx = true;
+          fromListComma = true;
           break;
         }
         if (["select", "where", "group", "order", "having", "set", "on", "values", "join"].includes(w)) break;
       }
     }
   }
-  const upper = prefix !== "" && prefix === prefix.toUpperCase() && /[A-Z]/.test(prefix);
 
   if (tableCtx) {
     const mult = idx.list.length > 1;
+    // an alias must be unique only against the aliases / table names already used in the statement
+    const taken = new Set<string>();
+    if (scope) {
+      for (const r of scope.refs) {
+        if (r.alias) taken.add(r.alias);
+        if (r.parts.length) taken.add(r.parts[r.parts.length - 1]);
+      }
+    }
+    // alias after FROM / JOIN / UPDATE / DELETE FROM and after a comma in a FROM list; never after INTO (INSERT INTO t has no alias)
+    const aliasCtx = cfg.insertTableAlias !== false && (prevWord === "from" || prevWord === "join" || prevWord === "update" || fromListComma);
+    // earlier tables of the statement, nearest first, for the JOIN ... ON condition from foreign keys
+    const earlier = scope ? scope.refs.slice().reverse() : [];
     for (const s of idx.list) {
       for (const t of s.list) {
         const qualify = mult && !!idx.defaultSchema && s.name.toLowerCase() !== idx.defaultSchema.toLowerCase();
-        options.push(tableOption(t, o, qualify));
+        let alias: string | undefined;
+        if (aliasCtx) alias = aliasFor(t.name, taken, cfg.dialect);
+        let on: string | undefined;
+        if (prevWord === "join" && alias) {
+          for (const r of earlier) {
+            if (!r.table) continue; // skip derived tables / CTEs: their columns are unknown
+            on = joinOn(r, t, r.alias ?? r.table.name, alias, cfg.dialect) ?? undefined;
+            if (on) break;
+          }
+        }
+        options.push(tableOption(t, o, qualify, alias, on));
       }
       if (mult) options.push(mkOpt({ label: s.name, type: "schema", boost: 20, apply: quoteIdent(s.name, cfg.dialect) + "." }, cfg.sourceLabel));
+    }
+    // Oracle synonyms: offered like the tables they stand for
+    for (const s of idx.list) {
+      for (const syn of s.synonyms.values()) {
+        const alias = aliasCtx ? aliasFor(syn.name, taken, cfg.dialect) : undefined;
+        const apply = alias ? `${quoteIdent(syn.name, cfg.dialect)} ${alias}` : quoteIdent(syn.name, cfg.dialect);
+        options.push(mkOpt({ label: syn.name, type: "table", detail: ` (${s.name})`, apply, boost: 29 }, cfg.sourceLabel));
+      }
     }
     // routines (table functions) and the built-in `cast`, after the tables and sequences like DataGrip
     for (const s of idx.list) for (const r of s.routines) options.push(routineOption(r));
@@ -283,12 +339,13 @@ function completionSource(ctx: CompletionContext): CompletionResult | null {
     for (const s of idx.list) for (const r of s.routines) options.push(routineOption(r));
     for (const f of functionsFor(cfg.dialect)) options.push(functionOption(f));
     const first = si === null ? true : a.statements[si].start >= from - 0;
+    const kc = cfg.keywordCase ?? "upper";
     for (const k of keywordList(cfg.dialect)) {
-      const text = upper ? k.toUpperCase() : k;
+      const text = kc === "upper" ? k.toUpperCase() : kc === "lower" ? k.toLowerCase() : k;
       options.push(mkOpt({ label: text, type: "keyword", boost: first ? 8 : -5 }, KEYWORD_HINTS[k]));
     }
     // the live templates: only for a typed prefix (Tab expands the exact abbreviation)
-    if (prefix !== "" && !cfg.noTemplates) options.push(...templateOptions());
+    if (prefix !== "" && !cfg.noTemplates) options.push(...templateOptions(9, cfg.dialect, cfg.keywordCase ?? "keep"));
   }
   if (!options.length) return null;
   // keep the listing order for equal matches (CM would sort alphabetically); `Sort by name` drops the ranking

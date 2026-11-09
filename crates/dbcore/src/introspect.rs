@@ -14,6 +14,8 @@
 //! synonyms`) and `columns keys foreign_keys indexes checks triggers` (object level). Folder hints are
 //! the object counts (`"5"`), shown by the UI next to the folder name like DataGrip.
 
+use std::collections::HashMap;
+
 use serde_json::{json, Value};
 
 use crate::conn::{Live, Pool};
@@ -1183,7 +1185,7 @@ pub(crate) async fn ora_current_schema(pool: &Pool) -> Result<String> {
 }
 
 /// Tables that are not the storage of a materialized view or a nested / overflow / dropped one.
-fn ora_table_filter(alias: &str) -> String {
+pub(crate) fn ora_table_filter(alias: &str) -> String {
     format!(
         "{a}.nested = 'NO' and {a}.dropped = 'NO' and {a}.iot_name is null and {a}.secondary = 'N' \
          and not exists (select 1 from all_mviews mv where mv.owner = {a}.owner and mv.mview_name = {a}.table_name)",
@@ -1192,7 +1194,7 @@ fn ora_table_filter(alias: &str) -> String {
 }
 
 /// SQL expression: the type of column alias `c` (a row of `all_tab_cols`) as DataGrip writes it.
-fn ora_type_expr(c: &str) -> String {
+pub(crate) fn ora_type_expr(c: &str) -> String {
     format!(
         "case \
            when {c}.data_type in ('VARCHAR2', 'CHAR') then {c}.data_type || '(' || {c}.char_length || case when {c}.char_used = 'C' then ' CHAR' else '' end || ')' \
@@ -2464,12 +2466,14 @@ async fn snapshot(live: &Live, schema: Option<&str>) -> Result<Vec<SnapshotObjec
                 name,
                 kind,
                 columns: Vec::new(),
+                foreign_keys: Vec::new(),
             });
         }
         if let (Some(c), Some(o)) = (col, out.last_mut()) {
             o.columns.push(c);
         }
     };
+    let mut fk_map: HashMap<(String, String), Vec<SnapshotForeignKey>> = HashMap::new();
     match live.driver() {
         Driver::Postgres => {
             let filter = match schema {
@@ -2603,9 +2607,142 @@ async fn snapshot(live: &Live, schema: Option<&str>) -> Result<Vec<SnapshotObjec
                             }),
                         );
                     }
+                    // foreign keys: `pragma foreign_key_list` returns id, seq, table, from, to, on_update, on_delete, match
+                    let fk_rows = pool
+                        .query_strings(&format!(
+                            "pragma {}.foreign_key_list({})",
+                            lq(&sc),
+                            ll(&s(&o, 0))
+                        ))
+                        .await?;
+                    let mut fks: Vec<SnapshotForeignKey> = Vec::new();
+                    for r in &fk_rows {
+                        let name = format!("{}_{}_fkey", s(&o, 0), s(r, 0));
+                        if let Some(last) = fks.last_mut() {
+                            if last.name == name {
+                                last.columns.push(s(r, 3));
+                                last.ref_columns.push(s(r, 4));
+                                continue;
+                            }
+                        }
+                        fks.push(SnapshotForeignKey {
+                            name,
+                            columns: vec![s(r, 3)],
+                            ref_schema: sc.clone(),
+                            ref_table: s(r, 2),
+                            ref_columns: vec![s(r, 4)],
+                        });
+                    }
+                    if !fks.is_empty() {
+                        fk_map.insert((sc.clone(), s(&o, 0)), fks);
+                    }
                 }
             }
         }
     }
+    if live.driver() != Driver::Sqlite {
+        fk_map = snapshot_foreign_keys(live, schema).await?;
+    }
+    for o in &mut out {
+        if let Some(fks) = fk_map.get(&(o.schema.clone(), o.name.clone())) {
+            o.foreign_keys = fks.clone();
+        }
+    }
     Ok(out)
+}
+
+/// Foreign keys of every table in the snapshot, keyed by `(schema, table)`. One catalog query per schema per
+/// DBMS (no N+1); composite foreign keys keep the column order. SQLite has no such catalog view, so its foreign
+/// keys are read with `pragma foreign_key_list` inline in [`snapshot`] (where the per-table loop already runs).
+async fn snapshot_foreign_keys(
+    live: &Live,
+    schema: Option<&str>,
+) -> Result<HashMap<(String, String), Vec<SnapshotForeignKey>>> {
+    let pool = &live.pool;
+    let mut map: HashMap<(String, String), Vec<SnapshotForeignKey>> = HashMap::new();
+    // Each row is one foreign-key column, ordered by (schema, table, constraint, ordinal):
+    //   schema, table, fk name, column, ref schema, ref table, ref column
+    let mut add_rows = |rows: Vec<Row>| {
+        for r in &rows {
+            let key = (s(r, 0), s(r, 1));
+            let name = s(r, 2);
+            let fks = map.entry(key.clone()).or_default();
+            if let Some(last) = fks.last_mut() {
+                if last.name == name {
+                    last.columns.push(s(r, 3));
+                    last.ref_columns.push(s(r, 6));
+                    continue;
+                }
+            }
+            fks.push(SnapshotForeignKey {
+                name,
+                columns: vec![s(r, 3)],
+                ref_schema: s(r, 4),
+                ref_table: s(r, 5),
+                ref_columns: vec![s(r, 6)],
+            });
+        }
+    };
+    match live.driver() {
+        Driver::Postgres => {
+            let filter = match schema {
+                Some(sc) => format!("n.nspname = {}", quote_literal(Driver::Postgres, sc)),
+                None => "n.nspname not in ('pg_catalog','information_schema') and n.nspname !~ '^pg_toast' and n.nspname !~ '^pg_temp'".into(),
+            };
+            let rows = pool
+                .query_strings(&format!(
+                    "select n.nspname, c.relname, con.conname, a.attname, refn.nspname, refc.relname, ra.attname \
+                     from pg_constraint con \
+                     join pg_class c on c.oid = con.conrelid \
+                     join pg_namespace n on n.oid = c.relnamespace \
+                     join pg_class refc on refc.oid = con.confrelid \
+                     join pg_namespace refn on refn.oid = refc.relnamespace \
+                     join unnest(con.conkey, con.confkey) with ordinality as u(attnum, refattnum, ord) on true \
+                     join pg_attribute a on a.attrelid = con.conrelid and a.attnum = u.attnum \
+                     join pg_attribute ra on ra.attrelid = con.confrelid and ra.attnum = u.refattnum \
+                     where con.contype = 'f' and {filter} \
+                     order by n.nspname, c.relname, con.conname, u.ord"
+                ))
+                .await?;
+            add_rows(rows);
+        }
+        Driver::MySql => {
+            let filter = match schema {
+                Some(sc) => format!("kcu.table_schema = {}", my_lit(sc)),
+                None => "kcu.table_schema not in ('information_schema','mysql','performance_schema','sys')".into(),
+            };
+            let rows = pool
+                .query_strings(&format!(
+                    "select kcu.table_schema, kcu.table_name, kcu.constraint_name, kcu.column_name, \
+                            kcu.referenced_table_schema, kcu.referenced_table_name, kcu.referenced_column_name \
+                     from information_schema.key_column_usage kcu \
+                     where kcu.referenced_table_name is not null and {filter} \
+                     order by kcu.table_schema, kcu.table_name, kcu.constraint_name, kcu.ordinal_position"
+                ))
+                .await?;
+            add_rows(rows);
+        }
+        Driver::Oracle => {
+            let filter = match schema {
+                Some(sc) => format!("a.owner = {}", quote_literal(Driver::Oracle, sc)),
+                None => "a.owner in (select username from all_users where oracle_maintained = 'N')"
+                    .into(),
+            };
+            let rows = pool
+                .query_strings(&format!(
+                    "select a.owner, a.table_name, a.constraint_name, acc.column_name, \
+                            a.r_owner, r.table_name, rcc.column_name \
+                     from all_constraints a \
+                     join all_cons_columns acc on acc.owner = a.owner and acc.constraint_name = a.constraint_name \
+                     join all_constraints r on r.owner = a.r_owner and r.constraint_name = a.r_constraint_name \
+                     join all_cons_columns rcc on rcc.owner = r.owner and rcc.constraint_name = r.constraint_name and rcc.position = acc.position \
+                     where a.constraint_type = 'R' and {filter} \
+                     order by a.owner, a.table_name, a.constraint_name, acc.position"
+                ))
+                .await?;
+            add_rows(rows);
+        }
+        Driver::Sqlite => {}
+    }
+    Ok(map)
 }

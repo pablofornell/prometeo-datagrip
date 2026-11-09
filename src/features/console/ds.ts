@@ -13,10 +13,22 @@ export function toEditorSchema(objects: readonly SnapshotObject[], database?: st
   for (const o of objects) {
     let l = bySchema.get(o.schema);
     if (!l) bySchema.set(o.schema, (l = []));
+    const fkCols = new Set((o.foreignKeys ?? []).flatMap((f) => f.columns));
     l.push({
       name: o.name,
       kind: KIND[o.kind] ?? "table",
-      columns: o.columns.map((c) => ({ name: c.name, type: c.typeName, key: c.isPk ? ("pk" as const) : undefined })),
+      columns: o.columns.map((c) => ({
+        name: c.name,
+        type: c.typeName,
+        key: c.isPk && fkCols.has(c.name) ? ("pkfk" as const) : c.isPk ? ("pk" as const) : fkCols.has(c.name) ? ("fk" as const) : undefined,
+      })),
+      foreignKeys: (o.foreignKeys ?? []).map((f) => ({
+        name: f.name,
+        columns: f.columns,
+        refSchema: f.refSchema,
+        refTable: f.refTable,
+        refColumns: f.refColumns,
+      })),
     });
   }
   const syn = new Map<string, { name: string; target?: string[] }[]>();

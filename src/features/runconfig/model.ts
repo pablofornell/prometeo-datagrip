@@ -1,5 +1,5 @@
 /** Run configurations of type "Database Script": what to run (script text or files) and where (data source / schema). */
-import type { Driver } from "../../api/db";
+import type { Driver, ScriptOptions, ScriptSummary } from "../../api/db";
 
 export interface RunTarget {
   dsId: string;
@@ -16,6 +16,10 @@ export interface RunConfig {
   mode: "text" | "files";
   text: string;
   files: string[];
+  /** `files` only: stop at the first failing statement (default). Off: the failures are counted and the run goes on. */
+  stopOnError: boolean;
+  /** `files` only: the whole file runs in one transaction, committed at the end (rolled back when the run stops or is cancelled). */
+  singleTransaction: boolean;
   showPage: boolean;
   activateTool: boolean;
   focusTool: boolean;
@@ -35,6 +39,9 @@ export function newConfig(p: Partial<RunConfig> = {}): RunConfig {
     mode: "files",
     text: "",
     files: [],
+    stopOnError: true,
+    // one transaction by default, so a failed or cancelled run can be rolled back as a whole
+    singleTransaction: true,
     showPage: true,
     activateTool: true,
     focusTool: false,
@@ -74,8 +81,8 @@ export function initSql(driver: Driver, schema: string | undefined): string[] {
   return [driver === "postgres" ? `SET search_path TO ${q(schema, '"')}` : `USE ${q(schema, "`")}`];
 }
 
-/** Last path component. */
-export const baseName = (p: string): string => p.slice(p.lastIndexOf("/") + 1);
+/** Last path component (Windows paths use `\`). */
+export const baseName = (p: string): string => p.slice(Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\")) + 1);
 
 /** Only configurations whose data sources are of the first target's DBMS can be added together (DataGrip filters the chooser). */
 export function compatibleDrivers(current: RunTarget[], driverOf: (dsId: string) => Driver | undefined): Driver | undefined {
@@ -97,4 +104,47 @@ export function sanitize(raw: unknown): RunConfig[] {
     c.files = Array.isArray(c.files) ? c.files.filter((f) => typeof f === "string") : [];
     return [c];
   });
+}
+
+/** The options of a file run (`ScriptOptions`) from its configuration. The file is read as UTF-8 (a byte order mark is dropped). */
+export const scriptOptionsOf = (c: Pick<RunConfig, "stopOnError" | "singleTransaction">): ScriptOptions => ({
+  stopOnError: c.stopOnError,
+  singleTransaction: c.singleTransaction,
+  encoding: "UTF-8",
+});
+
+const plural = (n: number, w: string): string => `${n} ${w}${n === 1 ? "" : "s"}`;
+
+/** A file run that failed ends the whole run (the remaining files and targets are not started) when it stops on errors. */
+export const stopsAfterFailure = (c: Pick<RunConfig, "mode" | "stopOnError">, failed: number): boolean => c.mode === "files" && c.stopOnError && failed > 0;
+
+/** What a rollback leaves: MySQL and Oracle commit DDL by themselves, so the DDL of a "single transaction" stays. */
+const rollbackNote = (sum: ScriptSummary): string => (sum.ddlCommitted ? "DDL statements are committed by the server and stay" : "nothing was kept");
+
+/** Balloon of a finished file run: the kind sets its colour; the first error comes with its line in the file. */
+export function scriptResult(sum: ScriptSummary, name: string, stopOnError: boolean): { kind: "success" | "warning" | "error"; title: string; body: string } {
+  const first = sum.firstError ? `Line ${sum.firstError.line}: ${sum.firstError.message}` : "";
+  if (sum.cancelled)
+    return {
+      kind: "warning",
+      title: `${name} cancelled`,
+      body: sum.rolledBack
+        ? `${plural(sum.ok, "statement")} rolled back${sum.ddlCommitted ? " (" + rollbackNote(sum) + ")" : ", nothing was kept"}.`
+        : `${plural(sum.ok, "statement")} ran before the cancel.`,
+    };
+  if (sum.rolledBack)
+    return {
+      kind: "error",
+      title: `${name} failed`,
+      body: `${plural(sum.failed, "statement")} failed: the transaction was rolled back${sum.ddlCommitted ? " (" + rollbackNote(sum) + ")" : ", nothing was kept"}. ${first}`,
+    };
+  if (sum.failed && stopOnError)
+    return { kind: "error", title: `${name} failed`, body: `${plural(sum.ok, "statement")} ran, then the run stopped at the error. ${first}` };
+  if (sum.failed)
+    return {
+      kind: "warning",
+      title: `${name} finished with errors`,
+      body: `${plural(sum.ok, "statement")} ran, ${plural(sum.failed, "statement")} failed. ${first}`,
+    };
+  return { kind: "success", title: `${name} finished`, body: `${plural(sum.ok, "statement")} ran.` };
 }

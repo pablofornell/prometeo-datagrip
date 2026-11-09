@@ -16,6 +16,13 @@ CARGO ?= cargo
 NPM   ?= npm
 NPX   ?= npx
 
+# Windows appends .exe to the binary name.
+ifeq ($(OS),Windows_NT)
+EXE := .exe
+else
+EXE :=
+endif
+
 # Test databases (Docker). The integration tests load their own seed data
 # (crates/dbcore/tests/fixtures), so the containers only need to run.
 PG_CONTAINER    ?= prometeo-pg
@@ -46,8 +53,8 @@ help: ## Show this help
 
 ## ---- Setup and run ----
 
-install: ## Install the frontend dependencies
-	$(NPM) install
+install: ## Install the frontend dependencies (npm ci when a lockfile is present)
+	@if [ -f package-lock.json ]; then $(NPM) ci; else $(NPM) install; fi
 
 dev: ## Run the app in development mode (Vite + Tauri)
 	$(NPM) run tauri dev
@@ -66,16 +73,16 @@ dist/index.html: $(FRONTEND_SRC)
 
 build: dist/index.html ## Build the optimized release binary (no installer bundles)
 	$(NPX) tauri build --no-bundle $(NO_BEFORE_BUILD)
-	@echo "Binary: target/release/prometeo-datagrip"
+	@echo "Binary: target/release/prometeo-datagrip$(EXE)"
 
-bundle: dist/index.html ## Build the release binary and the installer bundles (deb, AppImage, ...)
+bundle: dist/index.html ## Build the release binary and the installer bundles for the host OS
 	$(NPX) tauri build $(NO_BEFORE_BUILD)
 
 # `run` uses the fast-release profile (thin LTO, parallel codegen, incremental): close to release
 # speed, but a code change rebuilds in seconds instead of minutes. `build`/`bundle` stay fully optimized.
 run: dist/index.html ## Build a fast-release binary (only if something changed) and start the app
 	$(CARGO) build --profile fast-release --bins --features tauri/custom-protocol -p prometeo-datagrip
-	./target/fast-release/prometeo-datagrip
+	./target/fast-release/prometeo-datagrip$(EXE)
 
 ## ---- Tests ----
 

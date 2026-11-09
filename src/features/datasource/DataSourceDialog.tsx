@@ -1,5 +1,6 @@
-import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
-import { Dialog, Icon, Tabs, TextField, openMenu, tip } from "../../components/ui";
+import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount } from "solid-js";
+import { appInfo } from "../../api/db";
+import { Dialog, Icon, Tabs, TextField, notify, openMenu, tip } from "../../components/ui";
 import type { MenuItem } from "../../components/ui";
 import { AdvancedTab } from "./AdvancedTab";
 import { DriversPage } from "./DriversPage";
@@ -10,7 +11,10 @@ import { SshSslTab } from "./SshSslTab";
 import { TestBar } from "./TestBar";
 import { DBMS, DBMS_ORDER, type Dbms, dbmsIcon, driversRailIcon } from "./drivers";
 import { dsFolders, dsGroupOf } from "../../state/ds-folders";
+import { emitDataSourcesChanged } from "./events";
+import { passwordStorageWarning } from "./passwordStorage";
 import { type Session, createSession } from "./session";
+import { describeImport, exportDataSources, importDataSourcesFromClipboard, importDataSourcesFromFile } from "./transfer";
 import type { UrlPrefill } from "./urlParse";
 import { ColorSelect, LinkButton } from "./widgets";
 
@@ -114,6 +118,55 @@ export function DataSourceDialog(props: DialogProps) {
       { anchor: addBtn, compact: true, minWidth: 160 },
     );
 
+  let moreBtn!: HTMLButtonElement;
+  const [info] = createResource(() => appInfo().catch(() => undefined));
+  /** Plain-text password storage (the OS keyring is not reachable): shown in the footer. */
+  const storageWarning = () =>
+    passwordStorageWarning(info()?.passwordStorage, s.drafts.some((x) => x.saved?.hasPassword && x.saved.passwordStorage === "file"), info()?.configDir);
+
+  /** Export and import work on the saved data sources: pending edits would be lost by the reload an import does. */
+  const savedOnly = (what: string): boolean => {
+    if (!s.hasChanges()) return true;
+    notify({ title: what, body: "Apply or cancel the pending changes first: this works on the saved data sources.", kind: "info" });
+    return false;
+  };
+  const failed = (title: string, e: unknown) => notify({ title, body: String(e), kind: "error" });
+  const doExport = async (ids?: string[]) => {
+    if (!savedOnly("Export Data Sources")) return;
+    try {
+      const r = await exportDataSources(ids);
+      if (r) notify({ title: "Data sources exported", body: `${r.count} data source${r.count === 1 ? "" : "s"} written to ${r.path}. Passwords are not included.`, kind: "info" });
+    } catch (e) {
+      failed("Cannot export the data sources", e);
+    }
+  };
+  const doImport = async (from: "file" | "clipboard") => {
+    if (!savedOnly("Import Data Sources")) return;
+    try {
+      const summary = from === "file" ? await importDataSourcesFromFile() : await importDataSourcesFromClipboard();
+      if (!summary) return;
+      const r = describeImport(summary);
+      notify({ title: r.title, body: r.body, kind: r.kind });
+      if (summary.imported.length) {
+        await s.load(summary.imported[0].id);
+        emitDataSourcesChanged();
+      }
+    } catch (e) {
+      failed("Cannot import the data sources", e);
+    }
+  };
+  const openMore = () =>
+    openMenu(
+      [
+        { label: "Import Data Sources from File…", run: () => void doImport("file") },
+        { label: "Import Data Sources from Clipboard", run: () => void doImport("clipboard") },
+        { type: "separator" },
+        { label: "Export Data Sources…", run: () => void doExport() },
+        { label: "Export Selected Data Source…", enabled: !!d()?.id, run: () => void doExport(d()?.id ? [d()!.id!] : undefined) },
+      ],
+      { anchor: moreBtn, compact: true, minWidth: 200 },
+    );
+
   const d = () => s.current();
 
   const onListKey = (e: KeyboardEvent) => {
@@ -153,7 +206,11 @@ export function DataSourceDialog(props: DialogProps) {
       height={758}
       flush
       onClose={close}
-      footerLeft={<Show when={s.error()}><span class="ds-footer-error">{s.error()}</span></Show>}
+      footerLeft={
+        <Show when={s.error()} fallback={<Show when={storageWarning()}>{(w) => <span class="ds-footer-warning" title={w()}>{w()}</span>}</Show>}>
+          <span class="ds-footer-error">{s.error()}</span>
+        </Show>
+      }
       buttons={[
         { label: "OK", primary: true, run: () => void ok() },
         { label: "Cancel", run: close },
@@ -221,6 +278,9 @@ export function DataSourceDialog(props: DialogProps) {
                 }}
               >
                 <Icon name="settings" />
+              </button>
+              <button type="button" ref={moreBtn} class="dg-action-button ds-tb" {...tip("Import / Export Data Sources")} onClick={openMore}>
+                <Icon name="more-horizontal" />
               </button>
             </div>
             <div class="ds-list" tabindex={0} onKeyDown={onListKey}>

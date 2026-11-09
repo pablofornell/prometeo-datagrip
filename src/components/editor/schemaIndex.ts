@@ -1,4 +1,4 @@
-import type { SchemaColumn, SchemaRoutine, SchemaSnapshot, SchemaSynonym } from "./types";
+import type { SchemaColumn, SchemaForeignKey, SchemaRoutine, SchemaSnapshot, SchemaSynonym } from "./types";
 
 export interface TableIdx {
   schema: string;
@@ -6,6 +6,8 @@ export interface TableIdx {
   kind: string;
   columns: SchemaColumn[];
   byName: Map<string, SchemaColumn>;
+  /** Foreign keys of this table (used by JOIN completion). */
+  foreignKeys: SchemaForeignKey[];
 }
 
 export interface SchemaIdx {
@@ -33,6 +35,7 @@ export class SchemaIndex {
           kind: t.kind,
           columns: t.columns,
           byName: new Map(t.columns.map((c) => [c.name.toLowerCase(), c])),
+          foreignKeys: t.foreignKeys ?? [],
         };
         idx.tables.set(t.name.toLowerCase(), ti);
         idx.list.push(ti);

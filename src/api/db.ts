@@ -284,44 +284,9 @@ export const exportFolder = (path: string): string | null => {
   return i > 0 && path.startsWith("/") ? path.slice(0, i) : null;
 };
 
-/** `chooseExportPath` + `exportQuery`. Resolves `null` when the user cancels the dialog. */
-export async function exportQueryToFile(
-  dsId: string,
-  sql: string,
-  options: ExportOptions,
-  suggestedName?: string,
-): Promise<{ path: string; rows: number } | null> {
-  const path = await chooseExportPath(suggestedName, options.format);
-  return path === null ? null : { path, rows: await exportQuery(dsId, sql, options, path) };
-}
-
-/** `chooseExportPath` + `exportResult`. Resolves `null` when the user cancels the dialog. */
-export async function exportResultToFile(
-  result: Pick<ResultSet, "columns" | "rows">,
-  options: ExportOptions,
-  suggestedName?: string,
-): Promise<{ path: string; rows: number } | null> {
-  const path = await chooseExportPath(suggestedName, options.format);
-  return path === null ? null : { path, rows: await exportResult(result, options, path) };
-}
-
-/**
- * Run `sql` and stream EVERY row to `path`. Returns the row count. `path` MUST come from `chooseExportPath`
- * (the backend refuses any other path); prefer `exportQueryToFile`.
- */
-export const exportQuery = (dsId: string, sql: string, options: ExportOptions, path: string): Promise<number> =>
-  invoke("export_query", { dsId, sql, options, path });
-
-/** Same as `exportQuery` but returns the text (for the clipboard). */
+/** Run `sql` and return EVERY row as export text (for the clipboard). File exports: `exportQueryWithProgress` (tauri.ts). */
 export const exportQueryToString = (dsId: string, sql: string, options: ExportOptions): Promise<string> =>
   invoke("export_query_to_string", { dsId, sql, options });
-
-/**
- * Write an in-memory result set (what the grid shows) to `path`. Returns the row count. `path` MUST come
- * from `chooseExportPath` (the backend refuses any other path); prefer `exportResultToFile`.
- */
-export const exportResult = (result: Pick<ResultSet, "columns" | "rows">, options: ExportOptions, path: string): Promise<number> =>
-  invoke("export_result", { result: { hasMore: false, totalHint: null, ...result }, options, path });
 
 /** Format an in-memory result set as text (for the clipboard). */
 export const exportToString = (result: Pick<ResultSet, "columns" | "rows">, options: ExportOptions): Promise<string> =>

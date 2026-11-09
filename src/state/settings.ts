@@ -33,6 +33,8 @@ export interface Settings {
   editorIndentGuides: boolean;
   /** Case of the keywords after Reformat Code: `keep` (as typed), `upper`, `lower`. */
   sqlKeywordCase: "keep" | "upper" | "lower";
+  /** Completion inserts a table alias after a table in FROM / JOIN (DataGrip: Insert table alias). */
+  sqlInsertTableAlias: boolean;
   /** Editor color scheme: follow the UI theme or force one of the built-in schemes. */
   editorScheme: "auto" | SchemeId;
   /** Edits of the color scheme attributes, kept per scheme. */
@@ -46,7 +48,11 @@ export interface Settings {
   uiFontSize: number;
   /** Appearance > Compact mode: 22 px tree rows and 24 px menu rows. */
   compactMode: boolean;
-  /** Appearance > Use project colors in main toolbar (the tint of the data source colour). */
+  /** Appearance > Color by data source: tint tree rows, editor tabs and consoles (and the toolbar) with the data source color. */
+  dataSourceColors: boolean;
+  /** Strength of that tint in percent of the theme's tint (100 = the theme default). */
+  dataSourceColorIntensity: number;
+  /** Appearance > Use project colors in main toolbar (the tint of the data source colour; needs `dataSourceColors`). */
   projectColors: boolean;
   /** Appearance > Display icons in menu items. */
   menuIcons: boolean;
@@ -65,7 +71,8 @@ export const DEFAULT_SETTINGS: Settings = {
   execCaretInside: "ask",
   gridAlternateRows: false,
   editorIndentGuides: true,
-  sqlKeywordCase: "keep",
+  sqlKeywordCase: "upper",
+  sqlInsertTableAlias: true,
   editorScheme: "auto",
   colorOverrides: EMPTY_OVERRIDES,
   keymapOverrides: {},
@@ -73,6 +80,8 @@ export const DEFAULT_SETTINGS: Settings = {
   uiFontFamily: "inter",
   uiFontSize: 13,
   compactMode: false,
+  dataSourceColors: false,
+  dataSourceColorIntensity: 100,
   projectColors: true,
   menuIcons: true,
   treeIndentGuides: false,
@@ -116,7 +125,7 @@ export function editorMetrics(fontSize: number, lineHeight: number): { fontSize:
 
 // Editor settings reach the CSS through custom properties on <html> (editor.css reads them); the SqlEditor effect that
 // re-measures CodeMirror runs after this render effect, so it always sees the new metrics.
-if (typeof document !== "undefined") {
+if (typeof document !== "undefined" && document.documentElement) {
   createRoot(() =>
     createRenderEffect(() => {
       const m = editorMetrics(settings.editorFontSize, settings.editorLineHeight);
@@ -136,7 +145,9 @@ function applyAppearance(): void {
   const flag = (name: string, on: boolean, off = "off") => (on ? el.removeAttribute(name) : el.setAttribute(name, off));
   if (settings.compactMode) el.setAttribute("data-compact", "");
   else el.removeAttribute("data-compact");
-  flag("data-project-colors", settings.projectColors);
+  flag("data-project-colors", settings.dataSourceColors && settings.projectColors);
+  // every data source tint is `color-mix(.. calc(var(--dg-ds-tint-mix) * var(--dg-ds-tint-k)) ..)`: 0 paints none
+  el.style.setProperty("--dg-ds-tint-k", settings.dataSourceColors ? String(settings.dataSourceColorIntensity / 100) : "0");
   flag("data-menu-icons", settings.menuIcons);
   flag("data-editor-indent-guides", settings.editorIndentGuides);
   if (settings.gridAlternateRows) el.setAttribute("data-grid-alt", "");
@@ -174,7 +185,7 @@ function setZoom(z: number): void {
   }
 }
 
-if (typeof document !== "undefined") createRoot(() => createRenderEffect(applyAppearance));
+if (typeof document !== "undefined" && document.documentElement) createRoot(() => createRenderEffect(applyAppearance));
 
 // the registry applies the keymap edits
 createRoot(() => createRenderEffect(() => setKeymapOverrides(settings.keymapOverrides)));

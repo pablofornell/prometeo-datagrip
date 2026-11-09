@@ -1267,6 +1267,65 @@ async fn table_data_and_snapshot() {
     assert!(all.iter().all(|o| o.schema != "pg_catalog"));
 }
 
+#[tokio::test]
+async fn schema_snapshot_has_foreign_keys() {
+    let (_cfg, mgr) = setup!();
+    let snap = mgr.schema_snapshot("pg", Some("shop")).await.unwrap();
+    let fk_of = |t: &str| {
+        snap.iter()
+            .find(|o| o.name == t)
+            .unwrap()
+            .foreign_keys
+            .clone()
+    };
+    let fk_by_name = |t: &str| {
+        fk_of(t)
+            .into_iter()
+            .map(|f| (f.name.clone(), f))
+            .collect::<BTreeMap<_, _>>()
+    };
+
+    // order_items -> orders / products (two foreign keys, column order kept)
+    let oi = fk_by_name("order_items");
+    assert_eq!(
+        oi.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["order_items_order_id_fkey", "order_items_product_id_fkey"]
+    );
+    let f = &oi["order_items_order_id_fkey"];
+    assert_eq!(f.columns, vec!["order_id".to_string()]);
+    assert_eq!(
+        (f.ref_schema.as_str(), f.ref_table.as_str()),
+        ("shop", "orders")
+    );
+    assert_eq!(f.ref_columns, vec!["id".to_string()]);
+    let f = &oi["order_items_product_id_fkey"];
+    assert_eq!(f.columns, vec!["product_id".to_string()]);
+    assert_eq!(f.ref_table, "products");
+    assert_eq!(f.ref_columns, vec!["id".to_string()]);
+
+    // orders -> customers, categories -> categories (self reference)
+    let orders = fk_of("orders");
+    assert_eq!(orders.len(), 1);
+    assert_eq!(
+        (
+            orders[0].name.as_str(),
+            orders[0].columns.clone(),
+            orders[0].ref_table.as_str()
+        ),
+        (
+            "orders_customer_id_fkey",
+            vec!["customer_id".to_string()],
+            "customers"
+        )
+    );
+    assert_eq!(fk_of("products")[0].ref_table, "categories");
+    let cats = fk_of("categories");
+    assert_eq!(
+        (cats[0].ref_table.as_str(), cats[0].columns.clone()),
+        ("categories", vec!["parent_id".to_string()])
+    );
+}
+
 fn change(kind: ChangeKind, key: Value, values: Value) -> RowChange {
     let m = |v: Value| {
         v.as_object()
@@ -2594,6 +2653,8 @@ async fn explain_plan_and_analyse() {
 #[tokio::test]
 async fn advanced_properties_and_ssl_files_are_honoured() {
     let Some(mut cfg) = pg_cfg() else { return };
+    // `search_path=shop` below needs the seeded schema, also when this test runs first
+    seed_pg(&cfg).await;
     cfg.id = "pg-adv".into();
     cfg.options
         .insert("statement_timeout".into(), "4321".into());

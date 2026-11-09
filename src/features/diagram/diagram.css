@@ -1,0 +1,74 @@
+/* Database diagram view (features/diagram). The shared .dgd-view / .dgd-toolbar / .dgd-body base is defined in
+   features/ddl/ddl.css; this file only adds the diagram-specific pieces (the pannable stage, overlays and the
+   toolbar's text buttons, which reuse the grid's `.dgg-i` icon sprites). */
+.dgd-stage {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--dg-editor-bg, #191a1c);
+}
+.dgd-stage svg {
+  display: block;
+  position: absolute;
+  left: 0;
+  top: 0;
+}
+.dgd-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--dg-text-secondary, #73767c);
+  font: 13px / 18px var(--dg-font-ui, "Inter", sans-serif);
+  pointer-events: none;
+}
+.dgd-overlay.error {
+  flex-direction: column;
+  gap: 8px;
+  padding: 0 32px;
+  text-align: center;
+  pointer-events: auto;
+}
+.dgd-error-text {
+  max-width: 720px;
+  color: var(--dg-error-fg, #f75464);
+  white-space: pre-wrap;
+}
+.dgd-retry {
+  color: var(--dg-link, #548af7);
+  cursor: pointer;
+}
+.dgd-tbtn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  box-sizing: border-box;
+  height: 22px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--dg-toolbar-fg, #d1d3d9);
+  font: 12px / 16px var(--dg-font-ui, "Inter", sans-serif);
+  cursor: default;
+  outline: none;
+}
+.dgd-tbtn:hover {
+  background: var(--dg-action-button-hover-bg, #ffffff17);
+}
+.dgd-tbtn:active {
+  background: var(--dg-action-button-pressed-bg, #ffffff29);
+}
+.dgd-tbtn.selected {
+  background: var(--dg-toolbar-button-pressed-bg, #ffffff29);
+}
+.dgd-tbtn .dgg-i {
+  width: 12px;
+  height: 12px;
+  background-size: 12px 12px;
+}

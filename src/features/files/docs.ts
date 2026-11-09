@@ -37,6 +37,15 @@ export interface FileDoc {
 const SAVE_DELAY = 600;
 const errText = (e: unknown): string => String((e as Error)?.message ?? e).replace(/^Error:\s*/, "");
 
+/** Files whose last autosave failed: one notification per file until a save succeeds. */
+const failedAutosaves = new Set<string>();
+
+function notifySaveError(path: string, name: string, e: unknown): void {
+  if (failedAutosaves.has(path)) return;
+  failedAutosaves.add(path);
+  notify({ kind: "error", title: `Cannot save ${name}`, body: errText(e) });
+}
+
 export const fileTabId = (path: string): string => `file:${path}`;
 export const fileTabData = (t: { data?: unknown }): FileTabData | undefined => {
   const d = t.data as Partial<FileTabData> | undefined;
@@ -85,6 +94,7 @@ export async function acquireDoc(path: string, scratch: boolean): Promise<FileDo
     let p = loading.get(path);
     if (!p) {
       p = readFile(path).then((c) => {
+        failedAutosaves.delete(path);
         setDocs(path, {
           path,
           name: path.slice(path.lastIndexOf("/") + 1),
@@ -115,7 +125,10 @@ export function releaseDoc(path: string): void {
   if (refs > 0) return setDocs(path, "refs", refs);
   clearTimeout(timers.get(path));
   timers.delete(path);
-  if (docs[path].scratch && isDirty(path)) void writeFile(path, docs[path].text).catch(() => {});
+  if (docs[path].scratch && isDirty(path)) {
+    const d = docs[path];
+    void writeFile(path, d.text).catch((e) => notifySaveError(path, d.name, e));
+  }
   setDocs(
     produce((d) => {
       delete d[path];
@@ -167,10 +180,14 @@ export async function saveDoc(path: string, o: { quiet?: boolean } = {}): Promis
       return writeFile(path, text, null);
     });
     if (docs[path]) setDocs(path, { saved: text, mtimeMs: mtime });
+    failedAutosaves.delete(path);
     syncMarker(path);
     return true;
   } catch (e) {
-    if (e !== "reloaded" && e !== "cancelled" && !o.quiet) notify({ kind: "error", title: `Cannot save ${d.name}`, body: errText(e) });
+    if (e !== "reloaded" && e !== "cancelled") {
+      if (o.quiet) notifySaveError(path, d.name, e);
+      else notify({ kind: "error", title: `Cannot save ${d.name}`, body: errText(e) });
+    }
     return false;
   }
 }

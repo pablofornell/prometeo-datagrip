@@ -43,10 +43,10 @@ export function openThemePopup(): void {
   });
 }
 
-/** Keymap… popup: the one keymap (XWin) and a link to Settings > Keymap. */
+/** Keymap… popup: a link to Settings > Keymap. */
 export function openKeymapPopup(): void {
   openMenu(
-    [{ label: "XWin", checked: true, run: () => {} }, sep, { label: "Configure Keymap…", run: () => void runAction("app.settings", "keymap") }],
+    [{ label: "Configure Keymap…", run: () => void runAction("app.settings", "keymap") }],
     { title: "Keymap", compact: true, center: true, minWidth: 215, selected: 0 },
   );
 }

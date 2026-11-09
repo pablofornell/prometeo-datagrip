@@ -422,6 +422,16 @@ pub struct SnapshotColumn {
     pub is_pk: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotForeignKey {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub ref_schema: String,
+    pub ref_table: String,
+    pub ref_columns: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotObject {
@@ -429,4 +439,6 @@ pub struct SnapshotObject {
     pub name: String,
     pub kind: NodeKind,
     pub columns: Vec<SnapshotColumn>,
+    #[serde(default)]
+    pub foreign_keys: Vec<SnapshotForeignKey>,
 }

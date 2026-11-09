@@ -7,17 +7,20 @@ import {
   type ColumnMeta,
   type Driver,
   type ExportOptions,
+  type ExportProgress,
+  type ExportReport,
   type ObjectRef,
   defaultExportOptions,
-  exportQuery,
   exportQueryToString,
-  exportResult,
   exportToString,
   isTauri,
   approveExportPath,
 } from "../../api/db";
+import { cancelExport, exportQueryWithProgress, exportResultWithProgress } from "../../api/tauri";
 import { notify } from "../../components/ui";
-import { ensureConnected } from "../explorer";
+import { startTask } from "../../state/status";
+import { ensureConnected, loadSchemaSnapshot } from "../explorer";
+import { primaryKeyColumns, replacedNotice } from "../output/extractors";
 import { errText, requireDriver, writeClipboard } from "./ds";
 import { mountDialog } from "./dialogs";
 import { EXPORT_FORMATS, ExportDialog, type ExportPath, type ExportTarget, exportFileBase } from "./Popups";
@@ -25,6 +28,8 @@ import { limitedSql, qualifiedName, selectSql } from "./sql";
 
 const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
 const PREVIEW_ROWS = 10;
+const newId = (): string =>
+  typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
 
 /** What an Export Data dialog exports: a query, or rows that are already loaded (a grid result). */
 export interface ExportSource {
@@ -69,9 +74,13 @@ export async function copyExport(src: ExportSource, o: ExportOptions): Promise<v
   }
 }
 
-/** Writes the whole result to the dialog's output file. */
+/**
+ * Writes the whole result to the dialog's output file. While it runs, a status bar task shows the rows written and
+ * its Cancel stops it, also a query that has not returned a row yet (the backend then removes the partial file and leaves a file it was to replace as it was).
+ */
 export async function exportToFile(src: ExportSource, o: ExportOptions, out: ExportPath): Promise<void> {
   const fmt = EXPORT_FORMATS.find((f) => f.value === o.format) ?? EXPORT_FORMATS[0];
+  let cancelled = false;
   try {
     if (!isTauri()) {
       // a browser has no file system: download it
@@ -91,11 +100,31 @@ export async function exportToFile(src: ExportSource, o: ExportOptions, out: Exp
       if (why) throw new Error(why);
     }
     const l = src.loaded?.();
-    const rows = l?.complete ? await exportResult({ columns: l.columns, rows: l.rows }, o, path) : await exportQuery(src.dsId, src.sql, o, path);
-    notify({ kind: "success", title: "Export finished", body: `${plural(rows, "row")} exported to ${path}`, timeout: 6000 });
+    const id = newId();
+    const task = startTask(`Exporting ${src.label}…`, {
+      cancel: () => {
+        cancelled = true;
+        void cancelExport(id).catch(() => {});
+      },
+    });
+    const progress = (p: ExportProgress) => {
+      task.title(`Exporting ${src.label}… ${plural(p.rowsWritten, "row")}`);
+      if (p.total) task.progress(p.rowsWritten / p.total);
+    };
+    let report: ExportReport;
+    try {
+      report = l?.complete
+        ? await exportResultWithProgress({ columns: l.columns, rows: l.rows }, o, path, id, progress)
+        : await exportQueryWithProgress(src.dsId, src.sql, o, path, id, progress);
+    } finally {
+      task.done();
+    }
+    const replaced = replacedNotice(report.unmappable);
+    notify({ kind: "success", title: "Export finished", body: `${plural(report.rows, "row")} exported to ${path}${replaced ? `. ${replaced}` : ""}`, timeout: 6000 });
     src.onDone?.();
   } catch (e) {
-    notify({ kind: "error", title: "Export failed", body: errText(e) });
+    if (cancelled) notify({ kind: "info", title: "Export cancelled", body: `${src.label}: nothing was written.`, timeout: 6000 });
+    else notify({ kind: "error", title: "Export failed", body: errText(e) });
   }
 }
 
@@ -117,6 +146,11 @@ export function openExportDialog(src: ExportSource): void {
   ));
 }
 
+/** The primary key of a table: the key of its SQL UPDATE / WHERE export (`null`: none, the backend picks one). */
+async function tableKeyColumns(dsId: string, ref: ObjectRef): Promise<string[] | null> {
+  return primaryKeyColumns(await loadSchemaSnapshot(dsId, ref.schema ?? null), ref);
+}
+
 /** Streams every row of `select * from <table> [where] [order by]` to a file or the clipboard. */
 export async function exportTableQuery(
   dsId: string,
@@ -127,8 +161,9 @@ export async function exportTableQuery(
   out: ExportPath,
   filter: { where?: string; orderBy?: string } = {},
 ): Promise<void> {
-  const src: ExportSource = { dsId, label: qualifiedName(driver, ref), sql: selectSql(driver, ref, filter.where ?? "", filter.orderBy ?? ""), options };
-  await (target === "file" ? exportToFile(src, options, out) : copyExport(src, options));
+  const o: ExportOptions = { ...options, keyColumns: options.keyColumns ?? (await tableKeyColumns(dsId, ref)) };
+  const src: ExportSource = { dsId, label: qualifiedName(driver, ref), sql: selectSql(driver, ref, filter.where ?? "", filter.orderBy ?? ""), options: o };
+  await (target === "file" ? exportToFile(src, o, out) : copyExport(src, o));
 }
 
 /** `grid.export` with `{ dsId, objectRef }`: the Export Data dialog; exports the whole table. */
@@ -141,6 +176,6 @@ export async function openTableExport(dsId: string, ref: ObjectRef): Promise<voi
     notify({ kind: "error", title: "Cannot export the data", body: errText(e) });
     return;
   }
-  const options: ExportOptions = { ...defaultExportOptions(driver), tableName: qualifiedName(driver, ref) };
+  const options: ExportOptions = { ...defaultExportOptions(driver), tableName: qualifiedName(driver, ref), keyColumns: await tableKeyColumns(dsId, ref) };
   openExportDialog({ dsId, label: qualifiedName(driver, ref), sql: selectSql(driver, ref, "", ""), options });
 }

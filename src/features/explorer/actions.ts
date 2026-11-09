@@ -35,6 +35,7 @@ import {
 } from "./commands";
 import { showQuickDoc } from "./QuickDoc";
 import { importTargetOf } from "../import/target";
+import { type DumpTarget, dumpTargetOfSelection } from "../dump/target";
 import { canModify, modifyObject, newObjectOf, newObjectTypes, newTable } from "../schema-editor";
 import {
   connected,
@@ -42,6 +43,7 @@ import {
   dataSources,
   expandAllLoaded,
   isDsFolder,
+  nodes,
   refreshSelected,
   revealObject,
   selectedNode,
@@ -347,6 +349,14 @@ function folderMenu(n: ENode): MenuItem[] {
   ];
 }
 
+/** The node a node lives in, folders skipped (a table's schema or MySQL database; the dump target of a table needs it). */
+const containerOf = (n: ENode): ENode | undefined => {
+  for (let p = n.data.parentId ? nodes.get(n.data.parentId) : undefined; p; p = p.data.parentId ? nodes.get(p.data.parentId) : undefined) {
+    if (p.data.kind !== "folder") return p;
+  }
+  return undefined;
+};
+
 export function contextMenuItems(n: ENode | undefined): MenuItem[] {
   if (n && isDsFolder(n)) return folderMenu(n);
   if (!real(n)) return [newSub()];
@@ -369,6 +379,14 @@ export function contextMenuItems(n: ENode | undefined): MenuItem[] {
     run: () => void runAction("run.sqlScript", { dsId: d.dsId, schema: d.kind === "schema" ? d.name : undefined }),
   });
 
+  /** SQL Scripts > Dump to SQL File… (features/dump): schemas, MySQL databases, SQLite data sources and tables. */
+  const dumpItem = (t: DumpTarget): MenuItem => ({
+    label: "Dump to SQL File…",
+    icon: "sql-file",
+    run: () => void runAction("dump.sqlFile", t),
+  });
+  const dump = dumpTargetOfSelection([{ data: d, owner: containerOf(n)?.data }]);
+
   if (d.kind === "dataSource") {
     return [
       {
@@ -390,7 +408,8 @@ export function contextMenuItems(n: ENode | undefined): MenuItem[] {
       sep,
       { action: "db.quickDoc", mnemonic: "D" },
       { label: "Navigation", children: [{ action: "db.jumpToConsole" }] },
-      { label: "SQL Scripts", children: [runScript()] },
+      { label: "Diagrams", icon: "dg/schema", children: [{ action: "diagram.show" }] },
+      { label: "SQL Scripts", children: [runScript(), ...(dump ? [dumpItem(dump)] : [])] },
       sep,
       { label: "Remove Data Source…", shortcut: "Delete", run: () => requestDrop(n) },
     ];
@@ -401,14 +420,21 @@ export function contextMenuItems(n: ENode | undefined): MenuItem[] {
   items.push({ action: "db.refresh" });
   if (canRename(n)) items.push(sep, { action: "db.rename", mnemonic: "R" });
   if (colorable(n)) items.push(...(canRename(n) ? [] : [sep]), setColorItem(n));
-  items.push(sep, { action: "db.quickDoc", mnemonic: "D" }, navigation());
+  items.push(sep, { action: "db.quickDoc", mnemonic: "D" }, navigation(), { label: "Diagrams", icon: "dg/schema", children: [{ action: "diagram.show" }] });
   if (ddlRefOf(d)) {
     items.push(sep, {
       label: "SQL Scripts",
-      children: [{ action: "db.copyDdl" }, { action: "db.ddlToConsole" }, ...(d.kind === "schema" ? [runScript()] : [])],
+      children: [
+        { action: "db.copyDdl" },
+        { action: "db.ddlToConsole" },
+        ...(d.kind === "schema" ? [runScript()] : []),
+        ...(dump ? [dumpItem(dump)] : []),
+      ],
     });
   } else if (d.kind === "schema") {
-    items.push(sep, { label: "SQL Scripts", children: [runScript()] });
+    items.push(sep, { label: "SQL Scripts", children: [runScript(), ...(dump ? [dumpItem(dump)] : [])] });
+  } else if (dump) {
+    items.push(sep, { label: "SQL Scripts", children: [dumpItem(dump)] });
   }
   const importTarget = importTargetOf(d);
   if (importTarget || isTableLike(n)) {

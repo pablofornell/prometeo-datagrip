@@ -13,9 +13,11 @@ export function AppearancePage(props: { draft: Draft; open: (id: string) => void
   const q = () => d().query();
   const uiTheme = () => draftTheme(d());
   const scheme = () => draftScheme(d());
-  const check = (key: "compactMode" | "projectColors" | "menuIcons" | "treeIndentGuides" | "treeSmallIndents", label: string) => (
-    <Checkbox checked={d().values[key]} onChange={(c) => d().set(key, c)} label={<L q={q()}>{label}</L>} />
-  );
+  const check = (
+    key: "compactMode" | "dataSourceColors" | "projectColors" | "menuIcons" | "treeIndentGuides" | "treeSmallIndents",
+    label: string,
+    disabled = false,
+  ) => <Checkbox checked={d().values[key]} disabled={disabled} onChange={(c) => d().set(key, c)} label={<L q={q()}>{label}</L>} />;
   return (
     <div class="st-page">
       <Row field class="st-row-first">
@@ -68,7 +70,24 @@ export function AppearancePage(props: { draft: Draft; open: (id: string) => void
       <Section title="UI Options" q={q()}>
         <Row>{check("compactMode", "Compact mode")}</Row>
         <Hint>UI elements take up less screen space</Hint>
-        <Row class="st-row-gap">{check("projectColors", "Use project colors in main toolbar")}</Row>
+        <Row class="st-row-gap">
+          {check("dataSourceColors", "Color by data source")}
+          <span class="st-label st-label-inline" classList={{ "st-muted": !d().values.dataSourceColors }}>
+            <L q={q()}>Intensity:</L>
+          </span>
+          <NumberField
+            narrow
+            disabled={!d().values.dataSourceColors}
+            value={d().values.dataSourceColorIntensity}
+            min={25}
+            max={200}
+            step={25}
+            onChange={(n) => d().set("dataSourceColorIntensity", n)}
+          />
+          <span classList={{ "st-muted": !d().values.dataSourceColors }}>%</span>
+        </Row>
+        <Hint>Tint tree rows, editor tabs and consoles with the color of their data source (100 % is the theme default).</Hint>
+        <Row class="st-row-gap">{check("projectColors", "Use project colors in main toolbar", !d().values.dataSourceColors)}</Row>
         <Hint>Distinguish projects with different toolbar colors at a glance.</Hint>
         <Row class="st-row-gap">{check("menuIcons", "Display icons in menu items")}</Row>
       </Section>
@@ -274,6 +293,12 @@ export function CodeStyleSqlPage(props: { draft: Draft }) {
           />
         </Row>
         <Hint>Applied by Reformat Code (Ctrl+Alt+L) to reserved words; names, strings and comments are not touched.</Hint>
+      </Section>
+      <Section title="Completion" q={d().query()}>
+        <Row>
+          <Checkbox checked={d().values.sqlInsertTableAlias} onChange={(c) => d().set("sqlInsertTableAlias", c)} label={<L q={d().query()}>Insert table alias</L>} />
+        </Row>
+        <Hint>When a table is completed after FROM or JOIN, an alias is added automatically.</Hint>
       </Section>
     </div>
   );
