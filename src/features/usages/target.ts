@@ -5,8 +5,11 @@
 import type { ObjectRef } from "../../api/db";
 import { type NodeData, objectRefOf } from "../explorer/model";
 
-/** Node kinds that other objects can refer to: tables, views, sequences, synonyms, packages, routines and columns. */
-const FIND_KINDS: readonly string[] = ["table", "view", "materializedView", "sequence", "synonym", "package", "routine", "function", "procedure", "column"];
+/**
+ * Node kinds that other objects can refer to: tables, views, sequences, synonyms, packages, routines, columns and the
+ * primary or unique keys (their usages are the foreign keys that reference them).
+ */
+const FIND_KINDS: readonly string[] = ["table", "view", "materializedView", "sequence", "synonym", "package", "routine", "function", "procedure", "column", "primaryKey", "uniqueKey"];
 
 /** The reference Find Usages uses for the node, or null when its kind has no usages to show (indexes, keys, folders, ...). */
 export function usageTargetOf(d: NodeData): ObjectRef | null {

@@ -7,6 +7,7 @@ import { ImageView } from "./value/ImageView";
 import { JsonTree } from "./value/JsonTree";
 import { isContainer, parseJsonText } from "./value/json";
 import { loadValue, saveValue } from "./value/files";
+import { isLargeValue } from "./value/size";
 import type { CellFull } from "./value/types";
 import { isBinaryCell } from "./format";
 import type { Cell, ColumnKind } from "./types";
@@ -76,6 +77,8 @@ export function ValueEditor(props: Props): JSX.Element {
     const t = binary ? decoded() : initial;
     return t !== null && isContainer(parseJsonText(t)?.value);
   });
+  // the large dialog for binary, JSON and long values; short plain text keeps the compact one (decided when it opens)
+  const large = isLargeValue(initial, { binary, json: jsonOffered() });
   const imageOffered = () => image() !== null;
   const [tab, setTab] = createSignal<Tab>(imageOffered() ? "image" : "text");
   const parsed = createMemo(() => (tab() === "json" ? parseJsonText(binary ? (decoded() ?? "") : value()) : null));
@@ -188,6 +191,7 @@ export function ValueEditor(props: Props): JSX.Element {
     <div
       ref={root}
       class="dgg-ve dgg-vx-dialog"
+      classList={{ "dgg-vx-large": large }}
       tabIndex={-1}
       onMouseDown={(e) => e.stopPropagation()}
       onKeyDown={(e) => {

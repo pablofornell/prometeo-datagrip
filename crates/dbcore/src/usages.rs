@@ -2,18 +2,21 @@
 //!
 //! * Oracle: `ALL_DEPENDENCIES` (views, routines, packages, triggers, synonyms that depend on the object),
 //!   `ALL_SYNONYMS`, `ALL_TRIGGERS`, the foreign keys of `ALL_CONSTRAINTS`; `ALL_SOURCE` gives the line of each
-//!   PL/SQL unit that mentions the name, `ALL_VIEWS.TEXT_VC` the views that mention a column.
+//!   PL/SQL unit that mentions the name, `ALL_VIEWS.TEXT` the views that mention a column (read in full: `TEXT_VC`
+//!   is cut at 4000 characters). Only the units the search found are read, and never Oracle's own owners.
 //! * PostgreSQL: `pg_depend` / `pg_rewrite` (views), `pg_constraint` (foreign keys), `pg_trigger`, `pg_index`,
 //!   and the texts of the routines (`pg_proc.prosrc`).
 //! * MySQL: `information_schema` `VIEWS`, `ROUTINES`, `KEY_COLUMN_USAGE`, `TRIGGERS`, `STATISTICS`.
 //! * SQLite: `sqlite_master.sql` (views, triggers) and `pragma_foreign_key_list` of every table.
+//!
+//! A primary or unique key lists the foreign keys that reference it (the usages of a key are only those).
 //!
 //! Texts are matched on whole words ([`contains_word`]): `ORDER` does not match `ORDERS`. The match is textual, so a
 //! name in a comment or a string literal counts too, and a column name is common: a column target lists more than the
 //! real uses. Line numbers are lines of the stored text (routine bodies in PostgreSQL and MySQL start at line 1 of the
 //! body, not of the `CREATE` statement).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -108,6 +111,11 @@ fn has(list: &[String], column: &str) -> bool {
     list.iter().any(|c| same(c, column))
 }
 
+/// Both lists hold the same columns (in any order).
+fn same_set(a: &[String], b: &[String]) -> bool {
+    a.iter().all(|c| has(b, c)) && b.iter().all(|c| has(a, c))
+}
+
 /// One column pair of a foreign key as the catalog returns it. `group` tells apart the constraints of a table
 /// (SQLite has no constraint names: its `group` is the foreign key number); `constraint` is the name shown.
 #[derive(Debug, Clone)]
@@ -122,11 +130,13 @@ struct FkCol {
     parent_col: String,
 }
 
-/// The object a search is about: its `column` when the target is a column.
+/// The object a search is about: its `column` when the target is a column; `key` the columns of a primary or unique key
+/// target (the foreign keys that reference exactly those columns are its usages).
 struct Target {
     schema: String,
     name: String,
     column: Option<String>,
+    key: Option<Vec<String>>,
 }
 
 fn fk_detail(constraint: &str, cols: &[String], ptable: &str, pcols: &[String]) -> String {
@@ -165,9 +175,10 @@ fn fk_usages(rows: &[FkCol], t: &Target) -> Vec<Usage> {
     for ((cs, ct, _, ps, pt), (constraint, cols, pcols)) in groups {
         let child = same(&cs, &t.schema) && same(&ct, &t.name);
         let parent = same(&ps, &t.schema) && same(&pt, &t.name);
-        let keep = match &t.column {
-            None => parent,
-            Some(c) => (child && has(&cols, c)) || (parent && has(&pcols, c)),
+        let keep = match (&t.column, &t.key) {
+            (_, Some(key)) => parent && same_set(&pcols, key),
+            (None, None) => parent,
+            (Some(c), None) => (child && has(&cols, c)) || (parent && has(&pcols, c)),
         };
         if keep {
             out.push(Usage {
@@ -256,11 +267,111 @@ fn ora_kind(ty: &str) -> Option<UsageKind> {
     })
 }
 
+/// The foreign-key rows of the Oracle queries, in the order `ora_fk_sql` selects them.
+fn ora_fks(rows: &[Vec<Option<String>>]) -> Vec<FkCol> {
+    rows.iter()
+        .map(|r| FkCol {
+            child_schema: cell(r, 0),
+            child_table: cell(r, 1),
+            group: cell(r, 2),
+            constraint: cell(r, 2),
+            child_col: cell(r, 3),
+            parent_schema: cell(r, 4),
+            parent_table: cell(r, 5),
+            parent_col: cell(r, 6),
+        })
+        .collect()
+}
+
+/// The foreign keys (one row per column pair, in constraint and position order) that sit on `table` or reference it.
+/// Two simple joins, one per side, instead of an `or` across two self-joins: the child side and the parent side.
+fn ora_fk_sql(owner: &str, table: &str) -> String {
+    let cols = "select c.owner, c.table_name, c.constraint_name, cc.column_name, r.owner, r.table_name, rc.column_name, cc.position";
+    format!(
+        "{cols} from all_constraints c \
+           join all_cons_columns cc on cc.owner = c.owner and cc.constraint_name = c.constraint_name \
+           join all_constraints r on r.owner = c.r_owner and r.constraint_name = c.r_constraint_name \
+           join all_cons_columns rc on rc.owner = r.owner and rc.constraint_name = r.constraint_name and rc.position = cc.position \
+           where c.constraint_type = 'R' and c.owner = {s} and c.table_name = {t} \
+         union all \
+         {cols} from all_constraints r \
+           join all_constraints c on c.r_owner = r.owner and c.r_constraint_name = r.constraint_name \
+           join all_cons_columns cc on cc.owner = c.owner and cc.constraint_name = c.constraint_name \
+           join all_cons_columns rc on rc.owner = r.owner and rc.constraint_name = r.constraint_name and rc.position = cc.position \
+           where c.constraint_type = 'R' and r.owner = {s} and r.table_name = {t} and not (c.owner = {s} and c.table_name = {t}) \
+         order by 1, 2, 3, 8",
+        s = ol(owner),
+        t = ol(table)
+    )
+}
+
+/// The foreign keys that reference a primary or unique key: the key is the parent constraint (`r_constraint_name`).
+async fn ora_key_usages(pool: &Pool, sc: &str, o: &ObjectRef) -> Result<Vec<Usage>> {
+    let table = table_of(o)?;
+    let rows = pool
+        .query_strings(&format!(
+            "select c.owner, c.table_name, c.constraint_name, cc.column_name, r.owner, r.table_name, rc.column_name, cc.position \
+             from all_constraints r \
+               join all_constraints c on c.r_owner = r.owner and c.r_constraint_name = r.constraint_name \
+               join all_cons_columns cc on cc.owner = c.owner and cc.constraint_name = c.constraint_name \
+               join all_cons_columns rc on rc.owner = r.owner and rc.constraint_name = r.constraint_name and rc.position = cc.position \
+             where c.constraint_type = 'R' and r.owner = {s} and r.table_name = {t} and r.constraint_name = {k} \
+             order by 1, 2, 3, 8",
+            s = ol(sc),
+            t = ol(&table),
+            k = ol(&o.name)
+        ))
+        .await?;
+    let t = Target {
+        schema: sc.to_string(),
+        name: table,
+        column: None,
+        key: None,
+    };
+    Ok(fk_usages(&ora_fks(&rows), &t))
+}
+
+/// `(owner, name) in (...)` predicates over `pairs` (`name_col` names the object column), at most 500 pairs each: an
+/// Oracle IN list takes 1000 items.
+fn ora_pair_filters(pairs: &[(String, String)], name_col: &str) -> Vec<String> {
+    pairs
+        .chunks(500)
+        .map(|c| {
+            let list = c
+                .iter()
+                .map(|(o, n)| format!("({}, {})", ol(o), ol(n)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("(owner, {name_col}) in ({list})")
+        })
+        .collect()
+}
+
+/// Is `line` the header of routine `name` (`function name (...)`, `procedure name ...`)?
+fn declares(line: &str, name: &str) -> bool {
+    let mut words = line.split_whitespace();
+    let is_routine = words
+        .next()
+        .is_some_and(|k| same(k, "function") || same(k, "procedure"));
+    is_routine
+        && words
+            .next()
+            .and_then(|n| n.split('(').next())
+            .is_some_and(|n| same(n, name))
+}
+
+/// Oracle's own owners (SYS, SYSTEM, ...): their text is never searched.
+const ORA_USER_OWNERS: &str =
+    "owner in (select username from all_users where oracle_maintained = 'N')";
+
 async fn ora_usages(pool: &Pool, o: &ObjectRef) -> Result<Vec<Usage>> {
     let sc = match &o.schema {
         Some(s) => s.clone(),
         None => crate::introspect::ora_current_schema(pool).await?,
     };
+    if matches!(o.kind, NodeKind::PrimaryKey | NodeKind::UniqueKey) {
+        return ora_key_usages(pool, &sc, o).await;
+    }
     // `dep`: the object the dependents refer to (the table of a column, the package of a routine that is a package
     // member); `word`: the name searched for in the text; `text_only`: only units with a text hit count (a column,
     // a package member: depending on the package is not using the member).
@@ -316,6 +427,18 @@ async fn ora_usages(pool: &Pool, o: &ObjectRef) -> Result<Vec<Usage>> {
         .collect::<Vec<_>>()
         .join(", ");
     let mut out = Vec::new();
+    // a package member: the body of its package is a unit too (a member calls the others); the other objects leave
+    // themselves out (the package body of a package target is not its usage)
+    let member = o.table.is_some()
+        && matches!(
+            o.kind,
+            NodeKind::Function | NodeKind::Procedure | NodeKind::Routine
+        );
+    let not_self = if member {
+        String::new()
+    } else {
+        format!(" and not (d.owner = {} and d.name = {})", ol(&sc), ol(&dep))
+    };
 
     // units that depend on the object; their detail says so unless the trigger list below describes them
     let mut units: BTreeMap<(String, String, UsageKind), (String, Option<String>)> =
@@ -323,10 +446,7 @@ async fn ora_usages(pool: &Pool, o: &ObjectRef) -> Result<Vec<Usage>> {
     for r in pool
         .query_strings(&format!(
             "select d.owner, d.name, d.type from all_dependencies d \
-             where d.referenced_owner = {} and d.referenced_name = {} and d.referenced_type in ({in_types}) \
-               and not (d.owner = {} and d.name = {})",
-            ol(&sc),
-            ol(&dep),
+             where d.referenced_owner = {} and d.referenced_name = {} and d.referenced_type in ({in_types}){not_self}",
             ol(&sc),
             ol(&dep)
         ))
@@ -384,87 +504,88 @@ async fn ora_usages(pool: &Pool, o: &ObjectRef) -> Result<Vec<Usage>> {
     }
     // foreign keys referencing the table; for a column, the ones on it or referencing it
     if matches!(o.kind, NodeKind::Table | NodeKind::Column) {
-        let rows = pool
-            .query_strings(&format!(
-                "select c.owner, c.table_name, c.constraint_name, cc.column_name, r.owner, r.table_name, rc.column_name \
-                 from all_constraints c \
-                 join all_cons_columns cc on cc.owner = c.owner and cc.constraint_name = c.constraint_name \
-                 join all_constraints r on r.owner = c.r_owner and r.constraint_name = c.r_constraint_name \
-                 join all_cons_columns rc on rc.owner = r.owner and rc.constraint_name = r.constraint_name \
-                   and rc.position = cc.position \
-                 where c.constraint_type = 'R' \
-                   and ((c.owner = {s} and c.table_name = {t}) or (r.owner = {s} and r.table_name = {t})) \
-                 order by c.owner, c.table_name, c.constraint_name, cc.position",
-                s = ol(&sc),
-                t = ol(&dep)
-            ))
-            .await?;
-        let fks: Vec<FkCol> = rows
-            .iter()
-            .map(|r| FkCol {
-                child_schema: cell(r, 0),
-                child_table: cell(r, 1),
-                group: cell(r, 2),
-                constraint: cell(r, 2),
-                child_col: cell(r, 3),
-                parent_schema: cell(r, 4),
-                parent_table: cell(r, 5),
-                parent_col: cell(r, 6),
-            })
-            .collect();
+        let rows = pool.query_strings(&ora_fk_sql(&sc, &dep)).await?;
         let t = Target {
             schema: sc.clone(),
             name: dep.clone(),
             column: column.clone(),
+            key: None,
         };
-        out.extend(fk_usages(&fks, &t));
+        out.extend(fk_usages(&ora_fks(&rows), &t));
     }
 
-    // text hits per unit: the PL/SQL lines that mention the name, a view whose text mentions the column
+    // text hits per unit: the PL/SQL lines that mention the name, a view whose text mentions the column. Only the
+    // units found above are read (no unit, no scan), in their own owners' text: Oracle's own packages never are
     let mut hits: BTreeMap<(String, String, UsageKind), Vec<Usage>> = BTreeMap::new();
     let like = format!("%{}%", word.to_uppercase());
-    for r in pool
-        .query_strings(&format!(
-            "select owner, name, type, line, text from all_source \
-             where upper(text) like {} and type in ('FUNCTION', 'PROCEDURE', 'PACKAGE', 'PACKAGE BODY', 'TRIGGER')",
-            ol(&like)
-        ))
-        .await?
-    {
-        let Some(k) = ora_kind(&cell(&r, 2)) else { continue };
-        let key = (cell(&r, 0), cell(&r, 1), k);
-        let text = cell(&r, 4);
-        let Some((_, table)) = units.get(&key) else { continue };
-        if !contains_word(&text, &word) {
-            continue;
-        }
-        hits.entry(key.clone()).or_default().push(Usage {
-            schema: key.0.clone(),
-            name: key.1.clone(),
-            kind: k,
-            detail: clip(text.trim()),
-            line: cell(&r, 3).parse().ok(),
-            table: table.clone(),
-        });
-    }
-    if is_column {
+    let pairs: Vec<(String, String)> = units
+        .keys()
+        .map(|(o, n, _)| (o.clone(), n.clone()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    for filter in ora_pair_filters(&pairs, "name") {
         for r in pool
             .query_strings(&format!(
-                "select owner, view_name, text_vc from all_views where upper(text_vc) like {}",
+                "select owner, name, type, line, text from all_source \
+                 where upper(text) like {} and type in ('FUNCTION', 'PROCEDURE', 'PACKAGE', 'PACKAGE BODY', 'TRIGGER') \
+                   and {filter} and {ORA_USER_OWNERS}",
                 ol(&like)
             ))
             .await?
         {
-            let key = (cell(&r, 0), cell(&r, 1), UsageKind::View);
-            if units.contains_key(&key) && contains_word(&cell(&r, 2), &word) {
-                hits.entry(key.clone()).or_default().push(Usage {
-                    schema: key.0.clone(),
-                    name: key.1.clone(),
-                    kind: UsageKind::View,
-                    detail: format!("references column {word}"),
-                    line: None,
-                    table: None,
-                });
+            let Some(k) = ora_kind(&cell(&r, 2)) else { continue };
+            let key = (cell(&r, 0), cell(&r, 1), k);
+            let text = cell(&r, 4);
+            let Some((_, table)) = units.get(&key) else { continue };
+            if !contains_word(&text, &word) || (member && declares(&text, &word)) {
+                continue;
+            }
+            hits.entry(key.clone()).or_default().push(Usage {
+                schema: key.0.clone(),
+                name: key.1.clone(),
+                kind: k,
+                detail: clip(text.trim()),
+                line: cell(&r, 3).parse().ok(),
+                table: table.clone(),
+            });
+        }
+    }
+    if is_column {
+        let views: Vec<(String, String)> = units
+            .keys()
+            .filter(|k| k.2 == UsageKind::View)
+            .map(|k| (k.0.clone(), k.1.clone()))
+            .collect();
+        // `TEXT_VC` is cut at 4000 characters: a longer view is read from `TEXT` (LONG) through a function that returns
+        // a CLOB (a VARCHAR2 result is limited to 4000 bytes in SQL here)
+        for filter in ora_pair_filters(&views, "view_name") {
+            for r in pool
+                .query_strings(&format!(
+                    "with function prometeo_view_text(o varchar2, n varchar2) return clob is r clob; \
+                     begin dbms_lob.createtemporary(r, true); \
+                       for x in (select text from all_views where owner = o and view_name = n) loop \
+                         dbms_lob.writeappend(r, length(x.text), x.text); \
+                       end loop; \
+                       return r; \
+                     end; \
+                     select owner, view_name, \
+                            case when text_vc is null or length(text_vc) >= 4000 then prometeo_view_text(owner, view_name) else to_clob(text_vc) end \
+                     from all_views where {filter} and {ORA_USER_OWNERS}"
+                ))
+                .await?
+            {
+                let key = (cell(&r, 0), cell(&r, 1), UsageKind::View);
+                if units.contains_key(&key) && contains_word(&cell(&r, 2), &word) {
+                    hits.entry(key.clone()).or_default().push(Usage {
+                        schema: key.0.clone(),
+                        name: key.1.clone(),
+                        kind: UsageKind::View,
+                        detail: format!("references column {word}"),
+                        line: None,
+                        table: None,
+                    });
+                }
             }
         }
     }
@@ -520,6 +641,7 @@ async fn pg_usages(pool: &Pool, o: &ObjectRef) -> Result<Vec<Usage>> {
             pg_relation(pool, &sc, o).await
         }
         NodeKind::Sequence => pg_routine_text(pool, &o.name, None, None).await,
+        NodeKind::PrimaryKey | NodeKind::UniqueKey => pg_key_usages(pool, &sc, o).await,
         NodeKind::Function | NodeKind::Procedure | NodeKind::Routine => {
             let mut out =
                 pg_routine_text(pool, &o.name, None, Some((sc.as_str(), o.name.as_str()))).await?;
@@ -542,6 +664,35 @@ async fn pg_usages(pool: &Pool, o: &ObjectRef) -> Result<Vec<Usage>> {
         }
         _ => Ok(Vec::new()),
     }
+}
+
+/// The foreign keys that reference a primary or unique key: their referenced columns are the key's columns (the
+/// order may differ, so the two arrays are compared as sets).
+async fn pg_key_usages(pool: &Pool, sc: &str, o: &ObjectRef) -> Result<Vec<Usage>> {
+    let rel = pg_rel(sc, &table_of(o)?);
+    let mut out = Vec::new();
+    for r in pool
+        .query_strings(&format!(
+            "select n.nspname::text, c.relname::text, k.conname::text, pg_get_constraintdef(k.oid) \
+             from pg_constraint k join pg_class c on c.oid = k.conrelid join pg_namespace n on n.oid = c.relnamespace \
+             where k.contype = 'f' and k.confrelid = {rel} \
+               and exists (select 1 from pg_constraint p where p.conrelid = {rel} and p.conname = {name} \
+                           and p.contype in ('p', 'u') and p.conkey <@ k.confkey and k.confkey <@ p.conkey) \
+             order by 1, 2, 3",
+            name = pl(&o.name)
+        ))
+        .await?
+    {
+        out.push(Usage {
+            schema: cell(&r, 0),
+            name: cell(&r, 1),
+            kind: UsageKind::ForeignKey,
+            detail: format!("{}: {}", cell(&r, 2), cell(&r, 3)),
+            line: None,
+            table: Some(cell(&r, 1)),
+        });
+    }
+    Ok(out)
 }
 
 /// Views, foreign keys, triggers, indexes and routine texts that use a table, or a column of it.
@@ -668,7 +819,7 @@ async fn pg_routine_text(
         .query_strings(&format!(
             "select n.nspname::text, p.proname::text, p.prokind::text, p.prosrc::text from pg_proc p \
              join pg_namespace n on n.oid = p.pronamespace \
-             where p.prosrc ilike {} and n.nspname not in ('pg_catalog', 'information_schema')",
+             where p.prosrc ilike {} and n.nspname::text !~ '^pg_' and n.nspname <> 'information_schema'",
             pl(&format!("%{word}%"))
         ))
         .await?
@@ -701,11 +852,67 @@ async fn pg_routine_text(
 
 // ============================================================ MySQL
 
+/// The foreign keys on `table` or referencing it (one row per column pair, in constraint and position order).
+async fn my_fks(pool: &Pool, sc: &str, table: &str) -> Result<Vec<FkCol>> {
+    let rows = pool
+        .query_strings(&format!(
+            "select table_schema, table_name, constraint_name, column_name, referenced_table_schema, \
+                    referenced_table_name, referenced_column_name \
+             from information_schema.KEY_COLUMN_USAGE where referenced_table_name is not null \
+               and ((referenced_table_schema = {s} and referenced_table_name = {t}) \
+                    or (table_schema = {s} and table_name = {t})) \
+             order by table_schema, table_name, constraint_name, ordinal_position",
+            s = ml(sc),
+            t = ml(table)
+        ))
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| FkCol {
+            child_schema: cell(r, 0),
+            child_table: cell(r, 1),
+            group: cell(r, 2),
+            constraint: cell(r, 2),
+            child_col: cell(r, 3),
+            parent_schema: cell(r, 4),
+            parent_table: cell(r, 5),
+            parent_col: cell(r, 6),
+        })
+        .collect())
+}
+
+/// The foreign keys that reference a primary or unique key: the ones whose referenced columns are the key's columns.
+async fn my_key_usages(pool: &Pool, sc: &str, o: &ObjectRef) -> Result<Vec<Usage>> {
+    let table = table_of(o)?;
+    let cols: Vec<String> = pool
+        .query_strings(&format!(
+            "select column_name from information_schema.KEY_COLUMN_USAGE \
+             where table_schema = {} and table_name = {} and constraint_name = {} order by ordinal_position",
+            ml(sc),
+            ml(&table),
+            ml(&o.name)
+        ))
+        .await?
+        .iter()
+        .map(|r| cell(r, 0))
+        .collect();
+    let t = Target {
+        schema: sc.to_string(),
+        name: table.clone(),
+        column: None,
+        key: Some(cols),
+    };
+    Ok(fk_usages(&my_fks(pool, sc, &table).await?, &t))
+}
+
 async fn my_usages(pool: &Pool, o: &ObjectRef) -> Result<Vec<Usage>> {
     let sc = match &o.schema {
         Some(s) => s.clone(),
         None => first(pool, "select database()").await?.unwrap_or_default(),
     };
+    if matches!(o.kind, NodeKind::PrimaryKey | NodeKind::UniqueKey) {
+        return my_key_usages(pool, &sc, o).await;
+    }
     // `table`: the table (a column's), `word`: the name searched for, `column`: the column of a column target
     let (table, column) = match o.kind {
         NodeKind::Table | NodeKind::View | NodeKind::MaterializedView => (o.name.clone(), None),
@@ -733,7 +940,8 @@ async fn my_usages(pool: &Pool, o: &ObjectRef) -> Result<Vec<Usage>> {
     for r in pool
         .query_strings(&format!(
             "select table_schema, table_name, view_definition from information_schema.VIEWS \
-             where view_definition like {}",
+             where view_definition like {} \
+               and table_schema not in ('mysql', 'sys', 'information_schema', 'performance_schema')",
             ml(&format!("%{word}%"))
         ))
         .await?
@@ -784,37 +992,13 @@ async fn my_usages(pool: &Pool, o: &ObjectRef) -> Result<Vec<Usage>> {
     }
 
     if matches!(o.kind, NodeKind::Table | NodeKind::Column) {
-        let rows = pool
-            .query_strings(&format!(
-                "select table_schema, table_name, constraint_name, column_name, referenced_table_schema, \
-                        referenced_table_name, referenced_column_name \
-                 from information_schema.KEY_COLUMN_USAGE where referenced_table_name is not null \
-                   and ((referenced_table_schema = {s} and referenced_table_name = {t}) \
-                        or (table_schema = {s} and table_name = {t})) \
-                 order by table_schema, table_name, constraint_name, ordinal_position",
-                s = ml(&sc),
-                t = ml(&table)
-            ))
-            .await?;
-        let fks: Vec<FkCol> = rows
-            .iter()
-            .map(|r| FkCol {
-                child_schema: cell(r, 0),
-                child_table: cell(r, 1),
-                group: cell(r, 2),
-                constraint: cell(r, 2),
-                child_col: cell(r, 3),
-                parent_schema: cell(r, 4),
-                parent_table: cell(r, 5),
-                parent_col: cell(r, 6),
-            })
-            .collect();
         let t = Target {
             schema: sc.clone(),
             name: table.clone(),
             column: column.clone(),
+            key: None,
         };
-        out.extend(fk_usages(&fks, &t));
+        out.extend(fk_usages(&my_fks(pool, &sc, &table).await?, &t));
     }
 
     if o.kind == NodeKind::Table {
@@ -953,6 +1137,7 @@ async fn lite_usages(pool: &Pool, o: &ObjectRef) -> Result<Vec<Usage>> {
             schema: sc.clone(),
             name: table.clone(),
             column: column.clone(),
+            key: None,
         };
         out.extend(fk_usages(&fks, &t));
     }
@@ -1036,7 +1221,77 @@ mod tests {
             schema: "shop".into(),
             name: name.into(),
             column: column.map(str::to_string),
+            key: None,
         }
+    }
+
+    #[test]
+    fn key_target_lists_the_keys_that_reference_its_columns_only() {
+        let rows = vec![
+            fk(
+                "orders",
+                "fk_by_id",
+                "fk_by_id",
+                "customer_id",
+                "customers",
+                "id",
+            ),
+            fk(
+                "addresses",
+                "fk_by_mail",
+                "fk_by_mail",
+                "email",
+                "customers",
+                "mail",
+            ),
+        ];
+        let key = |cols: &[&str]| Target {
+            key: Some(cols.iter().map(|c| c.to_string()).collect()),
+            ..target("customers", None)
+        };
+        let got = fk_usages(&rows, &key(&["id"]));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "orders");
+        // the order of the key's columns does not matter
+        assert_eq!(fk_usages(&rows, &key(&["mail"])).len(), 1);
+        assert!(fk_usages(&rows, &key(&["id", "mail"])).is_empty());
+    }
+
+    #[test]
+    fn same_columns_in_any_order() {
+        let v = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(same_set(&v(&["a", "B"]), &v(&["b", "a"])));
+        assert!(!same_set(&v(&["a"]), &v(&["a", "b"])));
+        assert!(!same_set(&v(&["a", "b"]), &v(&["a"])));
+    }
+
+    #[test]
+    fn oracle_pair_filters_split_long_lists() {
+        assert!(ora_pair_filters(&[], "name").is_empty());
+        let pairs: Vec<(String, String)> = (0..1200)
+            .map(|i| ("SHOP".to_string(), format!("U{i}")))
+            .collect();
+        let filters = ora_pair_filters(&pairs, "name");
+        assert_eq!(filters.len(), 3);
+        assert!(filters[0].starts_with("(owner, name) in (('SHOP', 'U0'), "));
+        assert!(filters[2].ends_with("('SHOP', 'U1199'))"));
+        let views = ora_pair_filters(&pairs[..1], "view_name");
+        assert_eq!(views, vec!["(owner, view_name) in (('SHOP', 'U0'))"]);
+    }
+
+    #[test]
+    fn a_routine_header_is_a_declaration_not_a_use() {
+        assert!(declares(
+            "  function total_of (p number) return number is",
+            "total_of"
+        ));
+        assert!(declares("procedure TOTAL_OF(p number);", "total_of"));
+        assert!(!declares("  return total_of(p) * 2;", "total_of"));
+        assert!(!declares(
+            "  function total_of_all (p number) return number is",
+            "total_of"
+        ));
+        assert!(!declares("  -- procedure total_of is retired", "total_of"));
     }
 
     #[test]

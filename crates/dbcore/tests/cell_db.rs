@@ -515,4 +515,164 @@ mod oracle {
         )
         .await;
     }
+
+    /// Characters of 1, 2 and 4 bytes (the emoji is two UTF-16 units). The emoji starts at unit 1000, so the server's
+    /// first 1000-unit piece ends inside it: the read must go on piece by piece.
+    fn straddling_text() -> String {
+        format!("{}{}", "a".repeat(999), "😀é€".repeat(1500))
+    }
+
+    /// The first `n` bytes of `s`, cut back to a character boundary.
+    fn prefix(s: &str, n: usize) -> &str {
+        let mut end = n.min(s.len());
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
+    }
+
+    const DROP_BIG: &str =
+        "begin execute immediate 'drop table CV_BIG purge'; exception when others then null; end;\n/";
+    const DROP_TXT: &str =
+        "begin execute immediate 'drop table CV_TXT purge'; exception when others then null; end;\n/";
+
+    #[tokio::test]
+    async fn blob_of_3_mb_is_cut_on_the_server() {
+        let (cfg, mgr) = setup!();
+        let t = ObjectRef::table(None, "CV_BIG");
+        run_sql(&mgr, DROP_BIG).await;
+        run_sql(&mgr, "create table CV_BIG (ID number primary key, B blob)").await;
+        let blob: Vec<u8> = (0..3_000_000u32)
+            .map(|i| (i.wrapping_mul(31) % 251) as u8)
+            .collect();
+        insert(
+            &mgr,
+            &cfg.id,
+            &t,
+            json!({"ID": 1, "B": {"$bin": hex(&blob), "len": blob.len()}}),
+        )
+        .await;
+
+        // the first 1 MB of 3 MB, and the length of the whole (a first read warms up the column introspection)
+        mgr.fetch_cell(&cfg.id, &t, &key("ID", 1), "B", 1 << 20)
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let cut = mgr
+            .fetch_cell(&cfg.id, &t, &key("ID", 1), "B", 1 << 20)
+            .await
+            .unwrap();
+        eprintln!("oracle 3 MB BLOB, 1 MB cap: {:?}", started.elapsed());
+        assert_eq!(bytes_of(&cut), blob[..1 << 20]);
+        assert_eq!((cut.len, cut.truncated), (3_000_000, true));
+
+        let started = std::time::Instant::now();
+        let full = mgr
+            .fetch_cell(&cfg.id, &t, &key("ID", 1), "B", 0)
+            .await
+            .unwrap();
+        eprintln!("oracle 3 MB BLOB, whole: {:?}", started.elapsed());
+        assert_eq!(bytes_of(&full), blob);
+        assert_eq!((full.len, full.truncated), (3_000_000, false));
+
+        // caps that are not piece sizes, and one byte
+        for cap in [1u64, 1999, 2000, 2001, 4001] {
+            let c = mgr
+                .fetch_cell(&cfg.id, &t, &key("ID", 1), "B", cap)
+                .await
+                .unwrap();
+            assert_eq!(bytes_of(&c), blob[..cap as usize], "cap {cap}");
+            assert_eq!((c.len, c.truncated), (3_000_000, true), "cap {cap}");
+        }
+        run_sql(&mgr, DROP_BIG).await;
+    }
+
+    #[tokio::test]
+    async fn text_lobs_are_read_exactly_across_piece_boundaries() {
+        let (cfg, mgr) = setup!();
+        let t = ObjectRef::table(None, "CV_TXT");
+        run_sql(&mgr, DROP_TXT).await;
+        run_sql(
+            &mgr,
+            "create table CV_TXT (ID number primary key, C clob, N nclob)",
+        )
+        .await;
+        let text = straddling_text();
+        let units = text.encode_utf16().count() as u64; // 6999
+        let small = "😀é"; // 6 bytes, 3 units
+        let accents = "é".repeat(3000); // 6000 bytes, 3000 units
+        insert(&mgr, &cfg.id, &t, json!({"ID": 1, "C": text, "N": text})).await;
+        insert(&mgr, &cfg.id, &t, json!({"ID": 2, "C": small, "N": small})).await;
+        insert(
+            &mgr,
+            &cfg.id,
+            &t,
+            json!({"ID": 3, "C": accents, "N": accents}),
+        )
+        .await;
+        insert(&mgr, &cfg.id, &t, json!({"ID": 4})).await;
+
+        for col in ["C", "N"] {
+            // the whole value: its UTF-8 size
+            let full = mgr
+                .fetch_cell(&cfg.id, &t, &key("ID", 1), col, 0)
+                .await
+                .unwrap();
+            assert_eq!(text_of(&full), text, "{col} whole");
+            assert_eq!((full.len, full.truncated), (text.len() as u64, false));
+
+            // cuts at every kind of boundary, around the 1000-unit pieces
+            for cap in [
+                1usize, 2, 3, 4, 5, 998, 999, 1000, 1001, 1002, 1003, 1004, 1005, 2000, 2003, 5000,
+            ] {
+                let c = mgr
+                    .fetch_cell(&cfg.id, &t, &key("ID", 1), col, cap as u64)
+                    .await
+                    .unwrap();
+                assert_eq!(text_of(&c), prefix(&text, cap), "{col} cap {cap}");
+                // not read whole: the length is in UTF-16 units
+                assert_eq!((c.len, c.truncated), (units, true), "{col} cap {cap}");
+            }
+            // the pieces cover the whole value here, so its UTF-8 size is known
+            let c = mgr
+                .fetch_cell(&cfg.id, &t, &key("ID", 1), col, 13000)
+                .await
+                .unwrap();
+            assert_eq!(text_of(&c), prefix(&text, 13000), "{col} cap 13000");
+            assert_eq!((c.len, c.truncated), (text.len() as u64, true));
+
+            // a character of 4 bytes does not fit in 3 bytes; the whole value is read because it is 3 units
+            let c = mgr
+                .fetch_cell(&cfg.id, &t, &key("ID", 2), col, 3)
+                .await
+                .unwrap();
+            assert_eq!(text_of(&c), "", "{col}: the emoji does not fit");
+            assert_eq!((c.len, c.truncated), (6, true));
+            let c = mgr
+                .fetch_cell(&cfg.id, &t, &key("ID", 2), col, 4)
+                .await
+                .unwrap();
+            assert_eq!(text_of(&c), "😀");
+
+            // no piece boundary in the middle of a 2-byte character: 2001 bytes give 1000 characters
+            let c = mgr
+                .fetch_cell(&cfg.id, &t, &key("ID", 3), col, 2001)
+                .await
+                .unwrap();
+            assert_eq!(text_of(&c), "é".repeat(1000), "{col} accents");
+            assert_eq!((c.len, c.truncated), (6000, true));
+
+            let e = mgr
+                .fetch_cell(&cfg.id, &t, &key("ID", 4), col, 0)
+                .await
+                .unwrap_err();
+            assert!(e.to_string().contains("NULL"), "{e}");
+            let e = mgr
+                .fetch_cell(&cfg.id, &t, &key("ID", 99), col, 0)
+                .await
+                .unwrap_err();
+            assert!(e.to_string().contains("no longer exists"), "{e}");
+        }
+        run_sql(&mgr, DROP_TXT).await;
+    }
 }

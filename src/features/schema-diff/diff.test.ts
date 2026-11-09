@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { CompareColumn, CompareForeignKey, CompareIndex, CompareRoutine, CompareSequence, CompareTable, CompareView, Driver, SchemaModel } from "../../api/types";
-import { DEFAULT_DIFF_OPTIONS, type DiffNode, diffSchemas, filterDiff, nameKey, pairBy, routineLabel, summarize, visibleRows } from "./diff";
+import type { CompareColumn, CompareForeignKey, CompareIndex, CompareKey, CompareRoutine, CompareSequence, CompareTable, CompareView, Driver, SchemaModel } from "../../api/types";
+import { columnChanges, DEFAULT_DIFF_OPTIONS, type DiffNode, diffSchemas, filterDiff, indexDefinition, keyDefinition, nameKey, normDefault, pairBy, pairItems, routineLabel, summarize, visibleRows } from "./diff";
 
 const col = (name: string, dataType = "varchar(50)", extra: Partial<CompareColumn> = {}): CompareColumn => ({
   name,
@@ -288,5 +288,78 @@ describe("filterDiff and visibleRows", () => {
     expect(collapsed.some((r) => r.node.name === "gone")).toBe(false);
     const expanded = visibleRows(root, new Set([find(root, "schema/table:t")?.id ?? ""]));
     expect(expanded.find((r) => r.node.name === "gone")?.depth).toBe(1);
+  });
+});
+
+describe("system-made names, constraint states and index options", () => {
+  const ix = (p: Partial<CompareIndex>): CompareIndex => ({ name: "IX", columns: ["NAME"], unique: false, method: "", predicate: null, ...p });
+  const keyed = {
+    name: (k: CompareKey) => k.name,
+    definition: keyDefinition,
+    generated: (k: CompareKey) => k.generatedName === true,
+  };
+
+  it("pairs a constraint whose name the system made up with one of the same definition, whatever the names", () => {
+    const pairs = pairItems("oracle", [{ name: "SYS_C001", columns: ["ID"], generatedName: true }], [{ name: "SYS_C101", columns: ["ID"], generatedName: true }], keyed, DEFAULT_DIFF_OPTIONS);
+    expect(pairs).toHaveLength(1);
+    expect(pairs[0].left && pairs[0].right).toBeTruthy();
+  });
+
+  it("pairs a named constraint with a system-made one of the same definition", () => {
+    const pairs = pairItems("oracle", [{ name: "PK_T", columns: ["ID"] }], [{ name: "SYS_C101", columns: ["ID"], generatedName: true }], keyed, DEFAULT_DIFF_OPTIONS);
+    expect(pairs).toHaveLength(1);
+    expect(pairs[0].left && pairs[0].right).toBeTruthy();
+  });
+
+  it("never pairs two named constraints by definition", () => {
+    const pairs = pairItems("oracle", [{ name: "A", columns: ["ID"] }], [{ name: "B", columns: ["ID"] }], keyed, DEFAULT_DIFF_OPTIONS);
+    expect(pairs.map((p) => [!!p.left, !!p.right])).toEqual([
+      [true, false],
+      [false, true],
+    ]);
+  });
+
+  it("reports a primary key with a system name on each side, same columns, as the same", () => {
+    const a = model("oracle", "A", { tables: [table("T", { columns: [col("ID", "NUMBER(10)")], primaryKey: { name: "SYS_C001", columns: ["ID"], generatedName: true } })] });
+    const b = model("oracle", "B", { tables: [table("T", { columns: [col("ID", "NUMBER(10)")], primaryKey: { name: "SYS_C101", columns: ["ID"], generatedName: true } })] });
+    expect(diffSchemas(a, b).status).toBe("same");
+  });
+
+  it("reports a change of state as a change line in the words of the dialect", () => {
+    const withFk = (enabled: boolean) =>
+      model("oracle", "S", {
+        tables: [table("T", { columns: [col("ID", "NUMBER(10)")], foreignKeys: [{ name: "T_FK", columns: ["ID"], refSchema: null, refTable: "U", refColumns: ["ID"], onDelete: "NO ACTION", enabled }] })],
+      });
+    const fkNode = find(diffSchemas(withFk(false), withFk(true)), "schema/table:T/foreignKey:T_FK");
+    expect(fkNode?.changes).toEqual(["state disabled -> enabled"]);
+    expect(fkNode?.status).toBe("changed");
+
+    const withCheck = (enabled: boolean) =>
+      model("postgres", "s", { tables: [table("T", { columns: [col("ID", "integer")], checks: [{ name: "CK_T", expression: "(ID > 0)", enabled }] })] });
+    const ckNode = find(diffSchemas(withCheck(false), withCheck(true)), "schema/table:T/check:CK_T");
+    expect(ckNode?.changes).toEqual(["state not validated -> validated"]);
+  });
+
+  it("compares Oracle defaults without case and white space outside string literals", () => {
+    expect(normDefault("oracle", "  sysdate ")).toBe("SYSDATE");
+    expect(normDefault("oracle", "'Abc'  ")).toBe("'Abc'");
+    expect(normDefault("oracle", "'a' || 'b'")).toBe("'a' || 'b'");
+    expect(normDefault("oracle", "nvl( x ,  'Y' )")).toBe("NVL( X , 'Y' )");
+    expect(normDefault("oracle", "null")).toBeNull();
+    expect(normDefault("oracle", null)).toBeNull();
+    expect(normDefault("postgres", " sysdate ")).toBe(" sysdate ");
+  });
+
+  it("reports no default change on Oracle for the same default written differently, but one on PostgreSQL", () => {
+    const l = col("C", "DATE", { default: "sysdate" });
+    const r = col("C", "DATE", { default: "SYSDATE " });
+    expect(columnChanges(l, r, "oracle")).toEqual([]);
+    expect(columnChanges(l, r, "postgres")).toEqual(["default sysdate -> SYSDATE "]);
+  });
+
+  it("writes the bitmap flag and the descending columns in an index definition", () => {
+    expect(indexDefinition(ix({ columns: ["SAL", "NAME"], descending: [true, false] }))).toBe("(SAL desc, NAME)");
+    expect(indexDefinition(ix({ columns: ["STATUS"], bitmap: true, method: "normal" }))).toBe("bitmap (STATUS) normal");
+    expect(indexDefinition(ix({ columns: ["A"], unique: true }))).toBe("unique (A)");
   });
 });

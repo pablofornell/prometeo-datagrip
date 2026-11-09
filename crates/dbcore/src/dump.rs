@@ -12,20 +12,25 @@
 //! * MySQL: `SHOW CREATE ...`, data inserts wrapped in `SET FOREIGN_KEY_CHECKS=0` / `1`.
 //! * SQLite: `sqlite_master.sql`, data inserts wrapped in `PRAGMA foreign_keys=OFF` / `ON`.
 //! * Oracle: rebuilt from the `ALL_*` dictionary views. Order: header (`ALTER SESSION SET CURRENT_SCHEMA` with a
-//!   target schema; names are unqualified) → object types (specs in dependency order, then bodies) → standalone
+//!   target schema; names are unqualified) → object type specs (dependency order) → standalone
 //!   sequences (`START WITH` the current value) → `CREATE TABLE` (identity, virtual columns, PK / unique / check,
-//!   the `PARTITION BY` clause; no foreign keys) → data `INSERT`s with NLS-independent literals (`COMMIT` every
-//!   `commit_every` rows and at the end of each table; `XMLTYPE(..)` / `JSON(..)` for those columns, the
-//!   attributes of an object column in its constructor) → indexes (`LOCAL` for a local index) → foreign keys →
-//!   private synonyms → views → materialized views (built from their query, no data) → package specs, functions /
-//!   procedures, package bodies, triggers (each ended by a `/` line). Dropping (`drop_if_exists`) is a PL/SQL block
-//!   that ignores "does not exist"; a full dump drops the types `FORCE` before it creates them again, a subset drops
-//!   its own tables first (so the types they use can be replaced).
+//!   the `PARTITION BY` clause; no foreign keys; a constraint on a hidden column is left out, with a warning) → data
+//!   `INSERT`s with NLS-independent literals (`COMMIT` every `commit_every` rows and at the end of each table;
+//!   `XMLTYPE(..)` / `JSON(..)` for those columns, the attributes of an object column in its constructor) → indexes
+//!   (`LOCAL` only for a table restored partitioned) → foreign keys → private synonyms → views → materialized views
+//!   (built from their query, no data) → package specs, functions / procedures, package bodies, triggers, object
+//!   type bodies (each ended by a `/` line; the bodies last, since one that selects from a table or calls a routine
+//!   is INVALID before that exists). Dropping (`drop_if_exists`) is a PL/SQL block that ignores "does not exist". A
+//!   full dump drops its tables (`CASCADE CONSTRAINTS PURGE`) and then its types without `FORCE` (a type that still
+//!   has dependents stops the script with ORA-02303, rather than marking columns of other tables UNUSED); a subset
+//!   drops its own tables first (so the types they use can be replaced) and warns about the tables left out that use
+//!   one of its types.
 //!
 //! Scope: plain base tables (PG `relkind` `r` and `p`; SQLite tables; MySQL base tables). Oracle: partitioned
-//! tables with their partitions (not reference partitioning), materialized view logs are not dumped (a fast
-//! refreshable view is restored with `REFRESH FORCE`), collection columns and objects with non-scalar attributes
-//! have no data (a warning). Owner statements are not written. `file_per_table` is not implemented.
+//! tables with their partitions (not reference partitioning: that child is created unpartitioned, with a warning),
+//! materialized view logs are not dumped (a fast refreshable view is restored with `REFRESH FORCE`), collection
+//! columns and objects with non-scalar attributes have no data (a warning). Owner statements are not written.
+//! `file_per_table` is not implemented.
 
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
@@ -2531,6 +2536,7 @@ async fn dump_ora<W: Write>(
             crate::introspect::ora_table_filter("t")
         ))
         .await?;
+    let all_tables: Vec<String> = table_rows.iter().map(|r| s(r, 0)).collect();
     let table_rows: Vec<&Row> = table_rows
         .iter()
         .filter(|r| wanted(&opts.tables, &s(r, 0)))
@@ -2623,18 +2629,22 @@ async fn dump_ora<W: Write>(
     let con_rows = pool
         .query_strings(&format!(
             "select c.table_name, c.constraint_name, c.constraint_type, c.search_condition_vc, c.generated, c.status, \
-                    c.deferrable, c.deferred, cc.column_name \
+                    c.deferrable, c.deferred, cc.column_name, \
+                    (select count(*) from all_cons_columns hc \
+                     join all_tab_cols h on h.owner = hc.owner and h.table_name = hc.table_name \
+                                        and h.column_name = hc.column_name and h.user_generated = 'NO' \
+                     where hc.owner = c.owner and hc.constraint_name = c.constraint_name) as hidden \
              from all_constraints c \
              left join all_cons_columns cc on cc.owner = c.owner and cc.constraint_name = c.constraint_name \
              where c.owner = {o} and c.constraint_type in ('P', 'U', 'C') \
-               and not exists (select 1 from all_tab_cols h where h.owner = c.owner and h.table_name = c.table_name \
-                               and h.column_name = cc.column_name and h.user_generated = 'NO') \
                and coalesce(instr(c.search_condition_vc, 'SYS_NC'), 0) = 0 \
              order by c.table_name, decode(c.constraint_type, 'P', 1, 'U', 2, 3), c.constraint_name, cc.position"
         ))
         .await?;
     let mut items_of: HashMap<String, Vec<String>> = HashMap::new();
     let mut pk_of: HashMap<String, Vec<String>> = HashMap::new();
+    // constraints left out because one of their columns is hidden: their names, by table
+    let mut skipped_of: HashMap<String, Vec<String>> = HashMap::new();
     {
         // one entry per constraint, its columns collected
         let mut cur: Option<(String, String, Vec<String>, &Row)> = None;
@@ -2642,6 +2652,11 @@ async fn dump_ora<W: Write>(
             let Some((table, name, columns, r)) = c else {
                 return;
             };
+            // a hidden column cannot be named in the restore: the constraint is skipped whole, never partly written
+            if s(r, 9) != "0" {
+                skipped_of.entry(table).or_default().push(name);
+                return;
+            }
             let kind = s(r, 2);
             let cond = s(r, 3);
             let named = if s(r, 4) == "GENERATED NAME" {
@@ -2935,8 +2950,9 @@ async fn dump_ora<W: Write>(
         }
     }
 
-    // ---- object types: the specs in dependency order, then the bodies, before the tables that may use them.
-    // A subset of tables brings the types they use (and the types those use); a full dump brings them all.
+    // ---- object types: the specs in dependency order, before the tables that may use them. A subset of tables
+    // brings the types they use (and the types those use); a full dump brings them all. The bodies come last.
+    let mut type_bodies: Vec<String> = Vec::new();
     if opts.include_ddl {
         let src = pool
             .query_strings(&format!(
@@ -2992,13 +3008,52 @@ async fn dump_ora<W: Write>(
         };
         needed.retain(|n| spec_names.contains(n));
         let type_order = topo_sort(&needed, &edges);
+        if opts.tables.is_some() {
+            // a table left out of the subset that uses one of these types: replacing the type stops the restore there
+            let mut outside: Vec<(String, String)> = Vec::new();
+            for t in all_tables.iter().filter(|t| !names.contains(t)) {
+                for c in cols_of.get(t).into_iter().flatten() {
+                    if c.type_owner == schema && type_order.contains(&c.base) {
+                        outside.push((t.clone(), c.base.clone()));
+                    }
+                }
+            }
+            outside.sort();
+            outside.dedup();
+            for (t, ty) in outside {
+                writeln!(
+                    w,
+                    "-- table {t} is outside the dump and uses type {ty}: a restore that replaces {ty} stops there"
+                )?;
+                res.warnings.push(format!(
+                    "{t} uses type {ty}, which the dump writes: replacing {ty} stops the restore while {t} is there"
+                ));
+            }
+        }
         if opts.drop_if_exists && opts.tables.is_none() {
-            // a type with table dependents cannot be replaced: dropped first (FORCE), created again below
+            // a full dump: its tables go first, then the types without FORCE (FORCE would mark the columns of a type
+            // UNUSED in the tables outside the dump). A type that still has dependents stops the script here.
+            for name in order.iter().rev() {
+                writeln!(
+                    w,
+                    "{}",
+                    ora_drop_block(
+                        &format!("TABLE {} CASCADE CONSTRAINTS PURGE", qi(name)),
+                        &ORA_DROP_MISSING
+                    )
+                )?;
+            }
+            if !type_order.is_empty() {
+                writeln!(
+                    w,
+                    "-- types are dropped without FORCE: ORA-02303 below means a table outside this dump still uses one"
+                )?;
+            }
             for name in type_order.iter().rev() {
                 writeln!(
                     w,
                     "{}",
-                    ora_drop_block(&format!("TYPE {} FORCE", qi(name)), &ORA_DROP_MISSING)
+                    ora_drop_block(&format!("TYPE {}", qi(name)), &[-4043])
                 )?;
             }
         } else if opts.drop_if_exists && !type_order.is_empty() {
@@ -3029,12 +3084,9 @@ async fn dump_ora<W: Write>(
             .collect();
         bodies.sort();
         for name in bodies {
-            writeln!(
-                w,
-                "{}",
-                ora_unit_sql(&fix(&text_of[&("TYPE BODY".to_string(), name.clone())]))
-            )?;
-            writeln!(w)?;
+            type_bodies.push(ora_unit_sql(&fix(
+                &text_of[&("TYPE BODY".to_string(), name.clone())]
+            )));
         }
     }
 
@@ -3106,7 +3158,14 @@ async fn dump_ora<W: Write>(
                     "{name}: partitioning not restored, the table is created unpartitioned"
                 ));
             }
-            if opts.drop_if_exists {
+            for c in skipped_of.get(name).into_iter().flatten() {
+                writeln!(w, "-- constraint {c} not restored: it uses a hidden column")?;
+                res.warnings.push(format!(
+                    "{name}: constraint {c} not restored, it uses a hidden column"
+                ));
+            }
+            // a full dump dropped its tables before the types (see the object types above)
+            if opts.drop_if_exists && opts.tables.is_some() {
                 writeln!(
                     w,
                     "{}",
@@ -3220,11 +3279,23 @@ async fn dump_ora<W: Write>(
             } else {
                 ""
             };
-            // a local index is partitioned like its table; a global partitioned one becomes a plain index
-            let local = if s(head, 7) == "LOCAL" { " LOCAL" } else { "" };
+            // a local index is partitioned like its table: only when the table is restored partitioned (a reference
+            // or composite-over-hash partitioning is not, and `LOCAL` on a plain table fails); a global partitioned
+            // one becomes a plain index
+            let table_partitioned = defs[&table].partition.is_some();
+            let local = if s(head, 7) == "LOCAL" && table_partitioned {
+                " LOCAL"
+            } else {
+                ""
+            };
             if s(head, 7) == "GLOBAL" {
                 res.warnings.push(format!(
                     "index {index}: globally partitioned in the source, restored as a non-partitioned index"
+                ));
+            }
+            if s(head, 7) == "LOCAL" && !table_partitioned {
+                res.warnings.push(format!(
+                    "index {index}: local in the source, but its table is restored unpartitioned, so it is restored as a non-partitioned index"
                 ));
             }
             writeln!(
@@ -3461,6 +3532,12 @@ async fn dump_ora<W: Write>(
             }
             writeln!(w)?;
         }
+    }
+
+    // ---- object type bodies, last: one that selects from a table or calls a routine is INVALID before they exist
+    for body in &type_bodies {
+        writeln!(w, "{body}")?;
+        writeln!(w)?;
     }
 
     Ok(())

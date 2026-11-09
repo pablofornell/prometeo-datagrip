@@ -97,18 +97,61 @@ export function pairStatus<T>(p: Pair<T>, changed: boolean): DiffStatus {
 
 /**
  * Pairs the constraints / indexes of one table. With names kept they pair by name; with `ignoreConstraintNames` by
- * definition. Paired items are "changed" when the definitions differ (by name pairing only).
+ * definition. An item whose name the system made up (`generated`) never pairs by name: it pairs by definition with
+ * an item of the other side. Paired items are "changed" when the definitions differ (by name pairing only).
  */
 export function pairItems<T>(
   driver: Driver,
   left: readonly T[],
   right: readonly T[],
-  spec: { name: (x: T) => string; definition: (x: T) => string },
+  spec: { name: (x: T) => string; definition: (x: T) => string; generated?: (x: T) => boolean },
   opts: DiffOptions,
 ): Pair<T>[] {
-  const key = opts.ignoreConstraintNames ? spec.definition : (x: T) => nameKey(driver, spec.name(x));
-  return pairBy(left, right, key);
+  if (opts.ignoreConstraintNames) return pairBy(left, right, spec.definition);
+  const generated = spec.generated ?? (() => false);
+  const match: (number | undefined)[] = left.map(() => undefined);
+  const used = new Set<number>();
+  // by name, the items whose name is not made up
+  const byName = new Map<string, number[]>();
+  right.forEach((y, j) => {
+    if (generated(y)) return;
+    const k = nameKey(driver, spec.name(y));
+    const queue = byName.get(k);
+    if (queue) queue.push(j);
+    else byName.set(k, [j]);
+  });
+  left.forEach((x, i) => {
+    if (generated(x)) return;
+    const j = byName.get(nameKey(driver, spec.name(x)))?.shift();
+    if (j !== undefined) {
+      match[i] = j;
+      used.add(j);
+    }
+  });
+  // by definition, what is left when one side's name is made up by the system
+  left.forEach((x, i) => {
+    if (match[i] !== undefined) return;
+    const j = right.findIndex((y, n) => !used.has(n) && (generated(x) || generated(y)) && spec.definition(y) === spec.definition(x));
+    if (j >= 0) {
+      match[i] = j;
+      used.add(j);
+    }
+  });
+  const pairs: Pair<T>[] = left.map((x, i) => {
+    const y = match[i] === undefined ? undefined : right[match[i] as number];
+    return { key: generated(x) ? spec.definition(x) : nameKey(driver, spec.name(x)), left: x, right: y };
+  });
+  right.forEach((y, j) => {
+    if (!used.has(j)) pairs.push({ key: generated(y) ? spec.definition(y) : nameKey(driver, spec.name(y)), right: y });
+  });
+  return pairs;
 }
+
+/** A constraint is enabled unless it says otherwise (dialects without a state report nothing). */
+export const isEnabled = (x: { enabled?: boolean }): boolean => x.enabled !== false;
+
+/** The state of a constraint as the tree words it: PostgreSQL validates a constraint, the others enable it. */
+const stateText = (d: Driver, on: boolean): string => (d === "postgres" ? (on ? "validated" : "not validated") : on ? "enabled" : "disabled");
 
 // ---------------------------------------------------------------- definitions and change rules
 
@@ -133,18 +176,36 @@ export function foreignKeyDefinition(f: CompareForeignKey): string {
   return `${cols(f.columns)} references ${ref}${onDelete}`;
 }
 
+/** The columns of an index as text: a descending column is written `name desc`. */
+export const indexColumns = (i: CompareIndex): string[] => i.columns.map((c, n) => (i.descending?.[n] ? `${c} desc` : c));
+
 export function indexDefinition(i: CompareIndex): string {
   const method = i.method ? ` ${i.method}` : "";
   const where = i.predicate ? ` where ${i.predicate}` : "";
-  return `${i.unique ? "unique " : ""}${cols(i.columns)}${method}${where}`;
+  const kind = i.bitmap ? "bitmap " : i.unique ? "unique " : "";
+  return `${kind}${cols(indexColumns(i))}${method}${where}`;
+}
+
+/**
+ * A column default as compared. Oracle's default is SQL text: white space is collapsed and trimmed, the case is folded
+ * outside string literals ('...' is kept as it is), and a literal NULL is no default. Other dialects compare the text.
+ */
+export function normDefault(d: Driver | undefined, text: string | null): string | null {
+  if (text === null || d !== "oracle") return text;
+  const folded = text
+    .split(/('(?:[^']|'')*')/)
+    .map((part, i) => (i % 2 === 1 ? part : part.replace(/\s+/g, " ").toUpperCase()))
+    .join("")
+    .trim();
+  return folded === "NULL" ? null : folded;
 }
 
 /** The changes of a column, except its position (see `DiffOptions.ignoreColumnOrder`). */
-export function columnChanges(l: CompareColumn, r: CompareColumn): string[] {
+export function columnChanges(l: CompareColumn, r: CompareColumn, d?: Driver): string[] {
   const out: string[] = [];
   if (normType(l.dataType) !== normType(r.dataType)) out.push(`type ${l.dataType} -> ${r.dataType}`);
   if (l.nullable !== r.nullable) out.push(`nullable ${l.nullable ? "NULL" : "NOT NULL"} -> ${r.nullable ? "NULL" : "NOT NULL"}`);
-  if ((l.default ?? null) !== (r.default ?? null)) out.push(`default ${showDefault(l.default)} -> ${showDefault(r.default)}`);
+  if (normDefault(d, l.default) !== normDefault(d, r.default)) out.push(`default ${showDefault(l.default)} -> ${showDefault(r.default)}`);
   if ((l.extra ?? "") !== (r.extra ?? "")) out.push(`extra ${l.extra ?? "none"} -> ${r.extra ?? "none"}`);
   return out;
 }
@@ -204,11 +265,16 @@ interface ItemSpec<T> {
   kind: DiffKind;
   name: (x: T) => string;
   definition: (x: T) => string;
+  /** The name is made up by the system (Oracle `SYS_C...`): the item is matched by its definition. */
+  generated?: (x: T) => boolean;
+  /** Constraints: the state (see `isEnabled`); indexes have none. */
+  enabled?: (x: T) => boolean;
 }
 
 /** The nodes of a list of constraints or indexes (keys, checks, foreign keys, indexes). */
 function itemNodes<T>(parentId: string, driver: Driver, left: readonly T[], right: readonly T[], spec: ItemSpec<T>, opts: DiffOptions): DiffNode[] {
   const seen = new Set<string>();
+  const enabled = spec.enabled ?? (() => true);
   return pairItems(driver, left, right, spec, opts).map((p) => {
     const sample = (p.left ?? p.right) as T;
     const label = spec.name(sample) || spec.definition(sample);
@@ -221,6 +287,9 @@ function itemNodes<T>(parentId: string, driver: Driver, left: readonly T[], righ
     const ld = spec.definition(p.left);
     const rd = spec.definition(p.right);
     const changes = ld === rd ? [] : [`definition ${ld} -> ${rd}`];
+    if (enabled(p.left) !== enabled(p.right)) {
+      changes.push(`state ${stateText(driver, enabled(p.left))} -> ${stateText(driver, enabled(p.right))}`);
+    }
     return node(spec.kind, id, label, changes.length ? "changed" : "same", changes, [], leftName, rightName);
   });
 }
@@ -239,7 +308,7 @@ function columnNodes(parentId: string, driver: Driver, left: readonly CompareCol
     if (!p.left || !p.right) {
       return node("column", id, sample.name, pairStatus(p, false), [], [], p.left?.name ?? null, p.right?.name ?? null);
     }
-    const changes = columnChanges(p.left, p.right);
+    const changes = columnChanges(p.left, p.right, driver);
     if (!opts.ignoreColumnOrder && rankL.get(p.key) !== rankR.get(p.key)) {
       changes.push(`position ${(rankL.get(p.key) ?? 0) + 1} -> ${(rankR.get(p.key) ?? 0) + 1}`);
     }
@@ -247,10 +316,33 @@ function columnNodes(parentId: string, driver: Driver, left: readonly CompareCol
   });
 }
 
-const KEY_SPEC = (kind: "primaryKey" | "unique"): ItemSpec<CompareKey> => ({ kind, name: (k) => k.name, definition: keyDefinition });
-const CHECK_SPEC: ItemSpec<CompareCheck> = { kind: "check", name: (c) => c.name, definition: checkDefinition };
-const FK_SPEC: ItemSpec<CompareForeignKey> = { kind: "foreignKey", name: (f) => f.name, definition: foreignKeyDefinition };
-const INDEX_SPEC: ItemSpec<CompareIndex> = { kind: "index", name: (i) => i.name, definition: indexDefinition };
+const KEY_SPEC = (kind: "primaryKey" | "unique"): ItemSpec<CompareKey> => ({
+  kind,
+  name: (k) => k.name,
+  definition: keyDefinition,
+  generated: (k) => k.generatedName === true,
+  enabled: isEnabled,
+});
+const CHECK_SPEC: ItemSpec<CompareCheck> = {
+  kind: "check",
+  name: (c) => c.name,
+  definition: checkDefinition,
+  generated: (c) => c.generatedName === true,
+  enabled: isEnabled,
+};
+const FK_SPEC: ItemSpec<CompareForeignKey> = {
+  kind: "foreignKey",
+  name: (f) => f.name,
+  definition: foreignKeyDefinition,
+  generated: (f) => f.generatedName === true,
+  enabled: isEnabled,
+};
+const INDEX_SPEC: ItemSpec<CompareIndex> = {
+  kind: "index",
+  name: (i) => i.name,
+  definition: indexDefinition,
+  generated: (i) => i.generatedName === true,
+};
 
 function tableNode(l: CompareTable | undefined, r: CompareTable | undefined, driver: Driver, opts: DiffOptions, parentId: string): DiffNode {
   const sample = (l ?? r) as CompareTable;

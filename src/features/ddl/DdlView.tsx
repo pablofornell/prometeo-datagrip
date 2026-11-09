@@ -12,6 +12,7 @@ import type { EditorTab } from "../../state/tabs";
 import { ensureConnected, openConsoleTab } from "../explorer";
 import { type ObjectTabData, openTableTab } from "../table/commands";
 import { dsInfo, errText, loadDataSources } from "../table/ds";
+import { ddlLineOf } from "./line";
 import "./ddl.css";
 
 export function DdlView(props: { tab: EditorTab; active: boolean }): JSX.Element {
@@ -95,6 +96,17 @@ function Ddl(props: { tab: EditorTab; active: boolean; dsId: string; objectRef: 
   };
   createEffect(on(() => (props.tab.data as { column?: string } | undefined)?.column, revealColumn, { defer: true }));
 
+  // Find Usages: the line a usage names (`line`, with its text as the hint, see ./line). Keyed on the tab's data, which
+  // is replaced each time the DDL is opened, so the same usage opened again goes to its line again.
+  const revealUsageLine = (): void => {
+    const d = props.tab.data as { line?: number; lineText?: string } | undefined;
+    const doc = editor?.view?.state.doc;
+    if (!d?.line || !editor || !doc) return;
+    const l = doc.line(ddlLineOf(doc.toString(), d.lineText, d.line));
+    editor.revealRange({ from: l.from, to: l.to });
+  };
+  createEffect(on(() => props.tab.data, revealUsageLine, { defer: true }));
+
   createEffect(() => {
     if (props.active) setStatus({ aggregator: null, caret: null });
   });
@@ -134,6 +146,7 @@ function Ddl(props: { tab: EditorTab; active: boolean; dsId: string; objectRef: 
             ref={(h) => {
               editor = h;
               revealColumn();
+              revealUsageLine();
             }}
             sourceLabel={ds()?.name}
             defaultSchema={ref.schema ?? undefined}

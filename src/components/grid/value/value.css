@@ -192,8 +192,8 @@
   justify-content: flex-start;
 }
 
-/* the value viewer dialog: wider than the text editor, for the tab bar and the buttons of a binary value */
-.dgg-ve.dgg-vx-dialog {
+/* the value viewer dialog: the large size for binary, JSON and long values (the compact one is the text editor's, grid.css) */
+.dgg-ve.dgg-vx-dialog.dgg-vx-large {
   width: min(680px, 94%);
   height: min(460px, 88%);
 }

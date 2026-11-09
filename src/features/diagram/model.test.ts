@@ -127,7 +127,11 @@ describe("subsetOf", () => {
     expect(subsetOf(all, undefined).map((o) => o.name)).toEqual(["orders", "customers", "lines", "other"]);
   });
   it("keeps the selected tables and their direct neighbours in both directions", () => {
-    expect(subsetOf(all, ["ORDERS"]).map((o) => o.name)).toEqual(["orders", "customers", "lines"]);
+    expect(subsetOf(all, ["orders"]).map((o) => o.name)).toEqual(["orders", "customers", "lines"]);
     expect(subsetOf(all, ["customers"]).map((o) => o.name)).toEqual(["orders", "customers"]);
+  });
+  it("matches the names exactly: another case is another table", () => {
+    expect(subsetOf(all, ["ORDERS"])).toEqual([]);
+    expect(subsetOf(all, ["Customers", "other"]).map((o) => o.name)).toEqual(["other"]);
   });
 });

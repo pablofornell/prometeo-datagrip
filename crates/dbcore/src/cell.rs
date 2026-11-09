@@ -2,9 +2,10 @@
 //!
 //! The grid shows a binary value as a preview (`{ "$bin": <first bytes>, "len", "truncated" }`, see
 //! `value::bin_cell`). [`ConnectionManager::fetch_cell`] reads one column of one row by its primary key. The row
-//! predicate is the one an edit uses (`table::build_stmt`), with bind parameters. Reads are capped at `max_bytes`
-//! (never more than [`MAX_CELL_BYTES`]): PostgreSQL, MySQL and SQLite cut the value on the server, Oracle reads the
-//! whole LOB (the thin driver hands CLOB / BLOB over as LONG / LONG RAW) and cuts it here.
+//! predicate is the one an edit uses (`table::key_predicate`), with bind parameters. Reads are capped at `max_bytes`
+//! (never more than [`MAX_CELL_BYTES`]): PostgreSQL, MySQL and SQLite cut the value on the server, and so does Oracle
+//! for a CLOB / NCLOB / BLOB (`DBMS_LOB.SUBSTR` pieces, see `read_ora_lob`). Oracle's other columns are read whole
+//! (they are small, except LONG / LONG RAW, which the server cannot cut).
 
 use std::collections::BTreeMap;
 
@@ -16,10 +17,10 @@ use crate::conn::{Live, Pool};
 use crate::error::{DbError, Result};
 use crate::introspect::{table_columns, ColInfo};
 use crate::manager::ConnectionManager;
-use crate::model::{ChangeKind, Driver, ObjectRef, RowChange};
+use crate::model::{Driver, ObjectRef};
 use crate::oracle::{OraBind, OraPool};
 use crate::quote::{hex_decode, qualified, quote_ident};
-use crate::table::{build_stmt, Bind, RowAddr};
+use crate::table::{key_predicate, Bind};
 
 /// Largest value returned whole, and largest file loaded into a cell: 32 MB.
 pub const MAX_CELL_BYTES: u64 = 32 * 1024 * 1024;
@@ -33,7 +34,9 @@ pub enum CellKind {
 }
 
 /// The value of one cell. `text` (text kind) or `base64` (binary kind) holds at most the cap; `len` is the size of
-/// the whole value (UTF-8 bytes for text).
+/// the whole value (UTF-8 bytes for text). The exception is an Oracle CLOB / NCLOB that was not read whole (its
+/// pieces stopped at the cap): its `len` is its length in UTF-16 units, the size the server reports without reading
+/// the rest of the LOB.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CellContent {
@@ -307,8 +310,8 @@ async fn read_lite(
     Ok(out)
 }
 
-/// `select <column> <from>` on Oracle. The thin driver returns the whole CLOB / BLOB here (as text, or hex for
-/// binary), so the cut happens in [`content`].
+/// `select <column> <from>` on Oracle, for the columns that are not LOBs (see [`read_ora_lob`]). The thin driver
+/// returns the whole value (as text, or hex for binary), so the cut happens in [`content`].
 async fn read_ora(
     p: &OraPool,
     col: &str,
@@ -340,6 +343,168 @@ async fn read_ora(
         }));
     }
     Ok(out)
+}
+
+/// Pieces of a LOB read by one statement, in the units the server counts: 2000 bytes of a BLOB (a RAW of SQL is at
+/// most 2000 bytes, and its hex text fits in 4000), 1000 UTF-16 units of a CLOB / NCLOB (a VARCHAR2 of SQL is at most
+/// 4000 bytes, and a unit is at most 3 bytes of UTF-8).
+const ORA_BLOB_PIECE: u64 = 2000;
+const ORA_TEXT_PIECE: u64 = 1000;
+/// The server refuses a text piece that starts inside a surrogate pair.
+const ORA_SPLIT_PAIR: &str = "ORA-22831";
+
+/// UTF-16 units of `s`: what the server counts in the offsets and lengths of a CLOB / NCLOB (a character outside the
+/// Basic Multilingual Plane is two).
+fn utf16_units(s: &str) -> u64 {
+    s.encode_utf16().count() as u64
+}
+
+/// A length the server returned as text (`DBMS_LOB.GETLENGTH`); `None` for a NULL value.
+fn ora_len(v: Option<String>) -> Result<Option<u64>> {
+    v.map(|s| {
+        s.trim()
+            .parse::<u64>()
+            .map_err(|_| DbError::InvalidArgument(format!("Invalid LOB length: {s}")))
+    })
+    .transpose()
+}
+
+/// The text of a CLOB / NCLOB from its pieces, in order, when they cover the first `min(total, cap)` units. The size
+/// is the UTF-8 size when the whole value is here; a cut value reports its `total` units. `None`: the pieces stop
+/// short, because a piece ended inside a surrogate pair and the server dropped its first half.
+fn text_from_pieces(total: u64, cap: usize, pieces: &[String]) -> Option<Read> {
+    let units: u64 = pieces.iter().map(|p| utf16_units(p)).sum();
+    if units < total.min(cap as u64) {
+        return None;
+    }
+    let bytes = pieces.concat().into_bytes();
+    let len = if units >= total {
+        bytes.len() as u64
+    } else {
+        total
+    };
+    Some(Read {
+        binary: false,
+        len,
+        bytes,
+    })
+}
+
+/// A CLOB / NCLOB / BLOB column: its length and the first `cap` of it, in pieces of one statement, so the rest of
+/// the LOB stays on the server (the thin driver would hand the whole value over). The pieces are cut by
+/// `DBMS_LOB.SUBSTR`. A text piece that starts inside a surrogate pair is refused by the server (ORA-22831): such a
+/// value is read piece by piece, see [`read_ora_text_walk`].
+async fn read_ora_lob(
+    p: &OraPool,
+    col: &str,
+    from: &str,
+    binds: &[Bind],
+    binary: bool,
+    cap: usize,
+) -> Result<Vec<Option<Read>>> {
+    let (size, piece) = if binary {
+        (
+            ORA_BLOB_PIECE,
+            format!(
+                "rawtohex(dbms_lob.substr(x.v, {ORA_BLOB_PIECE}, (c.lv - 1) * {ORA_BLOB_PIECE} + 1))"
+            ),
+        )
+    } else {
+        (
+            ORA_TEXT_PIECE,
+            format!("dbms_lob.substr(x.v, {ORA_TEXT_PIECE}, (c.lv - 1) * {ORA_TEXT_PIECE} + 1)"),
+        )
+    };
+    // a row per piece up to the cap, with the length on each; at least one row, so that a NULL or an empty value
+    // comes back too
+    let sql = format!(
+        "select x.len, {piece} from (select {col} v, dbms_lob.getlength({col}) len {from}) x \
+         cross apply (select level lv from dual connect by level <= greatest(1, ceil(least(nvl(x.len, 0), :{}) / {size}))) c \
+         order by c.lv",
+        binds.len() + 1
+    );
+    let mut params = ora_binds(binds);
+    params.push(OraBind::Int(cap as i64));
+    let rows = match p.query_binds(&sql, &params).await {
+        Ok(rows) => rows,
+        Err(DbError::Server(s)) if !binary && s.code == ORA_SPLIT_PAIR => {
+            return read_ora_text_walk(p, col, from, binds, cap).await;
+        }
+        Err(e) => return Err(e),
+    };
+    let Some(first) = rows.first() else {
+        return Ok(Vec::new());
+    };
+    let Some(total) = ora_len(first.first().cloned().flatten())? else {
+        return Ok(vec![None]);
+    };
+    let pieces: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.get(1).cloned().flatten())
+        .collect();
+    if binary {
+        let mut bytes = Vec::new();
+        for h in &pieces {
+            let b = hex_decode(h).ok_or_else(|| {
+                DbError::InvalidArgument("The binary value could not be read".into())
+            })?;
+            bytes.extend(b);
+        }
+        return Ok(vec![Some(Read {
+            binary: true,
+            len: total,
+            bytes,
+        })]);
+    }
+    match text_from_pieces(total, cap, &pieces) {
+        Some(read) => Ok(vec![Some(read)]),
+        None => read_ora_text_walk(p, col, from, binds, cap).await,
+    }
+}
+
+/// A CLOB / NCLOB read one piece per statement, each starting where the last one ended. A piece that ends inside a
+/// surrogate pair comes back without its first half (the server drops it), so the next piece starts on that half.
+/// Used when [`read_ora_lob`] cannot read the text in one statement.
+async fn read_ora_text_walk(
+    p: &OraPool,
+    col: &str,
+    from: &str,
+    binds: &[Bind],
+    cap: usize,
+) -> Result<Vec<Option<Read>>> {
+    let sql = format!(
+        "select x.len, dbms_lob.substr(x.v, {ORA_TEXT_PIECE}, c.off) \
+         from (select {col} v, dbms_lob.getlength({col}) len {from}) x, (select :{} off from dual) c",
+        binds.len() + 1
+    );
+    let mut pieces: Vec<String> = Vec::new();
+    let mut units = 0u64;
+    let total = loop {
+        let mut params = ora_binds(binds);
+        params.push(OraBind::Int(units as i64 + 1));
+        let rows = p.query_binds(&sql, &params).await?;
+        let Some(first) = rows.first() else {
+            return Ok(Vec::new());
+        };
+        let Some(total) = ora_len(first.first().cloned().flatten())? else {
+            return Ok(vec![None]);
+        };
+        let piece = first.get(1).cloned().flatten().unwrap_or_default();
+        if piece.is_empty() {
+            break total;
+        }
+        units += utf16_units(&piece);
+        pieces.push(piece);
+        if units >= total.min(cap as u64) {
+            break total;
+        }
+    };
+    match text_from_pieces(total, cap, &pieces) {
+        Some(read) => Ok(vec![Some(read)]),
+        None => Err(DbError::NotFound(
+            "The value changed while it was read".into(),
+        )),
+    }
 }
 
 impl ConnectionManager {
@@ -377,27 +542,20 @@ async fn fetch_cell_with(
     let binary = is_binary(d, col);
 
     let q = qualified(d, schema, &table.name);
-    // the predicate of an edit of this row; the key is the primary key, so no LIMIT / ROWNUM is added
-    let ch = RowChange {
-        kind: ChangeKind::Delete,
-        key: keys.clone(),
-        values: BTreeMap::new(),
-        row_locator: None,
-    };
-    let st = build_stmt(d, &q, &info, &RowAddr::None, &ch)?;
-    let head = format!("delete from {q} where ");
-    let pred = st
-        .sql
-        .strip_prefix(&head)
-        .ok_or_else(|| DbError::InvalidArgument("The row cannot be addressed".into()))?;
+    // the predicate of an edit of this row (the key is the primary key, so no LIMIT / ROWNUM is needed)
+    let mut binds = Vec::new();
+    let pred = key_predicate(d, &info, keys, &mut binds)?;
     let from = format!("from {q} where {pred}");
     let col_q = quote_ident(d, column);
 
     let reads = match &live.pool {
-        Pool::Pg(p) => read_pg(p, &col_q, &from, &st.binds, binary, cap).await?,
-        Pool::My(p) => read_my(p, &col_q, &from, &st.binds, binary, cap).await?,
-        Pool::Lite(p) => read_lite(p, &col_q, &from, &st.binds, cap).await?,
-        Pool::Ora(p) => read_ora(p, &col_q, &from, &st.binds, binary).await?,
+        Pool::Pg(p) => read_pg(p, &col_q, &from, &binds, binary, cap).await?,
+        Pool::My(p) => read_my(p, &col_q, &from, &binds, binary, cap).await?,
+        Pool::Lite(p) => read_lite(p, &col_q, &from, &binds, cap).await?,
+        Pool::Ora(p) if matches!(col.base_type.as_str(), "BLOB" | "CLOB" | "NCLOB") => {
+            read_ora_lob(p, &col_q, &from, &binds, binary, cap).await?
+        }
+        Pool::Ora(p) => read_ora(p, &col_q, &from, &binds, binary).await?,
     };
     match reads.into_iter().next() {
         None => Err(DbError::NotFound(
@@ -543,6 +701,43 @@ mod tests {
         assert_eq!(whole.text.as_deref(), Some("aéb"));
         assert!(!whole.truncated);
         assert_eq!(whole.base64, None);
+    }
+
+    #[test]
+    fn utf16_units_count_a_character_outside_the_bmp_as_two() {
+        assert_eq!(utf16_units("aé€😀"), 5);
+        assert_eq!(utf16_units(""), 0);
+    }
+
+    #[test]
+    fn oracle_lengths_are_numbers_or_null() {
+        assert_eq!(ora_len(Some("42".into())).unwrap(), Some(42));
+        assert_eq!(ora_len(None).unwrap(), None);
+        assert!(ora_len(Some("4x".into())).is_err());
+    }
+
+    #[test]
+    fn text_pieces_must_cover_the_cap_or_the_whole_value() {
+        let pieces = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        // whole: the size is the UTF-8 size ("a" 1 byte, "é" 2, "€" 3)
+        let whole = text_from_pieces(3, 10, &pieces(&["aé", "€"])).unwrap();
+        assert_eq!((whole.len, whole.bytes.as_slice()), (6, "aé€".as_bytes()));
+        assert!(!content(whole, 10).truncated);
+        // cut: the pieces cover the cap, the size is the units of the whole value
+        let cut = text_from_pieces(6, 3, &pieces(&["aé", "€"])).unwrap();
+        assert_eq!(cut.len, 6);
+        let c = content(cut, 3);
+        assert_eq!(
+            (c.text.as_deref(), c.truncated),
+            (Some("aé"), true),
+            "3 bytes: '€' does not fit"
+        );
+        // a piece that ends inside a pair is not covered: the caller reads piece by piece
+        assert!(text_from_pieces(6, 3, &pieces(&["aé"])).is_none());
+        assert!(text_from_pieces(2, 2, &pieces(&["a"])).is_none());
+        // an empty value is whole
+        let empty = text_from_pieces(0, 3, &[]).unwrap();
+        assert_eq!((empty.len, empty.bytes.len()), (0, 0));
     }
 
     #[test]

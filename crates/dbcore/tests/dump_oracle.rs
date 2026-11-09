@@ -1225,13 +1225,15 @@ async fn object_types_xmltype_and_json_round_trip() {
         up.contains("CREATE OR REPLACE TYPE ZDW_NUMS AS TABLE OF NUMBER"),
         "{text}"
     );
+    // the specs come before the tables that use them, the bodies after the tables (a body selecting from a table
+    // is INVALID before the table exists)
     assert!(
         up.find("CREATE OR REPLACE TYPE ZDW_ADDR AS OBJECT")
             .unwrap()
-            < up.find("CREATE OR REPLACE TYPE BODY ZDW_ADDR").unwrap()
-            && up.find("CREATE OR REPLACE TYPE BODY ZDW_ADDR").unwrap()
-                < up.find("CREATE TABLE ZDW_OBJ").unwrap(),
-        "types before the tables that use them: {text}"
+            < up.find("CREATE TABLE ZDW_OBJ").unwrap()
+            && up.find("CREATE TABLE ZDW_OBJ").unwrap()
+                < up.find("CREATE OR REPLACE TYPE BODY ZDW_ADDR").unwrap(),
+        "type specs before the tables that use them, bodies after: {text}"
     );
     // the XML text carries the newline Oracle keeps after a document: the needles stop before it
     for needle in [
@@ -1402,6 +1404,384 @@ async fn materialized_views_and_synonyms_round_trip() {
     restore_file(mgr, &script, "prometeo-dump-oracle-mviews.sql").await;
     assert_eq!(one(mgr, &s, "select count(*) from zdw_mv_v").await, "2");
     assert_eq!(one(mgr, &s, "select count(*) from zdw_mv_fast").await, "3");
+
+    clean(mgr, &s, "ZDW").await;
+    mgr.disconnect("ora").await;
+}
+
+// ---------------------------------------------------------------- reference partitioning, types, hidden columns (prefix ZDW)
+
+const SETUP_REF: &str = r#"
+create table zdw_rp (id number not null primary key, d date not null, v varchar2(10))
+partition by range (d)
+(partition zdw_rp_old values less than (date '2025-01-01'), partition zdw_rp_new values less than (maxvalue));
+create table zdw_rc (id number not null, pid number not null, note varchar2(10),
+  constraint zdw_rc_fk foreign key (pid) references zdw_rp (id))
+partition by reference (zdw_rc_fk);
+create index zdw_rc_ix on zdw_rc (note) local;
+insert into zdw_rp values (1, date '2024-02-01', 'a');
+insert into zdw_rp values (2, date '2025-06-01', 'b');
+insert into zdw_rc values (10, 1, 'x');
+insert into zdw_rc values (11, 2, 'y');
+commit;
+"#;
+
+/// The child of a reference partitioning is written unpartitioned (its parent's partitions are not named): its local
+/// index is then a plain one, or the `CREATE INDEX .. LOCAL` after the data fails with ORA-14016.
+#[tokio::test]
+async fn reference_partitioned_child_restores_with_a_plain_index() {
+    let Some(cfg) = oracle_cfg() else {
+        eprintln!("PROMETEO_ORACLE_URL not set: skipping");
+        return;
+    };
+    let _guard = LOCK.lock().await;
+    let mgr = &connected(&cfg).await;
+    let s = mgr.open_session("ora").await.unwrap();
+    let schema = current_schema(mgr, &s).await;
+    clean(mgr, &s, "ZDW").await;
+    exec_ok(mgr, &s, SETUP_REF).await;
+    assert_eq!(
+        one(
+            mgr,
+            &s,
+            "select listagg(table_name || ':' || partitioning_type, ';') within group (order by table_name) \
+             from user_part_tables where table_name like 'ZDW%'"
+        )
+        .await,
+        "ZDW_RC:REFERENCE;ZDW_RP:RANGE"
+    );
+    let counts =
+        "select (select count(*) from zdw_rc) || ',' || (select count(*) from zdw_rp) from dual";
+    assert_eq!(one(mgr, &s, counts).await, "2,2");
+
+    let (text, res) = dump(mgr, &schema, &options(Some(vec!["ZDW_RP", "ZDW_RC"]))).await;
+    assert!(
+        res.warnings
+            .iter()
+            .any(|w| w.starts_with("ZDW_RC: partitioning not restored")),
+        "{:?}",
+        res.warnings
+    );
+    assert!(
+        text.contains("CREATE INDEX ZDW_RC_IX ON ZDW_RC (NOTE);"),
+        "{text}"
+    );
+    assert!(!text.contains(") LOCAL;"), "{text}");
+    assert!(
+        res.warnings
+            .iter()
+            .any(|w| w.starts_with("index ZDW_RC_IX: local in the source")),
+        "{:?}",
+        res.warnings
+    );
+
+    clean(mgr, &s, "ZDW").await;
+    restore_file(mgr, &text, "prometeo-dump-oracle-reference.sql").await;
+    assert_eq!(one(mgr, &s, counts).await, "2,2");
+    assert_eq!(
+        one(
+            mgr,
+            &s,
+            "select count(*) from user_indexes where index_name = 'ZDW_RC_IX'"
+        )
+        .await,
+        "1"
+    );
+    // again over the existing tables
+    restore(mgr, &s, &text).await;
+    assert_eq!(one(mgr, &s, counts).await, "2,2");
+
+    clean(mgr, &s, "ZDW").await;
+    mgr.disconnect("ora").await;
+}
+
+const SETUP_TYPE_USE: &str = r#"
+create or replace type zdw_pt as object (x number, y varchar2(10));
+/
+create table zdw_pt_tab (id number primary key, p zdw_pt, n number);
+create view zdw_pt_v as select id, p from zdw_pt_tab;
+insert into zdw_pt_tab values (1, zdw_pt(1, 'a'), 10);
+insert into zdw_pt_tab values (2, zdw_pt(2, 'b'), 20);
+insert into zdw_pt_tab values (3, null, 30);
+commit;
+"#;
+
+/// `id:x:n` of every row of the table that uses the object type (`-` for a NULL object).
+async fn type_use_facts(mgr: &ConnectionManager, s: &SessionId, table: &str) -> String {
+    one(
+        mgr,
+        s,
+        &format!(
+            "select listagg(t.id || ':' || nvl(to_char(t.p.x), '-') || ':' || t.n, ';') within group (order by t.id) \
+             from {table} t"
+        ),
+    )
+    .await
+}
+
+/// A whole-schema dump with `drop_if_exists` restores twice over its own objects, rows and all. The dropped type is
+/// never forced, and the tables go before it.
+#[tokio::test]
+async fn full_restore_with_an_object_type_keeps_the_data_twice() {
+    let Some(cfg) = oracle_cfg() else {
+        eprintln!("PROMETEO_ORACLE_URL not set: skipping");
+        return;
+    };
+    let _guard = LOCK.lock().await;
+    let mgr = &connected(&cfg).await;
+    let s = mgr.open_session("ora").await.unwrap();
+    let schema = current_schema(mgr, &s).await;
+    clean(mgr, &s, "ZDW").await;
+    exec_ok(mgr, &s, SETUP_TYPE_USE).await;
+    let before = type_use_facts(mgr, &s, "zdw_pt_tab").await;
+    assert_eq!(before, "1:1:10;2:2:20;3:-:30");
+
+    let (text, _) = dump(mgr, &schema, &options(None)).await;
+    let script = only_prefix(&text, "ZDW_");
+    let up = script.to_ascii_uppercase();
+    assert!(!up.contains("ZDW_PT FORCE"), "{script}");
+    assert!(
+        up.find("DROP TABLE ZDW_PT_TAB").unwrap() < up.find("DROP TYPE ZDW_PT").unwrap(),
+        "the table goes before the type: {script}"
+    );
+
+    clean(mgr, &s, "ZDW").await;
+    restore_file(mgr, &script, "prometeo-dump-oracle-type-drop.sql").await;
+    assert_eq!(type_use_facts(mgr, &s, "zdw_pt_tab").await, before);
+    assert_eq!(one(mgr, &s, "select count(*) from zdw_pt_v").await, "3");
+    // again over the existing objects
+    restore_file(mgr, &script, "prometeo-dump-oracle-type-drop.sql").await;
+    assert_eq!(type_use_facts(mgr, &s, "zdw_pt_tab").await, before);
+    assert_eq!(one(mgr, &s, "select count(*) from zdw_pt_v").await, "3");
+
+    clean(mgr, &s, "ZDW").await;
+    mgr.disconnect("ora").await;
+}
+
+/// A table of the schema outside the dump uses the type: the restore stops at the type (ORA-02303) instead of
+/// forcing it, which would mark that table's column UNUSED and lose its data.
+#[tokio::test]
+async fn restore_stops_rather_than_force_a_type_used_outside_the_dump() {
+    let Some(cfg) = oracle_cfg() else {
+        eprintln!("PROMETEO_ORACLE_URL not set: skipping");
+        return;
+    };
+    let _guard = LOCK.lock().await;
+    let mgr = &connected(&cfg).await;
+    let s = mgr.open_session("ora").await.unwrap();
+    let schema = current_schema(mgr, &s).await;
+    clean(mgr, &s, "ZDW").await;
+    exec_ok(mgr, &s, SETUP_TYPE_USE).await;
+    let (text, _) = dump(mgr, &schema, &options(None)).await;
+    let script = only_prefix(&text, "ZDW_");
+
+    // made after the dump: a table the dump does not know uses the type
+    exec_ok(
+        mgr,
+        &s,
+        "create table zdw_pt_out (id number, p zdw_pt); \
+         insert into zdw_pt_out values (1, zdw_pt(7, 'z')); commit;",
+    )
+    .await;
+    let file = std::env::temp_dir().join("prometeo-dump-oracle-type-outside.sql");
+    std::fs::write(&file, &script).unwrap();
+    let sum = mgr
+        .run_sql_file(
+            "ora",
+            None,
+            &file,
+            &ScriptOptions::default(),
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+    let _ = std::fs::remove_file(&file);
+    let err = sum
+        .first_error
+        .clone()
+        .map(|e| e.message)
+        .unwrap_or_default();
+    assert!(err.contains("ORA-02303"), "{sum:?}");
+    assert_eq!(
+        one(mgr, &s, "select nvl(to_char(t.p.x), '-') from zdw_pt_out t").await,
+        "7",
+        "the column of the table outside the dump is kept"
+    );
+
+    clean(mgr, &s, "ZDW").await;
+    mgr.disconnect("ora").await;
+}
+
+const SETUP_BODY: &str = r#"
+create table zdw_bt_tab (id number primary key, v varchar2(10));
+insert into zdw_bt_tab values (1, 'a');
+insert into zdw_bt_tab values (2, 'b');
+commit;
+create or replace type zdw_bt as object (id number, member function rows_cnt return number);
+/
+create or replace type body zdw_bt as
+  member function rows_cnt return number is n number;
+  begin select count(*) into n from zdw_bt_tab; return n; end;
+end;
+/
+"#;
+
+/// The body of a type that selects from a table is written after the table, so it compiles VALID.
+#[tokio::test]
+async fn type_body_selecting_from_a_table_is_valid_after_restore() {
+    let Some(cfg) = oracle_cfg() else {
+        eprintln!("PROMETEO_ORACLE_URL not set: skipping");
+        return;
+    };
+    let _guard = LOCK.lock().await;
+    let mgr = &connected(&cfg).await;
+    let s = mgr.open_session("ora").await.unwrap();
+    let schema = current_schema(mgr, &s).await;
+    clean(mgr, &s, "ZDW").await;
+    exec_ok(mgr, &s, SETUP_BODY).await;
+    let body_status =
+        "select status from user_objects where object_name = 'ZDW_BT' and object_type = 'TYPE BODY'";
+    assert_eq!(one(mgr, &s, body_status).await, "VALID");
+
+    let (text, _) = dump(mgr, &schema, &options(None)).await;
+    let script = only_prefix(&text, "ZDW_");
+    let up = script.to_ascii_uppercase();
+    let spec = up.find("CREATE OR REPLACE TYPE ZDW_BT AS OBJECT").unwrap();
+    let table = up.find("CREATE TABLE ZDW_BT_TAB").unwrap();
+    let body = up.find("CREATE OR REPLACE TYPE BODY ZDW_BT").unwrap();
+    assert!(spec < table && table < body, "{script}");
+
+    clean(mgr, &s, "ZDW").await;
+    restore_file(mgr, &script, "prometeo-dump-oracle-type-body.sql").await;
+    assert_eq!(one(mgr, &s, body_status).await, "VALID");
+    assert_eq!(
+        one(mgr, &s, "select zdw_bt(1).rows_cnt() from dual").await,
+        "2"
+    );
+    // again over the existing objects
+    restore_file(mgr, &script, "prometeo-dump-oracle-type-body.sql").await;
+    assert_eq!(one(mgr, &s, body_status).await, "VALID");
+
+    clean(mgr, &s, "ZDW").await;
+    mgr.disconnect("ora").await;
+}
+
+const SETUP_OUTSIDE: &str = r#"
+create or replace type zdw_w_t as object (n number);
+/
+create table zdw_w_in (id number primary key, t zdw_w_t);
+create table zdw_w_out (id number primary key, t zdw_w_t);
+insert into zdw_w_in values (1, zdw_w_t(1));
+insert into zdw_w_out values (2, zdw_w_t(2));
+commit;
+"#;
+
+/// A subset dump replaces the types its tables use; a table left out that uses one of them is a warning.
+#[tokio::test]
+async fn subset_dump_warns_about_a_type_used_by_a_table_outside_it() {
+    let Some(cfg) = oracle_cfg() else {
+        eprintln!("PROMETEO_ORACLE_URL not set: skipping");
+        return;
+    };
+    let _guard = LOCK.lock().await;
+    let mgr = &connected(&cfg).await;
+    let s = mgr.open_session("ora").await.unwrap();
+    let schema = current_schema(mgr, &s).await;
+    clean(mgr, &s, "ZDW").await;
+    exec_ok(mgr, &s, SETUP_OUTSIDE).await;
+
+    let (text, res) = dump(mgr, &schema, &options(Some(vec!["ZDW_W_IN"]))).await;
+    assert!(
+        res.warnings
+            .iter()
+            .any(|w| w.starts_with("ZDW_W_OUT uses type ZDW_W_T")),
+        "{:?}",
+        res.warnings
+    );
+    assert!(
+        text.contains("-- table ZDW_W_OUT is outside the dump and uses type ZDW_W_T"),
+        "{text}"
+    );
+    // a full dump has every table of the schema: no such warning
+    let (_, full) = dump(mgr, &schema, &options(None)).await;
+    assert!(
+        !full.warnings.iter().any(|w| w.contains("ZDW_W_OUT")),
+        "{:?}",
+        full.warnings
+    );
+
+    clean(mgr, &s, "ZDW").await;
+    mgr.disconnect("ora").await;
+}
+
+const SETUP_HIDDEN: &str = r#"
+create table zdw_hc (a number not null, b number, c varchar2(5));
+create index zdw_hc_fx on zdw_hc (upper(c));
+declare
+  h varchar2(128);
+begin
+  select column_name into h from user_tab_cols where table_name = 'ZDW_HC' and user_generated = 'NO';
+  execute immediate 'alter table zdw_hc add constraint zdw_hc_uq unique (a, "' || h || '")';
+end;
+/
+alter table zdw_hc add constraint zdw_hc_ub unique (b);
+insert into zdw_hc values (1, 1, 'x');
+commit;
+"#;
+
+/// A constraint that uses a hidden column (of a function-based index) is skipped whole: never written with the
+/// visible column alone.
+#[tokio::test]
+async fn constraint_on_a_hidden_column_is_skipped_whole() {
+    let Some(cfg) = oracle_cfg() else {
+        eprintln!("PROMETEO_ORACLE_URL not set: skipping");
+        return;
+    };
+    let _guard = LOCK.lock().await;
+    let mgr = &connected(&cfg).await;
+    let s = mgr.open_session("ora").await.unwrap();
+    let schema = current_schema(mgr, &s).await;
+    clean(mgr, &s, "ZDW").await;
+    exec_ok(mgr, &s, SETUP_HIDDEN).await;
+
+    let (text, res) = dump(mgr, &schema, &options(Some(vec!["ZDW_HC"]))).await;
+    assert!(
+        res.warnings
+            .iter()
+            .any(|w| w.starts_with("ZDW_HC: constraint ZDW_HC_UQ not restored")),
+        "{:?}",
+        res.warnings
+    );
+    assert!(
+        text.contains("-- constraint ZDW_HC_UQ not restored: it uses a hidden column"),
+        "{text}"
+    );
+    assert!(!text.contains("UNIQUE (A)"), "{text}");
+    assert!(!text.contains("CONSTRAINT ZDW_HC_UQ"), "{text}");
+    assert!(text.contains("CONSTRAINT ZDW_HC_UB UNIQUE (B)"), "{text}");
+
+    clean(mgr, &s, "ZDW").await;
+    restore_file(mgr, &text, "prometeo-dump-oracle-hidden.sql").await;
+    assert_eq!(
+        one(
+            mgr,
+            &s,
+            "select count(*) from user_constraints where table_name = 'ZDW_HC' and constraint_name = 'ZDW_HC_UQ'"
+        )
+        .await,
+        "0"
+    );
+    assert_eq!(
+        one(
+            mgr,
+            &s,
+            "select count(*) from user_constraints where table_name = 'ZDW_HC' and constraint_name = 'ZDW_HC_UB'"
+        )
+        .await,
+        "1"
+    );
+    assert_eq!(one(mgr, &s, "select count(*) from zdw_hc").await, "1");
 
     clean(mgr, &s, "ZDW").await;
     mgr.disconnect("ora").await;

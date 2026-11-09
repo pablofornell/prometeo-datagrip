@@ -54,7 +54,7 @@ import {
 import { FilterBar } from "./FilterBar";
 import { createFkNavigation } from "./fkNav";
 import { logSubmitted } from "../output/edit";
-import { extractorMenuItems } from "../output/extractors";
+import { extractorMenuItems, isBinaryFormat } from "../output/extractors";
 import { ChoiceDialog, ColumnFilterPopup, EXPORT_FORMATS, ExportDialog, SqlPopup, exportFileBase, type ExportPath, type ExportTarget } from "./Popups";
 import { type PageSize, type Query, type QueryReport, createTableSource } from "./source";
 import { appendCondition, buildCondition, changeStatements, orderByToSort, previewSql, qualifiedName, selectSql, sortToOrderBy, tableQuerySql, toRowChanges } from "./sql";
@@ -699,7 +699,7 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
               dialect={driver()}
               extractorLabel={EXPORT_FORMATS.find((f) => f.value === extractor())?.label ?? "CSV"}
               onChangeExtractor={(at) => openMenu(extractorMenuItems(extractor(), setExtractor), { x: at.x, y: at.y, minWidth: 230, title: "Data Extractors" })}
-              onExportToClipboard={exportToClipboard}
+              onExportToClipboard={isBinaryFormat(extractor()) ? undefined : exportToClipboard}
               onSelectionChange={onSelection}
               onViewChange={setView}
               apiRef={(a) => (api = a)}

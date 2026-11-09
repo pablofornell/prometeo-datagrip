@@ -1742,15 +1742,19 @@ export const mockHandlers: Record<string, MockHandler> = {
             dataType: c.type,
             nullable: c.nullable ?? !c.pk,
             default: c.def ?? null,
+            defaultKind: c.def ? ("expression" as const) : null,
             extra: c.identity ? "identity by default" : null,
           })),
-          primaryKey: pk.length ? { name: `${t.name}_pkey`, columns: pk } : null,
-          unique: (t.uniques ?? []).map((u) => ({ name: u.name, columns: u.cols })),
-          checks: (t.checks ?? []).map((c) => ({ name: c.name, expression: c.def })),
-          foreignKeys: (t.fks ?? []).map((f) => ({ name: f.name, columns: f.cols, refSchema: null, refTable: f.refTable, refColumns: f.refCols, onDelete: "NO ACTION" })),
+          primaryKey: pk.length ? { name: `${t.name}_pkey`, columns: pk, generatedName: false, enabled: true } : null,
+          unique: (t.uniques ?? []).map((u) => ({ name: u.name, columns: u.cols, generatedName: false, enabled: true })),
+          checks: (t.checks ?? []).map((c) => ({ name: c.name, expression: c.def, generatedName: false, enabled: true })),
+          foreignKeys: (t.fks ?? []).map((f) => ({ name: f.name, columns: f.cols, refSchema: null, refTable: f.refTable, refColumns: f.refCols, onDelete: "NO ACTION", generatedName: false, enabled: true })),
           indexes: (t.indexes ?? [])
             .filter((i) => !i.primary)
-            .map((i) => ({ name: i.name, columns: i.cols.split(",").map((c) => c.trim()), unique: !!i.unique, method: "btree", predicate: i.where ?? null })),
+            .map((i) => {
+              const columns = i.cols.split(",").map((c) => c.trim());
+              return { name: i.name, columns, descending: columns.map(() => false), unique: !!i.unique, method: "btree", predicate: i.where ?? null, generatedName: false, bitmap: false };
+            }),
         };
       });
     const views = s.tables

@@ -50,18 +50,21 @@ async fn cleanup(mgr: &ConnectionManager, sess: &SessionId, stmts: &[&str]) {
 
 const ORA_DROP: &[&str] = &[
     "drop synonym uf_syn",
+    "drop view uf_v_big",
     "drop view uf_v_orders",
     "drop trigger uf_trg",
     "drop package uf_pkg",
     "drop function uf_total",
+    "drop table uf_notes purge",
     "drop table uf_orders purge",
     "drop table uf_customers purge",
 ];
 
 /// Line numbers follow `ALL_SOURCE`: the text starts at `FUNCTION` / `PACKAGE BODY`, without `CREATE OR REPLACE`.
 const ORA_SCRIPT: &str = r#"
-create table uf_customers (id number primary key, name varchar2(40));
-create table uf_orders (id number primary key, customer_id number references uf_customers (id), total number);
+create table uf_customers (id number constraint uf_customers_pk primary key, name varchar2(40) constraint uf_customers_name_uk unique);
+create table uf_orders (id number constraint uf_orders_pk primary key, customer_id number references uf_customers (id), total number);
+create table uf_notes (id number primary key, customer_name varchar2(40) references uf_customers (name));
 create or replace view uf_v_orders as select o.id, o.total from uf_orders o;
 create or replace function uf_total (p_customer number) return number is
   r number;
@@ -81,6 +84,10 @@ create or replace package body uf_pkg as
     select count(*) into n from uf_orders where customer_id = p;
     return n;
   end;
+  function double_of (p number) return number is
+  begin
+    return total_of(p) * 2;
+  end;
 end uf_pkg;
 /
 create or replace trigger uf_trg before insert on uf_orders for each row
@@ -90,6 +97,13 @@ end;
 /
 create or replace synonym uf_syn for uf_orders;
 "#;
+
+/// A view whose text is longer than 4000 characters: `ALL_VIEWS.TEXT_VC` keeps only the first 4000, the column of the
+/// last select item (`o.total`) is only in `TEXT`.
+fn ora_big_view() -> String {
+    let pads: String = (0..300).map(|i| format!("0 as pad_{i:03}, ")).collect();
+    format!("create or replace view uf_v_big as select o.id, {pads}o.total as big_total from uf_orders o;\n")
+}
 
 #[tokio::test]
 async fn oracle_usages() {
@@ -102,9 +116,9 @@ async fn oracle_usages() {
     let owner = cfg.user.to_uppercase();
     let sc = Some(owner.as_str());
     cleanup(&mgr, &s, ORA_DROP).await;
-    exec(&mgr, &s, ORA_SCRIPT).await;
+    exec(&mgr, &s, &format!("{ORA_SCRIPT}{}", ora_big_view())).await;
 
-    // a table: its view, the routine and the package body whose text names it, its trigger and its synonym
+    // a table: its views, the routine and the package body whose text names it, its trigger and its synonym
     let us = mgr
         .find_usages(&cfg.id, &obj(sc, "UF_ORDERS", NodeKind::Table, None))
         .await
@@ -113,6 +127,7 @@ async fn oracle_usages() {
         must(&us, UsageKind::View, "UF_V_ORDERS").detail,
         "references UF_ORDERS"
     );
+    must(&us, UsageKind::View, "UF_V_BIG");
     let f = must(&us, UsageKind::Function, "UF_TOTAL");
     assert_eq!(f.line, Some(4), "{f:?}");
     assert!(f.detail.to_lowercase().contains("uf_orders"), "{f:?}");
@@ -146,6 +161,59 @@ async fn oracle_usages() {
         "{fk:?}"
     );
 
+    // the parent's key: the foreign keys that reference it (UF_CUSTOMERS_PK: by id; the unique key by name)
+    let us = mgr
+        .find_usages(
+            &cfg.id,
+            &obj(
+                sc,
+                "UF_CUSTOMERS_PK",
+                NodeKind::PrimaryKey,
+                Some("UF_CUSTOMERS"),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        must(&us, UsageKind::ForeignKey, "UF_ORDERS")
+            .detail
+            .ends_with("(CUSTOMER_ID) references UF_CUSTOMERS (ID)"),
+        "{us:#?}"
+    );
+    assert!(
+        us.iter().all(|u| u.kind == UsageKind::ForeignKey),
+        "{us:#?}"
+    );
+    absent(&us, UsageKind::ForeignKey, "UF_NOTES");
+    let us = mgr
+        .find_usages(
+            &cfg.id,
+            &obj(
+                sc,
+                "UF_CUSTOMERS_NAME_UK",
+                NodeKind::UniqueKey,
+                Some("UF_CUSTOMERS"),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        must(&us, UsageKind::ForeignKey, "UF_NOTES")
+            .detail
+            .ends_with("(CUSTOMER_NAME) references UF_CUSTOMERS (NAME)"),
+        "{us:#?}"
+    );
+    absent(&us, UsageKind::ForeignKey, "UF_ORDERS");
+    // a key nothing references
+    let us = mgr
+        .find_usages(
+            &cfg.id,
+            &obj(sc, "UF_ORDERS_PK", NodeKind::PrimaryKey, Some("UF_ORDERS")),
+        )
+        .await
+        .unwrap();
+    assert!(us.is_empty(), "{us:#?}");
+
     // a column: the foreign key on it, and the routines whose text names it inside the same table
     let us = mgr
         .find_usages(
@@ -159,6 +227,46 @@ async fn oracle_usages() {
     assert_eq!(must(&us, UsageKind::PackageBody, "UF_PKG").line, Some(5));
     absent(&us, UsageKind::View, "UF_V_ORDERS");
     absent(&us, UsageKind::Trigger, "UF_TRG");
+
+    // a column of a view longer than 4000 characters: the view is found through its full text
+    let us = mgr
+        .find_usages(
+            &cfg.id,
+            &obj(sc, "TOTAL", NodeKind::Column, Some("UF_ORDERS")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        must(&us, UsageKind::View, "UF_V_BIG").detail,
+        "references column TOTAL"
+    );
+    assert_eq!(
+        must(&us, UsageKind::View, "UF_V_ORDERS").detail,
+        "references column TOTAL"
+    );
+
+    // a package member: the body is searched, so a call from another member of the package is a usage; the
+    // declaration of the member in the body is not
+    let us = mgr
+        .find_usages(
+            &cfg.id,
+            &obj(sc, "TOTAL_OF", NodeKind::Function, Some("UF_PKG")),
+        )
+        .await
+        .unwrap();
+    let body: Vec<_> = us
+        .iter()
+        .filter(|u| u.kind == UsageKind::PackageBody)
+        .map(|u| (u.name.as_str(), u.line))
+        .collect();
+    assert_eq!(body, vec![("UF_PKG", Some(10))], "{us:#?}");
+    assert!(
+        must(&us, UsageKind::PackageBody, "UF_PKG")
+            .detail
+            .contains("total_of(p)"),
+        "{us:#?}"
+    );
+    absent(&us, UsageKind::Function, "UF_TOTAL");
 
     // a routine does not list itself
     let us = mgr
@@ -178,6 +286,7 @@ create schema uf_usages;
 create table uf_usages.customers (id int primary key, name text);
 create table uf_usages.orders (id int primary key, customer_id int references uf_usages.customers (id), total int);
 create index uf_orders_customer_idx on uf_usages.orders (customer_id);
+alter table uf_usages.customers add constraint customers_name_key unique (name);
 create view uf_usages.v_orders as select id, total from uf_usages.orders;
 create view uf_usages.v_customer_ids as select customer_id from uf_usages.orders;
 create function uf_usages.total_of(p int) returns int language plpgsql as $$
@@ -228,6 +337,48 @@ async fn postgres_usages() {
     let fk = must(&us, UsageKind::ForeignKey, "orders");
     assert_eq!(fk.table.as_deref(), Some("orders"));
     assert!(fk.detail.contains("FOREIGN KEY (customer_id)"), "{fk:?}");
+
+    // a primary key: the foreign key that references it; a unique key nothing references, and a primary key that
+    // no foreign key references, give nothing
+    let us = mgr
+        .find_usages(
+            &cfg.id,
+            &obj(
+                sc,
+                "customers_pkey",
+                NodeKind::PrimaryKey,
+                Some("customers"),
+            ),
+        )
+        .await
+        .unwrap();
+    let fk = must(&us, UsageKind::ForeignKey, "orders");
+    assert!(fk.detail.contains("FOREIGN KEY (customer_id)"), "{fk:?}");
+    assert!(
+        us.iter().all(|u| u.kind == UsageKind::ForeignKey),
+        "{us:#?}"
+    );
+    let us = mgr
+        .find_usages(
+            &cfg.id,
+            &obj(
+                sc,
+                "customers_name_key",
+                NodeKind::UniqueKey,
+                Some("customers"),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(us.is_empty(), "{us:#?}");
+    let us = mgr
+        .find_usages(
+            &cfg.id,
+            &obj(sc, "orders_pkey", NodeKind::PrimaryKey, Some("orders")),
+        )
+        .await
+        .unwrap();
+    assert!(us.is_empty(), "{us:#?}");
 
     let us = mgr
         .find_usages(
@@ -317,6 +468,31 @@ async fn mysql_usages() {
         fk.detail,
         "uf_orders_customer_fk (customer_id) references uf_customers (id)"
     );
+
+    // the primary key of the parent: the foreign key that references its columns; the primary key of the child: none
+    let us = mgr
+        .find_usages(
+            &cfg.id,
+            &obj(None, "PRIMARY", NodeKind::PrimaryKey, Some("uf_customers")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        must(&us, UsageKind::ForeignKey, "uf_orders").detail,
+        "uf_orders_customer_fk (customer_id) references uf_customers (id)"
+    );
+    assert!(
+        us.iter().all(|u| u.kind == UsageKind::ForeignKey),
+        "{us:#?}"
+    );
+    let us = mgr
+        .find_usages(
+            &cfg.id,
+            &obj(None, "PRIMARY", NodeKind::PrimaryKey, Some("uf_orders")),
+        )
+        .await
+        .unwrap();
+    assert!(us.is_empty(), "{us:#?}");
 
     let us = mgr
         .find_usages(

@@ -2,8 +2,9 @@
  * Registry actions of the explorer (menus, toolbar buttons and shortcuts all go through them) and the
  * context menu structure. Actions work on the selected node; right click selects before the menu opens.
  */
-import { type MenuItem, openMenu } from "../../components/ui";
+import { type MenuItem, notify, openMenu } from "../../components/ui";
 import { type Action, registerActions, runAction } from "../../state/actions";
+import type { SnapshotObject } from "../../api/db";
 import { COLORS, swatch } from "../datasource/widgets";
 import {
   canDrop,
@@ -52,7 +53,9 @@ import {
   colorOfNode,
   setNodeColor,
 } from "./core";
-import { type ENode, type ExplorerKind, TABLE_CHILD, TABLE_LIKE, ddlRefOf, referenceOf, tableRefOf } from "./model";
+import { type ENode, ddlRefOf, referenceOf, tableRefOf } from "./model";
+import { dropRank, groupDropStatements, tableDropGroups } from "./drop-order";
+import { loadSchemaSnapshot, schemaSnapshotErrorFor } from "./schema";
 import { LOCAL, localIconUrl, providerIcon } from "./icons";
 import { usageTargetOf } from "../usages/target";
 import { dsFolders, dsGroupOf } from "../../state/ds-folders";
@@ -164,7 +167,7 @@ export function registerExplorerActions(): () => void {
       when: explorerFocused,
       enabled: () => (group().length > 1 ? dropPlanOf(group()) !== undefined : canDrop(sel()) || isDsFolder(sel())),
       run: () => {
-        if (group().length > 1) requestDropMany(group());
+        if (group().length > 1) void requestDropMany(group());
         else if (isDsFolder(sel())) removeFolder(sel()!.data.name);
         else requestDrop(sel());
       },
@@ -382,32 +385,51 @@ const containerOf = (n: ENode): ENode | undefined => {
 };
 
 /**
- * "Drop…" on several nodes: one DROP per object, dependants first (the parts of a table, then views, then the tables).
+ * "Drop…" on several nodes: one DROP per object, in drop order: the parts of a table, then the views and other objects,
+ * then the tables (a table after the tables that reference it, see `tableDropGroups`), then the sequences.
  * Only objects of one data source and one container (a schema, a database) can be dropped together: one confirmation,
  * one run, and the container refreshed afterwards (`confirmDrop` refreshes the container of its first node).
+ * `objects`: the snapshot of that container, which gives the foreign keys; without it the tables keep the tree order.
  * Undefined when the nodes cannot be dropped together.
  */
-export function dropPlanOf(list: readonly ENode[]): { node: ENode; sql: string; what: string } | undefined {
+export function dropPlanOf(list: readonly ENode[], objects: readonly SnapshotObject[] = []): { node: ENode; sql: string; what: string } | undefined {
   if (list.length < 2) return undefined;
   const [first] = list;
   const container = containerOf(first)?.id;
   const drops: { rank: number; sql: string }[] = [];
+  const tables: { node: ENode; sql: string }[] = [];
   for (const n of list) {
     if (!real(n) || n.data.kind === "dataSource" || n.data.dsId !== first.data.dsId || containerOf(n)?.id !== container) return undefined;
     const sql = dropSqlOf(n.data);
     if (!sql) return undefined;
-    drops.push({ rank: dropRank(n.data.kind), sql });
+    if (n.data.kind === "table") tables.push({ node: n, sql });
+    else drops.push({ rank: dropRank(n.data.kind), sql });
   }
-  drops.sort((a, b) => a.rank - b.rank); // stable: the tree order within one rank
+  const schema = containerOf(first)?.data.name ?? "";
+  for (const group of tableDropGroups(tables.map((t) => t.node.data.name), schema, objects)) {
+    for (const sql of groupDropStatements(first.data.driver, group.map((i) => tables[i].sql))) drops.push({ rank: dropRank("table"), sql });
+  }
+  drops.sort((a, b) => a.rank - b.rank); // stable: the drop order within one rank
   return { node: first, sql: drops.map((d) => d.sql).join(";\n"), what: `${list.length} objects` };
 }
 
-/** Parts of a table first, then the views and other objects that read tables, then the tables themselves. */
-const dropRank = (kind: ExplorerKind): number => (kind === "table" ? 3 : TABLE_CHILD.includes(kind) ? 0 : TABLE_LIKE.includes(kind) ? 1 : 2);
-
-/** Opens the Drop confirmation for several nodes: the dialog and the run are the ones of a single node. */
-function requestDropMany(list: readonly ENode[]): void {
-  const plan = dropPlanOf(list);
+/**
+ * Opens the Drop confirmation for several nodes: the dialog and the run are the ones of a single node. Two or more tables
+ * are ordered by the foreign keys of their schema, so that snapshot is loaded first (it is answered at once when loaded).
+ */
+async function requestDropMany(list: readonly ENode[]): Promise<void> {
+  const [first] = list;
+  const schema = containerOf(first)?.data.name;
+  let objects: SnapshotObject[] = [];
+  if (schema !== undefined && list.filter((n) => n.data.kind === "table").length > 1) {
+    objects = await loadSchemaSnapshot(first.data.dsId, schema);
+    const error = schemaSnapshotErrorFor(first.data.dsId, schema);
+    if (error) {
+      notify({ kind: "error", title: "Cannot work out the order of the tables to drop", body: error });
+      return;
+    }
+  }
+  const plan = dropPlanOf(list, objects);
   if (plan) setDialog({ kind: "drop", ...plan });
 }
 
@@ -511,7 +533,7 @@ export function contextMenuItems(n: ENode | undefined, selection: readonly ENode
     if (isTableLike(n)) children.push(exportItem());
     items.push(one({ label: "Import/Export", children }));
   }
-  if (multi) items.push(sep, { label: "Drop…", shortcut: "Delete", enabled: () => dropPlanOf(list) !== undefined, run: () => requestDropMany(list) });
+  if (multi) items.push(sep, { label: "Drop…", shortcut: "Delete", enabled: () => dropPlanOf(list) !== undefined, run: () => void requestDropMany(list) });
   else if (canDrop(n)) items.push(sep, { label: "Drop…", shortcut: "Delete", run: () => requestDrop(n) });
   return items;
 }

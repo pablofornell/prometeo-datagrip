@@ -52,8 +52,17 @@ export const [badges, setBadges] = createSignal<Record<string, string>>({});
 /** Colors set with "Set Color" on schemas / tables (a data source's color is part of its configuration). */
 export const [nodeColors, setNodeColors] = createSignal<Record<string, string>>({});
 export const [selectedNode, setSelectedNode] = createSignal<ENode | undefined>(undefined);
-/** Every selected node of the tree in tree order (one node for a single selection); the lead is `selectedNode()`. */
-export const [selectedTreeNodes, setSelectedTreeNodes] = createSignal<ENode[]>([]);
+/** Ids of every selected node of the tree in tree order (one id for a single selection); the lead is `selectedNode()`. */
+const [selectedTreeIds, setSelectedTreeIds] = createSignal<string[]>([]);
+/**
+ * Every selected node of the tree in tree order, as the nodes are now: a refresh rebuilds the nodes under the same ids,
+ * so the ids are kept and resolved here (a node that is gone is left out).
+ */
+export const selectedTreeNodes = (): ENode[] =>
+  selectedTreeIds().flatMap((id) => {
+    const n = nodes.get(id);
+    return n ? [n] : [];
+  });
 export const [searchQuery, setSearchQuery] = createSignal("");
 export const [showSystemObjects, setShowSystemObjectsSignal] = createSignal(false);
 export const [loaded, setLoaded] = createSignal(false);
@@ -693,7 +702,7 @@ export function onSelect(n: ENode | undefined): void {
 
 /** The tree's selection changed (several rows, Ctrl / Shift click, Ctrl+A): the nodes in tree order. */
 export function onSelectionChange(items: ENode[]): void {
-  setSelectedTreeNodes(items);
+  setSelectedTreeIds(items.map((n) => n.id));
 }
 
 export function nodeInfo(n: ENode | undefined): ExplorerNodeInfo | undefined {

@@ -6,9 +6,10 @@ import { EditorView } from "@codemirror/view";
 import type { NodeKind, ObjectRef, Usage } from "../../api/db";
 import { type NavTarget, resolveAt } from "../../components/editor/navigate";
 import { notify } from "../../components/ui";
-import { activeTab } from "../../state/tabs";
+import { activeTab, updateTab } from "../../state/tabs";
+import { revealLine } from "../console/registry";
 import { getSelectedNode, openConsoleTab, openDdlRef } from "../explorer";
-import { openFileTab } from "../files/docs";
+import { fileTabId, openFileTab } from "../files/docs";
 import type { TextHit } from "./model";
 
 /** The object to find the usages of, and the data source it lives in. */
@@ -62,18 +63,34 @@ export function refOfUsage(u: Usage): ObjectRef {
   }
 }
 
-/** Opens the DDL of the object that uses the searched one. */
+/**
+ * Opens the DDL of the object that uses the searched one. A usage with a line opens the DDL at that line: the line and
+ * its text go into the data of the DDL tab (DdlView reveals them).
+ */
 export async function openUsage(dsId: string, u: Usage): Promise<void> {
-  await openDdlRef(dsId, refOfUsage(u));
+  const ref = refOfUsage(u);
+  await openDdlRef(dsId, ref);
+  // openDdlRef has focused the DDL tab it opened: nothing to do when the tab in front is not that one (a failed connection)
+  const tab = activeTab();
+  if (!u.line || !tab || tab.kind !== "ddl") return;
+  const data = tab.data as { objectRef?: ObjectRef; line?: number } | undefined;
+  const at = data?.objectRef;
+  if (!at || at.name !== ref.name || (at.schema ?? null) !== (ref.schema ?? null)) return;
+  updateTab(tab.id, { data: { ...data, line: u.line, lineText: u.detail } });
 }
 
-/** Opens the console or the file a text line comes from. */
+/** Opens the console or the file a text line comes from, with the caret on that line. */
 export function openHit(h: TextHit): void {
+  let tabId: string | null = null;
   if (h.console) {
-    if (h.dsId) openConsoleTab(h.dsId, h.name);
-    return;
+    if (!h.dsId) return;
+    openConsoleTab(h.dsId, h.name);
+    tabId = activeTab()?.id ?? null;
+  } else if (h.path) {
+    openFileTab({ path: h.path, name: h.name }, !!h.scratch);
+    tabId = fileTabId(h.path);
   }
-  if (h.path) openFileTab({ path: h.path, name: h.name }, !!h.scratch);
+  if (tabId) revealLine(tabId, h.line);
 }
 
 /** Alt+F7 and the menus: the request given, else the one of the focus; a notice when there is none. */

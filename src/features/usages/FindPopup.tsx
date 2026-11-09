@@ -62,7 +62,9 @@ function FindPopup(props: { req: UsageRequest; onClose: () => void }): JSX.Eleme
     await ensureConnected(r.dsId);
     return findUsages(r.dsId, r.object);
   });
-  const [texts] = createResource(() => props.req, () => gatherSqlTexts());
+  // a key has no text usages: its name (PRIMARY, a constraint name) is too common in the SQL texts to search for
+  const isKey = object.kind === "primaryKey" || object.kind === "uniqueKey";
+  const [texts] = createResource(() => props.req, () => (isKey ? [] : gatherSqlTexts()));
   const [sel, setSel] = createSignal(0);
   let list!: HTMLDivElement;
 

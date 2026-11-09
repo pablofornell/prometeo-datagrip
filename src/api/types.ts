@@ -185,6 +185,8 @@ export interface CompareColumn {
   dataType: string;
   nullable: boolean;
   default: string | null;
+  /** `literal` (the text is the value, without quotes: MySQL, SQLite) or `expression` (SQL text); null when there is no default. */
+  defaultKind?: "literal" | "expression" | null;
   /** `identity always`, `identity by default`, `generated`, `auto_increment`, ...; null for plain columns. */
   extra: string | null;
 }
@@ -193,11 +195,19 @@ export interface CompareColumn {
 export interface CompareKey {
   name: string;
   columns: string[];
+  /** Oracle: the name is system generated (`SYS_C...`): matched by definition, never by name. */
+  generatedName?: boolean;
+  /** Oracle: enabled; PostgreSQL: validated; other dialects: true. */
+  enabled?: boolean;
 }
 
 export interface CompareCheck {
   name: string;
   expression: string;
+  /** See `CompareKey.generatedName`. */
+  generatedName?: boolean;
+  /** See `CompareKey.enabled`. */
+  enabled?: boolean;
 }
 
 export interface CompareForeignKey {
@@ -209,16 +219,26 @@ export interface CompareForeignKey {
   refColumns: string[];
   /** `NO ACTION`, `RESTRICT`, `CASCADE`, `SET NULL` or `SET DEFAULT`. */
   onDelete: string;
+  /** See `CompareKey.generatedName`. */
+  generatedName?: boolean;
+  /** See `CompareKey.enabled`. */
+  enabled?: boolean;
 }
 
 export interface CompareIndex {
   name: string;
   /** Column names; expressions as text. */
   columns: string[];
+  /** One flag per column, in the order of `columns`: true for a descending column. */
+  descending?: boolean[];
   unique: boolean;
   /** Access method in lower case (`btree`, `normal`, ...); empty when the dialect has none. */
   method: string;
   predicate: string | null;
+  /** Oracle: the name is system generated (`SYS_...`): matched by definition, never by name. */
+  generatedName?: boolean;
+  /** Oracle: a bitmap index. */
+  bitmap?: boolean;
 }
 
 export interface CompareTable {
@@ -611,7 +631,11 @@ export interface ImportFormat {
   nullText: string;
 }
 
-/** The full value of one cell (`fetch_cell`). `text` / `base64` hold at most the cap; `len` is the whole size. */
+/**
+ * The full value of one cell (`fetch_cell`). `text` / `base64` hold at most the cap. `len` is the whole size: bytes for
+ * binary values and for text read whole; for an Oracle CLOB / NCLOB that was cut it is the length in UTF-16 units
+ * (the byte size would need the whole LOB to be read).
+ */
 export interface CellContent {
   kind: "text" | "binary";
   text?: string;
