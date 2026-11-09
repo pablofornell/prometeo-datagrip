@@ -198,7 +198,13 @@ async fn postgres_end_to_end() {
     // ---- execute select * from the big table, page with fetch_more
     let sess = st.open_session(&ds).await.unwrap();
     let t0 = Instant::now();
-    let ev = run(&st, &sess, "select * from shop.big_table order by id limit 1000", 500).await;
+    let ev = run(
+        &st,
+        &sess,
+        "select * from shop.big_table order by id limit 1000",
+        500,
+    )
+    .await;
     println!(
         "BENCH execute(select * from shop.big_table order by id limit 1000) -> done: {:?}",
         t0.elapsed()

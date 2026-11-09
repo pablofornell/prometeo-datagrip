@@ -109,6 +109,13 @@ pub fn run() {
                 eprintln!("cannot start logging: {e}");
             }
             install_panic_hook(&log_dir);
+            // one line per start, so a log sent from another machine tells the version and the OS
+            tracing::info!(
+                "Prometeo DataGrip {} started ({} {})",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            );
             // The WebView keeps its own storage (localStorage: explorer state, tabs, layout). Under an overridden
             // data / config dir it must live there too, or the state of one profile leaks into another.
             let webview_dir = std::env::var_os("PROMETEO_DATA_DIR")
