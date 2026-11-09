@@ -68,6 +68,34 @@ and clear it from the same dialog. To keep the history file bounded, the app kee
 **5000 entries or 10 MB**, whichever limit is reached first; older entries are dropped
 automatically. The history file is compacted in place without blocking the UI.
 
+## Dump, restore and moving to another machine
+
+- **Dump:** right-click a schema (Oracle user, PostgreSQL schema, MySQL database, SQLite data source) or a
+  table and choose **SQL Scripts > Dump to SQL File…**. The file holds the structure (sequences, tables,
+  keys, indexes, foreign keys, views and, if selected, routines and triggers) and the data as `INSERT`
+  statements, in an order that restores into an empty schema. Options: structure and/or data, `DROP`
+  statements, rows per `INSERT`, commit every N rows, and a target schema name.
+- **Restore:** right-click the target and choose **SQL Scripts > Run SQL Script…**, or use a run
+  configuration. Large files are read in parts. By default the run is **one transaction**: when a statement
+  fails, or you cancel, all data changes of the run are rolled back. Clear **Single transaction** to commit
+  each statement instead. Oracle and MySQL commit DDL (`CREATE`, `ALTER`, `DROP` ...) themselves, so a
+  rollback cannot undo DDL; the summary says so.
+- **Move your setup:** in the Data Sources dialog, **… > Export** writes the data sources to a file (never the
+  passwords), and **… > Import** reads them on the other machine. **File > Manage IDE Settings** exports and
+  imports the settings, keymap and layout. See [SECURITY.md](SECURITY.md).
+
+## Diagrams
+
+Right-click a schema or a table and choose **Diagrams > Show Diagram** (Ctrl+Alt+Shift+U). Tables are boxes
+with their columns; lines are foreign keys. Use the wheel to zoom, drag the background to pan, drag a table
+to move it, and double-click a table to open its data. The toolbar can export the diagram to SVG or PNG.
+
+## Data source colors
+
+A data source can have a color (**Data Sources > Color**). The tint of tree rows, editor tabs and consoles is
+**off by default**: enable it in **Settings > Appearance > Color by data source**, and set its **Intensity**
+(25 to 200 % of the theme's tint). **Use project colors in main toolbar** applies only when it is on.
+
 ## Settings, themes and layout
 
 - **File > Settings…** (`Ctrl+Alt+S`) changes the theme, editor font and keymap.

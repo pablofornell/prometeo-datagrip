@@ -48,7 +48,11 @@ export interface Settings {
   uiFontSize: number;
   /** Appearance > Compact mode: 22 px tree rows and 24 px menu rows. */
   compactMode: boolean;
-  /** Appearance > Use project colors in main toolbar (the tint of the data source colour). */
+  /** Appearance > Color by data source: tint tree rows, editor tabs and consoles (and the toolbar) with the data source color. */
+  dataSourceColors: boolean;
+  /** Strength of that tint in percent of the theme's tint (100 = the theme default). */
+  dataSourceColorIntensity: number;
+  /** Appearance > Use project colors in main toolbar (the tint of the data source colour; needs `dataSourceColors`). */
   projectColors: boolean;
   /** Appearance > Display icons in menu items. */
   menuIcons: boolean;
@@ -76,6 +80,8 @@ export const DEFAULT_SETTINGS: Settings = {
   uiFontFamily: "inter",
   uiFontSize: 13,
   compactMode: false,
+  dataSourceColors: false,
+  dataSourceColorIntensity: 100,
   projectColors: true,
   menuIcons: true,
   treeIndentGuides: false,
@@ -139,7 +145,9 @@ function applyAppearance(): void {
   const flag = (name: string, on: boolean, off = "off") => (on ? el.removeAttribute(name) : el.setAttribute(name, off));
   if (settings.compactMode) el.setAttribute("data-compact", "");
   else el.removeAttribute("data-compact");
-  flag("data-project-colors", settings.projectColors);
+  flag("data-project-colors", settings.dataSourceColors && settings.projectColors);
+  // every data source tint is `color-mix(.. calc(var(--dg-ds-tint-mix) * var(--dg-ds-tint-k)) ..)`: 0 paints none
+  el.style.setProperty("--dg-ds-tint-k", settings.dataSourceColors ? String(settings.dataSourceColorIntensity / 100) : "0");
   flag("data-menu-icons", settings.menuIcons);
   flag("data-editor-indent-guides", settings.editorIndentGuides);
   if (settings.gridAlternateRows) el.setAttribute("data-grid-alt", "");

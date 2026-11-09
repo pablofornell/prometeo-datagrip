@@ -16,6 +16,8 @@ const DEFAULTS = {
   colorOverrides: { dark: {}, light: {} },
   keymapOverrides: {},
   uiFontSize: 13,
+  dataSourceColors: false,
+  dataSourceColorIntensity: 100,
 } as unknown as Settings;
 
 const LAYOUT: LayoutState = {
@@ -40,6 +42,14 @@ describe("sanitizeSettings", () => {
     expect(r).toEqual({ editorFontSize: 48, uiFontSize: 8, gridPageSize: 0 });
   });
 
+  it("keeps the data source color switch and clamps its intensity to 25..200 %", () => {
+    expect(sanitizeSettings({ dataSourceColors: true, dataSourceColorIntensity: 900 }, DEFAULTS)).toEqual({
+      dataSourceColors: true,
+      dataSourceColorIntensity: 200,
+    });
+    expect(sanitizeSettings({ dataSourceColorIntensity: 3.7 }, DEFAULTS)).toEqual({ dataSourceColorIntensity: 25 });
+    expect(sanitizeSettings({ dataSourceColors: "yes" }, DEFAULTS)).toEqual({});
+  });
   it("rounds the settings that are whole numbers", () => {
     const r = sanitizeSettings({ gridPageSize: 99.6, editorFontSize: 13.4, uiFontSize: 14.5, editorLineHeight: 1.25 }, DEFAULTS);
     expect(r).toEqual({ gridPageSize: 100, editorFontSize: 13, uiFontSize: 15, editorLineHeight: 1.25 });

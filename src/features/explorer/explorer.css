@@ -251,21 +251,21 @@
 /* ---- data source color (Set Color): tree rows, editor tabs, console background */
 .dg-tree-row.dg-tinted:not(.dg-selected) {
   border-radius: 0; /* no seams between the tinted rows */
-  background: color-mix(in srgb, var(--dg-row-tint) var(--dg-ds-tint-mix), transparent);
+  background: color-mix(in srgb, var(--dg-row-tint) calc(var(--dg-ds-tint-mix) * var(--dg-ds-tint-k, 1)), transparent);
 }
 .dg-tab.dg-tab-tinted:not(.dg-selected):not(:hover) {
-  background: color-mix(in srgb, var(--dg-tab-tint) var(--dg-ds-tint-mix), transparent);
+  background: color-mix(in srgb, var(--dg-tab-tint) calc(var(--dg-ds-tint-mix) * var(--dg-ds-tint-k, 1)), transparent);
 }
 .dg-tab.dg-tab-tinted.dg-selected {
-  background: color-mix(in srgb, var(--dg-tab-tint) var(--dg-ds-tint-mix), var(--dg-tab-selected-inactive-bg));
+  background: color-mix(in srgb, var(--dg-tab-tint) calc(var(--dg-ds-tint-mix) * var(--dg-ds-tint-k, 1)), var(--dg-tab-selected-inactive-bg));
 }
 .dg-island:focus-within .dg-tab.dg-tab-tinted.dg-selected,
 .dg-tabs-focused .dg-tab.dg-tab-tinted.dg-selected {
-  background: color-mix(in srgb, var(--dg-tab-tint) var(--dg-ds-tint-mix), var(--dg-tab-selected-bg));
+  background: color-mix(in srgb, var(--dg-tab-tint) calc(var(--dg-ds-tint-mix) * var(--dg-ds-tint-k, 1)), var(--dg-tab-selected-bg));
 }
 .dgc-editor.dg-ds-tinted .sql-editor .cm-editor,
 .dgc-editor.dg-ds-tinted .sql-editor .cm-gutters {
-  background: color-mix(in srgb, var(--dg-ds-tint) var(--dg-ds-tint-mix), var(--dg-editor-bg));
+  background: color-mix(in srgb, var(--dg-ds-tint) calc(var(--dg-ds-tint-mix) * var(--dg-ds-tint-k, 1)), var(--dg-editor-bg));
 }
 
 /* Quick Documentation of a table / column named in the SQL editor (Ctrl+Q) */

@@ -307,7 +307,7 @@
   border-color: var(--dg-tab-selected-inactive-border);
 }
 .dg-editor-area .dg-pane:not(.dg-pane-focused) .dg-tab.dg-tab-tinted.dg-selected {
-  background: color-mix(in srgb, var(--dg-tab-tint) var(--dg-ds-tint-mix), var(--dg-tab-selected-inactive-bg));
+  background: color-mix(in srgb, var(--dg-tab-tint) calc(var(--dg-ds-tint-mix) * var(--dg-ds-tint-k, 1)), var(--dg-tab-selected-inactive-bg));
 }
 .dg-tabs-overflow {
   flex: none;

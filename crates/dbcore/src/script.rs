@@ -57,7 +57,8 @@ const SAVEPOINT: &str = "prometeo_script";
 pub struct ScriptOptions {
     /// Stop at the first statement that fails (default). Off: the failures are counted and the run goes on.
     pub stop_on_error: bool,
-    /// The run is one transaction: committed at the end, rolled back when it stops on an error or is cancelled.
+    /// The run is one transaction (default): committed at the end, rolled back when it stops on an error or is
+    /// cancelled. DDL on MySQL / Oracle is committed by the server itself and stays.
     pub single_transaction: bool,
     /// `UTF-8` (default; a byte order mark is dropped) or `ISO-8859-1`.
     pub encoding: String,
@@ -67,7 +68,7 @@ impl Default for ScriptOptions {
     fn default() -> Self {
         ScriptOptions {
             stop_on_error: true,
-            single_transaction: false,
+            single_transaction: true,
             encoding: "UTF-8".into(),
         }
     }
@@ -1026,6 +1027,14 @@ mod tests {
             .unwrap()
     }
 
+    /// The default options without the single transaction: each statement stays when a later one fails.
+    fn autocommit() -> ScriptOptions {
+        ScriptOptions {
+            single_transaction: false,
+            ..Default::default()
+        }
+    }
+
     async fn run(mgr: &ConnectionManager, path: &Path, opts: &ScriptOptions) -> ScriptSummary {
         run_in_pieces(mgr, path, opts, CHUNK_BYTES, &CancellationToken::new()).await
     }
@@ -1039,7 +1048,7 @@ mod tests {
             "a.sql",
             b"create table t (a integer);\ninsert into t values (1);\ninsert into nope values (2);\ninsert into t values (3);\n",
         );
-        let sum = run(&mgr, &path, &ScriptOptions::default()).await;
+        let sum = run(&mgr, &path, &autocommit()).await;
         assert_eq!(
             (sum.ok, sum.failed, sum.cancelled, sum.rolled_back),
             (2, 1, false, false)
@@ -1329,14 +1338,7 @@ mod tests {
         let first = bytes.len();
         bytes.extend_from_slice(b"insert into u values (9);\n\xff\xfe broken\n");
         let path = script_file(dir.path(), "bad.sql", &bytes);
-        let sum = run_in_pieces(
-            &mgr,
-            &path,
-            &ScriptOptions::default(),
-            first,
-            &CancellationToken::new(),
-        )
-        .await;
+        let sum = run_in_pieces(&mgr, &path, &autocommit(), first, &CancellationToken::new()).await;
         // five statements fit the first piece; the last two wait for the next one, which cannot be read
         assert_eq!((sum.ok, sum.failed), (3, 1));
         let e = sum.first_error.unwrap();

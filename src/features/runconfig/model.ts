@@ -40,7 +40,8 @@ export function newConfig(p: Partial<RunConfig> = {}): RunConfig {
     text: "",
     files: [],
     stopOnError: true,
-    singleTransaction: false,
+    // one transaction by default, so a failed or cancelled run can be rolled back as a whole
+    singleTransaction: true,
     showPage: true,
     activateTool: true,
     focusTool: false,

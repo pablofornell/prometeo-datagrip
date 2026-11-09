@@ -45,7 +45,7 @@ const CHOICES: Partial<Record<keyof Settings, readonly string[]>> = {
 };
 
 /** Settings that are whole numbers (a fraction in a file is rounded). */
-const INTEGERS: readonly string[] = ["gridPageSize", "editorFontSize", "uiFontSize"];
+const INTEGERS: readonly string[] = ["gridPageSize", "editorFontSize", "uiFontSize", "dataSourceColorIntensity"];
 
 /** Allowed range of the settings that are a number. */
 const RANGES: Partial<Record<keyof Settings, [number, number]>> = {
@@ -53,6 +53,7 @@ const RANGES: Partial<Record<keyof Settings, [number, number]>> = {
   editorFontSize: [8, 48],
   editorLineHeight: [1, 3],
   uiFontSize: [8, 32],
+  dataSourceColorIntensity: [25, 200],
 };
 
 const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);

@@ -35,7 +35,7 @@ describe("run configuration model", () => {
 
 describe("file runs of a configuration", () => {
   it("passes the stop and transaction options on, and reads the file as UTF-8", () => {
-    expect(scriptOptionsOf(newConfig())).toEqual({ stopOnError: true, singleTransaction: false, encoding: "UTF-8" });
+    expect(scriptOptionsOf(newConfig())).toEqual({ stopOnError: true, singleTransaction: true, encoding: "UTF-8" });
     expect(scriptOptionsOf({ stopOnError: false, singleTransaction: true })).toEqual({
       stopOnError: false,
       singleTransaction: true,
@@ -45,7 +45,7 @@ describe("file runs of a configuration", () => {
   it("gives configurations saved before the options the defaults", () => {
     const [c] = sanitize([{ id: "old", name: "n", targets: [], files: ["/a.sql"] }]);
     expect(c.stopOnError).toBe(true);
-    expect(c.singleTransaction).toBe(false);
+    expect(c.singleTransaction).toBe(true);
   });
   it("words the balloon of a finished file run, with the first error and its line", () => {
     const ok = { ok: 3, failed: 0, firstError: null, cancelled: false, rolledBack: false, ddlCommitted: false, elapsedMs: 5 };
