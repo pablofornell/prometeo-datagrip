@@ -496,9 +496,8 @@ describe("golden migration scripts (make B like A, drops included)", () => {
       const text = renderMigration(plan, { includeDrops: true }, { from: "A", to: "B" });
       const file = `${FIXTURE_DIR}/${c.dbms}_migration.sql`;
       if (process.env.UPDATE_FIXTURES === "1") fs.writeFileSync(file, text);
-      expect(fs.readFileSync(file, "utf8").replace(/
-/g, "
-")).toBe(text);
+      // a Windows checkout may turn the file into CRLF: compare the text, not the line endings
+      expect(fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n")).toBe(text);
     });
   }
 });
