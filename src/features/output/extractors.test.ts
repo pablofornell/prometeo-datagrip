@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from "vitest";
 import type { SnapshotObject } from "../../api/types";
-import { EXPORT_CHARSETS, EXTRACTORS, extractorLabel, extractorMenuItems, primaryKeyColumns, replacedNotice } from "./extractors";
+import { CLIPBOARD_EXTRACTORS, EXPORT_CHARSETS, EXTRACTORS, extractorLabel, extractorMenuItems, isBinaryFormat, primaryKeyColumns, replacedNotice, truncatedNotice } from "./extractors";
 
 describe("data extractors", () => {
   it("every extractor has a unique id and the popup lists them in the three sections", () => {
@@ -39,6 +39,37 @@ describe("export charsets and the replaced-characters notice", () => {
   it("counts the replaced characters in the singular and the plural", () => {
     expect(replacedNotice(1)).toBe('1 character was replaced with "?" (not in Windows-1252)');
     expect(replacedNotice(12)).toBe('12 characters were replaced with "?" (not in Windows-1252)');
+  });
+});
+
+describe("Excel (xlsx) extractor", () => {
+  it("is an Other extractor labelled Excel with the xlsx extension", () => {
+    const x = EXTRACTORS.find((e) => e.id === "xlsx");
+    expect(x).toMatchObject({ label: "Excel (xlsx)", ext: "xlsx", section: "Other" });
+    expect(x?.mime).toBe("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    expect(extractorLabel("xlsx")).toBe("Excel (xlsx)");
+  });
+  it("is a binary format: never offered for the clipboard, the text formats still are", () => {
+    expect(isBinaryFormat("xlsx")).toBe(true);
+    expect(isBinaryFormat("csv")).toBe(false);
+    expect(isBinaryFormat("json")).toBe(false);
+    expect(CLIPBOARD_EXTRACTORS.map((x) => x.id)).not.toContain("xlsx");
+    expect(CLIPBOARD_EXTRACTORS.length).toBe(EXTRACTORS.length - 1);
+  });
+  it("the Data Extractors popup still lists it, under Other", () => {
+    const items = extractorMenuItems("xlsx", () => {});
+    const rows = items.filter((i) => !i.type) as { label: string; checked?: boolean }[];
+    expect(rows.find((r) => r.label === "Excel (xlsx)")?.checked).toBe(true);
+  });
+});
+
+describe("truncated cells notice", () => {
+  it("says nothing when no cell was cut", () => {
+    expect(truncatedNotice(0)).toBe("");
+  });
+  it("counts the cut cells in the singular and the plural", () => {
+    expect(truncatedNotice(1)).toBe("1 cell was cut to the 32,767 characters an Excel cell holds");
+    expect(truncatedNotice(3)).toBe("3 cells were cut to the 32,767 characters an Excel cell holds");
   });
 });
 

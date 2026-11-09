@@ -1,5 +1,7 @@
 //! Table data browsing and editing.
 
+use std::collections::BTreeMap;
+
 use futures_util::StreamExt;
 use serde_json::Value;
 
@@ -781,6 +783,161 @@ fn parse_rowid_locator(v: &Value) -> Result<i64> {
 const MY_FLOAT_TOL: &str = "0.00001";
 const MY_DOUBLE_TOL: &str = "0.000000000001";
 
+/// The placeholder of the value `v` of column `c` (`$n`, `:n` or `?`), with the value pushed to `binds`. An
+/// Oracle date / timestamp value is wrapped in the conversion of its fixed format.
+fn placeholder(d: Driver, binds: &mut Vec<Bind>, c: &ColInfo, v: &Value) -> Result<String> {
+    let mut b = to_bind(d, v, c)?;
+    if d == Driver::MySql && my_is_int(&c.type_name) {
+        // integers beyond 2^53 travel as strings; a string would be compared as a double
+        if let Bind::Text(s) = &b {
+            if let Ok(i) = s.trim().parse::<i64>() {
+                b = Bind::Int(i);
+            } else if let Ok(u) = s.trim().parse::<u64>() {
+                b = Bind::UInt(u);
+            }
+        }
+    }
+    // Oracle converts dates / timestamps with fixed formats: NLS settings must not change what a value means
+    let mut ora_wrap: Option<String> = None;
+    if d == Driver::Oracle {
+        if let (Some(kind), Value::String(text)) = (oracle_time_kind(&c.base_type), v) {
+            let ts = parse_oracle_ts(text).ok_or_else(|| {
+                DbError::InvalidArgument(format!(
+                    "'{text}' is not a valid date or time for column {}",
+                    c.name
+                ))
+            })?;
+            let (norm, func, fmt) = match kind {
+                OracleTimeKind::Date => (ts.date_text(), "to_date", "YYYY-MM-DD HH24:MI:SS"),
+                OracleTimeKind::Timestamp => (
+                    ts.timestamp_text(),
+                    "to_timestamp",
+                    "YYYY-MM-DD HH24:MI:SS.FF9",
+                ),
+                OracleTimeKind::TimestampTz => {
+                    (ts.timestamp_tz_text(), "to_timestamp_tz", ts.tz_format())
+                }
+            };
+            b = Bind::Text(norm);
+            ora_wrap = Some(format!("{func}(:{{n}}, '{fmt}')"));
+        }
+    }
+    binds.push(b);
+    let n = binds.len();
+    Ok(match d {
+        Driver::Postgres => format!("cast(${n} as {})", c.base_type),
+        Driver::Oracle => match ora_wrap {
+            Some(w) => w.replace("{n}", &n.to_string()),
+            None => format!(":{n}"),
+        },
+        _ => "?".to_string(),
+    })
+}
+
+/// One `column <op> value` condition of a row key.
+fn key_part(
+    d: Driver,
+    binds: &mut Vec<Bind>,
+    c: &ColInfo,
+    v: &Value,
+    has_pk: bool,
+) -> Result<String> {
+    let id = quote_ident(d, &c.name);
+    if v.is_null() {
+        return Ok(format!("{id} is null"));
+    }
+    let text = |v: &Value| -> String {
+        match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        }
+    };
+    match d {
+        Driver::Postgres if pg_text_compared(&c.base_type) => {
+            binds.push(Bind::Text(text(v)));
+            Ok(format!(
+                "cast({id} as text) = cast(${} as text)",
+                binds.len()
+            ))
+        }
+        Driver::MySql => {
+            let t = c.type_name.to_ascii_lowercase();
+            if t.starts_with("json") {
+                binds.push(Bind::Text(text(v)));
+                Ok(format!("cast({id} as char) = ?"))
+            } else if let (true, Some(f)) = (
+                t.starts_with("float") || t.starts_with("double") || t.starts_with("real"),
+                v.as_f64(),
+            ) {
+                let tol = if t.starts_with("float") {
+                    MY_FLOAT_TOL
+                } else {
+                    MY_DOUBLE_TOL
+                };
+                binds.extend([Bind::Float(f), Bind::Float(f), Bind::Float(f)]);
+                Ok(format!("({id} = ? or abs({id} - ?) <= abs(?) * {tol})"))
+            } else if t.starts_with("decimal") || t.starts_with("numeric") {
+                binds.push(Bind::Text(text(v)));
+                Ok(format!("{id} = cast(? as decimal(65,30))"))
+            } else if !has_pk && my_is_text(&t) {
+                // default collations ignore case and trailing blanks: compare bytes
+                let p = placeholder(d, binds, c, v)?;
+                Ok(format!("{id} = {p} collate utf8mb4_bin"))
+            } else {
+                let p = placeholder(d, binds, c, v)?;
+                Ok(format!("{id} = {p}"))
+            }
+        }
+        // an empty string is NULL in Oracle; LOBs have no `=`
+        Driver::Oracle => {
+            if v.as_str().is_some_and(str::is_empty) {
+                return Ok(format!("{id} is null"));
+            }
+            let t = c.base_type.to_ascii_uppercase();
+            let p = placeholder(d, binds, c, v)?;
+            if matches!(t.as_str(), "CLOB" | "NCLOB" | "BLOB") {
+                Ok(format!("dbms_lob.compare({id}, {p}) = 0"))
+            } else {
+                Ok(format!("{id} = {p}"))
+            }
+        }
+        _ => {
+            let p = placeholder(d, binds, c, v)?;
+            Ok(format!("{id} = {p}"))
+        }
+    }
+}
+
+/// The condition that addresses one row by its key values (`keys`: column -> value; the primary key, or every
+/// column of a table without one). Its bind parameters are pushed to `binds` after the ones already there, so
+/// one numbering serves a statement that sets values first. A cut-off binary preview is not part of the key.
+/// Shared by the edits (`build_stmt`) and the cell reads (`cell::fetch_cell`).
+pub(crate) fn key_predicate(
+    d: Driver,
+    info: &[ColInfo],
+    keys: &BTreeMap<String, Value>,
+    binds: &mut Vec<Bind>,
+) -> Result<String> {
+    let has_pk = info.iter().any(|c| c.is_pk);
+    let mut parts = Vec::new();
+    for (k, v) in keys {
+        let c = info
+            .iter()
+            .find(|c| c.name == *k)
+            .ok_or_else(|| DbError::InvalidArgument(format!("Unknown column '{k}'")))?;
+        if is_truncated_bin(v) {
+            continue; // a cut-off preview is not part of the key
+        }
+        parts.push(key_part(d, binds, c, v, has_pk)?);
+    }
+    if parts.is_empty() {
+        return Err(DbError::InvalidArgument(
+            "No key values to identify the row".into(),
+        ));
+    }
+    Ok(parts.join(" and "))
+}
+
 pub(crate) fn build_stmt(
     d: Driver,
     q: &str,
@@ -795,124 +952,7 @@ pub(crate) fn build_stmt(
     };
     let has_pk = info.iter().any(|c| c.is_pk);
     let mut binds: Vec<Bind> = Vec::new();
-    // placeholder for a value of column `c`
-    let ph = |binds: &mut Vec<Bind>, c: &ColInfo, v: &Value| -> Result<String> {
-        let mut b = to_bind(d, v, c)?;
-        if d == Driver::MySql && my_is_int(&c.type_name) {
-            // integers beyond 2^53 travel as strings; a string would be compared as a double
-            if let Bind::Text(s) = &b {
-                if let Ok(i) = s.trim().parse::<i64>() {
-                    b = Bind::Int(i);
-                } else if let Ok(u) = s.trim().parse::<u64>() {
-                    b = Bind::UInt(u);
-                }
-            }
-        }
-        // Oracle converts dates / timestamps with fixed formats: NLS settings must not change what a value means
-        let mut ora_wrap: Option<String> = None;
-        if d == Driver::Oracle {
-            if let (Some(kind), Value::String(text)) = (oracle_time_kind(&c.base_type), v) {
-                let ts = parse_oracle_ts(text).ok_or_else(|| {
-                    DbError::InvalidArgument(format!(
-                        "'{text}' is not a valid date or time for column {}",
-                        c.name
-                    ))
-                })?;
-                let (norm, func, fmt) = match kind {
-                    OracleTimeKind::Date => (ts.date_text(), "to_date", "YYYY-MM-DD HH24:MI:SS"),
-                    OracleTimeKind::Timestamp => (
-                        ts.timestamp_text(),
-                        "to_timestamp",
-                        "YYYY-MM-DD HH24:MI:SS.FF9",
-                    ),
-                    OracleTimeKind::TimestampTz => {
-                        (ts.timestamp_tz_text(), "to_timestamp_tz", ts.tz_format())
-                    }
-                };
-                b = Bind::Text(norm);
-                ora_wrap = Some(format!("{func}(:{{n}}, '{fmt}')"));
-            }
-        }
-        binds.push(b);
-        let n = binds.len();
-        Ok(match d {
-            Driver::Postgres => format!("cast(${n} as {})", c.base_type),
-            Driver::Oracle => match ora_wrap {
-                Some(w) => w.replace("{n}", &n.to_string()),
-                None => format!(":{n}"),
-            },
-            _ => "?".to_string(),
-        })
-    };
     let ident = |s: &str| quote_ident(d, s);
-
-    // one `column <op> value` condition of a row key
-    let key_pred = |binds: &mut Vec<Bind>, c: &ColInfo, v: &Value| -> Result<String> {
-        let id = ident(&c.name);
-        if v.is_null() {
-            return Ok(format!("{id} is null"));
-        }
-        let text = |v: &Value| -> String {
-            match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            }
-        };
-        match d {
-            Driver::Postgres if pg_text_compared(&c.base_type) => {
-                binds.push(Bind::Text(text(v)));
-                Ok(format!(
-                    "cast({id} as text) = cast(${} as text)",
-                    binds.len()
-                ))
-            }
-            Driver::MySql => {
-                let t = c.type_name.to_ascii_lowercase();
-                if t.starts_with("json") {
-                    binds.push(Bind::Text(text(v)));
-                    Ok(format!("cast({id} as char) = ?"))
-                } else if let (true, Some(f)) = (
-                    t.starts_with("float") || t.starts_with("double") || t.starts_with("real"),
-                    v.as_f64(),
-                ) {
-                    let tol = if t.starts_with("float") {
-                        MY_FLOAT_TOL
-                    } else {
-                        MY_DOUBLE_TOL
-                    };
-                    binds.extend([Bind::Float(f), Bind::Float(f), Bind::Float(f)]);
-                    Ok(format!("({id} = ? or abs({id} - ?) <= abs(?) * {tol})"))
-                } else if t.starts_with("decimal") || t.starts_with("numeric") {
-                    binds.push(Bind::Text(text(v)));
-                    Ok(format!("{id} = cast(? as decimal(65,30))"))
-                } else if !has_pk && my_is_text(&t) {
-                    // default collations ignore case and trailing blanks: compare bytes
-                    let p = ph(binds, c, v)?;
-                    Ok(format!("{id} = {p} collate utf8mb4_bin"))
-                } else {
-                    let p = ph(binds, c, v)?;
-                    Ok(format!("{id} = {p}"))
-                }
-            }
-            // an empty string is NULL in Oracle; LOBs have no `=`
-            Driver::Oracle => {
-                if v.as_str().is_some_and(str::is_empty) {
-                    return Ok(format!("{id} is null"));
-                }
-                let t = c.base_type.to_ascii_uppercase();
-                let p = ph(binds, c, v)?;
-                if matches!(t.as_str(), "CLOB" | "NCLOB" | "BLOB") {
-                    Ok(format!("dbms_lob.compare({id}, {p}) = 0"))
-                } else {
-                    Ok(format!("{id} = {p}"))
-                }
-            }
-            _ => {
-                let p = ph(binds, c, v)?;
-                Ok(format!("{id} = {p}"))
-            }
-        }
-    };
 
     let where_sql = |binds: &mut Vec<Bind>| -> Result<String> {
         // 1. an exact physical locator (tables without PK)
@@ -940,20 +980,7 @@ pub(crate) fn build_stmt(
             }
         }
         // 2. the key values (PK columns, or the original value of every column)
-        let mut parts = Vec::new();
-        for (k, v) in &ch.key {
-            let c = find(k)?;
-            if is_truncated_bin(v) {
-                continue; // a cut-off preview is not part of the key
-            }
-            parts.push(key_pred(binds, c, v)?);
-        }
-        if parts.is_empty() {
-            return Err(DbError::InvalidArgument(
-                "No key values to identify the row".into(),
-            ));
-        }
-        let key = parts.join(" and ");
+        let key = key_predicate(d, info, &ch.key, binds)?;
         // 3. no locator: still change exactly one row, even if the key matches duplicates
         Ok(match addr {
             RowAddr::PgCtid => {
@@ -986,7 +1013,7 @@ pub(crate) fn build_stmt(
                     sets.push(format!("{} = ({e})", ident(k)));
                     continue;
                 }
-                let p = ph(&mut binds, c, v)?;
+                let p = placeholder(d, &mut binds, c, v)?;
                 sets.push(format!("{} = {p}", ident(k)));
             }
             let w = where_sql(&mut binds)?;
@@ -1024,7 +1051,7 @@ pub(crate) fn build_stmt(
                     vals.push("default".to_string());
                 } else {
                     names.push(ident(k));
-                    vals.push(ph(&mut binds, c, v)?);
+                    vals.push(placeholder(d, &mut binds, c, v)?);
                 }
             }
             let sql = if names.is_empty() {
@@ -1373,6 +1400,39 @@ mod tests {
         assert!(build_stmt(Driver::Sqlite, "t", &info, &RowAddr::None, &ch).is_err());
         let ch = change(ChangeKind::Delete, &[], &[]);
         assert!(build_stmt(Driver::Sqlite, "t", &info, &RowAddr::None, &ch).is_err());
+    }
+
+    #[test]
+    fn key_predicate_continues_the_bind_numbering_and_skips_cut_previews() {
+        let info = vec![col("a", "int", true), col("b", "int", true)];
+        let keys: BTreeMap<String, Value> = [
+            ("a".to_string(), json!(7)),
+            (
+                "b".to_string(),
+                json!({"$bin": "00", "len": 9, "truncated": true}),
+            ),
+        ]
+        .into();
+        // two binds come before the key, as they would in an UPDATE's SET list
+        let mut binds = vec![Bind::Int(0), Bind::Int(0)];
+        let p = key_predicate(Driver::Postgres, &info, &keys, &mut binds).unwrap();
+        assert!(p.contains("$3") && !p.contains("$4"), "{p}");
+        assert!(
+            !p.contains("\"b\""),
+            "a cut-off preview is not part of the key: {p}"
+        );
+        assert_eq!(binds.len(), 3);
+
+        let unknown: BTreeMap<String, Value> = [("zz".to_string(), json!(1))].into();
+        let mut none = Vec::new();
+        assert!(key_predicate(Driver::Sqlite, &info, &unknown, &mut none).is_err());
+        let only_preview: BTreeMap<String, Value> = [(
+            "b".to_string(),
+            json!({"$bin": "00", "len": 9, "truncated": true}),
+        )]
+        .into();
+        assert!(key_predicate(Driver::Sqlite, &info, &only_preview, &mut none).is_err());
+        assert!(none.is_empty());
     }
 
     fn ora_col(name: &str, ty: &str, pk: bool) -> ColInfo {

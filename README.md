@@ -42,6 +42,7 @@ Linux, dmg on macOS). `npm run tauri build -- --no-bundle` builds only the binar
 - [Troubleshooting](docs/TROUBLESHOOTING.md): logs, window state, connections, resets.
 - [Architecture contract](docs/PLAN.md).
 - [Security](docs/SECURITY.md): credential storage and threat model.
+- [Known issues and limits](docs/KNOWN-ISSUES.md): what is not fixed, not built or not verified yet.
 
 ## Layout
 

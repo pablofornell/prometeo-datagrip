@@ -1,0 +1,2 @@
+# Golden SQL fixtures are compared byte for byte: keep them LF on every checkout
+crates/dbcore/tests/fixtures/** text eol=lf

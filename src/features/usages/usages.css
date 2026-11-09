@@ -1,0 +1,8 @@
+/* Find Usages popup: Search Everywhere's frame (navigate.css: dgn-*), with group headers and a title in the header. */
+.dgu-header { gap: 8px; min-width: 0; }
+.dgu-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.dgu-list:focus { outline: 0; }
+.dgu-group { padding: 8px 10px 2px; color: var(--dg-text-secondary); font-size: 12px; white-space: nowrap; }
+.dgu-count { margin-left: 4px; color: var(--dg-text-disabled); }
+.dgu-hit .dgn-name { max-width: 35%; }
+.dgu-error { color: var(--dg-error); white-space: normal; }

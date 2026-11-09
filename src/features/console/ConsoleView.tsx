@@ -13,7 +13,7 @@ import { markConsoleActive } from "../output/model";
 import { txLabel } from "../table/session";
 import { ConsoleToolbar } from "./ConsoleToolbar";
 import { dsOf, toEditorSchema } from "./ds";
-import { registerSession, unregisterSession } from "./registry";
+import { registerEditor, registerSession, unregisterEditor, unregisterSession } from "./registry";
 import { ConsoleSession } from "./session";
 
 const SAVE_DELAY = 600;
@@ -118,6 +118,7 @@ export function ConsoleInner(props: { tab: EditorTab; active: boolean; dsId: str
     flush();
     session.dispose();
     unregisterSession(props.tab.id);
+    unregisterEditor(props.tab.id);
   });
 
   // ---- Ctrl+B / Ctrl+Click, Ctrl+Q, Alt+Shift+B on a table / column named in the SQL
@@ -221,6 +222,7 @@ export function ConsoleInner(props: { tab: EditorTab; active: boolean; dsId: str
             ref={(h) => {
               editor = h;
               session.editor = h;
+              registerEditor(props.tab.id, h);
               props.backing?.onReady?.(session);
             }}
             autofocus={props.active}

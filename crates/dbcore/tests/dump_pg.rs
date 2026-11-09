@@ -502,3 +502,174 @@ async fn table_subset_data_only_commits_and_progress_table() {
     cleanup(mgr, &s, &[src, dst]).await;
     mgr.close_session(&s).await;
 }
+
+/// A range-partitioned table (with a default partition): the partitions come along as `partition of`, its rows are
+/// written once, through the parent, and an index on the parent is created on every partition.
+#[tokio::test]
+async fn partitioned_table_round_trip() {
+    let Some(cfg) = pg_cfg() else {
+        eprintln!("PROMETEO_PG_URL not set: skipping");
+        return;
+    };
+    let mgr = &connected(&cfg).await;
+    let s = mgr.open_session("pg").await.unwrap();
+    let (src, dst) = ("dump_src_p", "dump_dst_p");
+    cleanup(mgr, &s, &[dst, src]).await;
+    assert_ok(&run(mgr, &s, &format!("create schema {src}")).await);
+    assert_ok(
+        &run(
+            mgr,
+            &s,
+            &format!(
+                "create table {src}.events (id bigint not null, created_at date not null, kind text, \
+                     primary key (id, created_at)) partition by range (created_at); \
+                 create table {src}.events_2024 partition of {src}.events \
+                     for values from ('2024-01-01') to ('2025-01-01'); \
+                 create table {src}.events_later partition of {src}.events \
+                     for values from ('2025-01-01') to ('2030-01-01'); \
+                 create table {src}.events_rest partition of {src}.events default; \
+                 create index events_kind_idx on {src}.events (kind); \
+                 insert into {src}.events values (1, '2024-03-01', 'a'), (2, '2025-05-01', 'b'), \
+                     (3, '2031-01-01', 'c'), (4, '2024-07-01', 'd');"
+            ),
+        )
+        .await,
+    );
+
+    assert_ok(&run(mgr, &s, &format!("create schema {dst}")).await);
+    let (dump, res) = dump_text(mgr, src, dst, DumpOptions::default()).await;
+    // one table (the partitioned one; its partitions are written with it), four rows, through the parent
+    assert_eq!((res.tables, res.rows), (1, 4), "{dump}");
+    for needle in [
+        "partition by range (created_at);",
+        "create table \"dump_dst_p\".\"events_2024\" partition of \"dump_dst_p\".\"events\" for values from ('2024-01-01') to ('2025-01-01');",
+        "partition of \"dump_dst_p\".\"events\" default;",
+        "create index events_kind_idx on dump_dst_p.events using btree (kind);",
+    ] {
+        assert!(dump.contains(needle), "missing {needle:?} in:\n{dump}");
+    }
+    assert!(!dump.contains("on only"), "{dump}");
+    assert_eq!(
+        dump.matches("insert into").count(),
+        1,
+        "one insert for the partitioned table:\n{dump}"
+    );
+
+    restore_text(mgr, &s, &dump).await;
+    assert_eq!(
+        scalar(
+            &run(
+                mgr,
+                &s,
+                &format!(
+                    "select count(*) from pg_inherits where inhparent = '{dst}.events'::regclass"
+                )
+            )
+            .await
+        ),
+        json!(3)
+    );
+    assert_eq!(count(mgr, &s, &format!("{dst}.events")).await, json!(4));
+    assert_eq!(
+        count(mgr, &s, &format!("{dst}.events_2024")).await,
+        json!(2)
+    );
+    assert_eq!(
+        count(mgr, &s, &format!("{dst}.events_later")).await,
+        json!(1)
+    );
+    assert_eq!(
+        count(mgr, &s, &format!("{dst}.events_rest")).await,
+        json!(1)
+    );
+    // the index went on the parent and on each partition
+    assert_eq!(
+        scalar(
+            &run(
+                mgr,
+                &s,
+                &format!("select count(*) from pg_indexes where schemaname = '{dst}' and indexdef like '%(kind)%'")
+            )
+            .await
+        ),
+        json!(4)
+    );
+    // rows route to the partitions: 2032 is in none of them but the default one
+    assert_ok(
+        &run(
+            mgr,
+            &s,
+            &format!("insert into {dst}.events values (5, '2032-01-01', 'e')"),
+        )
+        .await,
+    );
+    assert_eq!(
+        count(mgr, &s, &format!("{dst}.events_rest")).await,
+        json!(2)
+    );
+
+    cleanup(mgr, &s, &[src, dst]).await;
+    mgr.close_session(&s).await;
+}
+
+/// A foreign table is not dumped: a comment and a warning name it. (file_fdw is installed for the test, and removed
+/// again when this test installed it.)
+#[tokio::test]
+async fn foreign_table_is_skipped_with_a_warning() {
+    let Some(cfg) = pg_cfg() else {
+        eprintln!("PROMETEO_PG_URL not set: skipping");
+        return;
+    };
+    let mgr = &connected(&cfg).await;
+    let s = mgr.open_session("pg").await.unwrap();
+    let (src, dst) = ("dump_src_f", "dump_dst_f");
+    cleanup(mgr, &s, &[dst, src]).await;
+    let had_fdw = scalar(
+        &run(
+            mgr,
+            &s,
+            "select count(*) from pg_extension where extname = 'file_fdw'",
+        )
+        .await,
+    ) != json!(0);
+    assert_ok(&run(mgr, &s, "create extension if not exists file_fdw").await);
+    assert_ok(
+        &run(
+            mgr,
+            &s,
+            &format!(
+                "create schema {src}; \
+                 create server dump_fdw_srv foreign data wrapper file_fdw; \
+                 create foreign table {src}.remote_log (line text) server dump_fdw_srv options (filename '/dev/null');"
+            ),
+        )
+        .await,
+    );
+
+    assert_ok(&run(mgr, &s, &format!("create schema {dst}")).await);
+    let (dump, res) = dump_text(mgr, src, dst, DumpOptions::default()).await;
+    assert!(
+        dump.contains("-- foreign table remote_log: not dumped"),
+        "{dump}"
+    );
+    assert!(
+        res.warnings
+            .iter()
+            .any(|w| w == "foreign table remote_log: not dumped"),
+        "{:?}",
+        res.warnings
+    );
+    assert_eq!((res.tables, res.rows), (0, 0));
+    restore_text(mgr, &s, &dump).await;
+    assert_eq!(
+        scalar(&run(mgr, &s, &format!("select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = '{dst}' and c.relname = 'remote_log'")).await),
+        json!(0)
+    );
+
+    cleanup(mgr, &s, &[src, dst]).await;
+    assert_ok(&run(mgr, &s, "drop server if exists dump_fdw_srv cascade").await);
+    if !had_fdw {
+        assert_ok(&run(mgr, &s, "drop extension if exists file_fdw").await);
+    }
+    mgr.close_session(&s).await;
+}

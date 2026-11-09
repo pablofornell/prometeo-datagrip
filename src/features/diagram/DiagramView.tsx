@@ -13,7 +13,7 @@ import type { EditorTab } from "../../state/tabs";
 import { loadSchemaSnapshot, schemaSnapshotErrorFor, schemaSnapshotFor } from "../explorer";
 import { openDdlTab, openTableTab } from "../table/commands";
 import { layoutDiagram } from "./layout";
-import { buildDiagram, prunePositions, type ColumnsMode, type DiagramOptions } from "./model";
+import { buildDiagram, prunePositions, subsetOf, type ColumnsMode, type DiagramOptions } from "./model";
 import { resolvePalette } from "./palette";
 import { diagramBounds, renderDiagramSvg } from "./svg";
 import { MAX_ZOOM, MIN_ZOOM, fitView, type View } from "./view";
@@ -22,6 +22,8 @@ import "./diagram.css";
 interface DiagramTabData {
   dsId?: string;
   schema?: string | null;
+  /** Diagram of these tables (and their direct FK neighbours) instead of the whole schema. */
+  tables?: string[];
 }
 
 const COLUMN_LABEL: Record<ColumnsMode, string> = { all: "All", keys: "Key Columns", none: "None" };
@@ -30,10 +32,10 @@ export function DiagramView(props: { tab: EditorTab; active: boolean }): JSX.Ele
   const data = props.tab.data as DiagramTabData | undefined;
   const dsId = data?.dsId;
   if (!dsId) return <div class="dgd-view"><div class="dgd-overlay">This diagram has no data source.</div></div>;
-  return <Diagram tab={props.tab} active={props.active} dsId={dsId} schema={data?.schema ?? null} />;
+  return <Diagram tab={props.tab} active={props.active} dsId={dsId} schema={data?.schema ?? null} tables={data?.tables} />;
 }
 
-function Diagram(props: { tab: EditorTab; active: boolean; dsId: string; schema: string | null }): JSX.Element {
+function Diagram(props: { tab: EditorTab; active: boolean; dsId: string; schema: string | null; tables?: string[] }): JSX.Element {
   const [columnsMode, setColumnsMode] = createSignal<ColumnsMode>("all");
   const [showTypes, setShowTypes] = createSignal(true);
   const [selected, setSelected] = createSignal<number | null>(null);
@@ -48,7 +50,7 @@ function Diagram(props: { tab: EditorTab; active: boolean; dsId: string; schema:
   let didFit = false;
   let drag: null | { mode: "pan"; sx: number; sy: number; tx: number; ty: number } | { mode: "node"; index: number; key: string; ox: number; oy: number; sx: number; sy: number } = null;
 
-  const objects = () => schemaSnapshotFor(props.dsId, props.schema);
+  const objects = () => subsetOf(schemaSnapshotFor(props.dsId, props.schema), props.tables);
   const loadError = () => schemaSnapshotErrorFor(props.dsId, props.schema);
   const options = (): DiagramOptions => ({ columns: columnsMode(), showTypes: showTypes() });
   const model = createMemo(() => buildDiagram(objects(), options()));

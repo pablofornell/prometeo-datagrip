@@ -11,6 +11,7 @@ import {
   closeSession,
   defaultExportOptions,
   exportQueryToString,
+  fetchCell,
   exportToString,
   openSession,
   sessionTxStatus,
@@ -53,7 +54,7 @@ import {
 import { FilterBar } from "./FilterBar";
 import { createFkNavigation } from "./fkNav";
 import { logSubmitted } from "../output/edit";
-import { extractorMenuItems } from "../output/extractors";
+import { extractorMenuItems, isBinaryFormat } from "../output/extractors";
 import { ChoiceDialog, ColumnFilterPopup, EXPORT_FORMATS, ExportDialog, SqlPopup, exportFileBase, type ExportPath, type ExportTarget } from "./Popups";
 import { type PageSize, type Query, type QueryReport, createTableSource } from "./source";
 import { appendCondition, buildCondition, changeStatements, orderByToSort, previewSql, qualifiedName, selectSql, sortToOrderBy, tableQuerySql, toRowChanges } from "./sql";
@@ -125,6 +126,8 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
   const sortSpecs = createMemo<SortSpec[]>(() => orderByToSort(src.applied().orderBy, cols() ?? []));
   const sourceLabel = () => ds()?.name ?? dsId;
   const tableName = () => qualifiedName(driver(), ref);
+  // full values of cells for the value viewer (a row is addressed by its primary key; see DataGrid)
+  const cellSource = { fetch: (key: Record<string, unknown>, column: string) => fetchCell(dsId, ref, key, column) };
 
   const ask = (c: Omit<Choice, "resolve">) => new Promise<string>((resolve) => setChoice({ ...c, resolve }));
   const answer = (v: string) => {
@@ -691,11 +694,12 @@ function TableEditor(props: { tab: EditorTab; active: boolean; dsId: string; obj
               onReload={reload}
               onColumnFilter={(col, anchor) => setColFilter({ col, anchor })}
               navigation={fk.navigation}
+              cellSource={cellSource}
               fkColumns={fk.fkColumns}
               dialect={driver()}
               extractorLabel={EXPORT_FORMATS.find((f) => f.value === extractor())?.label ?? "CSV"}
               onChangeExtractor={(at) => openMenu(extractorMenuItems(extractor(), setExtractor), { x: at.x, y: at.y, minWidth: 230, title: "Data Extractors" })}
-              onExportToClipboard={exportToClipboard}
+              onExportToClipboard={isBinaryFormat(extractor()) ? undefined : exportToClipboard}
               onSelectionChange={onSelection}
               onViewChange={setView}
               apiRef={(a) => (api = a)}

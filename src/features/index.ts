@@ -16,3 +16,5 @@ import "./editor-tabs";
 import "./files";
 import "./runconfig";
 import "./dump";
+import "./schema-diff";
+import "./usages";

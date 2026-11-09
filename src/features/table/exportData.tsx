@@ -20,7 +20,7 @@ import { cancelExport, exportQueryWithProgress, exportResultWithProgress } from 
 import { notify } from "../../components/ui";
 import { startTask } from "../../state/status";
 import { ensureConnected, loadSchemaSnapshot } from "../explorer";
-import { primaryKeyColumns, replacedNotice } from "../output/extractors";
+import { isBinaryFormat, primaryKeyColumns, replacedNotice, truncatedNotice } from "../output/extractors";
 import { errText, requireDriver, writeClipboard } from "./ds";
 import { mountDialog } from "./dialogs";
 import { EXPORT_FORMATS, ExportDialog, type ExportPath, type ExportTarget, exportFileBase } from "./Popups";
@@ -49,8 +49,12 @@ export interface ExportSource {
   onDone?: () => void;
 }
 
+/** The preview of a binary format (an Excel workbook has no text to show). */
+const BINARY_PREVIEW = "No text preview: an Excel workbook is a binary file. It holds the same rows, with a bold header row that is frozen and filtered.";
+
 /** The text of the first rows, in `o`. */
 export async function exportPreview(src: ExportSource, o: ExportOptions): Promise<string> {
+  if (isBinaryFormat(o.format)) return BINARY_PREVIEW;
   const l = src.loaded?.();
   if (l) return exportToString({ columns: l.columns, rows: l.rows.slice(0, PREVIEW_ROWS) }, o);
   return exportQueryToString(src.dsId, src.previewSql ?? limitedSql(await requireDriver(src.dsId), src.sql, PREVIEW_ROWS), o);
@@ -65,6 +69,10 @@ export async function exportText(src: ExportSource, o: ExportOptions): Promise<s
 /** Copies the whole result to the clipboard. */
 export async function copyExport(src: ExportSource, o: ExportOptions): Promise<void> {
   const fmt = EXPORT_FORMATS.find((f) => f.value === o.format) ?? EXPORT_FORMATS[0];
+  if (isBinaryFormat(o.format)) {
+    notify({ kind: "error", title: "Cannot copy the data", body: `${fmt.label} is a binary file: export it to a file instead.` });
+    return;
+  }
   try {
     await writeClipboard(await exportText(src, o));
     notify({ kind: "success", title: "Copied to the clipboard", body: `${fmt.label} of ${src.label}`, timeout: 4000 });
@@ -83,7 +91,8 @@ export async function exportToFile(src: ExportSource, o: ExportOptions, out: Exp
   let cancelled = false;
   try {
     if (!isTauri()) {
-      // a browser has no file system: download it
+      // a browser has no file system: download it (an Excel workbook is built by the desktop app)
+      if (isBinaryFormat(o.format)) throw new Error(`${fmt.label} export needs the desktop app`);
       const a = document.createElement("a");
       a.href = URL.createObjectURL(new Blob([await exportText(src, o)], { type: fmt.mime }));
       a.download = out.path.split("/").pop() || `export.${fmt.ext}`;
@@ -119,8 +128,8 @@ export async function exportToFile(src: ExportSource, o: ExportOptions, out: Exp
     } finally {
       task.done();
     }
-    const replaced = replacedNotice(report.unmappable);
-    notify({ kind: "success", title: "Export finished", body: `${plural(report.rows, "row")} exported to ${path}${replaced ? `. ${replaced}` : ""}`, timeout: 6000 });
+    const notes = [replacedNotice(report.unmappable), truncatedNotice(report.truncated)].filter(Boolean).join(". ");
+    notify({ kind: "success", title: "Export finished", body: `${plural(report.rows, "row")} exported to ${path}${notes ? `. ${notes}` : ""}`, timeout: 6000 });
     src.onDone?.();
   } catch (e) {
     if (cancelled) notify({ kind: "info", title: "Export cancelled", body: `${src.label}: nothing was written.`, timeout: 6000 });

@@ -19,17 +19,35 @@ export function reportDump(o: DumpOutcome): void {
     notify({ kind: "info", title: "Dump cancelled", body: "The file was removed.", timeout: 6000 });
     return;
   }
+  const summary = `${dumpResultText(o.result)} written to ${o.path} (${(o.result.elapsedMs / 1000).toFixed(1)} s)`;
+  const warnings = o.result.warnings ?? [];
+  const actions = [
+    {
+      label: "Open Folder",
+      run: () => void openDumpFolder(o.path).catch((e) => notify({ kind: "error", title: "Cannot open the folder", body: errText(e) })),
+    },
+  ];
+  if (warnings.length === 0) {
+    notify({ kind: "success", title: "Dump finished", body: summary, actions, timeout: 15000 });
+    return;
+  }
+  // what the dump could not write in full: listed, and the balloon stays until it is closed
   notify({
-    kind: "success",
-    title: "Dump finished",
-    body: `${dumpResultText(o.result)} written to ${o.path} (${(o.result.elapsedMs / 1000).toFixed(1)} s)`,
-    actions: [
-      {
-        label: "Open Folder",
-        run: () => void openDumpFolder(o.path).catch((e) => notify({ kind: "error", title: "Cannot open the folder", body: errText(e) })),
-      },
-    ],
-    timeout: 15000,
+    kind: "warning",
+    title: `Dump finished with ${warnings.length} ${warnings.length === 1 ? "warning" : "warnings"}`,
+    body: (
+      <>
+        <div>{summary}</div>
+        <ul>
+          {warnings.slice(0, 10).map((w) => (
+            <li>{w}</li>
+          ))}
+          {warnings.length > 10 ? <li>and {warnings.length - 10} more (see the comments in the file)</li> : null}
+        </ul>
+      </>
+    ),
+    actions,
+    timeout: 0,
   });
 }
 

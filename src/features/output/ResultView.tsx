@@ -6,7 +6,7 @@ import { notify, openMenu } from "../../components/ui";
 import { setGridSelection } from "../../state/status";
 import { createFkNavigation } from "../table/fkNav";
 import { SqlPopup } from "../table/Popups";
-import { copyResult, copyText, extractorMenuItems, formatLabel } from "./export";
+import { copyResult, copyText, extractorMenuItems, formatLabel, isBinaryFormat } from "./export";
 import type { ConsoleOutput, ResultTab } from "./model";
 import { resultTableRef } from "./tableOf";
 
@@ -97,7 +97,7 @@ export function ResultView(props: { tab: ResultTab; out: ConsoleOutput; selected
         onColumnsChange={(s) => (tab().columnsState = s)}
         extractorLabel={formatLabel(tab().extractor())}
         onChangeExtractor={(at) => openMenu(extractorMenuItems(tab().extractor(), tab().setExtractor), { x: at.x, y: at.y, minWidth: 230, title: "Data Extractors" })}
-        onExportToClipboard={host() ? () => void copyResult(tab(), host()!, tab().extractor()) : undefined}
+        onExportToClipboard={host() && !isBinaryFormat(tab().extractor()) ? () => void copyResult(tab(), host()!, tab().extractor()) : undefined}
         viewMode={tab().viewMode()}
         onCopy={(text) => void copyText(text)}
         onReload={() => props.out.host?.rerun(tab())}

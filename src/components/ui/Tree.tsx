@@ -12,6 +12,10 @@
  * Keys: Up/Down, Left (collapse / go to parent), Right (expand / first child), Home/End, PageUp/PageDown,
  * Enter and F4 (`onActivate`; return true when handled, otherwise Enter/double-click toggle folders),
  * typing = speed search (orange highlight, Up/Down jump between matches, Esc clears).
+ *
+ * `multiSelect` (off by default): Ctrl+click toggles a row, Shift+click and Shift+Up/Down/Home/End/PageUp/PageDown
+ * select from the anchor, Ctrl+A selects every visible row; `onSelectionChange` gets the selected items. The model is
+ * in treeSelection.ts.
  */
 import {
   Index,
@@ -28,6 +32,7 @@ import {
 import { settings } from "../../state/settings";
 import { Icon } from "./Icon";
 import { Highlighted, SpeedSearchField, createSpeedSearch, matchRanges } from "./SpeedSearch";
+import { type TreeSelection, dropHidden, orderedIds, rangeSelection, selectAll, singleSelection, toggleSelection } from "./treeSelection";
 
 export interface TreeItem {
   id: string;
@@ -74,7 +79,12 @@ export interface TreeProps<T extends TreeItem = TreeItem> {
   roots: T[];
   loadChildren?: (item: T) => Promise<T[]> | T[];
   selectedId?: string | null;
+  /** The lead row (the caret): the one that was clicked or reached with the keyboard. */
   onSelect?: (item: T | undefined) => void;
+  /** Several rows at once (Ctrl / Shift click, Shift+arrows, Ctrl+A); off = one row. `onSelect` keeps reporting the lead. */
+  multiSelect?: boolean;
+  /** The selected items in tree order, whenever the selection changes. */
+  onSelectionChange?: (items: T[]) => void;
   /** Enter / F4 / double click. Return true if handled; otherwise Enter and double click toggle. */
   onActivate?: (item: T, via: "enter" | "f4" | "dblclick") => boolean | void;
   onContextMenu?: (item: T | undefined, e: MouseEvent) => void;
@@ -114,7 +124,9 @@ export function Tree<T extends TreeItem = TreeItem>(props: TreeProps<T>): JSX.El
   const [rev, bump] = createSignal(0);
   const [loadingIds, setLoadingIds] = createSignal<Set<string>>(new Set());
   const [errors, setErrors] = createSignal<Map<string, string>>(new Map());
-  const [selId, setSelId] = createSignal<string | null>(props.selectedId ?? null);
+  const [sel, setSel] = createSignal<TreeSelection>(singleSelection(props.selectedId ?? null));
+  /** The lead row (the caret). */
+  const selId = () => sel().lead;
   const [scrollTop, setScrollTop] = createSignal(0);
   const [viewH, setViewH] = createSignal(600);
   const cache = new Map<string, T[]>();
@@ -125,7 +137,7 @@ export function Tree<T extends TreeItem = TreeItem>(props: TreeProps<T>): JSX.El
   const [filterMode, setFilterMode] = createSignal(false);
 
   createEffect(() => {
-    if (props.selectedId !== undefined) setSelId(props.selectedId);
+    if (props.selectedId !== undefined) setSel(singleSelection(props.selectedId));
   });
 
   const childrenOf = (it: T): T[] | undefined => (it.children as T[] | undefined) ?? cache.get(it.id);
@@ -239,6 +251,23 @@ export function Tree<T extends TreeItem = TreeItem>(props: TreeProps<T>): JSX.El
   };
   const toggle = (id: string) => (expanded().has(id) ? collapse(id) : expand(id));
 
+  /** The ids of the visible rows, top to bottom. */
+  const order = (): string[] => rows().map((r) => r.item.id);
+
+  /** The selected items in tree order (the ones that are not shown last). */
+  const itemsOf = (s: TreeSelection): T[] =>
+    orderedIds(s, order())
+      .map((id) => byId.get(id))
+      .filter((it): it is T => !!it);
+
+  /** Sets the selection: `onSelect` gets the lead, `onSelectionChange` the selected items. `scroll`: keep the lead in view. */
+  const commit = (next: TreeSelection, scroll = false) => {
+    setSel(next);
+    props.onSelect?.(next.lead !== null ? byId.get(next.lead) : undefined);
+    if (props.onSelectionChange) props.onSelectionChange(itemsOf(next));
+    if (scroll) queueMicrotask(() => scrollToId(next.lead));
+  };
+
   const select = (id: string | null, opts?: { reveal?: boolean }) => {
     if (opts?.reveal && id) {
       let p = parentOf.get(id);
@@ -249,9 +278,7 @@ export function Tree<T extends TreeItem = TreeItem>(props: TreeProps<T>): JSX.El
       }
       if (add.length) setExpanded((s) => new Set([...s, ...add]));
     }
-    setSelId(id);
-    props.onSelect?.(id ? byId.get(id) : undefined);
-    queueMicrotask(() => scrollToId(id));
+    commit(singleSelection(id), true);
   };
 
   const scrollToId = (id: string | null) => {
@@ -262,6 +289,42 @@ export function Tree<T extends TreeItem = TreeItem>(props: TreeProps<T>): JSX.El
     if (top < scroller.scrollTop) scroller.scrollTop = Math.max(0, top - pad);
     else if (top + rowHeight() > scroller.scrollTop + scroller.clientHeight - pad)
       scroller.scrollTop = top + rowHeight() - scroller.clientHeight + pad;
+  };
+
+  // Multi-select: a row that stops being shown (collapsed, filtered out, deleted by a refresh) leaves the selection and
+  // the lead moves to the nearest shown ancestor. Rows that were never shown (a restored selection) stay selected.
+  let shownBefore = new Set<string>();
+  createEffect(
+    on(rows, (rs) => {
+      if (!props.multiSelect) return;
+      // filter mode hides rows on purpose: the selection keeps them, and they are compared again once it is off
+      if (filterMode() && search.query()) return;
+      const now = new Set(rs.map((r) => r.item.id));
+      const before = shownBefore;
+      shownBefore = now;
+      const next = dropHidden(
+        sel(),
+        (id) => before.has(id) && !now.has(id),
+        (id) => {
+          let p = parentOf.get(id);
+          while (p !== undefined && !now.has(p)) p = parentOf.get(p);
+          return p;
+        },
+      );
+      if (next !== sel()) commit(next);
+    }),
+  );
+
+  /** A click in multi-select: Ctrl toggles the row, Shift selects from the anchor; a right click on a selected row keeps the selection. */
+  const clickRow = (id: string, e: MouseEvent) => {
+    if (e.button === 2 && sel().ids.has(id)) return;
+    if (!e.shiftKey && !e.ctrlKey && !e.metaKey) {
+      select(id);
+      return;
+    }
+    e.preventDefault(); // no text selection and no focus change by the browser
+    commit(e.shiftKey ? rangeSelection(sel(), order(), id) : toggleSelection(sel(), id), true);
+    scroller.focus();
   };
 
   const collapseAll = () => {
@@ -346,12 +409,21 @@ export function Tree<T extends TreeItem = TreeItem>(props: TreeProps<T>): JSX.El
       e.preventDefault();
       return;
     }
+    if (props.multiSelect && e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && e.key.toLowerCase() === "a") {
+      e.preventDefault(); // not the editor's Select All
+      commit(selectAll(sel(), order()), true);
+      return;
+    }
     // Ctrl / Alt / Meta combinations (Ctrl+F4, Ctrl+Enter, ...) belong to the global keymap, not to the tree.
     if (e.ctrlKey || e.altKey || e.metaKey) return;
     const cur = indexOfId(selId());
+    // with Shift (multi-select) the movement extends the selection from the anchor instead of replacing it
+    const extend = !!props.multiSelect && e.shiftKey;
     const go = (i: number) => {
       if (!rs.length) return;
-      select(rs[Math.max(0, Math.min(rs.length - 1, i))].item.id);
+      const id = rs[Math.max(0, Math.min(rs.length - 1, i))].item.id;
+      if (extend) commit(rangeSelection(sel(), order(), id), true);
+      else select(id);
     };
     const page = Math.max(1, Math.floor(scroller.clientHeight / rowHeight()) - 1);
     let handled = true;
@@ -444,7 +516,10 @@ export function Tree<T extends TreeItem = TreeItem>(props: TreeProps<T>): JSX.El
       onMouseDown={(e) => {
         if (e.button === 2 || e.button === 0) {
           const row = rowFromEvent(e);
-          if (row && (e.target as HTMLElement).closest(".dg-tree-chevron") === null) select(row.item.id);
+          if (row && (e.target as HTMLElement).closest(".dg-tree-chevron") === null) {
+            if (props.multiSelect) clickRow(row.item.id, e);
+            else select(row.item.id);
+          }
         }
       }}
       onContextMenu={(e) => {
@@ -470,12 +545,24 @@ export function Tree<T extends TreeItem = TreeItem>(props: TreeProps<T>): JSX.El
             return (
             <div
               class="dg-tree-row"
-              classList={{ "dg-selected": r().item.id === selId(), "dg-tinted": !!props.rowColor?.(r().item) }}
+              classList={{
+                "dg-selected": sel().ids.has(r().item.id),
+                "dg-tinted": !!props.rowColor?.(r().item),
+                "dg-tree-lead": !!props.multiSelect && selId() === r().item.id,
+              }}
               data-row-id={r().item.id}
               role="treeitem"
               aria-expanded={r().hasChildren ? r().expanded : undefined}
-              aria-selected={r().item.id === selId()}
-              style={{ top: v().i * rowHeight() + "px", "padding-left": r().depth * indentPx() + "px", "--dg-tree-guide-w": r().depth * indentPx() + "px", "--dg-tree-indent-w": indentPx() + "px", "--dg-row-tint": props.rowColor?.(r().item) }}
+              aria-selected={sel().ids.has(r().item.id)}
+              style={{
+                top: v().i * rowHeight() + "px",
+                "padding-left": r().depth * indentPx() + "px",
+                "--dg-tree-guide-w": r().depth * indentPx() + "px",
+                "--dg-tree-indent-w": indentPx() + "px",
+                "--dg-row-tint": props.rowColor?.(r().item),
+                // the lead row of a multi-selection keeps a focus outline (no other row has one)
+                ...(props.multiSelect && selId() === r().item.id ? { outline: "1px dotted currentColor", "outline-offset": "-2px" } : {}),
+              }}
               data-tip={r().item.tooltip}
               data-tip-mono={r().item.tooltip && r().item.tooltipMono ? "" : undefined}
               onDblClick={() => {

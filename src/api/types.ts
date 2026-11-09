@@ -151,6 +151,144 @@ export interface SnapshotObject {
   foreignKeys?: SnapshotForeignKey[];
 }
 
+/** Find Usages (crates/dbcore/src/usages.rs): a usage kind as the backend names it. */
+export type UsageKind =
+  | "view"
+  | "materializedView"
+  | "function"
+  | "procedure"
+  | "package"
+  | "packageBody"
+  | "trigger"
+  | "foreignKey"
+  | "synonym"
+  | "index";
+
+/** One object that refers to the searched object, or one line of its text (`line`, 1-based). */
+export interface Usage {
+  schema: string;
+  name: string;
+  kind: UsageKind;
+  /** The constraint of a foreign key, `references X`, `references column X`, or the text of the line. */
+  detail: string;
+  line: number | null;
+  /** The table a trigger, a foreign key or an index sits on. */
+  table: string | null;
+}
+
+// ---------------------------------------------------------------- schema compare (crates/dbcore/src/compare.rs)
+
+/** A column of a compared table; `dataType` is normalized for the dialect. */
+export interface CompareColumn {
+  name: string;
+  position: number;
+  dataType: string;
+  nullable: boolean;
+  default: string | null;
+  /** `literal` (the text is the value, without quotes: MySQL, SQLite) or `expression` (SQL text); null when there is no default. */
+  defaultKind?: "literal" | "expression" | null;
+  /** `identity always`, `identity by default`, `generated`, `auto_increment`, ...; null for plain columns. */
+  extra: string | null;
+}
+
+/** Primary key or unique constraint. `name` is empty for unnamed SQLite constraints. */
+export interface CompareKey {
+  name: string;
+  columns: string[];
+  /** Oracle: the name is system generated (`SYS_C...`): matched by definition, never by name. */
+  generatedName?: boolean;
+  /** Oracle: enabled; PostgreSQL: validated; other dialects: true. */
+  enabled?: boolean;
+}
+
+export interface CompareCheck {
+  name: string;
+  expression: string;
+  /** See `CompareKey.generatedName`. */
+  generatedName?: boolean;
+  /** See `CompareKey.enabled`. */
+  enabled?: boolean;
+}
+
+export interface CompareForeignKey {
+  name: string;
+  columns: string[];
+  /** Set only when the referenced table is in another schema. */
+  refSchema: string | null;
+  refTable: string;
+  refColumns: string[];
+  /** `NO ACTION`, `RESTRICT`, `CASCADE`, `SET NULL` or `SET DEFAULT`. */
+  onDelete: string;
+  /** See `CompareKey.generatedName`. */
+  generatedName?: boolean;
+  /** See `CompareKey.enabled`. */
+  enabled?: boolean;
+}
+
+export interface CompareIndex {
+  name: string;
+  /** Column names; expressions as text. */
+  columns: string[];
+  /** One flag per column, in the order of `columns`: true for a descending column. */
+  descending?: boolean[];
+  unique: boolean;
+  /** Access method in lower case (`btree`, `normal`, ...); empty when the dialect has none. */
+  method: string;
+  predicate: string | null;
+  /** Oracle: the name is system generated (`SYS_...`): matched by definition, never by name. */
+  generatedName?: boolean;
+  /** Oracle: a bitmap index. */
+  bitmap?: boolean;
+}
+
+export interface CompareTable {
+  name: string;
+  columns: CompareColumn[];
+  primaryKey: CompareKey | null;
+  unique: CompareKey[];
+  checks: CompareCheck[];
+  foreignKeys: CompareForeignKey[];
+  indexes: CompareIndex[];
+}
+
+export interface CompareView {
+  name: string;
+  /** The select text, schema names of the compared schema removed, white space collapsed. */
+  definition: string;
+  materialized: boolean;
+}
+
+export interface CompareSequence {
+  name: string;
+  incrementBy: string;
+  minValue: string;
+  maxValue: string;
+  cycle: boolean;
+  cacheSize: string;
+}
+
+export interface CompareRoutine {
+  name: string;
+  /** `FUNCTION`, `PROCEDURE`, `PACKAGE`, `PACKAGE BODY`, `TRIGGER`, ... */
+  kind: string;
+  /** PostgreSQL identity arguments (overloads), or the table of a trigger. */
+  signature: string;
+  /** Fingerprint (hex) of the normalized text. */
+  sourceHash: string;
+}
+
+/** The normalized objects of one schema, as "Compare schemas" reads them. */
+export interface SchemaModel {
+  driver: Driver;
+  schema: string;
+  /** Only the objects whose name starts with this text; null: all. */
+  namePrefix: string | null;
+  tables: CompareTable[];
+  views: CompareView[];
+  sequences: CompareSequence[];
+  routines: CompareRoutine[];
+}
+
 // ---------------------------------------------------------------- result sets
 
 export interface ColumnMeta {
@@ -351,7 +489,8 @@ export type ExportFormat =
   | "whereClause"
   | "html"
   | "xml"
-  | "pretty";
+  | "pretty"
+  | "xlsx";
 
 export interface ExportOptions {
   format: ExportFormat;
@@ -387,10 +526,14 @@ export interface ExportProgress {
   total: number | null;
 }
 
-/** Result of an export file: the rows written and the characters a Windows-1252 file replaced with `?`. */
+/**
+ * Result of an export file: the rows written, the characters a Windows-1252 file replaced with `?`, and the Excel
+ * (xlsx) cells cut to the length a cell holds.
+ */
 export interface ExportReport {
   rows: number;
   unmappable: number;
+  truncated: number;
 }
 
 // ---------------------------------------------------------------- explain
@@ -486,6 +629,27 @@ export interface ImportFormat {
   trim: boolean;
   /** An unquoted value equal to this text is NULL (empty: empty cells are NULL). */
   nullText: string;
+}
+
+/**
+ * The full value of one cell (`fetch_cell`). `text` / `base64` hold at most the cap. `len` is the whole size: bytes for
+ * binary values and for text read whole; for an Oracle CLOB / NCLOB that was cut it is the length in UTF-16 units
+ * (the byte size would need the whole LOB to be read).
+ */
+export interface CellContent {
+  kind: "text" | "binary";
+  text?: string;
+  /** Standard base64 with padding. */
+  base64?: string;
+  len: number;
+  truncated: boolean;
+}
+
+/** The file picked for a cell value (`choose_value_file`). */
+export interface ValueFile {
+  path: string;
+  name: string;
+  size: number;
 }
 
 /** The file picked in the native open dialog. */
@@ -629,6 +793,8 @@ export interface DumpResult {
   /** Stopped by `cancel_dump`; the file was removed. */
   cancelled: boolean;
   elapsedMs: number;
+  /** Objects or data the dump could not write in full (each is also a comment in the file). Absent: none. */
+  warnings?: string[];
 }
 
 // ---------------------------------------------------------------- SQL script file (crates/dbcore/src/script.rs)

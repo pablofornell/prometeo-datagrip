@@ -2,6 +2,8 @@
 //!
 //! Entry point is [`ConnectionManager`]. See `README.md` for the API overview.
 
+pub mod cell;
+pub mod compare;
 pub mod conn;
 pub mod ddl;
 pub mod dump;
@@ -21,6 +23,7 @@ pub mod script;
 pub mod split;
 pub mod table;
 pub mod tx;
+pub mod usages;
 pub mod value;
 
 pub use conn::{Conn, Pool};
@@ -41,3 +44,4 @@ pub use model::*;
 pub use oracle::{OraBind, OraConn, OraPool, OraTx};
 pub use script::{ScriptError, ScriptOptions, ScriptProgress, ScriptSummary};
 pub use split::{split_statements, statement_at, statement_at_utf16, Statement};
+pub use usages::{Usage, UsageKind};

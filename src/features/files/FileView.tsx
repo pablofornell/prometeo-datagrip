@@ -11,6 +11,7 @@ import { setEditorPath, setStatus, type Crumb } from "../../state/status";
 import type { EditorTab } from "../../state/tabs";
 import { type ConsoleBacking, ConsoleEditor } from "../console";
 import { dsOf } from "../console/ds";
+import { registerEditor, unregisterEditor } from "../console/registry";
 import { explorerDataSources } from "../explorer";
 import { dsIconUrl } from "../output/dsicon";
 import { ActionButton } from "../../components/ui";
@@ -67,6 +68,7 @@ export function FileView(props: { tab: EditorTab; active: boolean }): JSX.Elemen
     );
   });
   onCleanup(() => acquired && releaseDoc(path));
+  onCleanup(() => unregisterEditor(props.tab.id));
 
   // a file whose data source was deleted behaves as one without
   const dsId = createMemo(() => {
@@ -134,7 +136,10 @@ export function FileView(props: { tab: EditorTab; active: boolean }): JSX.Elemen
                 onCaretChange={(line, col) => {
                   if (props.active) setStatus("caret", { line, col });
                 }}
-                ref={(h) => props.active && h.focus()}
+                ref={(h) => {
+                  registerEditor(props.tab.id, h);
+                  if (props.active) h.focus();
+                }}
                 autofocus={props.active}
               />
             </div>

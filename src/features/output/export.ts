@@ -6,7 +6,7 @@ import { type OutputHost, type ResultTab, currentOutput } from "./model";
 
 import { extractorLabel } from "./extractors";
 
-export { EXTRACTORS, extractorLabel, extractorMenuItems } from "./extractors";
+export { CLIPBOARD_EXTRACTORS, EXTRACTORS, extractorLabel, extractorMenuItems, isBinaryFormat } from "./extractors";
 export const formatLabel = extractorLabel;
 
 const errText = (e: unknown): string => String((e as Error)?.message ?? e).replace(/^Error:\s*/, "");

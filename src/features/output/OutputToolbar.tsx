@@ -4,7 +4,7 @@ import { GridToolbar } from "../../components/grid";
 import type { ObjectRef } from "../../api/types";
 import { ActionButton, Icon, type MenuItem, ToolbarSeparator, openMenu, overflowToolbar } from "../../components/ui";
 import { openDdlTab, openTableTab } from "../table/commands";
-import { EXTRACTORS, copyResult, exportResultData, extractorMenuItems, formatLabel } from "./export";
+import { CLIPBOARD_EXTRACTORS, copyResult, exportResultData, extractorMenuItems, formatLabel } from "./export";
 import { resultTable } from "../console/title";
 import { PLAN_TAB, currentOutput, type ConsoleOutput, type ResultTab } from "./model";
 
@@ -87,7 +87,7 @@ function ResultToolbar(props: { out: ConsoleOutput; tab: ResultTab }): JSX.Eleme
               { type: "separator" },
               {
                 label: "Copy As",
-                children: EXTRACTORS.map<MenuItem>((f) => ({ label: f.label, run: () => host() && void copyResult(tab(), host()!, f.id) })),
+                children: CLIPBOARD_EXTRACTORS.map<MenuItem>((f) => ({ label: f.label, run: () => host() && void copyResult(tab(), host()!, f.id) })),
               },
               { type: "separator" },
               { label: "Close Tab", run: () => props.out.closeResult(tab().id) },

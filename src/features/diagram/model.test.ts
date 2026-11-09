@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildDiagram, measureTable, nodeKey, prunePositions, visibleColumns, type DiagramInputObject, type DiagramOptions } from "./model";
+import { buildDiagram, measureTable, nodeKey, prunePositions, subsetOf, visibleColumns, type DiagramInputObject, type DiagramOptions } from "./model";
 
 const opts: DiagramOptions = { columns: "all", showTypes: true };
 
@@ -111,5 +111,27 @@ describe("visibleColumns / measureTable", () => {
     const noTypes = measureTable("long_table_name", cols(), { ...opts, showTypes: false });
     expect(noTypes.width).toBeLessThan(withTypes.width);
     expect(noTypes.height).toBe(withTypes.height);
+  });
+});
+
+describe("subsetOf", () => {
+  const t = (name: string, refs: string[] = []) => ({
+    schema: "s",
+    name,
+    kind: "table" as const,
+    columns: [],
+    foreignKeys: refs.map((r) => ({ name: `fk_${name}_${r}`, columns: ["x"], refSchema: "s", refTable: r, refColumns: ["id"] })),
+  });
+  const all = [t("orders", ["customers"]), t("customers"), t("lines", ["orders"]), t("other")];
+  it("keeps every object without a table list", () => {
+    expect(subsetOf(all, undefined).map((o) => o.name)).toEqual(["orders", "customers", "lines", "other"]);
+  });
+  it("keeps the selected tables and their direct neighbours in both directions", () => {
+    expect(subsetOf(all, ["orders"]).map((o) => o.name)).toEqual(["orders", "customers", "lines"]);
+    expect(subsetOf(all, ["customers"]).map((o) => o.name)).toEqual(["orders", "customers"]);
+  });
+  it("matches the names exactly: another case is another table", () => {
+    expect(subsetOf(all, ["ORDERS"])).toEqual([]);
+    expect(subsetOf(all, ["Customers", "other"]).map((o) => o.name)).toEqual(["other"]);
   });
 });
