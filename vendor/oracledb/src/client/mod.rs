@@ -94,7 +94,7 @@ pub struct Client {
     transport: Transport,
     caps: capabilities::Capabilities,
     config: Config,
-    combo_key: Option<[u8; 32]>,
+    combo_key: Option<Vec<u8>>,
     dbobject_type_cache: DbObjectTypeCache,
     charset_id: u16,
     ncharset_id: u16,
@@ -183,7 +183,7 @@ impl Client {
         &mut self,
         message: &mut impl Message,
     ) -> Result<Response, Error> {
-        message.pre_process(self);
+        message.pre_process(self)?;
         self.send_message(message)?;
         let mut response = Response::new();
         if let Err(e) = self.receive_response(message, &mut response) {
@@ -662,7 +662,9 @@ impl Client {
             .set_new_password(new_password);
         mem::swap(&mut temp_config, &mut self.config);
         let mut auth_message = AuthMessage::new();
-        auth_message.set_combo_key(&self.combo_key.unwrap());
+        let combo_key =
+            self.combo_key.clone().ok_or_else(Error::not_connected)?;
+        auth_message.set_combo_key(combo_key);
         let result = self.process_message(&mut auth_message);
         mem::swap(&mut temp_config, &mut self.config);
         result.map(|_| ())

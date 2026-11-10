@@ -2369,3 +2369,27 @@ mod runtime {
         mgr.close_session(&s).await;
     }
 }
+
+/// Logon with an account that only has an 11G password verifier (old accounts that were never
+/// re-passworded on 12c+ servers). Needs a server with `SQLNET.ALLOWED_LOGON_VERSION_SERVER=11`
+/// and such an account (`create user .. identified by values 'S:<sha1(pw||salt)><salt>'`); see
+/// vendor/oracledb/PATCHES.md. Run with
+///   PROMETEO_ORACLE_11G_URL=oracle://legacy11g:Legacy11g@127.0.0.1:15219/FREEPDB1
+#[tokio::test]
+async fn logon_with_11g_password_verifier() {
+    let Some(mut cfg) = oracle_cfg_from_env("PROMETEO_ORACLE_11G_URL") else {
+        eprintln!("PROMETEO_ORACLE_11G_URL not set: skipping");
+        return;
+    };
+    cfg.id = "ora-11g".into();
+    let mgr = connected(&cfg).await;
+    let s = mgr.open_session("ora-11g").await.unwrap();
+    assert_eq!(scalar(&run(&mgr, &s, "select 1 from dual").await), json!(1));
+    mgr.close_session(&s).await;
+
+    // a wrong password is a normal ORA-01017, not a panic / closed connection
+    cfg.id = "ora-11g-bad".into();
+    cfg.password = Some("wrong-password".into());
+    let err = ConnectionManager::new().connect(&cfg).await.unwrap_err();
+    assert!(err.to_string().contains("ORA-01017"), "{err}");
+}

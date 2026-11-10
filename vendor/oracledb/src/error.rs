@@ -58,6 +58,7 @@ pub enum ErrorKind {
     InvalidConnectString(String, String),
     InvalidDbObjectTypeName(String),
     InvalidDescriptorNode(String, String),
+    InvalidAuthResponse(String),
     InvalidEncodedString,
     InvalidEncodedVector,
     InvalidEndUserSecurityContext(String),
@@ -105,6 +106,7 @@ pub enum ErrorKind {
     UnsupportedDeepDataSecurityFeature,
     UnsupportedObjectMetadataType(String),
     UnsupportedOsonNodeType(u8),
+    UnsupportedPasswordVerifier(u32),
     UnsupportedOsonVersion(u8),
     UnsupportedTdsType(u8),
     UnsupportedVectorFormat(u8),
@@ -265,6 +267,11 @@ impl fmt::Display for Error {
             ErrorKind::InvalidDescriptorNode(key, expected_type) => write!(
                 fmt,
                 "full descriptor node {key} is not a valid {expected_type}"
+            )?,
+            ErrorKind::InvalidAuthResponse(reason) => write!(
+                fmt,
+                "invalid authentication response from the server: {}",
+                reason
             )?,
             ErrorKind::InvalidEncodedString => {
                 fmt.write_str("invalid encoded string")?
@@ -430,6 +437,13 @@ impl fmt::Display for Error {
             )?,
             ErrorKind::UnsupportedObjectMetadataType(name) => write!(
                 fmt, "datatype {name} is not supported in object metadata"
+            )?,
+            ErrorKind::UnsupportedPasswordVerifier(verifier_type) => write!(
+                fmt,
+                "the password verifier type 0x{:x} of this account is not \
+                 supported (only 11G and 12C verifiers are); reset the \
+                 password so the server generates a 12C verifier",
+                verifier_type
             )?,
             ErrorKind::UnsupportedOsonNodeType(node_type) => {
                 write!(fmt, "unsupported OSON node type {node_type}")?
@@ -724,6 +738,10 @@ impl Error {
         Error::new(ErrorKind::NoDataFound, None)
     }
 
+    pub(crate) fn invalid_auth_response(reason: String) -> Error {
+        Error::new(ErrorKind::InvalidAuthResponse(reason), None)
+    }
+
     pub(crate) fn not_connected() -> Error {
         Error::new(ErrorKind::NotConnected, None)
     }
@@ -822,6 +840,10 @@ impl Error {
     #[cfg(feature = "arrow")]
     pub(crate) fn unsupported_arrow_type(arrow_type: String) -> Error {
         Error::new(ErrorKind::UnsupportedArrowType(arrow_type), None)
+    }
+
+    pub(crate) fn unsupported_password_verifier(verifier_type: u32) -> Error {
+        Error::new(ErrorKind::UnsupportedPasswordVerifier(verifier_type), None)
     }
 
     pub(crate) fn unsupported_conversion(

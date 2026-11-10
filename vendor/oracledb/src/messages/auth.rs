@@ -45,6 +45,8 @@ use crate::ora_version::OracleVersion;
 use crate::response::Response;
 use crate::write_buffer::WriteBuffer;
 
+type Aes192CbcDec = cbc::Decryptor<aes::Aes192>;
+type Aes192CbcEnc = cbc::Encryptor<aes::Aes192>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 
@@ -60,18 +62,63 @@ impl Pair {
     }
 }
 
-fn decrypt_cbc(key: &[u8; 32], encrypted_text: &[u8], plain_text: &mut [u8]) {
-    let iv = [0u8; 16];
-    Aes256CbcDec::new(key.into(), &iv.into())
-        .decrypt_padded_b2b::<NoPadding>(encrypted_text, plain_text)
-        .unwrap();
+fn bad_auth(reason: impl Into<String>) -> Error {
+    Error::invalid_auth_response(reason.into())
 }
 
-fn encrypt_cbc(key: &[u8; 32], plain_text: &[u8], encrypted_text: &mut [u8]) {
+/// AES-CBC (zero IV, no padding) decryption. The key is 24 bytes (AES-192,
+/// 11G verifiers) or 32 bytes (AES-256, 12C verifiers); the input length must
+/// be a multiple of the block size.
+fn decrypt_cbc(key: &[u8], encrypted_text: &[u8]) -> Result<Vec<u8>, Error> {
     let iv = [0u8; 16];
-    Aes256CbcEnc::new(key.into(), &iv.into())
-        .encrypt_padded_b2b::<NoPadding>(plain_text, encrypted_text)
-        .unwrap();
+    let mut plain_text = vec![0u8; encrypted_text.len()];
+    let result = match key.len() {
+        24 => Aes192CbcDec::new_from_slices(key, &iv)
+            .expect("key and IV lengths checked")
+            .decrypt_padded_b2b::<NoPadding>(encrypted_text, &mut plain_text)
+            .map(|_| ()),
+        32 => Aes256CbcDec::new_from_slices(key, &iv)
+            .expect("key and IV lengths checked")
+            .decrypt_padded_b2b::<NoPadding>(encrypted_text, &mut plain_text)
+            .map(|_| ()),
+        n => return Err(bad_auth(format!("unexpected key length {n}"))),
+    };
+    result.map_err(|_| {
+        bad_auth(format!(
+            "AUTH_SESSKEY has an invalid length ({} bytes)",
+            encrypted_text.len()
+        ))
+    })?;
+    Ok(plain_text)
+}
+
+/// AES-CBC (zero IV, no padding) encryption; see `decrypt_cbc`. Callers
+/// always pass whole blocks.
+fn encrypt_cbc(key: &[u8], plain_text: &[u8]) -> Vec<u8> {
+    let iv = [0u8; 16];
+    let mut encrypted_text = vec![0u8; plain_text.len()];
+    match key.len() {
+        24 => {
+            Aes192CbcEnc::new_from_slices(key, &iv)
+                .expect("key and IV lengths checked")
+                .encrypt_padded_b2b::<NoPadding>(
+                    plain_text,
+                    &mut encrypted_text,
+                )
+                .expect("plain text is a whole number of blocks");
+        }
+        32 => {
+            Aes256CbcEnc::new_from_slices(key, &iv)
+                .expect("key and IV lengths checked")
+                .encrypt_padded_b2b::<NoPadding>(
+                    plain_text,
+                    &mut encrypted_text,
+                )
+                .expect("plain text is a whole number of blocks");
+        }
+        n => unreachable!("AES key of {n} bytes"),
+    }
+    encrypted_text
 }
 
 fn get_derived_key(
@@ -83,11 +130,86 @@ fn get_derived_key(
     pbkdf2::pbkdf2_hmac::<sha2::Sha512>(key, salt, iterations, derived_key);
 }
 
+/// Computes the key that encrypts the session key halves, from the password
+/// and the verifier data sent by the server. Returns it together with the
+/// PBKDF2 password key (12C only, needed for the "speedy" key).
+///
+/// - 12C: PBKDF2-SHA512(password, vfr_data || "AUTH_PBKDF2_SPEEDY_KEY",
+///   VGEN_COUNT) = password_key; hash = SHA512(password_key || vfr_data)[..32]
+/// - 11G: hash = SHA1(password || vfr_data) || 4 zero bytes (24 bytes)
+///
+/// This is what python-oracledb does in thin mode (`AuthMessage
+/// ._generate_verifier`).
+fn password_hash(
+    verifier_type: u32,
+    password: &[u8],
+    verifier_data: &[u8],
+    vgen_count: Option<u32>,
+) -> Result<(Vec<u8>, Option<[u8; 64]>), Error> {
+    if verifier_type == constants::VERIFIER_TYPE_12C as u32 {
+        let iterations = vgen_count.ok_or_else(|| {
+            bad_auth("AUTH_PBKDF2_VGEN_COUNT missing for a 12C verifier")
+        })?;
+        let mut salt = verifier_data.to_vec();
+        salt.extend(b"AUTH_PBKDF2_SPEEDY_KEY");
+        let mut password_key = [0u8; 64];
+        get_derived_key(password, &salt, iterations, &mut password_key);
+        let mut hasher = sha2::Sha512::new();
+        hasher.update(password_key);
+        hasher.update(verifier_data);
+        Ok((hasher.finalize()[..32].to_vec(), Some(password_key)))
+    } else if verifier_type == constants::VERIFIER_TYPE_11G_1 as u32
+        || verifier_type == constants::VERIFIER_TYPE_11G_2 as u32
+    {
+        let mut hasher = sha1::Sha1::new();
+        hasher.update(password);
+        hasher.update(verifier_data);
+        let mut hash = hasher.finalize().to_vec();
+        hash.extend([0u8; 4]);
+        Ok((hash, None))
+    } else {
+        Err(Error::unsupported_password_verifier(verifier_type))
+    }
+}
+
+/// Builds the combo key (the key that encrypts the password) from both
+/// halves of the session key. 48-byte session keys (11G) XOR bytes 16..40 of
+/// the halves; 32-byte ones (12C) run PBKDF2 over the hex of both halves.
+fn combo_key(
+    part_a: &[u8],
+    part_b: &[u8],
+    key_len: usize,
+    csk_salt: Option<&[u8]>,
+    sder_count: Option<u32>,
+) -> Result<Vec<u8>, Error> {
+    if part_a.len() == 48 {
+        Ok(part_a[16..40]
+            .iter()
+            .zip(&part_b[16..40])
+            .map(|(a, b)| a ^ b)
+            .collect())
+    } else {
+        let salt = csk_salt
+            .ok_or_else(|| bad_auth("AUTH_PBKDF2_CSK_SALT missing"))?;
+        let iterations = sder_count
+            .ok_or_else(|| bad_auth("AUTH_PBKDF2_SDER_COUNT missing"))?;
+        let mut raw_temp_key = part_b[..key_len].to_vec();
+        raw_temp_key.extend(&part_a[..key_len]);
+        let temp_key = base16ct::upper::encode_string(&raw_temp_key);
+        let mut combo_key = vec![0u8; key_len];
+        get_derived_key(temp_key.as_bytes(), salt, iterations, &mut combo_key);
+        Ok(combo_key)
+    }
+}
+
 pub struct AuthMessage {
     pub session_data: HashMap<String, String>,
     pairs: Vec<Pair>,
-    combo_key: Option<[u8; 32]>,
+    combo_key: Option<Vec<u8>>,
     resend_needed: bool,
+    /// Flags of the AUTH_VFR_DATA pair sent by the server: the type of the
+    /// account's password verifier (`constants::VERIFIER_TYPE_*`).
+    verifier_type: Option<u32>,
 }
 
 impl AuthMessage {
@@ -110,7 +232,7 @@ impl AuthMessage {
         &mut self,
         key: &str,
         password: &[u8],
-        combo_key: &[u8; 32],
+        combo_key: &[u8],
     ) {
         let pad_amount = 16 - password.len() % 16;
         let mut padded_input = vec![0u8; password.len() + pad_amount + 16];
@@ -121,17 +243,12 @@ impl AuthMessage {
         for i in 0..pad_amount {
             padded_input[offset + i] = pad_byte;
         }
-        let mut output_val = vec![0u8; padded_input.len()];
-        encrypt_cbc(combo_key, &padded_input, &mut output_val);
+        let output_val = encrypt_cbc(combo_key, &padded_input);
         self.add_pair_binary(key, &output_val[..], 0);
     }
 
     /// Encrypts the main password (and the new password, if applicable).
-    fn encrypt_passwords(
-        &mut self,
-        client: &mut Client,
-        combo_key: &[u8; 32],
-    ) {
+    fn encrypt_passwords(&mut self, client: &mut Client, combo_key: &[u8]) {
         self.encrypt_password(
             "AUTH_PASSWORD",
             &client.config().get_password_bytes(),
@@ -146,105 +263,97 @@ impl AuthMessage {
         }
     }
 
-    /// Generates the combo key used for encrypting the passwords sent to the
-    /// server for validation.
-    fn generate_combo_key(
-        &mut self,
-        session_key_part_a: &[u8],
-        session_key_part_b: &[u8],
-        combo_key: &mut [u8; 32],
-    ) {
-        let iterations: u32 = self
-            .session_data
-            .get("AUTH_PBKDF2_SDER_COUNT")
-            .unwrap()
-            .parse()
-            .unwrap();
-        let salt = base16ct::upper::decode_vec(
-            self.session_data.get("AUTH_PBKDF2_CSK_SALT").unwrap(),
-        )
-        .unwrap();
-        let mut raw_temp_key: [u8; 64] = [0; 64];
-        raw_temp_key[..32].copy_from_slice(session_key_part_b);
-        raw_temp_key[32..].copy_from_slice(session_key_part_a);
-        let temp_key_str = base16ct::upper::encode_string(&raw_temp_key);
-        let temp_key = temp_key_str.as_bytes();
-        get_derived_key(temp_key, &salt, iterations, combo_key);
+    /// Returns an optional hex-encoded session data value, decoded.
+    fn session_hex(&self, key: &str) -> Result<Option<Vec<u8>>, Error> {
+        self.session_data
+            .get(key)
+            .map(|v| {
+                base16ct::mixed::decode_vec(v)
+                    .map_err(|_| bad_auth(format!("{key} is not valid hex")))
+            })
+            .transpose()
+    }
+
+    /// Returns an optional numeric session data value.
+    fn session_u32(&self, key: &str) -> Result<Option<u32>, Error> {
+        self.session_data
+            .get(key)
+            .map(|v| {
+                v.trim()
+                    .parse::<u32>()
+                    .map_err(|_| bad_auth(format!("{key} is not a number")))
+            })
+            .transpose()
     }
 
     /// Generates the "speedy" key used by the server for validation without
-    /// requiring time consuming calculations.
-    fn generate_speedy_key(
-        &mut self,
-        password_key: &[u8],
-        combo_key: &[u8; 32],
-    ) {
+    /// requiring time consuming calculations (12C verifiers only).
+    fn generate_speedy_key(&mut self, password_key: &[u8], combo_key: &[u8]) {
         let mut input_val = [0u8; 80];
         rand::rng().fill(&mut input_val[..16]);
         input_val[16..].copy_from_slice(password_key);
-        let mut speedy_key = [0u8; 80];
-        encrypt_cbc(combo_key, &input_val, &mut speedy_key);
+        let speedy_key = encrypt_cbc(combo_key, &input_val);
         self.add_pair_binary("AUTH_PBKDF2_SPEEDY_KEY", &speedy_key, 0);
     }
 
     /// Generates the password verifier and the various keys required by the
-    /// server for validation.
-    fn generate_verifier(&mut self, client: &mut Client) {
-        // create password hash
-        let iterations: u32 = self
-            .session_data
-            .get("AUTH_PBKDF2_VGEN_COUNT")
-            .unwrap()
-            .parse()
-            .unwrap();
-        let verifier_data = base16ct::upper::decode_vec(
-            self.session_data.get("AUTH_VFR_DATA").unwrap(),
-        )
-        .unwrap();
-        let mut salt = verifier_data.clone();
-        salt.extend(b"AUTH_PBKDF2_SPEEDY_KEY");
-        let mut password_key: [u8; 64] = [0; 64];
+    /// server for validation. Supports 12C and 11G password verifiers (10G
+    /// and others give a clear error instead of a panic).
+    fn generate_verifier(&mut self, client: &mut Client) -> Result<(), Error> {
+        let verifier_type = self
+            .verifier_type
+            .ok_or_else(|| bad_auth("AUTH_VFR_DATA missing"))?;
+        let verifier_data = self
+            .session_hex("AUTH_VFR_DATA")?
+            .ok_or_else(|| bad_auth("AUTH_VFR_DATA missing"))?;
         let password = client.config().get_password_bytes();
-        get_derived_key(&password, &salt, iterations, &mut password_key);
-        let mut hasher = sha2::Sha512::new();
-        hasher.update(password_key);
-        hasher.update(verifier_data);
-        let password_hash: &[u8; 32] =
-            &hasher.finalize()[..32].try_into().unwrap();
+        let (password_hash, password_key) = password_hash(
+            verifier_type,
+            &password,
+            &verifier_data,
+            self.session_u32("AUTH_PBKDF2_VGEN_COUNT")?,
+        )?;
+        let key_len = password_hash.len();
 
         // decrypt first half of session key
-        let encoded_server_key = base16ct::upper::decode_vec(
-            self.session_data.get("AUTH_SESSKEY").unwrap(),
-        )
-        .unwrap();
-        let mut session_key_part_a = [0u8; 32];
-        decrypt_cbc(
-            password_hash,
-            &encoded_server_key,
-            &mut session_key_part_a,
-        );
+        let encoded_server_key = self
+            .session_hex("AUTH_SESSKEY")?
+            .ok_or_else(|| bad_auth("AUTH_SESSKEY missing"))?;
+        let session_key_part_a =
+            decrypt_cbc(&password_hash, &encoded_server_key)?;
+        if session_key_part_a.len() != 48 && session_key_part_a.len() < 32 {
+            return Err(bad_auth(format!(
+                "AUTH_SESSKEY has an unexpected length ({} bytes)",
+                session_key_part_a.len()
+            )));
+        }
 
-        // generate second half of session key
-        let mut session_key_part_b = [0u8; 32];
-        rand::rng().fill(&mut session_key_part_b);
-        let mut session_key = vec![0; 32];
-        encrypt_cbc(password_hash, &session_key_part_b, &mut session_key);
+        // generate second half of session key: 48 bytes for a 48-byte server
+        // half, otherwise 32 (python-oracledb sends 96 or 64 hex digits)
+        let part_b_len = if session_key_part_a.len() == 48 { 48 } else { 32 };
+        let mut session_key_part_b = vec![0u8; part_b_len];
+        rand::rng().fill(&mut session_key_part_b[..]);
+        let session_key = encrypt_cbc(&password_hash, &session_key_part_b);
         self.add_pair_binary("AUTH_SESSKEY", &session_key, 1);
 
         // calculate combo key
-        let mut combo_key = [0u8; 32];
-        self.generate_combo_key(
+        let combo_key = combo_key(
             &session_key_part_a,
             &session_key_part_b,
-            &mut combo_key,
-        );
+            key_len,
+            self.session_hex("AUTH_PBKDF2_CSK_SALT")?.as_deref(),
+            self.session_u32("AUTH_PBKDF2_SDER_COUNT")?,
+        )?;
 
-        // generate speedy key
-        self.generate_speedy_key(&password_key, &combo_key);
+        // generate speedy key (12C verifiers only)
+        if let Some(password_key) = password_key {
+            self.generate_speedy_key(&password_key, &combo_key);
+        }
 
         // encrypt password(s)
         self.encrypt_passwords(client, &combo_key);
         self.combo_key = Some(combo_key);
+        Ok(())
     }
 
     /// Returns the alter session statement that is sent during the initial
@@ -448,17 +557,18 @@ impl AuthMessage {
             pairs: Vec::<Pair>::new(),
             combo_key: None,
             resend_needed: false,
+            verifier_type: None,
         }
     }
 
     /// Sets the combo key to use for performing authentication.
-    pub(crate) fn set_combo_key(&mut self, combo_key: &[u8; 32]) {
-        self.combo_key = Some(*combo_key);
+    pub(crate) fn set_combo_key(&mut self, combo_key: Vec<u8>) {
+        self.combo_key = Some(combo_key);
     }
 
     /// Takes the combo key from the auth message so it can be stored
     /// elsewhere.
-    pub(crate) fn take_combo_key(&mut self) -> Option<[u8; 32]> {
+    pub(crate) fn take_combo_key(&mut self) -> Option<Vec<u8>> {
         self.combo_key.take()
     }
 }
@@ -473,13 +583,16 @@ impl Message for AuthMessage {
         for _ in 0..num_params {
             let key = resp.read_utf8_with_double_length()?.to_string();
             let value = resp.read_utf8_with_double_length()?.to_string();
-            resp.read_ub4()?; // flags
+            let flags = resp.read_ub4()?;
+            if key == "AUTH_VFR_DATA" {
+                self.verifier_type = Some(flags);
+            }
             self.session_data.insert(key, value);
         }
         Ok(())
     }
 
-    fn pre_process(&mut self, client: &mut Client) {
+    fn pre_process(&mut self, client: &mut Client) -> Result<(), Error> {
         self.pairs.clear();
         if self.get_is_phase_one() {
             self.add_pair("AUTH_TERMINAL", client.config().terminal(), 0);
@@ -488,10 +601,10 @@ impl Message for AuthMessage {
             self.add_pair("AUTH_PID", &std::process::id().to_string(), 0);
             self.add_pair("AUTH_SID", client.config().osuser(), 0);
             self.resend_needed = true;
-        } else if let Some(combo_key) = self.combo_key {
+        } else if let Some(combo_key) = self.combo_key.clone() {
             self.encrypt_passwords(client, &combo_key);
         } else {
-            self.generate_verifier(client);
+            self.generate_verifier(client)?;
             self.add_pair(
                 "SESSION_CLIENT_CHARSET",
                 &constants::CHARSET_ID_UTF8.to_string(),
@@ -524,6 +637,7 @@ impl Message for AuthMessage {
             }
             self.resend_needed = false;
         }
+        Ok(())
     }
 
     fn resend_needed(&self) -> bool {

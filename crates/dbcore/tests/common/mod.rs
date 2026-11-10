@@ -37,9 +37,12 @@ pub fn mysql_cfg() -> Option<DataSourceConfig> {
 
 /// `PROMETEO_ORACLE_URL=oracle://demo:prometeo@127.0.0.1:15219/FREEPDB1` (user:password@host:port/service name).
 pub fn oracle_cfg() -> Option<DataSourceConfig> {
-    let url = std::env::var("PROMETEO_ORACLE_URL")
-        .ok()
-        .filter(|u| !u.is_empty())?;
+    oracle_cfg_from_env("PROMETEO_ORACLE_URL")
+}
+
+/// Like `oracle_cfg`, from another environment variable.
+pub fn oracle_cfg_from_env(var: &str) -> Option<DataSourceConfig> {
+    let url = std::env::var(var).ok().filter(|u| !u.is_empty())?;
     let rest = url.strip_prefix("oracle://")?;
     let (cred, target) = rest.rsplit_once('@')?;
     let (user, password) = cred.split_once(':').unwrap_or((cred, ""));
