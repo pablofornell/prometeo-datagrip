@@ -441,7 +441,7 @@ impl fmt::Display for Error {
             ErrorKind::UnsupportedPasswordVerifier(verifier_type) => write!(
                 fmt,
                 "the password verifier type 0x{:x} of this account is not \
-                 supported (only 11G and 12C verifiers are); reset the \
+                 supported (only 10G, 11G and 12C verifiers are); reset the \
                  password so the server generates a 12C verifier",
                 verifier_type
             )?,

@@ -17,12 +17,6 @@ where it helps, what to do instead. Update the list when an item is fixed.
 - **Windows installer.** It is not built on the development machine (no MSVC linker there). The CI job on
   `windows-latest` builds it, and only for a version tag.
 
-## Connections
-
-- **Oracle accounts with only a 10G password verifier** (`dba_users.password_versions = 10G`) cannot log on:
-  the driver supports 11G and 12C verifiers, like python-oracledb in thin mode. The error says so. Resetting the
-  password on the server (`alter user .. identified by ..`) creates the newer verifiers.
-
 ## SQL dump and restore
 
 - **Oracle objects that are not dumped:** object tables (`CREATE TABLE .. OF type`), materialized view logs,

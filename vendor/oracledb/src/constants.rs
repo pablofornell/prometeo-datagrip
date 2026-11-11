@@ -353,6 +353,7 @@ pub const CHARSET_ID_UTF8: u16 = 873;
 pub const CHARSET_ID_UTF16: u16 = 2000;
 
 // verifier types
+pub const VERIFIER_TYPE_10G: u16 = 0x939;
 pub const VERIFIER_TYPE_11G_1: u16 = 0xb152;
 pub const VERIFIER_TYPE_11G_2: u16 = 0x1b25;
 pub const VERIFIER_TYPE_12C: u16 = 0x4815;

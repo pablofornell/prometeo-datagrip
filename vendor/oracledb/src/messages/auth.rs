@@ -33,6 +33,7 @@
 
 use aes::cipher::block_padding::NoPadding;
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
+use des::cipher::{BlockCipherEncrypt, KeyInit};
 use rand::RngExt;
 use sha2::Digest;
 use std::collections::HashMap;
@@ -45,6 +46,8 @@ use crate::ora_version::OracleVersion;
 use crate::response::Response;
 use crate::write_buffer::WriteBuffer;
 
+type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 type Aes192CbcDec = cbc::Decryptor<aes::Aes192>;
 type Aes192CbcEnc = cbc::Encryptor<aes::Aes192>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
@@ -66,13 +69,18 @@ fn bad_auth(reason: impl Into<String>) -> Error {
     Error::invalid_auth_response(reason.into())
 }
 
-/// AES-CBC (zero IV, no padding) decryption. The key is 24 bytes (AES-192,
-/// 11G verifiers) or 32 bytes (AES-256, 12C verifiers); the input length must
+/// AES-CBC (zero IV, no padding) decryption. The key is 16 bytes (AES-128,
+/// 10G verifiers and their combo key), 24 bytes (AES-192, 11G verifiers) or
+/// 32 bytes (AES-256, 12C verifiers); the input length must
 /// be a multiple of the block size.
 fn decrypt_cbc(key: &[u8], encrypted_text: &[u8]) -> Result<Vec<u8>, Error> {
     let iv = [0u8; 16];
     let mut plain_text = vec![0u8; encrypted_text.len()];
     let result = match key.len() {
+        16 => Aes128CbcDec::new_from_slices(key, &iv)
+            .expect("key and IV lengths checked")
+            .decrypt_padded_b2b::<NoPadding>(encrypted_text, &mut plain_text)
+            .map(|_| ()),
         24 => Aes192CbcDec::new_from_slices(key, &iv)
             .expect("key and IV lengths checked")
             .decrypt_padded_b2b::<NoPadding>(encrypted_text, &mut plain_text)
@@ -98,6 +106,15 @@ fn encrypt_cbc(key: &[u8], plain_text: &[u8]) -> Vec<u8> {
     let iv = [0u8; 16];
     let mut encrypted_text = vec![0u8; plain_text.len()];
     match key.len() {
+        16 => {
+            Aes128CbcEnc::new_from_slices(key, &iv)
+                .expect("key and IV lengths checked")
+                .encrypt_padded_b2b::<NoPadding>(
+                    plain_text,
+                    &mut encrypted_text,
+                )
+                .expect("plain text is a whole number of blocks");
+        }
         24 => {
             Aes192CbcEnc::new_from_slices(key, &iv)
                 .expect("key and IV lengths checked")
@@ -121,6 +138,38 @@ fn encrypt_cbc(key: &[u8], plain_text: &[u8]) -> Vec<u8> {
     encrypted_text
 }
 
+/// DES-CBC (zero IV) of `input` (whole blocks); returns the last block.
+fn des_cbc_last_block(key: &[u8; 8], input: &[u8]) -> [u8; 8] {
+    let cipher = des::Des::new(key.into());
+    let mut block = [0u8; 8];
+    for chunk in input.chunks(8) {
+        for (b, c) in block.iter_mut().zip(chunk) {
+            *b ^= c;
+        }
+        let mut out = des::cipher::Block::<des::Des>::from(block);
+        cipher.encrypt_block(&mut out);
+        block = out.into();
+    }
+    block
+}
+
+/// The 10G (pre-11g) password hash: UTF-16BE of the upper-cased user and
+/// password, zero padded to 8 bytes, DES-CBC with key 0x0123456789ABCDEF; the
+/// last block is the key of a second DES-CBC pass, whose last block is the
+/// hash (`dba_users.password` of 10g).
+fn des_password_hash(user: &str, password: &[u8]) -> [u8; 8] {
+    let text = format!("{}{}", user, String::from_utf8_lossy(password))
+        .to_uppercase();
+    let mut input: Vec<u8> =
+        text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+    input.resize(input.len().div_ceil(8) * 8, 0);
+    let key1 = des_cbc_last_block(
+        &[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef],
+        &input,
+    );
+    des_cbc_last_block(&key1, &input)
+}
+
 fn get_derived_key(
     key: &[u8],
     salt: &[u8],
@@ -137,11 +186,14 @@ fn get_derived_key(
 /// - 12C: PBKDF2-SHA512(password, vfr_data || "AUTH_PBKDF2_SPEEDY_KEY",
 ///   VGEN_COUNT) = password_key; hash = SHA512(password_key || vfr_data)[..32]
 /// - 11G: hash = SHA1(password || vfr_data) || 4 zero bytes (24 bytes)
+/// - 10G: hash = the DES password hash of the user and password (see
+///   `des_password_hash`) || 8 zero bytes (16 bytes, AES-128)
 ///
-/// This is what python-oracledb does in thin mode (`AuthMessage
-/// ._generate_verifier`).
+/// 12C and 11G are what python-oracledb does in thin mode (`AuthMessage
+/// ._generate_verifier`); python-oracledb has no 10G, which follows JDBC thin.
 fn password_hash(
     verifier_type: u32,
+    user: &str,
     password: &[u8],
     verifier_data: &[u8],
     vgen_count: Option<u32>,
@@ -167,22 +219,38 @@ fn password_hash(
         let mut hash = hasher.finalize().to_vec();
         hash.extend([0u8; 4]);
         Ok((hash, None))
+    } else if verifier_type == constants::VERIFIER_TYPE_10G as u32 {
+        let mut hash = des_password_hash(user, password).to_vec();
+        hash.extend([0u8; 8]);
+        Ok((hash, None))
     } else {
         Err(Error::unsupported_password_verifier(verifier_type))
     }
 }
 
 /// Builds the combo key (the key that encrypts the password) from both
-/// halves of the session key. 48-byte session keys (11G) XOR bytes 16..40 of
-/// the halves; 32-byte ones (12C) run PBKDF2 over the hex of both halves.
+/// halves of the session key. 10G: MD5 of the XOR of bytes 16..32 of the
+/// halves (what JDBC thin and go-ora do); 48-byte session keys (11G) XOR
+/// bytes 16..40 of the halves; 32-byte ones (12C) run PBKDF2 over the hex of
+/// both halves.
 fn combo_key(
+    verifier_type: u32,
     part_a: &[u8],
     part_b: &[u8],
     key_len: usize,
     csk_salt: Option<&[u8]>,
     sder_count: Option<u32>,
 ) -> Result<Vec<u8>, Error> {
-    if part_a.len() == 48 {
+    if verifier_type == constants::VERIFIER_TYPE_10G as u32
+        && csk_salt.is_none()
+    {
+        let xor: Vec<u8> = part_a[16..32]
+            .iter()
+            .zip(&part_b[16..32])
+            .map(|(a, b)| a ^ b)
+            .collect();
+        Ok(md5::Md5::digest(&xor).to_vec())
+    } else if part_a.len() == 48 {
         Ok(part_a[16..40]
             .iter()
             .zip(&part_b[16..40])
@@ -297,8 +365,8 @@ impl AuthMessage {
     }
 
     /// Generates the password verifier and the various keys required by the
-    /// server for validation. Supports 12C and 11G password verifiers (10G
-    /// and others give a clear error instead of a panic).
+    /// server for validation. Supports 12C, 11G and 10G password verifiers
+    /// (others give a clear error instead of a panic).
     fn generate_verifier(&mut self, client: &mut Client) -> Result<(), Error> {
         let verifier_type = self
             .verifier_type
@@ -307,8 +375,10 @@ impl AuthMessage {
             .session_hex("AUTH_VFR_DATA")?
             .ok_or_else(|| bad_auth("AUTH_VFR_DATA missing"))?;
         let password = client.config().get_password_bytes();
+        let user = client.config().user().unwrap_or_default();
         let (password_hash, password_key) = password_hash(
             verifier_type,
+            user,
             &password,
             &verifier_data,
             self.session_u32("AUTH_PBKDF2_VGEN_COUNT")?,
@@ -338,6 +408,7 @@ impl AuthMessage {
 
         // calculate combo key
         let combo_key = combo_key(
+            verifier_type,
             &session_key_part_a,
             &session_key_part_b,
             key_len,
@@ -658,5 +729,43 @@ impl Message for AuthMessage {
         for pair in self.pairs.iter() {
             self.write_pair(buf, pair);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn des_password_hash_matches_the_10g_verifier() {
+        // dba_users.password of SCOTT / TIGER on 10g
+        assert_eq!(
+            base16ct::upper::encode_string(&des_password_hash(
+                "scott", b"tiger"
+            )),
+            "F894844C34402B67"
+        );
+        assert_eq!(
+            base16ct::upper::encode_string(&des_password_hash(
+                "SYSTEM", b"MANAGER"
+            )),
+            "D4DF7931AB130E37"
+        );
+    }
+
+    #[test]
+    fn combo_key_10g_is_md5_of_the_xor() {
+        let a: Vec<u8> = (0..32).collect();
+        let b = vec![0u8; 32];
+        let key = combo_key(
+            constants::VERIFIER_TYPE_10G as u32,
+            &a,
+            &b,
+            16,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(key, md5::Md5::digest(&a[16..32]).to_vec());
     }
 }
